@@ -1075,6 +1075,17 @@ pub extern "C" fn v8__FunctionTemplate__PrototypeTemplate(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionTemplate__InstanceTemplate(
+    this: *const FunctionTemplate,
+) -> *const ObjectTemplate {
+    if this.is_null() {
+        return ptr::null();
+    }
+    let t = unsafe { &*(this as *const FnTemplate) };
+    t.instance as *const ObjectTemplate
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionTemplate__SetClassName(
     this: *const FunctionTemplate,
     name: *const String,

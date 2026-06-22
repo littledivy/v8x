@@ -38,8 +38,6 @@ pub extern "C" fn v8__Float16Array__New() { unimplemented!("v8__Float16Array__Ne
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionCallbackInfo__NewTarget() { unimplemented!("v8__FunctionCallbackInfo__NewTarget") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionTemplate__InstanceTemplate() { unimplemented!("v8__FunctionTemplate__InstanceTemplate") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__HeapProfiler__TakeHeapSnapshot() { unimplemented!("v8__HeapProfiler__TakeHeapSnapshot") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__AddGCEpilogueCallback() { unimplemented!("v8__Isolate__AddGCEpilogueCallback") }
