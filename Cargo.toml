@@ -1,0 +1,28 @@
+[package]
+# Package name is `v8` so it can replace the real crate via `[patch]` in
+# downstream projects (Deno). The project itself is "v82jsc": a rusty_v8 API
+# surface backed by JavaScriptCore.
+name = "v8"
+version = "149.4.0"
+edition = "2024"
+description = "rusty_v8 API surface implemented on JavaScriptCore (v82jsc)"
+build = "build.rs"
+
+[lib]
+name = "v8"
+path = "src/lib.rs"
+
+[features]
+default = []
+use_custom_libcxx = []
+simdutf = []
+v8_enable_pointer_compression = []
+v8_enable_sandbox = ["v8_enable_pointer_compression"]
+v8_enable_v8_checks = []
+
+[dependencies]
+bitflags = "2.5"
+paste = "1.0"
+temporal_capi = { version = "0.2.3", features = ["zoneinfo64"] }
+
+[dev-dependencies]
