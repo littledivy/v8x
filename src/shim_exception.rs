@@ -10,7 +10,8 @@ use crate::{
     StackTrace, String, Value,
 };
 use crate::shim_core::{
-    ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval,
+    clear_pending_exception, ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval,
+    peek_pending_exception, record_pending_exception,
 };
 use std::os::raw::c_char;
 use std::ptr;
@@ -657,22 +658,42 @@ pub extern "C" fn v8__PromiseRejectMessage__GetEvent(
 // for this; we keep TryCatch self-contained and rely on ReThrow/Reset).
 // ===================================================================
 
+// Buffer layout (usize slots):
+//   [0] = isolate ptr
+//   [1] = rethrow flag (1 if ReThrow was called -> don't clear on destruct)
+// On construct we clear the isolate's pending exception so this TryCatch only
+// observes exceptions thrown after it. (deno_core constructs a fresh TryCatch
+// per operation, so we don't need to preserve a parent handler's slot here.)
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TryCatch__CONSTRUCT(buf: *mut usize, isolate: *mut RealIsolate) {
     unsafe {
         *buf.add(0) = isolate as usize;
-        *buf.add(1) = 0; // has_caught = false
-        *buf.add(2) = 0; // exception = null
+        *buf.add(1) = 0;
+        *buf.add(2) = 0;
         *buf.add(3) = 0;
         *buf.add(4) = 0;
         *buf.add(5) = 0;
     }
+    // Snapshot point: clear any stale pending exception so HasCaught only
+    // reflects exceptions thrown within this TryCatch's scope.
+    clear_pending_exception(isolate);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TryCatch__DESTRUCT(this: *mut usize) {
-    // Nothing protected here; exception slot is a borrowed handle.
-    let _ = this;
+    if this.is_null() {
+        return;
+    }
+    unsafe {
+        let isolate = *this.add(0) as *mut RealIsolate;
+        let rethrow = *this.add(1) != 0;
+        // V8 semantics: on destruct, a caught-but-not-rethrown exception is
+        // cleared so it doesn't leak to the enclosing handler.
+        if !rethrow {
+            clear_pending_exception(isolate);
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -680,7 +701,10 @@ pub extern "C" fn v8__TryCatch__HasCaught(this: *const TryCatch) -> bool {
     if this.is_null() {
         return false;
     }
-    unsafe { *((this as *const usize).add(1)) != 0 }
+    unsafe {
+        let isolate = *(this as *const usize).add(0) as *mut RealIsolate;
+        !peek_pending_exception(isolate).is_null()
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -696,8 +720,13 @@ pub extern "C" fn v8__TryCatch__Exception(this: *const TryCatch) -> *const Value
         return ptr::null();
     }
     unsafe {
-        let v = *((this as *const usize).add(2));
-        v as *const Value
+        let isolate = *(this as *const usize).add(0) as *mut RealIsolate;
+        let v = peek_pending_exception(isolate);
+        if v.is_null() {
+            return ptr::null();
+        }
+        // Re-intern so the returned handle is rooted in the current scope.
+        intern::<Value>(v)
     }
 }
 
@@ -707,9 +736,9 @@ pub extern "C" fn v8__TryCatch__Reset(this: *mut TryCatch) {
         return;
     }
     unsafe {
-        let p = this as *mut usize;
-        *p.add(1) = 0;
-        *p.add(2) = 0;
+        let isolate = *(this as *const usize).add(0) as *mut RealIsolate;
+        *(this as *mut usize).add(1) = 0;
+        clear_pending_exception(isolate);
     }
 }
 
@@ -719,8 +748,11 @@ pub extern "C" fn v8__TryCatch__ReThrow(this: *mut TryCatch) -> *const Value {
         return ptr::null();
     }
     unsafe {
-        // Returning the stored exception; the caller re-propagates it.
-        let v = *((this as *const usize).add(2));
+        let isolate = *(this as *const usize).add(0) as *mut RealIsolate;
+        // Mark as rethrown so DESTRUCT leaves the pending exception in place to
+        // propagate to the enclosing handler.
+        *(this as *mut usize).add(1) = 1;
+        let v = peek_pending_exception(isolate);
         v as *const Value
     }
 }

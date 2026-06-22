@@ -259,6 +259,56 @@ pub extern "C" fn v8__Value__IsTrue(this: *const Value) -> bool {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__BooleanValue(
+    this: *const Value,
+    _isolate: *mut crate::RealIsolate,
+) -> bool {
+    let c = ctx();
+    if c.is_null() {
+        return false;
+    }
+    // ToBoolean coercion (the JS truthiness of the value).
+    unsafe { JSValueToBoolean(c, jsval(this)) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__TypeOf(
+    this: *const Value,
+    _isolate: *mut crate::RealIsolate,
+) -> *const V8String {
+    let c = ctx();
+    if c.is_null() {
+        return ptr::null();
+    }
+    // Map JS `typeof` semantics. JSC's JSType lumps function under Object, so
+    // probe with JSObjectIsFunction.
+    let s: &[u8] = match jsty(this) {
+        JSType::Undefined => b"undefined\0",
+        JSType::Null => b"object\0",
+        JSType::Boolean => b"boolean\0",
+        JSType::Number => b"number\0",
+        JSType::String => b"string\0",
+        JSType::Symbol => b"symbol\0",
+        JSType::BigInt => b"bigint\0",
+        JSType::Object => unsafe {
+            let o = jsval(this) as JSObjectRef;
+            if JSObjectIsFunction(c, o) {
+                b"function\0"
+            } else {
+                b"object\0"
+            }
+        },
+        _ => b"object\0",
+    };
+    unsafe {
+        let js = JSStringCreateWithUTF8CString(s.as_ptr() as *const c_char);
+        let v = JSValueMakeString(c, js);
+        JSStringRelease(js);
+        intern_ctx::<V8String>(c, v)
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsString(this: *const Value) -> bool {
     jsty(this) == JSType::String
 }
@@ -678,6 +728,152 @@ pub extern "C" fn v8__Value__NumberValue(
         let n = JSValueToNumber(c, jsval(this), &mut exc);
         if exc.is_null() {
             maybe_set(out, n);
+        } else {
+            maybe_none(out);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsFalse(this: *const Value) -> bool {
+    let c = ctx();
+    if c.is_null() {
+        return false;
+    }
+    unsafe { JSValueIsBoolean(c, jsval(this)) && !JSValueToBoolean(c, jsval(this)) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsName(this: *const Value) -> bool {
+    // A Name is a String or a Symbol.
+    let t = jsty(this);
+    t == JSType::String || t == JSType::Symbol
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsFloat16Array(_this: *const Value) -> bool {
+    // JSC has no Float16Array typed-array type exposed here.
+    false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__SameValue(this: *const Value, that: *const Value) -> bool {
+    let c = ctx();
+    if c.is_null() {
+        return false;
+    }
+    // SameValue differs from === only for NaN (equal) and +0/-0 (not equal).
+    unsafe {
+        let a = jsval(this);
+        let b = jsval(that);
+        if JSValueIsStrictEqual(c, a, b) {
+            // Distinguish +0 from -0.
+            if JSValueIsNumber(c, a) && JSValueIsNumber(c, b) {
+                let mut exc: JSValueRef = ptr::null();
+                let na = JSValueToNumber(c, a, &mut exc);
+                let nb = JSValueToNumber(c, b, &mut exc);
+                if na == 0.0 && nb == 0.0 {
+                    return na.is_sign_negative() == nb.is_sign_negative();
+                }
+            }
+            return true;
+        }
+        // NaN SameValue NaN is true.
+        if JSValueIsNumber(c, a) && JSValueIsNumber(c, b) {
+            let mut exc: JSValueRef = ptr::null();
+            let na = JSValueToNumber(c, a, &mut exc);
+            let nb = JSValueToNumber(c, b, &mut exc);
+            return na.is_nan() && nb.is_nan();
+        }
+        false
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__InstanceOf(
+    this: *const Value,
+    context: *const Context,
+    object: *const Object,
+    out: *mut Maybe<bool>,
+) {
+    let c = ctx_of(context) as JSContextRef;
+    if c.is_null() || object.is_null() {
+        unsafe { maybe_none(out) };
+        return;
+    }
+    unsafe {
+        let ctor = jsval(object as *const Value) as JSObjectRef;
+        let mut exc: JSValueRef = ptr::null();
+        let r = JSValueIsInstanceOfConstructor(c, jsval(this), ctor, &mut exc);
+        if exc.is_null() {
+            maybe_set(out, r);
+        } else {
+            maybe_none(out);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__ToNumber(
+    this: *const Value,
+    context: *const Context,
+) -> *const Number {
+    let c = ctx_of(context) as JSContextRef;
+    if c.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let mut exc: JSValueRef = ptr::null();
+        let n = JSValueToNumber(c, jsval(this), &mut exc);
+        if !exc.is_null() {
+            return ptr::null();
+        }
+        let v = JSValueMakeNumber(c, n);
+        intern_ctx::<Number>(c, v)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IntegerValue(
+    this: *const Value,
+    context: *const Context,
+    out: *mut Maybe<i64>,
+) {
+    let c = ctx_of(context) as JSContextRef;
+    if c.is_null() {
+        unsafe { maybe_none(out) };
+        return;
+    }
+    unsafe {
+        let mut exc: JSValueRef = ptr::null();
+        let n = JSValueToNumber(c, jsval(this), &mut exc);
+        if exc.is_null() {
+            // ToInteger: truncate toward zero; NaN -> 0.
+            let i = if n.is_nan() { 0 } else { n.trunc() as i64 };
+            maybe_set(out, i);
+        } else {
+            maybe_none(out);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__Uint32Value(
+    this: *const Value,
+    context: *const Context,
+    out: *mut Maybe<u32>,
+) {
+    let c = ctx_of(context) as JSContextRef;
+    if c.is_null() {
+        unsafe { maybe_none(out) };
+        return;
+    }
+    unsafe {
+        let mut exc: JSValueRef = ptr::null();
+        let n = JSValueToNumber(c, jsval(this), &mut exc);
+        if exc.is_null() && n.is_finite() {
+            let i = n.trunc().rem_euclid(4294967296.0);
+            maybe_set(out, i as u32);
         } else {
             maybe_none(out);
         }

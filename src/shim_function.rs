@@ -94,6 +94,7 @@ unsafe extern "C" {
         propertyName: JSStringRef,
         exception: *mut JSValueRef,
     ) -> JSValueRef;
+    fn JSObjectSetPrototype(ctx: JSContextRef, object: JSObjectRef, value: JSValueRef);
     fn JSObjectMakeFunctionWithCallback(
         ctx: JSContextRef,
         name: JSStringRef,
@@ -284,8 +285,19 @@ unsafe extern "C" fn fn_construct_trampoline(
     if bridge.is_null() {
         return unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
     }
-    // Fresh `this` object for the constructor.
+    // Fresh `this` object for the constructor, with its prototype set to the
+    // constructor function's `.prototype` so instance methods (installed on the
+    // prototype template) are reachable, matching `new F()` semantics.
     let this = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
+    unsafe {
+        let proto_key = JSStringCreateWithUTF8CString(c"prototype".as_ptr());
+        let mut exc: JSValueRef = ptr::null();
+        let proto = JSObjectGetProperty(ctx, function, proto_key, &mut exc);
+        JSStringRelease(proto_key);
+        if !proto.is_null() && JSValueIsObject(ctx, proto) {
+            JSObjectSetPrototype(ctx, this, proto);
+        }
+    }
     let r = unsafe {
         dispatch(
             ctx,
@@ -334,15 +346,49 @@ unsafe fn make_function_len(
     let obj = unsafe {
         JSObjectMake(ctx, fn_class(), Box::into_raw(bridge) as *mut c_void)
     };
-    // Install `length` (arity). ReadOnly|DontEnum|DontDelete == 2|4|8.
+    // Install `length` (arity). Per ES spec a function's `length` is
+    // { writable:false, enumerable:false, configurable:true } — i.e. ReadOnly|
+    // DontEnum (2|4) but NOT DontDelete, so embedder code (e.g. deno's
+    // applyWebIdlInterfaceShape) can redefine it without a JSC "unconfigurable
+    // property" TypeError.
     let key = unsafe { JSStringCreateWithUTF8CString(c"length".as_ptr()) };
     let lenval = unsafe { JSValueMakeNumber(ctx, length.max(0) as f64) };
     let mut exc: JSValueRef = ptr::null();
     unsafe {
-        JSObjectSetProperty(ctx, obj, key, lenval, 2 | 4 | 8, &mut exc);
+        JSObjectSetProperty(ctx, obj, key, lenval, 2 | 4, &mut exc);
         JSStringRelease(key);
     }
+    // Objects made with a custom JSClass do NOT inherit `Function.prototype`, so
+    // they lack `call`/`apply`/`bind`. deno's async-op stubs do
+    // `originalOp.call(this, id, ...)`, so splice `Function.prototype` into the
+    // function object's prototype chain.
+    unsafe {
+        let fp = function_prototype(ctx);
+        if !fp.is_null() {
+            JSObjectSetPrototype(ctx, obj, fp);
+        }
+    }
     obj
+}
+
+/// Return `Function.prototype` for `ctx` (cached per call is cheap; JSC interns
+/// the global). Used to give our custom-class function objects `call`/`apply`/
+/// `bind`.
+unsafe fn function_prototype(ctx: JSContextRef) -> JSValueRef {
+    unsafe {
+        let global = JSContextGetGlobalObject(ctx);
+        let fkey = JSStringCreateWithUTF8CString(c"Function".as_ptr());
+        let mut exc: JSValueRef = ptr::null();
+        let func_ctor = JSObjectGetProperty(ctx, global, fkey, &mut exc);
+        JSStringRelease(fkey);
+        if func_ctor.is_null() || !JSValueIsObject(ctx, func_ctor) {
+            return ptr::null();
+        }
+        let pkey = JSStringCreateWithUTF8CString(c"prototype".as_ptr());
+        let fp = JSObjectGetProperty(ctx, func_ctor as JSObjectRef, pkey, &mut exc);
+        JSStringRelease(pkey);
+        fp
+    }
 }
 
 #[inline]
@@ -505,6 +551,11 @@ pub extern "C" fn v8__Function__Call(
                     eprintln!("[v82jsc] Function__Call threw: {}", std::string::String::from_utf8_lossy(&buf));
                 }
             }
+        }
+        // Record the thrown value as the isolate's pending exception so a
+        // surrounding TryCatch (and deno's error reporting) can observe it.
+        if !exc.is_null() {
+            crate::shim_core::record_pending_exception(ctx, exc);
         }
         return ptr::null();
     }

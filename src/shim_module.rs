@@ -21,8 +21,8 @@ use crate::{
 
 use crate::isolate::ModuleImportPhase;
 use crate::module::{
-    Location, ModuleStatus, ResolveModuleCallback, ResolveSourceCallback,
-    StalledTopLevelAwaitMessage, SyntheticModuleEvaluationSteps,
+    Location, ModuleStatus, ResolveModuleCallback, ResolveModuleCallbackRet,
+    ResolveSourceCallback, StalledTopLevelAwaitMessage, SyntheticModuleEvaluationSteps,
     SyntheticModuleEvaluationStepsRet,
 };
 use crate::script::ScriptOrigin;
@@ -123,6 +123,13 @@ struct SyntheticModule {
     import_specifiers: Vec<std::string::String>,
     /// Namespace object holding the exports; protected for the module's life.
     namespace: JSObjectRef,
+    /// This module's own specifier (resource name), used to register its
+    /// namespace into `globalThis.__v8jsc_modules` so dependents resolve it.
+    specifier: std::string::String,
+    /// Resolved dependency module handles (one per import specifier), filled in
+    /// during InstantiateModule via the resolve callback. Evaluated (post-order)
+    /// before this module's own body runs, mirroring V8 module linking.
+    dependencies: Vec<*const Module>,
 }
 
 unsafe extern "C" fn mod_finalize(object: JSObjectRef) {
@@ -317,7 +324,7 @@ pub extern "C" fn v8__Script__Run(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptOrigin__CONSTRUCT(
     buf: *mut MaybeUninit<ScriptOrigin>,
-    _resource_name: *const Value,
+    resource_name: *const Value,
     _resource_line_offset: i32,
     _resource_column_offset: i32,
     _resource_is_shared_cross_origin: bool,
@@ -329,10 +336,13 @@ pub extern "C" fn v8__ScriptOrigin__CONSTRUCT(
     _host_defined_options: *const Data,
 ) {
     // ScriptOrigin is an opaque byte buffer to us; JSC doesn't consume origin
-    // metadata through the C API. Zero-initialize so it is a valid value.
+    // metadata through the C API. Zero-initialize, then stash the resource-name
+    // handle in the first usize slot so Source::CONSTRUCT can carry it into the
+    // Source (used to derive a module's specifier for our linker).
     if !buf.is_null() {
         unsafe {
             ptr::write_bytes(buf as *mut u8, 0u8, size_of::<ScriptOrigin>());
+            *(buf as *mut usize) = resource_name as usize;
         }
     }
 }
@@ -345,7 +355,7 @@ pub extern "C" fn v8__ScriptOrigin__CONSTRUCT(
 pub extern "C" fn v8__ScriptCompiler__Source__CONSTRUCT(
     buf: *mut MaybeUninit<Source>,
     source_string: *const V8String,
-    _origin: *const ScriptOrigin,
+    origin: *const ScriptOrigin,
     _cached_data: *mut CachedData,
 ) {
     if buf.is_null() {
@@ -353,10 +363,15 @@ pub extern "C" fn v8__ScriptCompiler__Source__CONSTRUCT(
     }
     unsafe {
         // Zero the whole struct, then stash the source-string handle in the
-        // first field (_source_string) so Compile* can recover it.
+        // first field (_source_string) so Compile* can recover it, and the
+        // resource-name handle (carried in the ScriptOrigin's first slot) in
+        // the second field (_resource_name) so we can derive the specifier.
         ptr::write_bytes(buf as *mut u8, 0u8, size_of::<Source>());
-        let first = buf as *mut usize;
-        *first = source_string as usize;
+        let slots = buf as *mut usize;
+        *slots = source_string as usize;
+        if !origin.is_null() {
+            *slots.add(1) = *(origin as *const usize);
+        }
     }
 }
 
@@ -379,6 +394,61 @@ unsafe fn source_string_of(source: *mut Source) -> JSValueRef {
         return ptr::null();
     }
     unsafe { *(source as *const usize) as JSValueRef }
+}
+
+/// Convert a JS string value to a Rust String. Empty on failure/null.
+unsafe fn jsstring_to_rust(ctx: JSContextRef, v: JSValueRef) -> std::string::String {
+    if ctx.is_null() || v.is_null() {
+        return std::string::String::new();
+    }
+    unsafe {
+        let mut exc: JSValueRef = ptr::null();
+        let s = JSValueToStringCopy(ctx, v, &mut exc);
+        if s.is_null() {
+            return std::string::String::new();
+        }
+        let max = JSStringGetMaximumUTF8CStringSize(s);
+        let mut buf = vec![0u8; max];
+        let n = JSStringGetUTF8CString(s, buf.as_mut_ptr() as *mut _, max);
+        JSStringRelease(s);
+        if n == 0 {
+            return std::string::String::new();
+        }
+        buf.truncate(n - 1);
+        std::string::String::from_utf8(buf).unwrap_or_default()
+    }
+}
+
+/// Recover the module specifier (resource name) from a `Source`. The
+/// `_resource_name` field is at usize index 1 and holds a `*const Value` that
+/// is a JS string (or null). Returns an empty string if unavailable.
+unsafe fn resource_name_of(ctx: JSContextRef, source: *mut Source) -> std::string::String {
+    if source.is_null() || ctx.is_null() {
+        return std::string::String::new();
+    }
+    let name_val = unsafe { *((source as *const usize).add(1)) } as JSValueRef;
+    if name_val.is_null() {
+        return std::string::String::new();
+    }
+    unsafe {
+        if JSValueIsUndefined(ctx, name_val) || JSValueIsNull(ctx, name_val) {
+            return std::string::String::new();
+        }
+        let mut exc: JSValueRef = ptr::null();
+        let s = JSValueToStringCopy(ctx, name_val, &mut exc);
+        if s.is_null() {
+            return std::string::String::new();
+        }
+        let max = JSStringGetMaximumUTF8CStringSize(s);
+        let mut buf = vec![0u8; max];
+        let n = JSStringGetUTF8CString(s, buf.as_mut_ptr() as *mut _, max);
+        JSStringRelease(s);
+        if n == 0 {
+            return std::string::String::new();
+        }
+        buf.truncate(n - 1);
+        std::string::String::from_utf8(buf).unwrap_or_default()
+    }
 }
 
 // ===================================================================
@@ -422,7 +492,14 @@ pub extern "C" fn v8__ScriptCompiler__CachedData__DELETE<'a>(this: *mut CachedDa
         buffer_policy: i32,
     }
     unsafe {
-        drop(Box::from_raw(this as *mut RawCachedData));
+        let raw = Box::from_raw(this as *mut RawCachedData);
+        // Free the data buffer too when we own it (BufferOwned == 1).
+        if raw.buffer_policy == 1 && !raw.data.is_null() && raw.length > 0 {
+            let slice =
+                std::slice::from_raw_parts_mut(raw.data as *mut u8, raw.length as usize);
+            drop(Box::from_raw(slice as *mut [u8]));
+        }
+        drop(raw);
     }
 }
 
@@ -493,6 +570,10 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
         }
     };
 
+    // Recover the resource name (module specifier) from the ScriptOrigin so the
+    // module's namespace can be registered for dependents to import.
+    let specifier = unsafe { resource_name_of(ctx, source) };
+
     // Rewrite ES-module syntax into a function body that assigns exports onto
     // the `__ns` namespace object. Best-effort; supports the module shapes
     // emitted by deno_core builtins.
@@ -512,6 +593,8 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
         source: Some(rewrite.body),
         import_specifiers: rewrite.imports,
         namespace,
+        specifier,
+        dependencies: Vec::new(),
     });
     let obj = unsafe {
         JSObjectMake(ctx, mod_class(), Box::into_raw(state) as *mut _)
@@ -534,12 +617,88 @@ struct RewrittenModule {
 ///   - `export default EXPR`
 /// Imported bindings resolve through `globalThis.__v8jsc_modules[spec]`.
 /// Returns None for shapes we can't safely rewrite (e.g. `export * from`).
+/// Collapse statements whose `{ ... }` binding list spans multiple physical
+/// lines (`import {`, `export {`) into one logical line. Non-brace statements
+/// and plain code pass through unchanged (one logical line each). Blank lines
+/// that were consumed inside a join are replaced so total line accounting stays
+/// roughly stable, but exact positions are not required for evaluation.
+fn join_module_statements(src: &str) -> Vec<std::string::String> {
+    let lines: Vec<&str> = src.lines().collect();
+    let mut result: Vec<std::string::String> = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let trimmed = lines[i].trim();
+        let starts_brace_stmt = (trimmed.starts_with("import")
+            || trimmed.starts_with("export"))
+            && trimmed.contains('{')
+            && !trimmed.contains('}');
+        if starts_brace_stmt {
+            // Accumulate until we see the closing `}` (and any following
+            // `from "..."` / `;` on that or a later line).
+            let mut buf = std::string::String::new();
+            buf.push_str(lines[i].trim_end());
+            buf.push(' ');
+            let mut closed = false;
+            i += 1;
+            while i < lines.len() {
+                let l = lines[i];
+                buf.push_str(l.trim());
+                buf.push(' ');
+                if l.contains('}') {
+                    closed = true;
+                    // The `from "..."` clause may be on the same line as `}`.
+                    // If the line ends the statement (contains `from` or ends
+                    // with `;` or just `}`), stop here.
+                    i += 1;
+                    // Pull in a trailing `from "..."` line if `}` was alone.
+                    if !buf.contains(" from ")
+                        && !buf.trim_end().ends_with(';')
+                        && i < lines.len()
+                        && lines[i].trim_start().starts_with("from ")
+                    {
+                        buf.push_str(lines[i].trim());
+                        buf.push(' ');
+                        i += 1;
+                    }
+                    break;
+                }
+                i += 1;
+            }
+            let _ = closed;
+            result.push(buf.split_whitespace().collect::<Vec<_>>().join(" "));
+        } else {
+            result.push(lines[i].to_string());
+            i += 1;
+        }
+    }
+    result
+}
+
 fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
     let mut out = std::string::String::new();
+    // Import bindings are hoisted to the top of the module body to mirror ES
+    // module semantics (imported names are live before any other statement
+    // runs). Deno's bootstrap uses imported bindings earlier in source order
+    // than the import statement itself, so we must emit them first.
+    let mut imports_out = std::string::String::new();
+    // Export assignments (`__ns[name] = local`) are deferred to the end of the
+    // body so multi-line declarations (e.g. `export const X = { ... }` spanning
+    // many lines) finish before the namespace is populated, and so forward
+    // references between exports resolve.
+    let mut exports_out = std::string::String::new();
     let mut export_names: Vec<std::string::String> = Vec::new();
     let mut imports: Vec<std::string::String> = Vec::new();
 
-    for raw_line in src.lines() {
+    // Pre-join multi-line `import { ... } from "..."` / `export { ... }` /
+    // `export { ... } from "..."` statements into a single logical line so the
+    // per-line rewriter below sees the whole statement at once. Deno's builtin
+    // modules format these imports across many lines. Each produced logical line
+    // carries an explicit trailing newline count so source positions and any
+    // embedded plain code keep their line breaks.
+    let logical = join_module_statements(src);
+
+    for raw_line in logical.iter() {
+        let raw_line: &str = raw_line.as_str();
         let line = raw_line.trim_start();
         let trimmed = line.trim();
 
@@ -550,36 +709,80 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
 
         // import ... from "spec";  /  import "spec";
         if trimmed.starts_with("import ") || trimmed == "import" {
-            if let Some(spec) = extract_specifier(trimmed) {
+            let spec = extract_specifier(trimmed).unwrap_or_default();
+            if !spec.is_empty() {
                 imports.push(spec.clone());
             }
-            if trimmed.starts_with("import {") || trimmed.contains("import {") {
-                // import { a, b as c } from "spec"
-                let names = between(trimmed, '{', '}').unwrap_or_default();
-                let spec = extract_specifier(trimmed).unwrap_or_default();
-                out.push_str(&format!(
-                    "const {{ {} }} = (globalThis.__v8jsc_modules||{{}})[{:?}]||{{}};\n",
-                    names, spec
-                ));
-            } else if trimmed.starts_with("import ") && trimmed.contains(" from ") {
-                // import def from "spec"  -> default import
-                let mid = &trimmed["import ".len()..];
-                let name = mid.split(" from ").next().unwrap_or("").trim();
-                let spec = extract_specifier(trimmed).unwrap_or_default();
-                if !name.is_empty() && !name.starts_with('{') {
-                    out.push_str(&format!(
-                        "const {} = ((globalThis.__v8jsc_modules||{{}})[{:?}]||{{}}).default;\n",
-                        name, spec
+            let module_expr =
+                format!("((globalThis.__v8jsc_modules||{{}})[{:?}]||{{}})", spec);
+
+            // Clause between `import` and `from` (the binding list).
+            let clause = if let Some((c, _)) = trimmed["import".len()..].split_once(" from ") {
+                c.trim()
+            } else {
+                ""
+            };
+
+            if clause.contains('{') {
+                // Possibly `def, { a, b as c }` — split off a leading default.
+                let brace_start = clause.find('{').unwrap();
+                let head = clause[..brace_start].trim().trim_end_matches(',').trim();
+                if !head.is_empty() {
+                    // default binding
+                    imports_out.push_str(&format!(
+                        "const {} = {}.default;\n",
+                        head, module_expr
                     ));
                 }
+                // Named bindings: convert `a as b` -> `a: b` for destructuring.
+                let names = between(trimmed, '{', '}').unwrap_or_default();
+                let mut destructure: Vec<std::string::String> = Vec::new();
+                for part in names.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    if let Some((l, r)) = part.split_once(" as ") {
+                        destructure.push(format!("{}: {}", l.trim(), r.trim()));
+                    } else {
+                        destructure.push(part.to_string());
+                    }
+                }
+                imports_out.push_str(&format!(
+                    "const {{ {} }} = {};\n",
+                    destructure.join(", "),
+                    module_expr
+                ));
+            } else if clause.starts_with("* as ") {
+                // import * as ns from "spec"
+                let name = clause["* as ".len()..].trim();
+                if !name.is_empty() {
+                    imports_out.push_str(&format!("const {} = {};\n", name, module_expr));
+                }
+            } else if !clause.is_empty() && trimmed.contains(" from ") {
+                // import def from "spec"  -> default import
+                imports_out.push_str(&format!(
+                    "const {} = {}.default;\n",
+                    clause, module_expr
+                ));
             }
             // bare `import "spec";` -> side effect only, nothing to bind.
             continue;
         }
 
-        // export { a, b as c };
+        // export { a, b as c };   or   export { a, b } from "spec";  (re-export)
         if trimmed.starts_with("export {") || trimmed.starts_with("export{") {
             let inner = between(trimmed, '{', '}').unwrap_or_default();
+            // Re-export: bindings come from the named module, not local scope.
+            let reexport_spec = if trimmed.contains(" from ") {
+                let spec = extract_specifier(trimmed).unwrap_or_default();
+                if !spec.is_empty() {
+                    imports.push(spec.clone());
+                }
+                Some(spec)
+            } else {
+                None
+            };
             for part in inner.split(',') {
                 let part = part.trim();
                 if part.is_empty() {
@@ -591,7 +794,14 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
                     (part.to_string(), part.to_string())
                 };
                 export_names.push(exported.clone());
-                out.push_str(&format!("__ns[{:?}] = {};\n", exported, local));
+                if let Some(spec) = &reexport_spec {
+                    exports_out.push_str(&format!(
+                        "__ns[{:?}] = ((globalThis.__v8jsc_modules||{{}})[{:?}]||{{}})[{:?}];\n",
+                        exported, spec, local
+                    ));
+                } else {
+                    exports_out.push_str(&format!("__ns[{:?}] = {};\n", exported, local));
+                }
             }
             continue;
         }
@@ -600,7 +810,10 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
         if trimmed.starts_with("export default ") {
             let expr = &trimmed["export default ".len()..];
             export_names.push("default".to_string());
-            out.push_str(&format!("__ns[\"default\"] = ({});\n", expr.trim_end_matches(';')));
+            exports_out.push_str(&format!(
+                "__ns[\"default\"] = ({});\n",
+                expr.trim_end_matches(';')
+            ));
             continue;
         }
 
@@ -621,6 +834,38 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
                 .trim_start_matches("async function ")
                 .trim_start_matches("function ")
                 .trim_start_matches("class ");
+            // `export const { a, b: c } = expr` — destructuring declaration.
+            if after_kw.trim_start().starts_with('{') {
+                out.push_str(rest);
+                out.push('\n');
+                let inner = between(after_kw, '{', '}').unwrap_or_default();
+                for part in inner.split(',') {
+                    let part = part.trim();
+                    if part.is_empty() {
+                        continue;
+                    }
+                    // `a`, `a: b`, `a = default`, `a: b = default` — the bound
+                    // local name is what's after `:` (or the bare name), before
+                    // any `=`.
+                    let local = part
+                        .split(':')
+                        .next_back()
+                        .unwrap_or(part)
+                        .split('=')
+                        .next()
+                        .unwrap_or(part)
+                        .trim();
+                    let name: std::string::String = local
+                        .chars()
+                        .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                        .collect();
+                    if !name.is_empty() {
+                        export_names.push(name.clone());
+                        exports_out.push_str(&format!("__ns[{:?}] = {};\n", name, name));
+                    }
+                }
+                continue;
+            }
             let name: std::string::String = after_kw
                 .chars()
                 .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
@@ -629,7 +874,7 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
             out.push('\n');
             if !name.is_empty() {
                 export_names.push(name.clone());
-                out.push_str(&format!("__ns[{:?}] = {};\n", name, name));
+                exports_out.push_str(&format!("__ns[{:?}] = {};\n", name, name));
             }
             continue;
         }
@@ -639,8 +884,17 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
         out.push('\n');
     }
 
+    // Prepend hoisted import bindings (ES module semantics) and append deferred
+    // export assignments so all declarations are complete first.
+    let combined = format!("{}{}{}", imports_out, out, exports_out);
+
+    // `import.meta` is only valid in real modules; our body runs as a plain
+    // function. Replace it with a parameter the wrapper provides. This is a
+    // textual substitution (acceptable for the trusted builtin sources we run).
+    let body = combined.replace("import.meta", "__v8jsc_meta");
+
     Some(RewrittenModule {
-        body: out,
+        body,
         export_names,
         imports,
     })
@@ -764,8 +1018,35 @@ pub extern "C" fn v8__UnboundScript__CreateCodeCache(
 pub extern "C" fn v8__UnboundModuleScript__CreateCodeCache(
     _script: *const UnboundModuleScript,
 ) -> *mut CachedData<'static> {
-    // TODO(v82jsc): no serializable bytecode cache via JSC C API.
-    ptr::null_mut()
+    // JSC exposes no serializable bytecode cache. deno (`deno run`) requires
+    // `create_code_cache()` to return Some, so we hand back a tiny placeholder
+    // cache. It is never usable: on consume, our compile path ignores cached
+    // data and reports `rejected() == true`, so V8/deno recompiles from source.
+    make_placeholder_code_cache()
+}
+
+/// Build a minimal owned `CachedData` (1 byte) matching the layout used by
+/// `v8__ScriptCompiler__CachedData__NEW`, marked as owned so deno frees it.
+fn make_placeholder_code_cache() -> *mut CachedData<'static> {
+    #[repr(C)]
+    struct RawCachedData {
+        data: *const u8,
+        length: i32,
+        rejected: bool,
+        buffer_policy: i32,
+    }
+    // deno asserts the returned cache is BufferOwned. Allocate a 1-byte owned
+    // buffer; our CachedData__DELETE frees owned buffers.
+    let v = vec![0u8; 1].into_boxed_slice();
+    let len = v.len() as i32;
+    let data = Box::into_raw(v) as *const u8;
+    let boxed = Box::new(RawCachedData {
+        data,
+        length: len,
+        rejected: false,
+        buffer_policy: 1, // BufferOwned
+    });
+    Box::into_raw(boxed) as *mut CachedData<'static>
 }
 
 #[unsafe(no_mangle)]
@@ -827,19 +1108,52 @@ pub extern "C" fn v8__Module__GetException(_this: *const Module) -> *const Value
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__GetModuleRequests(this: *const Module) -> *const FixedArray {
-    // Synthetic modules have no imports: return an empty JS array.
+    // Build a FixedArray of ModuleRequest objects (one per static import) so
+    // deno can construct its import graph and pre-resolve specifiers. Each
+    // request is a plain JS object `{ specifier, phase }` that the
+    // ModuleRequest accessors below read.
     let ctx = module_state(this)
         .map(|m| m.ctx as JSContextRef)
         .unwrap_or_else(current_ctx);
     if ctx.is_null() {
         return ptr::null();
     }
-    let mut exc: JSValueRef = ptr::null();
-    let arr = unsafe { JSObjectMakeArray(ctx, 0, ptr::null(), &mut exc) };
-    if arr.is_null() {
-        return ptr::null();
+    let specs: Vec<std::string::String> = module_state(this)
+        .map(|m| m.import_specifiers.clone())
+        .unwrap_or_default();
+
+    let mut elems: Vec<JSValueRef> = Vec::with_capacity(specs.len());
+    unsafe {
+        for spec in &specs {
+            let req = JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut());
+            if let Ok(cspec) = std::ffi::CString::new(spec.as_str()) {
+                let sval_str = JSStringCreateWithUTF8CString(cspec.as_ptr());
+                let sval = JSValueMakeString(ctx, sval_str);
+                JSStringRelease(sval_str);
+                let key = JSStringCreateWithUTF8CString(c"specifier".as_ptr());
+                JSObjectSetProperty(ctx, req, key, sval, 0, ptr::null_mut());
+                JSStringRelease(key);
+            }
+            // Tag so v8__Data__IsModuleRequest can recognize it.
+            let mark = JSStringCreateWithUTF8CString(c"__v8jsc_module_request".as_ptr());
+            JSObjectSetProperty(
+                ctx,
+                req,
+                mark,
+                JSValueMakeBoolean(ctx, true),
+                1 << 1, /* DontEnum */
+                ptr::null_mut(),
+            );
+            JSStringRelease(mark);
+            elems.push(req as JSValueRef);
+        }
+        let mut exc: JSValueRef = ptr::null();
+        let arr = JSObjectMakeArray(ctx, elems.len(), elems.as_ptr(), &mut exc);
+        if arr.is_null() {
+            return ptr::null();
+        }
+        intern_ctx::<FixedArray>(ctx, arr as JSValueRef)
     }
-    intern_ctx::<FixedArray>(ctx, arr as JSValueRef)
 }
 
 #[unsafe(no_mangle)]
@@ -891,20 +1205,85 @@ pub extern "C" fn v8__Module__GetIdentityHash(_this: *const Module) -> int {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__InstantiateModule(
     this: *const Module,
-    _context: *const Context,
-    _cb: ResolveModuleCallback,
+    context: *const Context,
+    cb: ResolveModuleCallback,
     _source_callback: Option<ResolveSourceCallback>,
 ) -> MaybeBool {
-    // Synthetic modules have no imports, so "linking" only advances status.
-    match module_state(this) {
-        Some(m) => {
-            if matches!(m.status, ModuleStatus::Uninstantiated) {
-                m.status = ModuleStatus::Instantiated;
-            }
-            MaybeBool::JustTrue
-        }
-        None => MaybeBool::JustFalse,
+    // JSC has no module linker, so we walk the import graph ourselves: for each
+    // static import specifier, call the resolve callback to obtain the dependency
+    // module, recursively instantiate it, and remember it so Evaluate can run
+    // dependencies first (post-order), mirroring V8's linking + evaluation.
+    let ctx = ctx_of(context) as JSContextRef;
+    // Capture the current isolate: re-entrant deno resolve callbacks construct
+    // and drop scopes that can clear the current-isolate thread-local, which we
+    // must restore before each subsequent callback.
+    let iso = current_iso();
+    let Some(m) = module_state(this) else {
+        return MaybeBool::JustFalse;
+    };
+    if !matches!(m.status, ModuleStatus::Uninstantiated) {
+        return MaybeBool::JustTrue;
     }
+    m.status = ModuleStatus::Instantiating;
+    let specs = m.import_specifiers.clone();
+
+    let mut deps: Vec<*const Module> = Vec::new();
+    for spec in &specs {
+        crate::shim_core::restore_current(iso);
+        let dep = unsafe { resolve_dependency(context, cb, this, spec) };
+        if dep.is_null() {
+            // Unresolved import; leave inert (binding will be undefined).
+            continue;
+        }
+        // Recursively instantiate the dependency.
+        if let Some(dm) = module_state(dep) {
+            if matches!(dm.status, ModuleStatus::Uninstantiated) {
+                let _ = v8__Module__InstantiateModule(dep, context, cb, _source_callback);
+            }
+        }
+        deps.push(dep);
+    }
+    crate::shim_core::restore_current(iso);
+    if let Some(m) = module_state(this) {
+        m.dependencies = deps;
+        m.status = ModuleStatus::Instantiated;
+    }
+    MaybeBool::JustTrue
+}
+
+/// Resolve one import specifier to a dependency module via the host callback.
+unsafe fn resolve_dependency(
+    context: *const Context,
+    cb: ResolveModuleCallback,
+    referrer: *const Module,
+    spec: &str,
+) -> *const Module {
+    let ctx = ctx_of(context) as JSContextRef;
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let cspec = match std::ffi::CString::new(spec) {
+        Ok(c) => c,
+        Err(_) => return ptr::null(),
+    };
+    let spec_str = unsafe { JSStringCreateWithUTF8CString(cspec.as_ptr()) };
+    let spec_val = unsafe { JSValueMakeString(ctx, spec_str) };
+    unsafe { JSStringRelease(spec_str) };
+    let spec_handle = intern_ctx::<V8String>(ctx, spec_val);
+    // Empty import-attributes FixedArray.
+    let mut exc: JSValueRef = ptr::null();
+    let attrs_arr = unsafe { JSObjectMakeArray(ctx, 0, ptr::null(), &mut exc) };
+    let attrs_handle = intern_ctx::<FixedArray>(ctx, attrs_arr as JSValueRef);
+
+    let ret = unsafe {
+        let ctx_l = crate::Local::from_raw(context).unwrap();
+        let spec_l = crate::Local::from_raw(spec_handle).unwrap();
+        let attrs_l = crate::Local::from_raw(attrs_handle).unwrap();
+        let ref_l = crate::Local::from_raw(referrer).unwrap();
+        cb(ctx_l, spec_l, attrs_l, ref_l)
+    };
+    // ResolveModuleCallbackRet is a transparent *const Module.
+    unsafe { *(&ret as *const ResolveModuleCallbackRet as *const *const Module) }
 }
 
 #[unsafe(no_mangle)]
@@ -916,7 +1295,40 @@ pub extern "C" fn v8__Module__Evaluate(
     let Some(m) = module_state(this) else {
         return ptr::null();
     };
+    // Already evaluated? (e.g. shared dependency reached via two paths.)
+    if matches!(m.status, ModuleStatus::Evaluated) {
+        return make_resolved_promise(ctx);
+    }
     m.status = ModuleStatus::Evaluating;
+
+    // Evaluate dependencies first (post-order) so their namespaces are populated
+    // and registered before this module's body references them.
+    let iso = current_iso();
+    let deps = m.dependencies.clone();
+    for dep in &deps {
+        if dep.is_null() {
+            continue;
+        }
+        if let Some(dm) = module_state(*dep) {
+            if matches!(dm.status, ModuleStatus::Evaluated) {
+                continue;
+            }
+        }
+        let _ = v8__Module__Evaluate(*dep, context);
+    }
+    crate::shim_core::restore_current(iso);
+
+    let Some(m) = module_state(this) else {
+        return ptr::null();
+    };
+
+    // Register this module's namespace object into `globalThis.__v8jsc_modules`
+    // keyed by specifier, so dependents (and self-references) resolve imports.
+    // We register the live namespace object up front; the body / eval steps then
+    // populate its properties in place.
+    if !m.specifier.is_empty() {
+        unsafe { register_module_namespace(ctx, &m.specifier, m.namespace) };
+    }
 
     if let Some(eval_steps) = m.eval_steps {
         // Synthetic module: run deno's evaluation steps, which call
@@ -943,7 +1355,8 @@ pub extern "C" fn v8__Module__Evaluate(
     // exports onto the namespace object.
     if let Some(src) = m.source.clone() {
         let namespace = m.namespace;
-        let ok = unsafe { eval_module_source(ctx, &src, namespace) };
+        let meta = unsafe { build_import_meta(context, this) };
+        let ok = unsafe { eval_module_source(ctx, &src, namespace, meta) };
         if let Some(m) = module_state(this) {
             m.status = if ok { ModuleStatus::Evaluated } else { ModuleStatus::Errored };
         }
@@ -986,9 +1399,10 @@ unsafe fn eval_module_source(
     ctx: JSContextRef,
     rewritten: &str,
     namespace: JSObjectRef,
+    meta: JSValueRef,
 ) -> bool {
     let wrapped = format!(
-        "(function(__ns){{\n{}\n}})",
+        "(function(__ns, __v8jsc_meta){{\n{}\n}})",
         rewritten
     );
     let cstr = match std::ffi::CString::new(wrapped) {
@@ -1002,17 +1416,108 @@ unsafe fn eval_module_source(
     };
     unsafe { JSStringRelease(js) };
     if f.is_null() {
+        report_module_exception(ctx, exc);
         return false;
     }
     let fobj = unsafe { JSValueToObject(ctx, f, &mut exc) };
     if fobj.is_null() {
+        report_module_exception(ctx, exc);
         return false;
     }
-    let args = [namespace as JSValueRef];
-    let r = unsafe {
-        JSObjectCallAsFunction(ctx, fobj, ptr::null_mut(), 1, args.as_ptr(), &mut exc)
+    let meta = if meta.is_null() {
+        unsafe { JSValueMakeUndefined(ctx) }
+    } else {
+        meta
     };
-    !r.is_null() && exc.is_null()
+    let args = [namespace as JSValueRef, meta];
+    let r = unsafe {
+        JSObjectCallAsFunction(ctx, fobj, ptr::null_mut(), 2, args.as_ptr(), &mut exc)
+    };
+    if r.is_null() || !exc.is_null() {
+        report_module_exception(ctx, exc);
+        return false;
+    }
+    true
+}
+
+/// Register `namespace` into `globalThis.__v8jsc_modules[specifier]` so other
+/// modules' rewritten import statements can resolve their bindings.
+unsafe fn register_module_namespace(
+    ctx: JSContextRef,
+    specifier: &str,
+    namespace: JSObjectRef,
+) {
+    if ctx.is_null() || namespace.is_null() || specifier.is_empty() {
+        return;
+    }
+    unsafe {
+        let global = JSContextGetGlobalObject(ctx);
+        let mut exc: JSValueRef = ptr::null();
+        // globalThis.__v8jsc_modules ||= {}
+        let reg_key =
+            JSStringCreateWithUTF8CString(c"__v8jsc_modules".as_ptr());
+        let mut reg = JSObjectGetProperty(ctx, global, reg_key, &mut exc);
+        let reg_obj = if reg.is_null() || JSValueIsUndefined(ctx, reg) {
+            let o = JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut());
+            JSObjectSetProperty(ctx, global, reg_key, o as JSValueRef, 1 << 1, &mut exc);
+            o
+        } else {
+            JSValueToObject(ctx, reg, &mut exc)
+        };
+        JSStringRelease(reg_key);
+        if reg_obj.is_null() {
+            return;
+        }
+        if let Ok(cspec) = std::ffi::CString::new(specifier) {
+            let spec_key = JSStringCreateWithUTF8CString(cspec.as_ptr());
+            JSObjectSetProperty(
+                ctx,
+                reg_obj,
+                spec_key,
+                namespace as JSValueRef,
+                0,
+                &mut exc,
+            );
+            JSStringRelease(spec_key);
+        }
+    }
+}
+
+/// Build the `import.meta` object for a source-text module by invoking the
+/// host callback registered via SetHostInitializeImportMetaObjectCallback.
+unsafe fn build_import_meta(
+    context: *const Context,
+    module: *const Module,
+) -> JSValueRef {
+    let ctx = ctx_of(context) as JSContextRef;
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let meta = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
+    let iso = current_iso();
+    if iso.is_null() {
+        return meta as JSValueRef;
+    }
+    let cb = iso_state(iso).import_meta_cb;
+    if let Some(cb) = cb {
+        unsafe {
+            let ctx_l = crate::Local::from_raw(context).unwrap();
+            let mod_l = crate::Local::from_raw(module).unwrap();
+            let meta_l =
+                crate::Local::<Object>::from_raw(meta as *const Object).unwrap();
+            cb(ctx_l, mod_l, meta_l);
+        }
+    }
+    meta as JSValueRef
+}
+
+/// Record a JSC exception from module evaluation as the isolate's pending
+/// exception so deno's TryCatch-based error reporting can surface it.
+unsafe fn report_module_exception(ctx: JSContextRef, exc: JSValueRef) {
+    if exc.is_null() {
+        return;
+    }
+    crate::shim_core::record_pending_exception(ctx, exc);
 }
 
 #[unsafe(no_mangle)]
@@ -1028,7 +1533,7 @@ pub extern "C" fn v8__Module__IsSyntheticModule(this: *const Module) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__CreateSyntheticModule(
     isolate: *const RealIsolate,
-    _module_name: *const V8String,
+    module_name: *const V8String,
     export_names_len: usize,
     export_names_raw: *const *const V8String,
     evaluation_steps: SyntheticModuleEvaluationSteps,
@@ -1039,6 +1544,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
         return ptr::null();
     }
     let gctx = unsafe { JSContextGetGlobalContext(ctx) };
+    let specifier = unsafe { jsstring_to_rust(ctx, jsval(module_name)) };
 
     // Collect the export names as Rust strings.
     let mut names: Vec<std::string::String> = Vec::with_capacity(export_names_len);
@@ -1085,6 +1591,8 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
         source: None,
         import_specifiers: Vec::new(),
         namespace,
+        specifier,
+        dependencies: Vec::new(),
     });
     let obj = unsafe {
         JSObjectMake(ctx, mod_class(), Box::into_raw(state) as *mut _)
@@ -1148,9 +1656,23 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
 // ===================================================================
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__ModuleRequest__GetSpecifier(_this: *const ModuleRequest) -> *const V8String {
-    // TODO(v82jsc): no module requests.
-    ptr::null()
+pub extern "C" fn v8__ModuleRequest__GetSpecifier(this: *const ModuleRequest) -> *const V8String {
+    // A ModuleRequest is a `{ specifier, ... }` object (see GetModuleRequests).
+    let ctx = current_ctx();
+    if ctx.is_null() || this.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let obj = jsval(this) as JSObjectRef;
+        let key = JSStringCreateWithUTF8CString(c"specifier".as_ptr());
+        let mut exc: JSValueRef = ptr::null();
+        let v = JSObjectGetProperty(ctx, obj, key, &mut exc);
+        JSStringRelease(key);
+        if v.is_null() || JSValueIsUndefined(ctx, v) {
+            return ptr::null();
+        }
+        intern_ctx::<V8String>(ctx, v)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -1167,6 +1689,15 @@ pub extern "C" fn v8__ModuleRequest__GetSourceOffset(_this: *const ModuleRequest
 pub extern "C" fn v8__ModuleRequest__GetImportAttributes(
     _this: *const ModuleRequest,
 ) -> *const FixedArray {
-    // TODO(v82jsc): no module requests.
-    ptr::null()
+    // No import attributes: return an empty JS array (deno iterates it).
+    let ctx = current_ctx();
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let mut exc: JSValueRef = ptr::null();
+    let arr = unsafe { JSObjectMakeArray(ctx, 0, ptr::null(), &mut exc) };
+    if arr.is_null() {
+        return ptr::null();
+    }
+    intern_ctx::<FixedArray>(ctx, arr as JSValueRef)
 }

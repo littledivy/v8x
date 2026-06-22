@@ -631,3 +631,60 @@ pub extern "C" fn v8__Array__Length(array: *const Array) -> u32 {
         n as u32
     }
 }
+
+// ===================================================================
+// Object::Wrap / Unwrap — associate a cppgc-managed RustObj pointer with a JS
+// wrapper object. JSC has no V8 "wrappable" internal slots, so we keep a side
+// table keyed by (wrapper JSValueRef, tag). The RustObj pointer is a raw Rust
+// pointer (not a JS value), so it can't be stored as a JS property value.
+// ===================================================================
+
+thread_local! {
+    static WRAP_TABLE: std::cell::RefCell<
+        std::collections::HashMap<(usize, u16), usize>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__Wrap(
+    _isolate: *const RealIsolate,
+    wrapper: *const Object,
+    value: *const crate::binding::RustObj,
+    tag: u16,
+) {
+    if wrapper.is_null() {
+        return;
+    }
+    WRAP_TABLE.with(|t| {
+        t.borrow_mut()
+            .insert((wrapper as usize, tag), value as usize);
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__Unwrap(
+    _isolate: *const RealIsolate,
+    wrapper: *const Object,
+    tag: u16,
+) -> *mut crate::binding::RustObj {
+    if wrapper.is_null() {
+        return ptr::null_mut();
+    }
+    WRAP_TABLE.with(|t| {
+        t.borrow()
+            .get(&(wrapper as usize, tag))
+            .map(|&p| p as *mut crate::binding::RustObj)
+            .unwrap_or(ptr::null_mut())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__IsApiWrapper(this: *const Object) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    WRAP_TABLE.with(|t| {
+        let map = t.borrow();
+        map.keys().any(|(w, _)| *w == this as usize)
+    })
+}

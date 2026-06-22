@@ -101,14 +101,61 @@ pub extern "C" fn cppgc__WeakMember__DESTRUCT(member: *mut *mut c_void) {
 // CppHeap — no cppgc backing.
 // ===================================================================
 
+// JSC has no cppgc (Oilpan) heap. deno still expects `Isolate::GetCppHeap()` to
+// return a non-null heap so it can wrap native-backed objects (e.g. CryptoKey)
+// via `make_garbage_collected`. We provide a dummy process-wide heap and back
+// `make_garbage_collected` with the system allocator. Without real GC these
+// allocations leak; that is acceptable for running scripts (the alternative —
+// panicking — fails the whole runtime).
+thread_local! {
+    static DUMMY_CPP_HEAP: std::cell::Cell<*mut c_void> =
+        const { std::cell::Cell::new(ptr::null_mut()) };
+}
+
+/// Return (creating on first use) the process/thread dummy CppHeap pointer.
+pub(crate) fn current_cpp_heap() -> *mut c_void {
+    DUMMY_CPP_HEAP.with(|c| {
+        let mut h = c.get();
+        if h.is_null() {
+            // A small leaked allocation serves as a stable, unique heap handle.
+            h = Box::into_raw(Box::new(0u64)) as *mut c_void;
+            c.set(h);
+        }
+        h
+    })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__CppHeap__Create(
     _platform: *mut c_void,
     _marking_support: u8,
     _sweeping_support: u8,
 ) -> *mut c_void {
-    // TODO(v82jsc): no cppgc heap available.
-    ptr::null_mut()
+    current_cpp_heap()
+}
+
+/// Allocate a cppgc-managed object of `sizeof(RustObj) + additional_bytes`
+/// bytes, aligned to `align`. RustObj is 8 bytes (a vtable pointer slot in real
+/// V8). Without real cppgc we use the system allocator; the head bytes are
+/// zeroed (our shim never invokes the C++ vtable). The object is intentionally
+/// leaked — there is no GC to sweep it.
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__make_garbage_collectable(
+    _heap: *mut c_void,
+    additional_bytes: usize,
+    align: usize,
+) -> *mut c_void {
+    const RUST_OBJ_SIZE: usize = 8;
+    let size = RUST_OBJ_SIZE + additional_bytes;
+    let align = align.max(8);
+    let layout = match std::alloc::Layout::from_size_align(size, align) {
+        Ok(l) => l,
+        Err(_) => return ptr::null_mut(),
+    };
+    unsafe {
+        let p = std::alloc::alloc_zeroed(layout);
+        p as *mut c_void
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -255,6 +302,69 @@ pub extern "C" fn v8__Global__Reset(data: *const Data) {
         return;
     }
     global_unprotect(jsval(data));
+}
+
+// ===================================================================
+// TracedReference — a GC-traced handle. We model it like a Global: the buffer
+// holds a single pointer slot (the value JSValueRef) and we protect/unprotect
+// against a stable context so it survives GC. Layout: one usize slot.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TracedReference__CONSTRUCT(this: *mut usize) {
+    if !this.is_null() {
+        unsafe { *this = 0 };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TracedReference__DESTRUCT(this: *mut usize) {
+    if this.is_null() {
+        return;
+    }
+    unsafe {
+        let v = *this as JSValueRef;
+        if !v.is_null() {
+            global_unprotect(v);
+            *this = 0;
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TracedReference__Reset(
+    this: *mut usize,
+    _isolate: *mut crate::RealIsolate,
+    data: *const Data,
+) {
+    if this.is_null() {
+        return;
+    }
+    unsafe {
+        // Release any previously held value.
+        let old = *this as JSValueRef;
+        if !old.is_null() {
+            global_unprotect(old);
+        }
+        let v = jsval(data);
+        if v.is_null() {
+            *this = 0;
+        } else {
+            global_protect(v);
+            *this = v as usize;
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TracedReference__Get(
+    this: *const usize,
+    _isolate: *mut crate::RealIsolate,
+) -> *const Data {
+    if this.is_null() {
+        return ptr::null();
+    }
+    unsafe { *this as *const Data }
 }
 
 // ===================================================================

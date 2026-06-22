@@ -588,6 +588,22 @@ pub extern "C" fn v8__Data__IsModule(this: *const Data) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Data__IsModuleRequest(this: *const Data) -> bool {
-    // TODO(v82jsc): module requests are not represented as JSValues here.
-    false
+    // Our ModuleRequest objects (built in shim_module::GetModuleRequests) carry
+    // a `__v8jsc_module_request` marker property.
+    let ctx = crate::shim_core::current_ctx();
+    if ctx.is_null() || this.is_null() {
+        return false;
+    }
+    unsafe {
+        let v = this as crate::jsc_sys::JSValueRef;
+        if !JSValueIsObject(ctx, v) {
+            return false;
+        }
+        let obj = v as crate::jsc_sys::JSObjectRef;
+        let key = JSStringCreateWithUTF8CString(c"__v8jsc_module_request".as_ptr());
+        let mut exc: crate::jsc_sys::JSValueRef = std::ptr::null();
+        let prop = JSObjectGetProperty(ctx, obj, key, &mut exc);
+        JSStringRelease(key);
+        !prop.is_null() && JSValueToBoolean(ctx, prop)
+    }
 }

@@ -4,8 +4,6 @@
 #![allow(non_snake_case)]
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cppgc__make_garbage_collectable() { unimplemented!("cppgc__make_garbage_collectable") }
-#[unsafe(no_mangle)]
 pub extern "C" fn cppgc__Persistent__CONSTRUCT() { unimplemented!("cppgc__Persistent__CONSTRUCT") }
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__Persistent__DESTRUCT() { unimplemented!("cppgc__Persistent__DESTRUCT") }
@@ -52,8 +50,6 @@ pub extern "C" fn v8__Isolate__AdjustAmountOfExternalAllocatedMemory() { unimple
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__DateTimeConfigurationChangeNotification() { unimplemented!("v8__Isolate__DateTimeConfigurationChangeNotification") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__GetCppHeap() { unimplemented!("v8__Isolate__GetCppHeap") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetHeapCodeAndMetadataStatistics() { unimplemented!("v8__Isolate__GetHeapCodeAndMetadataStatistics") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetHeapSpaceStatistics() { unimplemented!("v8__Isolate__GetHeapSpaceStatistics") }
@@ -90,15 +86,9 @@ pub extern "C" fn v8__Object__HasPrivate() { unimplemented!("v8__Object__HasPriv
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__HasRealNamedProperty() { unimplemented!("v8__Object__HasRealNamedProperty") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__IsApiWrapper() { unimplemented!("v8__Object__IsApiWrapper") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__PreviewEntries() { unimplemented!("v8__Object__PreviewEntries") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetIntegrityLevel() { unimplemented!("v8__Object__SetIntegrityLevel") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__Unwrap() { unimplemented!("v8__Object__Unwrap") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__Wrap() { unimplemented!("v8__Object__Wrap") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Private__New() { unimplemented!("v8__Private__New") }
 #[unsafe(no_mangle)]
@@ -126,8 +116,6 @@ pub extern "C" fn v8__SharedArrayBuffer__ByteLength() { unimplemented!("v8__Shar
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackFrame__GetFunctionName() { unimplemented!("v8__StackFrame__GetFunctionName") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__String__IsOneByte() { unimplemented!("v8__String__IsOneByte") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__String__NewExternalOneByte() { unimplemented!("v8__String__NewExternalOneByte") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__NewExternalTwoByte() { unimplemented!("v8__String__NewExternalTwoByte") }
@@ -135,14 +123,6 @@ pub extern "C" fn v8__String__NewExternalTwoByte() { unimplemented!("v8__String_
 pub extern "C" fn v8__Symbol__Description() { unimplemented!("v8__Symbol__Description") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Symbol__New() { unimplemented!("v8__Symbol__New") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TracedReference__CONSTRUCT() { unimplemented!("v8__TracedReference__CONSTRUCT") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TracedReference__DESTRUCT() { unimplemented!("v8__TracedReference__DESTRUCT") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TracedReference__Get() { unimplemented!("v8__TracedReference__Get") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TracedReference__Reset() { unimplemented!("v8__TracedReference__Reset") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TryCatch__Message() { unimplemented!("v8__TryCatch__Message") }
 #[unsafe(no_mangle)]
@@ -153,23 +133,3 @@ pub extern "C" fn v8__Uint8ClampedArray__New() { unimplemented!("v8__Uint8Clampe
 pub extern "C" fn v8__UnboundScript__BindToCurrentContext() { unimplemented!("v8__UnboundScript__BindToCurrentContext") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__UnboundScript__GetSourceMappingURL() { unimplemented!("v8__UnboundScript__GetSourceMappingURL") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__BooleanValue() { unimplemented!("v8__Value__BooleanValue") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__InstanceOf() { unimplemented!("v8__Value__InstanceOf") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IntegerValue() { unimplemented!("v8__Value__IntegerValue") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsFalse() { unimplemented!("v8__Value__IsFalse") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsFloat16Array() { unimplemented!("v8__Value__IsFloat16Array") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsName() { unimplemented!("v8__Value__IsName") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__SameValue() { unimplemented!("v8__Value__SameValue") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__ToNumber() { unimplemented!("v8__Value__ToNumber") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__TypeOf() { unimplemented!("v8__Value__TypeOf") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__Uint32Value() { unimplemented!("v8__Value__Uint32Value") }

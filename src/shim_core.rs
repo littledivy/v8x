@@ -30,11 +30,24 @@ pub(crate) struct IsoState {
     pub handles: Vec<(JSContextRef, JSValueRef)>,
     /// Embedder data slots (v8's kNumIsolateDataSlots == 4).
     pub data_slots: [*mut c_void; 4],
+    /// Pending JS exception (a protected JSValueRef) recorded when a JSC API
+    /// returns via its `exception` out-param. TryCatch snapshots/clears this.
+    /// `(ctx, value)` so we can unprotect when cleared.
+    pub pending_exception: Option<(JSContextRef, JSValueRef)>,
+    /// Host callback that populates a module's `import.meta` object.
+    pub import_meta_cb: Option<crate::isolate::HostInitializeImportMetaObjectCallback>,
+    /// CppHeap pointer (from CreateParams) returned by Isolate::GetCppHeap.
+    /// JSC has no cppgc; this is an opaque dummy heap (see shim_misc).
+    pub cpp_heap: *mut c_void,
 }
 
 thread_local! {
     static CURRENT_ISO: RefCell<*mut RealIsolate> = const { RefCell::new(ptr::null_mut()) };
     static CURRENT_CTX: RefCell<JSContextRef> = const { RefCell::new(ptr::null()) };
+    // The most-recently-active isolate, used as a fallback when re-entrant deno
+    // scopes momentarily clear CURRENT_ISO (e.g. nested CallbackScope drop calls
+    // Isolate::Exit). Only ever set to non-null isolates; never reset on exit.
+    static LAST_ISO: RefCell<*mut RealIsolate> = const { RefCell::new(ptr::null_mut()) };
 }
 
 #[inline(always)]
@@ -44,7 +57,13 @@ pub(crate) fn iso_state<'a>(p: *mut RealIsolate) -> &'a mut IsoState {
 
 #[inline(always)]
 pub(crate) fn current_iso() -> *mut RealIsolate {
-    CURRENT_ISO.with(|c| *c.borrow())
+    let cur = CURRENT_ISO.with(|c| *c.borrow());
+    if !cur.is_null() {
+        return cur;
+    }
+    // Fall back to the last active isolate when the current one was transiently
+    // cleared by a re-entrant scope exit.
+    LAST_ISO.with(|c| *c.borrow())
 }
 
 #[inline(always)]
@@ -54,6 +73,30 @@ pub(crate) fn current_ctx() -> JSContextRef {
 
 fn set_current(iso: *mut RealIsolate) {
     CURRENT_ISO.with(|c| *c.borrow_mut() = iso);
+    if !iso.is_null() {
+        LAST_ISO.with(|c| *c.borrow_mut() = iso);
+    }
+}
+
+/// Clear the persisted last-active isolate (called on dispose so we never hand
+/// back a freed isolate via the fallback).
+pub(crate) fn clear_last_iso(iso: *mut RealIsolate) {
+    LAST_ISO.with(|c| {
+        if *c.borrow() == iso {
+            *c.borrow_mut() = ptr::null_mut();
+        }
+    });
+}
+
+/// Restore the current isolate / context thread-locals. Used by module linking
+/// where re-entrant deno callbacks construct and then drop scopes that clear
+/// the current-isolate thread-local out from under us.
+pub(crate) fn restore_current(iso: *mut RealIsolate) {
+    if iso.is_null() {
+        return;
+    }
+    set_current(iso);
+    refresh_current_ctx(iso_state(iso));
 }
 
 fn refresh_current_ctx(st: &IsoState) {
@@ -146,6 +189,56 @@ pub(crate) fn intern<T>(v: JSValueRef) -> *const T {
     intern_ctx(current_ctx(), v)
 }
 
+/// Record `exc` (a JSValueRef returned via a JSC `exception` out-param) as the
+/// current isolate's pending exception, mirroring V8's thread-local pending
+/// exception. A subsequently-constructed TryCatch will observe it. Protects the
+/// value so it survives until taken/cleared.
+pub(crate) fn record_pending_exception(ctx: JSContextRef, exc: JSValueRef) {
+    if exc.is_null() {
+        return;
+    }
+    let iso = current_iso();
+    if iso.is_null() {
+        return;
+    }
+    let ctx = if ctx.is_null() { current_ctx() } else { ctx };
+    let ctx = if ctx.is_null() { fallback_ctx(iso) } else { ctx };
+    if ctx.is_null() {
+        return;
+    }
+    let st = iso_state(iso);
+    // Clear any previously held one first.
+    if let Some((octx, ov)) = st.pending_exception.take() {
+        if !octx.is_null() && !ov.is_null() {
+            unsafe { JSValueUnprotect(octx, ov) };
+        }
+    }
+    unsafe { JSValueProtect(ctx, exc) };
+    st.pending_exception = Some((ctx, exc));
+}
+
+/// Clear the current isolate's pending exception, unprotecting it.
+pub(crate) fn clear_pending_exception(iso: *mut RealIsolate) {
+    if iso.is_null() {
+        return;
+    }
+    let st = iso_state(iso);
+    if let Some((ctx, v)) = st.pending_exception.take() {
+        if !ctx.is_null() && !v.is_null() {
+            unsafe { JSValueUnprotect(ctx, v) };
+        }
+    }
+}
+
+/// Peek the current isolate's pending exception value (without clearing).
+pub(crate) fn peek_pending_exception(iso: *mut RealIsolate) -> JSValueRef {
+    if iso.is_null() {
+        return ptr::null();
+    }
+    let st = iso_state(iso);
+    st.pending_exception.map(|(_, v)| v).unwrap_or(ptr::null())
+}
+
 // ===================================================================
 // Isolate
 // ===================================================================
@@ -159,8 +252,24 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
         owned_contexts: Vec::new(),
         handles: Vec::new(),
         data_slots: [ptr::null_mut(); 4],
+        pending_exception: None,
+        import_meta_cb: None,
+        cpp_heap: crate::shim_misc::current_cpp_heap(),
     });
     Box::into_raw(state) as *mut RealIsolate
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__GetCppHeap(isolate: *mut RealIsolate) -> *mut c_void {
+    if isolate.is_null() {
+        return crate::shim_misc::current_cpp_heap();
+    }
+    let st = iso_state(isolate);
+    if st.cpp_heap.is_null() {
+        // Lazily adopt the process dummy heap so deno's cppgc wrapping works.
+        st.cpp_heap = crate::shim_misc::current_cpp_heap();
+    }
+    st.cpp_heap
 }
 
 #[unsafe(no_mangle)]
@@ -170,6 +279,11 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
     }
     unsafe {
         let mut st = Box::from_raw(this as *mut IsoState);
+        if let Some((ctx, v)) = st.pending_exception.take() {
+            if !ctx.is_null() && !v.is_null() {
+                JSValueUnprotect(ctx, v);
+            }
+        }
         while let Some((ctx, v)) = st.handles.pop() {
             if !ctx.is_null() && !v.is_null() {
                 JSValueUnprotect(ctx, v);
@@ -181,6 +295,7 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
         JSContextGroupRelease(st.group);
     }
     set_current(ptr::null_mut());
+    clear_last_iso(this);
 }
 
 #[unsafe(no_mangle)]
@@ -356,7 +471,93 @@ pub extern "C" fn v8__Context__New(
     let st = iso_state(isolate);
     let ctx = unsafe { JSGlobalContextCreateInGroup(st.group, ptr::null_mut()) };
     st.owned_contexts.push(ctx);
+    unsafe { install_context_compat_shims(ctx) };
     ctx as *const Context
+}
+
+/// Install small JS compatibility shims into a fresh context before any
+/// embedder JS runs (so primordials capture the patched versions).
+///
+/// JSC's global object has an *immutable prototype*, so deno's bootstrap call
+/// `Object.setPrototypeOf(globalThis, Window.prototype)` throws. V8's global
+/// allows it. We wrap `Object.setPrototypeOf` / `Reflect.setPrototypeOf` to
+/// tolerate that one case (returning success) while behaving normally for all
+/// other targets — keeping deno's bootstrap working without changing semantics
+/// for ordinary objects.
+unsafe fn install_context_compat_shims(ctx: JSGlobalContextRef) {
+    if ctx.is_null() {
+        return;
+    }
+    // JSC's global object has an immutable prototype at every level (verified:
+    // neither JS `Object.setPrototypeOf` nor the JSC C API can change it). deno's
+    // bootstrap does `Object.setPrototypeOf(globalThis, Window.prototype)` and
+    // then web APIs brand-check `this` via
+    //   ObjectPrototypeIsPrototypeOf(EventTargetPrototype, globalThis) && globalThis[brand] === brand.
+    // We emulate the missing prototype link: when setPrototypeOf targets the
+    // global and JSC rejects it, we (1) copy the prototype chain's own props onto
+    // globalThis so its methods are callable, and (2) record the virtual
+    // prototype and patch `Object.prototype.isPrototypeOf` /
+    // `Reflect`-level checks so `P.isPrototypeOf(globalThis)` returns true for any
+    // P in the recorded virtual chain. This runs before primordials capture, so
+    // deno's captured `ObjectPrototypeIsPrototypeOf` is the patched version.
+    const SRC: &[u8] = b"(function(){\
+        'use strict';\
+        var realO = Object.setPrototypeOf;\
+        var realR = Reflect.setPrototypeOf;\
+        var g = globalThis;\
+        var gdop = Object.getOwnPropertyDescriptor;\
+        var gopn = Object.getOwnPropertyNames;\
+        var gops = Object.getOwnPropertySymbols;\
+        var dp = Object.defineProperty;\
+        var getProto = Object.getPrototypeOf;\
+        var realIsProto = Object.prototype.isPrototypeOf;\
+        var virtualChain = [];\
+        function recordChain(p){\
+            var cur = p;\
+            while (cur && cur !== Object.prototype) {\
+                if (virtualChain.indexOf(cur) === -1) virtualChain.push(cur);\
+                cur = getProto(cur);\
+            }\
+        }\
+        function flatten(t, p){\
+            var chain = [];\
+            var cur = p;\
+            while (cur && cur !== Object.prototype && cur !== Function.prototype) {\
+                chain.push(cur); cur = getProto(cur);\
+            }\
+            for (var i = chain.length - 1; i >= 0; i--) {\
+                var proto = chain[i];\
+                var keys = gopn(proto).concat(gops(proto));\
+                for (var j = 0; j < keys.length; j++) {\
+                    var k = keys[j];\
+                    if (k === 'constructor') continue;\
+                    if (Object.prototype.hasOwnProperty.call(t, k)) continue;\
+                    var d = gdop(proto, k);\
+                    if (!d) continue;\
+                    try { dp(t, k, d); } catch(e) {}\
+                }\
+            }\
+        }\
+        function onGlobalProto(p){ flatten(g, p); recordChain(p); }\
+        Object.setPrototypeOf = function(t, p){\
+            if (t === g) { try { return realO(t, p); } catch(e) { onGlobalProto(p); return t; } }\
+            return realO(t, p);\
+        };\
+        Reflect.setPrototypeOf = function(t, p){\
+            if (t === g) { try { return realR(t, p); } catch(e) { onGlobalProto(p); return true; } }\
+            return realR(t, p);\
+        };\
+        dp(Object.prototype, 'isPrototypeOf', { value: function(o){\
+            if (o === g && virtualChain.indexOf(this) !== -1) return true;\
+            return realIsProto.call(this, o);\
+        }, writable: true, enumerable: false, configurable: true });\
+    })()\0";
+    unsafe {
+        let js = JSStringCreateWithUTF8CString(SRC.as_ptr() as *const std::os::raw::c_char);
+        let mut exc: JSValueRef = ptr::null();
+        JSEvaluateScript(ctx, js, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+        JSStringRelease(js);
+    }
 }
 
 #[unsafe(no_mangle)]

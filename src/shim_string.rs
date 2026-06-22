@@ -135,6 +135,38 @@ pub extern "C" fn v8__String__NewFromTwoByte(
 // ===================================================================
 
 #[unsafe(no_mangle)]
+pub extern "C" fn v8__String__IsOneByte(this: *const V8String) -> bool {
+    // True if every code unit fits in Latin-1 (<= 0xFF). JSC strings are UTF-16
+    // internally; scan the code units.
+    if this.is_null() {
+        return true;
+    }
+    let ctx = current_ctx();
+    if ctx.is_null() {
+        return true;
+    }
+    unsafe {
+        let s = JSValueToStringCopy(ctx, jsval(this), ptr::null_mut());
+        if s.is_null() {
+            return true;
+        }
+        let len = JSStringGetLength(s);
+        let chars = JSStringGetCharactersPtr(s);
+        let mut one_byte = true;
+        if !chars.is_null() {
+            for i in 0..len {
+                if *chars.add(i) > 0xFF {
+                    one_byte = false;
+                    break;
+                }
+            }
+        }
+        JSStringRelease(s);
+        one_byte
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn v8__String__Length(this: *const V8String) -> int {
     if this.is_null() {
         return 0;

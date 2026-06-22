@@ -80,17 +80,37 @@ unsafe extern "C" {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetExtrasBindingObject(this: *const Context) -> *const Object {
-    // V8 exposes an internal "extras binding" object carrying a `console`. JSC
-    // has none, so synthesize one: { console: {} }. deno_core's bootstrap reads
-    // `extras.console` and converts it to an Object.
+    // V8 exposes an internal "extras binding" object. deno reads `console` off
+    // it, and destructures `getContinuationPreservedEmbedderData` /
+    // `setContinuationPreservedEmbedderData` (the async-context get/set). JSC has
+    // none, so synthesize an object that provides these. The continuation data
+    // is the async-context "snapshot"; we back it with a per-context closure
+    // variable (correct single-threaded get/set semantics, which is all deno
+    // needs for AsyncContext bookkeeping).
     let ctx = ctx_of(this);
     unsafe {
-        let obj = JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut());
-        let console = JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut());
-        let name = JSStringCreateWithUTF8CString(c"console".as_ptr());
-        JSObjectSetProperty(ctx, obj, name, console as JSValueRef, 0, ptr::null_mut());
-        JSStringRelease(name);
-        intern_ctx::<Object>(ctx, obj as JSValueRef)
+        const SRC: &[u8] = b"(function(){\
+            var __cped = undefined;\
+            return {\
+                console: {},\
+                getContinuationPreservedEmbedderData: function(){ return __cped; },\
+                setContinuationPreservedEmbedderData: function(v){ __cped = v; },\
+            };\
+        })()\0";
+        let js = JSStringCreateWithUTF8CString(SRC.as_ptr() as *const std::os::raw::c_char);
+        let mut exc: JSValueRef = ptr::null();
+        let obj = JSEvaluateScript(ctx, js, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+        JSStringRelease(js);
+        if obj.is_null() {
+            // Fallback: at least provide `console`.
+            let o = JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut());
+            let console = JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut());
+            let name = JSStringCreateWithUTF8CString(c"console".as_ptr());
+            JSObjectSetProperty(ctx, o, name, console as JSValueRef, 0, ptr::null_mut());
+            JSStringRelease(name);
+            return intern_ctx::<Object>(ctx, o as JSValueRef);
+        }
+        intern_ctx::<Object>(ctx, obj)
     }
 }
 
@@ -378,10 +398,14 @@ pub extern "C" fn v8__Isolate__EnqueueMicrotask(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetHostInitializeImportMetaObjectCallback(
-    _isolate: *mut RealIsolate,
-    _callback: crate::isolate::HostInitializeImportMetaObjectCallback,
+    isolate: *mut RealIsolate,
+    callback: crate::isolate::HostInitializeImportMetaObjectCallback,
 ) {
-    // TODO(v82jsc): JSC module loader hooks are not in the C API. Inert.
+    // JSC has no module-loader hook, but our module rewriter synthesizes an
+    // `import.meta` object per module and invokes this callback to populate it.
+    if !isolate.is_null() {
+        crate::shim_core::iso_state(isolate).import_meta_cb = Some(callback);
+    }
 }
 
 #[unsafe(no_mangle)]
