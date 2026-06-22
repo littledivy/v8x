@@ -80,8 +80,11 @@ pub(crate) fn intern_ctx<T>(ctx: JSContextRef, v: JSValueRef) -> *const T {
     if v.is_null() {
         return ptr::null();
     }
+    // Fall back to the current context if none was supplied; protecting or
+    // unprotecting against a null context crashes inside JSC.
+    let ctx = if ctx.is_null() { current_ctx() } else { ctx };
     let iso = current_iso();
-    if !iso.is_null() {
+    if !iso.is_null() && !ctx.is_null() {
         unsafe {
             JSValueProtect(ctx, v);
             iso_state(iso).handles.push((ctx, v));
@@ -121,7 +124,9 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
     unsafe {
         let mut st = Box::from_raw(this as *mut IsoState);
         while let Some((ctx, v)) = st.handles.pop() {
-            JSValueUnprotect(ctx, v);
+            if !ctx.is_null() && !v.is_null() {
+                JSValueUnprotect(ctx, v);
+            }
         }
         for ctx in st.owned_contexts.drain(..) {
             JSGlobalContextRelease(ctx);
@@ -199,7 +204,9 @@ pub extern "C" fn v8__HandleScope__DESTRUCT(this: *mut usize) {
         let st = iso_state(isolate);
         while st.handles.len() > saved_depth {
             let (ctx, v) = st.handles.pop().unwrap();
-            JSValueUnprotect(ctx, v);
+            if !ctx.is_null() && !v.is_null() {
+                JSValueUnprotect(ctx, v);
+            }
         }
     }
 }

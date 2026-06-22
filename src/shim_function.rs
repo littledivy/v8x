@@ -311,6 +311,17 @@ unsafe fn make_function(
     callback: FunctionCallback,
     data: JSValueRef,
 ) -> JSObjectRef {
+    unsafe { make_function_len(ctx, callback, data, 0) }
+}
+
+/// Like `make_function` but also installs the function's `.length` (arity)
+/// property, which JS bootstrap code (e.g. `setUpAsyncStub`) relies on.
+unsafe fn make_function_len(
+    ctx: JSContextRef,
+    callback: FunctionCallback,
+    data: JSValueRef,
+    length: i32,
+) -> JSObjectRef {
     let gctx = unsafe { JSContextGetGlobalContext(ctx) };
     if !data.is_null() {
         unsafe { JSValueProtect(gctx, data) };
@@ -320,7 +331,18 @@ unsafe fn make_function(
         data,
         ctx: gctx,
     });
-    unsafe { JSObjectMake(ctx, fn_class(), Box::into_raw(bridge) as *mut c_void) }
+    let obj = unsafe {
+        JSObjectMake(ctx, fn_class(), Box::into_raw(bridge) as *mut c_void)
+    };
+    // Install `length` (arity). ReadOnly|DontEnum|DontDelete == 2|4|8.
+    let key = unsafe { JSStringCreateWithUTF8CString(c"length".as_ptr()) };
+    let lenval = unsafe { JSValueMakeNumber(ctx, length.max(0) as f64) };
+    let mut exc: JSValueRef = ptr::null();
+    unsafe {
+        JSObjectSetProperty(ctx, obj, key, lenval, 2 | 4 | 8, &mut exc);
+        JSStringRelease(key);
+    }
+    obj
 }
 
 #[inline]
@@ -404,12 +426,13 @@ pub extern "C" fn v8__Function__New(
     constructor_behavior: crate::ConstructorBehavior,
     side_effect_type: crate::SideEffectType,
 ) -> *const Function {
-    let _ = (length, constructor_behavior, side_effect_type);
+    let _ = (constructor_behavior, side_effect_type);
     let ctx = ctx_of(context) as JSContextRef;
     if ctx.is_null() {
         return ptr::null();
     }
-    let f = unsafe { make_function(ctx, callback, jsval(data_or_null)) };
+    let f =
+        unsafe { make_function_len(ctx, callback, jsval(data_or_null), length) };
     intern_ctx::<Function>(ctx, f as JSValueRef)
 }
 
@@ -824,7 +847,7 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
         return ptr::null();
     }
     let t = unsafe { &*(this as *const FnTemplate) };
-    let f = unsafe { make_function(ctx, t.callback, t.data) };
+    let f = unsafe { make_function_len(ctx, t.callback, t.data, t.length) };
 
     // Apply class name as the function's `name`.
     if let Some(name) = &t.class_name {

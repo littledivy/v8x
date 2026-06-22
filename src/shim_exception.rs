@@ -332,12 +332,81 @@ pub extern "C" fn v8__StackFrame__IsUserJavaScript(this: *const StackFrame) -> b
 // Promise
 // ===================================================================
 
+/// JSC exposes no `[[PromiseState]]`. We track it ourselves: attach `.then`
+/// handlers that stash the settled state/value as own properties on the
+/// promise object (`__v8jsc_state`: 0=pending,1=fulfilled,2=rejected;
+/// `__v8jsc_result`: the value). The handlers run on the microtask queue, so
+/// state becomes visible after a microtask checkpoint — exactly when callers
+/// read it. Attaching is idempotent (guarded by `__v8jsc_tracked`).
+unsafe fn track_promise(ctx: JSContextRef, promise: JSObjectRef) {
+    if ctx.is_null() || promise.is_null() {
+        return;
+    }
+    // Already tracked?
+    let guard_key =
+        JSStringCreateWithUTF8CString(b"__v8jsc_tracked\0".as_ptr() as *const c_char);
+    let mut exc: JSValueRef = ptr::null();
+    let guard = JSObjectGetProperty(ctx, promise, guard_key, &mut exc);
+    let already = !guard.is_null() && JSValueToBoolean(ctx, guard);
+    if already {
+        JSStringRelease(guard_key);
+        return;
+    }
+    JSObjectSetProperty(
+        ctx,
+        promise,
+        guard_key,
+        JSValueMakeBoolean(ctx, true),
+        1 << 1,
+        ptr::null_mut(),
+    );
+    JSStringRelease(guard_key);
+
+    // (function(p){ p.then(v => { p.__v8jsc_state=1; p.__v8jsc_result=v; },
+    //                       e => { p.__v8jsc_state=2; p.__v8jsc_result=e; }); })
+    let src = b"(function(p){p.__v8jsc_state=0;try{p.then(function(v){p.__v8jsc_state=1;p.__v8jsc_result=v;},function(e){p.__v8jsc_state=2;p.__v8jsc_result=e;});}catch(_){}})\0";
+    let js = JSStringCreateWithUTF8CString(src.as_ptr() as *const c_char);
+    let f = JSEvaluateScript(ctx, js, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+    JSStringRelease(js);
+    if f.is_null() {
+        return;
+    }
+    let fobj = JSValueToObject(ctx, f, &mut exc);
+    if fobj.is_null() {
+        return;
+    }
+    let args = [promise as JSValueRef];
+    JSObjectCallAsFunction(ctx, fobj, ptr::null_mut(), 1, args.as_ptr(), &mut exc);
+}
+
+/// Public wrapper so other shim modules (e.g. modules) can install promise
+/// state tracking on promises they create.
+pub(crate) fn track_promise_pub(ctx: JSContextRef, promise: JSObjectRef) {
+    unsafe { track_promise(ctx, promise) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Promise__State(this: *const Promise) -> PromiseState {
-    // JSC has no C API to query promise internal state; report Pending.
-    // TODO(v82jsc): cannot inspect [[PromiseState]] via the JSC C API.
-    let _ = this;
-    PromiseState::Pending
+    let ctx = current_ctx();
+    if ctx.is_null() || this.is_null() {
+        return PromiseState::Pending;
+    }
+    unsafe {
+        let obj = jsval(this) as JSObjectRef;
+        let key =
+            JSStringCreateWithUTF8CString(b"__v8jsc_state\0".as_ptr() as *const c_char);
+        let mut exc: JSValueRef = ptr::null();
+        let v = JSObjectGetProperty(ctx, obj, key, &mut exc);
+        JSStringRelease(key);
+        if v.is_null() || JSValueIsUndefined(ctx, v) {
+            return PromiseState::Pending;
+        }
+        match JSValueToNumber(ctx, v, &mut exc) as i32 {
+            1 => PromiseState::Fulfilled,
+            2 => PromiseState::Rejected,
+            _ => PromiseState::Pending,
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -348,13 +417,20 @@ pub extern "C" fn v8__Promise__MarkAsHandled(this: *const Promise) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Promise__Result(this: *const Promise) -> *const Value {
-    // TODO(v82jsc): cannot read [[PromiseResult]] via the JSC C API.
     let ctx = current_ctx();
-    if ctx.is_null() {
+    if ctx.is_null() || this.is_null() {
         return ptr::null();
     }
-    let v = unsafe { JSValueMakeUndefined(ctx) };
-    intern_ctx::<Value>(ctx, v)
+    unsafe {
+        let obj = jsval(this) as JSObjectRef;
+        let key =
+            JSStringCreateWithUTF8CString(b"__v8jsc_result\0".as_ptr() as *const c_char);
+        let mut exc: JSValueRef = ptr::null();
+        let v = JSObjectGetProperty(ctx, obj, key, &mut exc);
+        JSStringRelease(key);
+        let v = if v.is_null() { JSValueMakeUndefined(ctx) } else { v };
+        intern_ctx::<Value>(ctx, v)
+    }
 }
 
 /// Call `promise.<method>(...handlers)` and return the resulting promise.
@@ -457,6 +533,7 @@ pub extern "C" fn v8__Promise__Resolver__New(
         // functions off it.
         set(promise, b"__v8jsc_resolve\0", resolve as JSValueRef);
         set(promise, b"__v8jsc_reject\0", reject as JSValueRef);
+        track_promise(ctx, promise);
         intern_ctx::<PromiseResolver>(ctx, promise as JSValueRef)
     }
 }

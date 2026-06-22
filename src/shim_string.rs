@@ -384,14 +384,34 @@ pub extern "C" fn v8__String__GetExternalStringResourceBase(
 // We back the opaque [u8; SIZE] buffer with our own small repr that owns a
 // retained JSStringRef plus a cached data pointer / length / encoding flag.
 
+// NOTE: This must fit in `v8__String__ValueView_SIZE` (32 bytes). Four 8-byte
+// fields exactly fill it; the `is_one_byte` flag is packed into the high bit of
+// `length` (string lengths never approach 2^63).
 #[repr(C)]
 struct ValueViewRepr {
     js_string: JSStringRef, // retained; released on DESTRUCT
     data: *const c_void,    // -> u16 for two-byte, -> u8 (latin1) for one-byte
-    length: usize,
-    is_one_byte: bool,
-    // Owned latin1 byte buffer for the one-byte case (kept alive via leak/Box).
+    /// Low 63 bits: length. High bit: is_one_byte.
+    length_and_flag: usize,
+    // Owned latin1 byte buffer for the one-byte case (kept alive via Box).
     onebyte_owned: *mut u8,
+}
+
+const ONE_BYTE_FLAG: usize = 1usize << 63;
+
+impl ValueViewRepr {
+    #[inline]
+    fn pack(len: usize, is_one_byte: bool) -> usize {
+        (len & !ONE_BYTE_FLAG) | if is_one_byte { ONE_BYTE_FLAG } else { 0 }
+    }
+    #[inline]
+    fn length(&self) -> usize {
+        self.length_and_flag & !ONE_BYTE_FLAG
+    }
+    #[inline]
+    fn is_one_byte(&self) -> bool {
+        self.length_and_flag & ONE_BYTE_FLAG != 0
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -407,8 +427,7 @@ pub extern "C" fn v8__String__ValueView__CONSTRUCT(
             (*repr) = ValueViewRepr {
                 js_string: ptr::null_mut(),
                 data: ptr::null(),
-                length: 0,
-                is_one_byte: true,
+                length_and_flag: ValueViewRepr::pack(0, true),
                 onebyte_owned: ptr::null_mut(),
             };
             return;
@@ -418,8 +437,7 @@ pub extern "C" fn v8__String__ValueView__CONSTRUCT(
             (*repr) = ValueViewRepr {
                 js_string: ptr::null_mut(),
                 data: ptr::null(),
-                length: 0,
-                is_one_byte: true,
+                length_and_flag: ValueViewRepr::pack(0, true),
                 onebyte_owned: ptr::null_mut(),
             };
             return;
@@ -447,8 +465,7 @@ pub extern "C" fn v8__String__ValueView__CONSTRUCT(
             (*repr) = ValueViewRepr {
                 js_string: s, // keep retained too (released on destruct)
                 data: ptr as *const c_void,
-                length: len,
-                is_one_byte: true,
+                length_and_flag: ValueViewRepr::pack(len, true),
                 onebyte_owned: ptr,
             };
         } else {
@@ -456,8 +473,7 @@ pub extern "C" fn v8__String__ValueView__CONSTRUCT(
             (*repr) = ValueViewRepr {
                 js_string: s,
                 data: chars as *const c_void,
-                length: len,
-                is_one_byte: false,
+                length_and_flag: ValueViewRepr::pack(len, false),
                 onebyte_owned: ptr::null_mut(),
             };
         }
@@ -469,7 +485,7 @@ pub extern "C" fn v8__String__ValueView__DESTRUCT(this: *mut crate::string::Valu
     let repr = this as *mut ValueViewRepr;
     unsafe {
         if !(*repr).onebyte_owned.is_null() {
-            let len = (*repr).length;
+            let len = (*repr).length();
             let slice = ptr::slice_from_raw_parts_mut((*repr).onebyte_owned, len);
             drop(Box::from_raw(slice));
             (*repr).onebyte_owned = ptr::null_mut();
@@ -479,7 +495,7 @@ pub extern "C" fn v8__String__ValueView__DESTRUCT(this: *mut crate::string::Valu
             (*repr).js_string = ptr::null_mut();
         }
         (*repr).data = ptr::null();
-        (*repr).length = 0;
+        (*repr).length_and_flag = 0;
     }
 }
 
@@ -488,7 +504,7 @@ pub extern "C" fn v8__String__ValueView__is_one_byte(
     this: *const crate::string::ValueView,
 ) -> bool {
     let repr = this as *const ValueViewRepr;
-    unsafe { (*repr).is_one_byte }
+    unsafe { (*repr).is_one_byte() }
 }
 
 #[unsafe(no_mangle)]
@@ -504,7 +520,7 @@ pub extern "C" fn v8__String__ValueView__length(
     this: *const crate::string::ValueView,
 ) -> int {
     let repr = this as *const ValueViewRepr;
-    unsafe { (*repr).length as int }
+    unsafe { (*repr).length() as int }
 }
 
 // ===================================================================

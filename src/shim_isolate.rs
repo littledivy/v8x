@@ -68,39 +68,123 @@ unsafe extern "C" {
         class: *mut std::ffi::c_void,
         data: *mut std::ffi::c_void,
     ) -> JSObjectRef;
+    fn JSObjectSetProperty(
+        ctx: JSContextRef,
+        object: JSObjectRef,
+        property_name: JSStringRef,
+        value: JSValueRef,
+        attributes: u32,
+        exception: *mut JSValueRef,
+    );
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetExtrasBindingObject(this: *const Context) -> *const Object {
-    // V8 exposes an internal "extras binding" object; JSC has none. Return a
-    // fresh empty object so deno_core's bootstrap (which unwraps this) proceeds.
+    // V8 exposes an internal "extras binding" object carrying a `console`. JSC
+    // has none, so synthesize one: { console: {} }. deno_core's bootstrap reads
+    // `extras.console` and converts it to an Object.
     let ctx = ctx_of(this);
-    let obj = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
-    intern_ctx::<Object>(ctx, obj as JSValueRef)
+    unsafe {
+        let obj = JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut());
+        let console = JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut());
+        let name = JSStringCreateWithUTF8CString(c"console".as_ptr());
+        JSObjectSetProperty(ctx, obj, name, console as JSValueRef, 0, ptr::null_mut());
+        JSStringRelease(name);
+        intern_ctx::<Object>(ctx, obj as JSValueRef)
+    }
+}
+
+// Per-context embedder data: V8 exposes a single growable array of slots that
+// can hold either aligned pointers or `Value` handles, indexed the same way by
+// both the aligned-pointer and Value accessors. We back it with a side table
+// keyed by the context pointer.
+thread_local! {
+    static EMBEDDER_DATA: std::cell::RefCell<
+        std::collections::HashMap<usize, Vec<*mut c_void>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn embedder_slots_with<R>(
+    this: *const Context,
+    grow_to: Option<usize>,
+    f: impl FnOnce(&mut Vec<*mut c_void>) -> R,
+) -> R {
+    EMBEDDER_DATA.with(|m| {
+        let mut map = m.borrow_mut();
+        let v = map.entry(this as usize).or_default();
+        if let Some(n) = grow_to {
+            if v.len() < n {
+                v.resize(n, ptr::null_mut());
+            }
+        }
+        f(v)
+    })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Context__GetNumberOfEmbedderDataFields(_this: *const Context) -> u32 {
-    // We back embedder data with V8's default slot count.
-    0
+pub extern "C" fn v8__Context__GetNumberOfEmbedderDataFields(this: *const Context) -> u32 {
+    embedder_slots_with(this, None, |v| v.len() as u32)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetAlignedPointerFromEmbedderData(
-    _this: *const Context,
-    _index: int,
+    this: *const Context,
+    index: int,
 ) -> *mut c_void {
-    // TODO(v82jsc): aligned embedder data not stored per-context yet.
-    ptr::null_mut()
+    if index < 0 {
+        return ptr::null_mut();
+    }
+    embedder_slots_with(this, None, |v| {
+        v.get(index as usize).copied().unwrap_or(ptr::null_mut())
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__SetAlignedPointerInEmbedderData(
-    _this: *const Context,
-    _index: int,
-    _value: *mut c_void,
+    this: *const Context,
+    index: int,
+    value: *mut c_void,
 ) {
-    // TODO(v82jsc): aligned embedder data not stored per-context yet. Inert.
+    if index < 0 {
+        return;
+    }
+    let idx = index as usize;
+    embedder_slots_with(this, Some(idx + 1), |v| {
+        v[idx] = value;
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__GetEmbedderData(
+    this: *const Context,
+    index: int,
+) -> *const Value {
+    if index < 0 {
+        return ptr::null();
+    }
+    let p = embedder_slots_with(this, None, |v| {
+        v.get(index as usize).copied().unwrap_or(ptr::null_mut())
+    });
+    p as *const Value
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__SetEmbedderData(
+    this: *const Context,
+    index: int,
+    value: *const Value,
+) {
+    if index < 0 {
+        return;
+    }
+    let ctx = ctx_of(this);
+    if !value.is_null() && !ctx.is_null() {
+        unsafe { JSValueProtect(ctx, jsval(value)) };
+    }
+    let idx = index as usize;
+    embedder_slots_with(this, Some(idx + 1), |v| {
+        v[idx] = value as *mut c_void;
+    });
 }
 
 #[unsafe(no_mangle)]
