@@ -24,6 +24,9 @@
 //! ```
 
 #![allow(clippy::missing_safety_doc)]
+// Shim modules contain many unsafe ops inside unsafe fns; the C-ABI boundary is
+// inherently unsafe and individually-blocking each is noise.
+#![allow(unsafe_op_in_unsafe_fn)]
 
 #[macro_use]
 extern crate bitflags;
@@ -71,6 +74,20 @@ mod script;
 mod jsc_sys;
 mod shim_core;
 mod shim_impl;
+mod shim_value;
+mod shim_string;
+mod shim_object;
+mod shim_primitive;
+mod shim_isolate;
+mod shim_arraybuffer;
+mod shim_function;
+mod shim_exception;
+mod shim_serializer;
+mod shim_module;
+mod shim_property;
+mod shim_misc;
+mod shim_inspector;
+mod shim_simdutf;
 mod shims;
 mod script_or_module;
 mod shared_array_buffer;
