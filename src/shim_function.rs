@@ -493,6 +493,19 @@ pub extern "C" fn v8__Function__Call(
         )
     };
     if r.is_null() {
+        if !exc.is_null() && std::env::var("V82JSC_DEBUG").is_ok() {
+            unsafe {
+                let s = JSValueToStringCopy(ctx, exc, ptr::null_mut());
+                if !s.is_null() {
+                    let max = JSStringGetMaximumUTF8CStringSize(s);
+                    let mut buf = vec![0u8; max];
+                    let n = JSStringGetUTF8CString(s, buf.as_mut_ptr() as *mut _, max);
+                    JSStringRelease(s);
+                    buf.truncate(n.saturating_sub(1));
+                    eprintln!("[v82jsc] Function__Call threw: {}", std::string::String::from_utf8_lossy(&buf));
+                }
+            }
+        }
         return ptr::null();
     }
     intern_ctx::<Value>(ctx, r)
@@ -792,6 +805,20 @@ fn register_template(p: usize, kind: TemplKind) {
     });
 }
 
+/// Whether `p` is one of our `FunctionTemplate` / `ObjectTemplate` handles.
+///
+/// These are *not* JSC values — they are pointers to Rust-owned `FnTemplate` /
+/// `ObjTemplate` boxes. Callers that would otherwise treat a `*const Data` as a
+/// `JSValueRef` (e.g. `Global::new`, which `JSValueProtect`s its argument) must
+/// special-case them: protecting a Rust box pointer poisons JSC's
+/// protected-values root set and crashes GC ("INVALID HANDLE", blockVM=0x8).
+pub(crate) fn is_template_ptr(p: *const c_void) -> bool {
+    if p.is_null() {
+        return false;
+    }
+    TEMPLATES.with(|t| t.borrow().contains_key(&(p as usize)))
+}
+
 fn with_template_props(p: usize, f: impl FnOnce(&mut Vec<(JSValueRef, JSValueRef, u32)>)) {
     let kind = TEMPLATES.with(|t| t.borrow().get(&p).copied());
     match kind {
@@ -892,17 +919,19 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
     apply_props(ctx, f, &t.props);
 
     // Build a prototype object carrying prototype-template props and install it.
+    // v8 functions ALWAYS have a `.prototype` object (deno's setUpAsyncStub does
+    // `tmplFn.prototype[opName] = fn`), so install one even when the prototype
+    // template has no props.
     let proto = unsafe { &*t.proto };
+    let proto_obj = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
     if !proto.props.is_empty() {
-        let proto_obj = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
         apply_props(ctx, proto_obj, &proto.props);
-        let key =
-            unsafe { JSStringCreateWithUTF8CString(c"prototype".as_ptr()) };
-        let mut exc: JSValueRef = ptr::null();
-        unsafe {
-            JSObjectSetProperty(ctx, f, key, proto_obj as JSValueRef, 0, &mut exc);
-            JSStringRelease(key);
-        }
+    }
+    let key = unsafe { JSStringCreateWithUTF8CString(c"prototype".as_ptr()) };
+    let mut exc: JSValueRef = ptr::null();
+    unsafe {
+        JSObjectSetProperty(ctx, f, key, proto_obj as JSValueRef, 0, &mut exc);
+        JSStringRelease(key);
     }
 
     intern_ctx::<Function>(ctx, f as JSValueRef)
@@ -922,10 +951,52 @@ fn apply_props(
         if keystr.is_null() {
             continue;
         }
+        // A template property value may itself be a nested FunctionTemplate /
+        // ObjectTemplate (e.g. a method template set on a prototype template).
+        // Those are Rust box pointers, NOT JS values — storing one as a property
+        // would put a non-cell pointer into the JSC heap and crash the GC.
+        // Materialize templates into real JS objects before installing them.
+        let value = materialize_template_value(ctx, value);
         unsafe {
             JSObjectSetProperty(ctx, obj, keystr, value, attr, &mut exc);
             JSStringRelease(keystr);
         }
+    }
+}
+
+/// If `value` is one of our template handles, instantiate it into a real JS
+/// value (a function for a FunctionTemplate, an object for an ObjectTemplate);
+/// otherwise return it unchanged.
+fn materialize_template_value(ctx: JSContextRef, value: JSValueRef) -> JSValueRef {
+    if value.is_null() {
+        return value;
+    }
+    let raw = value as *const c_void as usize;
+    let kind = TEMPLATES.with(|t| t.borrow().get(&raw).copied());
+    match kind {
+        Some(TemplKind::Func) => {
+            let f = v8__FunctionTemplate__GetFunction(
+                value as *const FunctionTemplate,
+                ctx as *const Context,
+            );
+            if f.is_null() {
+                value
+            } else {
+                jsval(f)
+            }
+        }
+        Some(TemplKind::Obj) => {
+            let o = v8__ObjectTemplate__NewInstance(
+                value as *const ObjectTemplate,
+                ctx as *const Context,
+            );
+            if o.is_null() {
+                value
+            } else {
+                jsval(o)
+            }
+        }
+        None => value,
     }
 }
 

@@ -1117,13 +1117,6 @@ pub extern "C" fn v8__Module__SetSyntheticModuleExport(
         JSObjectSetProperty(ctx, m.namespace, key, val, 0, &mut exc);
         JSStringRelease(key);
     }
-    #[cfg(debug_assertions)]
-    if std::env::var_os("V82JSC_GC_DEBUG").is_some() {
-        unsafe {
-            let _ = JSValueGetType(ctx, val);
-            JSGarbageCollect(ctx);
-        }
-    }
     MaybeBool::JustTrue
 }
 

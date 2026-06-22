@@ -163,8 +163,20 @@ fn stable_protect_ctx() -> JSContextRef {
         .unwrap_or(ptr::null_mut()) as JSContextRef
 }
 
+fn is_non_value_handle(v: JSValueRef) -> bool {
+    crate::shim_core::is_non_value_handle(current_iso(), v)
+}
+
 fn global_protect(v: JSValueRef) {
     if v.is_null() {
+        return;
+    }
+    // FunctionTemplate / ObjectTemplate handles are Rust box pointers and a
+    // `Global<Context>` holds a `JSGlobalContextRef` — neither is a JSC value.
+    // `JSValueProtect`ing them poisons JSC's GC root set (crashes GC with
+    // "INVALID HANDLE", blockVM=0x8). deno stores `Global<FunctionTemplate>` and
+    // `Global<Context>`, so these guards are essential.
+    if is_non_value_handle(v) {
         return;
     }
     GLOBAL_PROTECT.with(|m| {
@@ -190,6 +202,9 @@ fn global_protect(v: JSValueRef) {
 
 fn global_unprotect(v: JSValueRef) {
     if v.is_null() {
+        return;
+    }
+    if is_non_value_handle(v) {
         return;
     }
     GLOBAL_PROTECT.with(|m| {

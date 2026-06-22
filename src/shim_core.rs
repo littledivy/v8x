@@ -73,6 +73,42 @@ pub(crate) fn ctx_of(c: *const Context) -> JSGlobalContextRef {
     c as JSGlobalContextRef
 }
 
+/// Best-effort context for the current isolate when no context is entered.
+/// Used as a last-resort root so handles are never returned unprotected (an
+/// unprotected handle dangles the moment a GC runs while JS still references the
+/// value — the classic JSC "INVALID HANDLE" heap-corruption crash). JSC value
+/// protection is per-VM, so any live context of the isolate's group is a valid
+/// place to protect against.
+#[inline]
+fn fallback_ctx(iso: *mut RealIsolate) -> JSContextRef {
+    if iso.is_null() {
+        return ptr::null();
+    }
+    let st = iso_state(iso);
+    st.contexts
+        .last()
+        .or_else(|| st.owned_contexts.last())
+        .copied()
+        .unwrap_or(ptr::null_mut()) as JSContextRef
+}
+
+/// Whether `v` is a handle that is *not* a JSC value and so must never be passed
+/// to `JSValueProtect`/`JSValueUnprotect`: a FunctionTemplate / ObjectTemplate
+/// (a Rust box) or a `JSGlobalContextRef` (a context, not a value). Protecting
+/// such a pointer poisons JSC's GC root set and crashes the collector.
+#[inline]
+pub(crate) fn is_non_value_handle(iso: *mut RealIsolate, v: JSValueRef) -> bool {
+    if crate::shim_function::is_template_ptr(v as *const c_void) {
+        return true;
+    }
+    if iso.is_null() {
+        return false;
+    }
+    let st = iso_state(iso);
+    let p = v as JSGlobalContextRef;
+    st.owned_contexts.contains(&p) || st.contexts.contains(&p)
+}
+
 /// Protect `v` against `ctx`, record it in the current isolate's handle stack,
 /// and return it as a `*const T`. Returns null for a null input.
 #[inline]
@@ -80,30 +116,25 @@ pub(crate) fn intern_ctx<T>(ctx: JSContextRef, v: JSValueRef) -> *const T {
     if v.is_null() {
         return ptr::null();
     }
-    // Fall back to the current context if none was supplied; protecting or
-    // unprotecting against a null context crashes inside JSC.
-    let ctx = if ctx.is_null() { current_ctx() } else { ctx };
     let iso = current_iso();
+    // FunctionTemplate / ObjectTemplate handles are Rust box pointers and a
+    // Context handle is a `JSGlobalContextRef` — none are JSC values, so never
+    // `JSValueProtect` them (it corrupts JSC's GC root set). Hand the pointer
+    // back unrooted; these are owned elsewhere for the run.
+    if is_non_value_handle(iso, v) {
+        return v as *const T;
+    }
+    // Fall back to the current context if none was supplied, then to any live
+    // context of the isolate; protecting against a null context would crash
+    // inside JSC and, worse, leave the handle unrooted.
+    let mut ctx = if ctx.is_null() { current_ctx() } else { ctx };
+    if ctx.is_null() {
+        ctx = fallback_ctx(iso);
+    }
     if !iso.is_null() && !ctx.is_null() {
         unsafe {
             JSValueProtect(ctx, v);
             iso_state(iso).handles.push((ctx, v));
-        }
-        #[cfg(debug_assertions)]
-        if std::env::var_os("V82JSC_GC_DEBUG").is_some() {
-            unsafe {
-                // Validate the value is a real, traversable cell, then GC.
-                let _ = JSValueGetType(ctx, v);
-                JSGarbageCollect(ctx);
-            }
-        }
-    } else {
-        #[cfg(debug_assertions)]
-        if std::env::var_os("V82JSC_GC_DEBUG").is_some() {
-            eprintln!(
-                "v82jsc: intern_ctx returned UNPROTECTED handle (iso={:?} ctx={:?})\n{:?}",
-                iso, ctx, std::backtrace::Backtrace::force_capture()
-            );
         }
     }
     v as *const T
