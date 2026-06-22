@@ -5,10 +5,7 @@ use crate::{
   isolate::RealIsolate,
 };
 use std::num::NonZeroUsize;
-use std::{
-  mem::MaybeUninit,
-  ptr::{self, NonNull},
-};
+use std::{mem::MaybeUninit, ptr::NonNull};
 
 #[derive(Clone, Copy, Debug)]
 #[repr(transparent)]
@@ -74,35 +71,35 @@ impl Drop for HandleScope {
   }
 }
 
-#[repr(transparent)]
+/// In this JSC-backed shim a `Local<T>` pointer *is* a `JSValueRef`, so V8's
+/// "write the escaped object's address into a reserved slot" trick would
+/// corrupt the JSC heap. Instead the slot is a reserved entry in the parent
+/// scope's handle frame (identified by its index in the isolate handle stack);
+/// `escape` retargets that entry to the escaped value so it remains protected
+/// for the parent scope's whole lifetime.
 #[derive(Debug)]
-pub(super) struct EscapeSlot(NonNull<Address>);
+pub(super) struct EscapeSlot {
+  isolate: NonNull<RealIsolate>,
+  index: usize,
+}
 
 impl EscapeSlot {
   pub fn new(isolate: NonNull<RealIsolate>) -> Self {
-    unsafe {
-      let undefined = v8__Undefined(isolate.as_ptr()) as *const _;
-      let local = v8__Local__New(isolate.as_ptr(), undefined);
-      let slot_address_ptr = local as *const Address as *mut _;
-      let slot_address_nn = NonNull::new_unchecked(slot_address_ptr);
-      Self(slot_address_nn)
-    }
+    let index = unsafe { v8__EscapeSlot__reserve(isolate.as_ptr()) };
+    Self { isolate, index }
   }
 
   pub fn escape<'e, T>(self, value: Local<'_, T>) -> Local<'e, T>
   where
     for<'l> Local<'l, T>: Into<Local<'l, Data>>,
   {
-    const {
-      assert!(size_of::<Self>() == size_of::<Local<T>>());
-      assert!(align_of::<Self>() == align_of::<Local<T>>());
-    }
     unsafe {
-      let undefined = Local::<Value>::from_non_null(self.0.cast());
-      debug_assert!(undefined.is_undefined());
-      let value_address = *(&*value as *const T as *const Address);
-      ptr::write(self.0.as_ptr(), value_address);
-      Local::from_non_null(self.0.cast())
+      let escaped = v8__EscapeSlot__escape(
+        self.isolate.as_ptr(),
+        self.index,
+        &*value as *const T as *const Data,
+      );
+      Local::from_non_null(NonNull::new_unchecked(escaped as *mut T))
     }
   }
 }
@@ -271,6 +268,12 @@ unsafe extern "C" {
     other: *const Data,
   ) -> *const Data;
   pub(super) fn v8__Undefined(isolate: *mut RealIsolate) -> *const Primitive;
+  pub(super) fn v8__EscapeSlot__reserve(isolate: *mut RealIsolate) -> usize;
+  pub(super) fn v8__EscapeSlot__escape(
+    isolate: *mut RealIsolate,
+    index: usize,
+    value: *const Data,
+  ) -> *const Data;
 
   pub(super) fn v8__TryCatch__CONSTRUCT(
     buf: *mut MaybeUninit<TryCatch>,

@@ -123,7 +123,89 @@ pub extern "C" fn v8__CppHeap__DELETE(_heap: *mut c_void) {
 
 // ===================================================================
 // Global<T> — protect / unprotect a JS value so it outlives handle scopes.
+//
+// Globals must protect a value for the global's whole life and unprotect on
+// Reset/drop, independent of handle scopes *and* of whichever context happens
+// to be current at the time. Earlier code protected/unprotected against
+// `current_ctx()`, which is unstable: a Global cloned while no context is
+// entered would skip the protect, yet its Reset (run with a context current)
+// would still unprotect — driving the JSC protect count negative and freeing a
+// still-referenced cell (heap corruption surfacing during GC).
+//
+// To make this robust we keep a process-wide refcount per JSValueRef, capturing
+// a stable context the first time a value is protected and reusing it for every
+// protect/unprotect of that value. (JSC protection is per-VM; any live context
+// of the value's group is equivalent, so a captured stable context is correct.)
 // ===================================================================
+
+thread_local! {
+    static GLOBAL_PROTECT: std::cell::RefCell<
+        std::collections::HashMap<usize, (JSContextRef, usize)>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Best-effort stable context for protecting `v`. Prefers the current context;
+/// falls back to any live context of the current isolate.
+fn stable_protect_ctx() -> JSContextRef {
+    let ctx = current_ctx();
+    if !ctx.is_null() {
+        return ctx;
+    }
+    let iso = current_iso();
+    if iso.is_null() {
+        return ptr::null();
+    }
+    let st = iso_state(iso);
+    st.contexts
+        .last()
+        .or_else(|| st.owned_contexts.last())
+        .copied()
+        .unwrap_or(ptr::null_mut()) as JSContextRef
+}
+
+fn global_protect(v: JSValueRef) {
+    if v.is_null() {
+        return;
+    }
+    GLOBAL_PROTECT.with(|m| {
+        let mut map = m.borrow_mut();
+        match map.get_mut(&(v as usize)) {
+            Some((ctx, count)) => {
+                // Already protected once; bump the refcount and re-protect so the
+                // JSC protect count matches our refcount exactly.
+                unsafe { JSValueProtect(*ctx, v) };
+                *count += 1;
+            }
+            None => {
+                let ctx = stable_protect_ctx();
+                if ctx.is_null() {
+                    return;
+                }
+                unsafe { JSValueProtect(ctx, v) };
+                map.insert(v as usize, (ctx, 1));
+            }
+        }
+    });
+}
+
+fn global_unprotect(v: JSValueRef) {
+    if v.is_null() {
+        return;
+    }
+    GLOBAL_PROTECT.with(|m| {
+        let mut map = m.borrow_mut();
+        if let Some((ctx, count)) = map.get_mut(&(v as usize)) {
+            let ctx = *ctx;
+            unsafe { JSValueUnprotect(ctx, v) };
+            *count -= 1;
+            if *count == 0 {
+                map.remove(&(v as usize));
+            }
+        }
+        // If we never recorded a protect for this value (e.g. it was created
+        // with no context available), do nothing — never unprotect blindly.
+    });
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Global__New(
@@ -133,11 +215,7 @@ pub extern "C" fn v8__Global__New(
     if data.is_null() {
         return ptr::null();
     }
-    let ctx = current_ctx();
-    let v = jsval(data);
-    if !ctx.is_null() {
-        unsafe { JSValueProtect(ctx, v) };
-    }
+    global_protect(jsval(data));
     // The Global keeps its own protection independent of the handle scope, so
     // return the same pointer (it *is* the JSValueRef) without scope-recording.
     data
@@ -161,10 +239,7 @@ pub extern "C" fn v8__Global__Reset(data: *const Data) {
     if data.is_null() {
         return;
     }
-    let ctx = current_ctx();
-    if !ctx.is_null() {
-        unsafe { JSValueUnprotect(ctx, jsval(data)) };
-    }
+    global_unprotect(jsval(data));
 }
 
 // ===================================================================

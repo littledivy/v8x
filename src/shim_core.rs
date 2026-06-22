@@ -89,6 +89,22 @@ pub(crate) fn intern_ctx<T>(ctx: JSContextRef, v: JSValueRef) -> *const T {
             JSValueProtect(ctx, v);
             iso_state(iso).handles.push((ctx, v));
         }
+        #[cfg(debug_assertions)]
+        if std::env::var_os("V82JSC_GC_DEBUG").is_some() {
+            unsafe {
+                // Validate the value is a real, traversable cell, then GC.
+                let _ = JSValueGetType(ctx, v);
+                JSGarbageCollect(ctx);
+            }
+        }
+    } else {
+        #[cfg(debug_assertions)]
+        if std::env::var_os("V82JSC_GC_DEBUG").is_some() {
+            eprintln!(
+                "v82jsc: intern_ctx returned UNPROTECTED handle (iso={:?} ctx={:?})\n{:?}",
+                iso, ctx, std::backtrace::Backtrace::force_capture()
+            );
+        }
     }
     v as *const T
 }
@@ -216,6 +232,72 @@ pub extern "C" fn v8__Local__New(isolate: *mut RealIsolate, other: *const Data) 
     let _ = isolate;
     // Clone the handle into the current scope: re-protect and record.
     intern::<Data>(jsval(other))
+}
+
+// ===================================================================
+// EscapableHandleScope support.
+//
+// In this shim a `Local<T>` pointer *is* a `JSValueRef` (the object itself),
+// not a pointer to a handle slot as in real V8. V8's EscapeSlot trick — write
+// the escaped object's address into a reserved parent slot — would therefore
+// corrupt the JSC heap object. Instead we reserve a real entry in the parent
+// scope's handle frame and, on escape, retarget that entry to the escaped
+// value so it stays protected for the parent scope's whole lifetime.
+//
+// `v8__EscapeSlot__reserve` runs while the parent scope is current (before the
+// inner HandleScope is constructed). It interns an `undefined` placeholder and
+// returns the index of that entry in the isolate handle stack.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__EscapeSlot__reserve(isolate: *mut RealIsolate) -> usize {
+    if isolate.is_null() {
+        return usize::MAX;
+    }
+    let st = iso_state(isolate);
+    let ctx = st.contexts.last().copied().unwrap_or(ptr::null_mut()) as JSContextRef;
+    if ctx.is_null() {
+        return usize::MAX;
+    }
+    let v = unsafe { JSValueMakeUndefined(ctx) };
+    unsafe {
+        JSValueProtect(ctx, v);
+        st.handles.push((ctx, v));
+    }
+    st.handles.len() - 1
+}
+
+/// Retarget the reserved parent-frame slot at `index` to `value`, keeping it
+/// protected in the parent scope. Returns `value` as a handle pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__EscapeSlot__escape(
+    isolate: *mut RealIsolate,
+    index: usize,
+    value: *const Data,
+) -> *const Data {
+    if isolate.is_null() || index == usize::MAX || value.is_null() {
+        return value;
+    }
+    let st = iso_state(isolate);
+    let new_val = jsval(value);
+    let Some(slot) = st.handles.get_mut(index) else {
+        return value;
+    };
+    let (ctx, old) = *slot;
+    if ctx.is_null() {
+        return value;
+    }
+    unsafe {
+        // Protect the escaped value against the parent context, then release
+        // the placeholder. Protect-before-unprotect keeps the value rooted even
+        // if it happens to alias `old`.
+        JSValueProtect(ctx, new_val);
+        if !old.is_null() {
+            JSValueUnprotect(ctx, old);
+        }
+    }
+    *slot = (ctx, new_val);
+    value
 }
 
 #[unsafe(no_mangle)]

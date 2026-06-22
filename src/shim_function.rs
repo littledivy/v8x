@@ -413,6 +413,27 @@ pub extern "C" fn v8__External__Value(this: *const External) -> *mut c_void {
     unsafe { JSObjectGetPrivate(jsval(this) as JSObjectRef) }
 }
 
+unsafe extern "C" {
+    fn JSValueIsObjectOfClass(
+        ctx: JSContextRef,
+        value: JSValueRef,
+        js_class: JSClassRef,
+    ) -> bool;
+}
+
+/// Whether `v` is one of our `External` objects (used by `v8__Value__IsExternal`
+/// and the `Object` introspection shims). Reports false for null/non-objects.
+pub(crate) fn value_is_external(v: JSValueRef) -> bool {
+    if v.is_null() {
+        return false;
+    }
+    let ctx = current_ctx();
+    if ctx.is_null() {
+        return false;
+    }
+    unsafe { JSValueIsObjectOfClass(ctx, v, ext_class()) }
+}
+
 // ===================================================================
 // Function
 // ===================================================================

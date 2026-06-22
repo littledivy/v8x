@@ -347,7 +347,7 @@ pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(isolate: *mut RealIsol
         return;
     }
     let ctx = current_ctx();
-    if !ctx.is_null() {
+    if !ctx.is_null() && std::env::var_os("V82JSC_NO_CHECKPOINT_GC").is_none() {
         unsafe { JSGarbageCollect(ctx) };
     }
 }

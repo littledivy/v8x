@@ -141,6 +141,10 @@ pub extern "C" fn v8__Object__New(isolate: *mut RealIsolate) -> *const Object {
         return ptr::null();
     }
     let o = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
+    #[cfg(debug_assertions)]
+    if std::env::var_os("V82JSC_GC_DEBUG").is_some() {
+        unsafe { JSGarbageCollect(ctx) };
+    }
     intern_ctx::<Object>(ctx, o as JSValueRef)
 }
 
@@ -236,6 +240,14 @@ pub extern "C" fn v8__Object__Set(
     }
     let mut exc: JSValueRef = ptr::null();
     unsafe { JSObjectSetPropertyForKey(ctx, o, jsval(key), jsval(value), 0, &mut exc) };
+    #[cfg(debug_assertions)]
+    if std::env::var_os("V82JSC_GC_DEBUG").is_some() {
+        unsafe {
+            let _ = JSValueGetType(ctx, jsval(value));
+            let _ = JSValueGetType(ctx, jsval(key));
+            JSGarbageCollect(ctx);
+        }
+    }
     if !exc.is_null() {
         return MaybeBool::Nothing;
     }

@@ -74,6 +74,7 @@ mod script;
 mod jsc_sys;
 mod shim_core;
 mod shim_impl;
+mod shim_cli_extra;
 mod shim_value;
 mod shim_string;
 mod shim_object;

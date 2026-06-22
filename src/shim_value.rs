@@ -448,9 +448,13 @@ pub extern "C" fn v8__Value__IsModuleNamespaceObject(this: *const Value) -> bool
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsExternal(this: *const Value) -> bool {
-    // TODO(v82jsc): External values are represented via private classes; no
-    // generic JSC C API check. Inert false.
-    false
+    // External values are objects of our private `v8jsc_external` JSClass.
+    // Reporting this correctly is essential: deno_core uses `IsExternal` to
+    // decide whether to read a raw embedder pointer out of a value
+    // (`External::Value`). If this lied (always false / always true), deno would
+    // either mis-handle op state or, worse, treat a raw Rust pointer as a JS
+    // value and store it into a JS object — corrupting the JSC heap.
+    crate::shim_function::value_is_external(crate::shim_core::jsval(this))
 }
 
 #[unsafe(no_mangle)]
