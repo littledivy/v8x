@@ -31,10 +31,19 @@ pub extern "C" fn v8__V8__SetFlagsFromString(_flags: *const u8, _length: usize) 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__SetFlagsFromCommandLine(
-    _argc: *mut c_int,
+    argc: *mut c_int,
     _argv: *mut *mut c_char,
     _usage: *const c_char,
 ) {
+    // JSC ignores v8 flags. Report every flag as consumed by collapsing argv to
+    // just the binary name (index 0), so deno sees no "unrecognized" leftovers.
+    if !argc.is_null() {
+        unsafe {
+            if *argc > 1 {
+                *argc = 1;
+            }
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
