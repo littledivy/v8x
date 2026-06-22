@@ -291,17 +291,33 @@ pub extern "C" fn v8__Context__SetPromiseHooks(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__SetContinuationPreservedEmbedderData(
     _this: *mut RealIsolate,
-    _value: *const Value,
+    value: *const Value,
 ) {
-    // TODO(v82jsc): continuation-preserved embedder data unsupported. Inert.
+    CONTINUATION_DATA.with(|c| c.set(value as JSValueRef));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetContinuationPreservedEmbedderData(
     _this: *mut RealIsolate,
 ) -> *const Value {
-    // TODO(v82jsc): always undefined-equivalent (null handle).
-    ptr::null()
+    // Async-context storage. Return the stored value, or `undefined` — NEVER
+    // null: the vendored wrapper unwraps this, so a null handle panics deno on
+    // every unhandled promise rejection.
+    let stored = CONTINUATION_DATA.with(|c| c.get());
+    let ctx = current_ctx();
+    if !stored.is_null() {
+        return intern_ctx::<Value>(ctx, stored);
+    }
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let undef = unsafe { JSValueMakeUndefined(ctx) };
+    intern_ctx::<Value>(ctx, undef)
+}
+
+thread_local! {
+    static CONTINUATION_DATA: std::cell::Cell<JSValueRef> =
+        const { std::cell::Cell::new(ptr::null()) };
 }
 
 // ===================================================================
