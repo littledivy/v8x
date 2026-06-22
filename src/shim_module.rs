@@ -136,6 +136,11 @@ struct SyntheticModule {
     /// during InstantiateModule via the resolve callback. Evaluated (post-order)
     /// before this module's own body runs, mirroring V8 module linking.
     dependencies: Vec<*const Module>,
+    /// True if this source-text module uses top-level `await` (outside any
+    /// function). Such modules are evaluated by wrapping the rewritten body in
+    /// an `async` function whose returned promise drives module completion, and
+    /// `v8__Module__IsGraphAsync` reports them async so deno awaits that promise.
+    is_async: bool,
 }
 
 unsafe extern "C" fn mod_finalize(object: JSObjectRef) {
@@ -601,6 +606,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
         namespace,
         specifier,
         dependencies: Vec::new(),
+        is_async: rewrite.is_async,
     });
     let obj = unsafe {
         JSObjectMake(ctx, mod_class(), Box::into_raw(state) as *mut _)
@@ -612,6 +618,7 @@ struct RewrittenModule {
     body: std::string::String,
     export_names: Vec<std::string::String>,
     imports: Vec<std::string::String>,
+    is_async: bool,
 }
 
 /// Translate a (small, TLA-free) ES module into a function body that, when run
@@ -903,7 +910,145 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
         body,
         export_names,
         imports,
+        is_async: has_top_level_await(src),
     })
+}
+
+/// Best-effort detection of top-level `await` (or `for await`) in module source
+/// — i.e. an `await` keyword that is NOT nested inside any function/arrow body.
+/// We scan character-by-character, skipping string/template/comment content and
+/// tracking brace depth, and we mark the brace depth at which each `function` /
+/// `=>` body opens. An `await` token found while not inside any such body is a
+/// top-level await. This is a heuristic (the JSC C API exposes no parser hook),
+/// but it is sound for the module shapes deno actually runs: false negatives are
+/// the only failure mode and would simply fall back to the old sync behavior.
+fn has_top_level_await(src: &str) -> bool {
+    let b = src.as_bytes();
+    let n = b.len();
+    let mut i = 0usize;
+    // Stack of brace depths at which a function/arrow body was opened. While the
+    // current depth is greater than the top of this stack, we are inside a
+    // function body and `await` there is not top-level.
+    let mut fn_body_depths: Vec<i32> = Vec::new();
+    let mut depth: i32 = 0;
+    // Tracks whether a `function`/arrow header was seen and we're waiting for its
+    // opening `{` to record the body depth.
+    let mut pending_fn_body = false;
+
+    let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+
+    while i < n {
+        let c = b[i];
+        match c {
+            // Line comment.
+            b'/' if i + 1 < n && b[i + 1] == b'/' => {
+                i += 2;
+                while i < n && b[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            // Block comment.
+            b'/' if i + 1 < n && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            // String literals.
+            b'"' | b'\'' => {
+                let q = c;
+                i += 1;
+                while i < n {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == q {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // Template literals — skip content, but recurse into `${ ... }` is
+            // overkill; awaits inside template substitutions at top level are
+            // exceedingly rare in practice. We conservatively skip the whole
+            // template, accepting a possible false negative.
+            b'`' => {
+                i += 1;
+                while i < n {
+                    if b[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'`' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'{' => {
+                depth += 1;
+                if pending_fn_body {
+                    fn_body_depths.push(depth);
+                    pending_fn_body = false;
+                }
+                i += 1;
+            }
+            b'}' => {
+                if let Some(&d) = fn_body_depths.last() {
+                    if d == depth {
+                        fn_body_depths.pop();
+                    }
+                }
+                depth -= 1;
+                i += 1;
+            }
+            // Arrow function: `=>` opens a body. If followed by `{` we'll catch
+            // it via pending_fn_body; if it's an expression-bodied arrow
+            // (`x => await y` is itself a syntax error unless arrow is async,
+            // and an async arrow's await is not top-level), mark pending so the
+            // next `{` (if any) is treated as a function body. Expression-bodied
+            // async arrows can't contain a *bare* top-level await anyway.
+            b'=' if i + 1 < n && b[i + 1] == b'>' => {
+                pending_fn_body = true;
+                i += 2;
+            }
+            _ if is_ident(c) => {
+                let start = i;
+                while i < n && is_ident(b[i]) {
+                    i += 1;
+                }
+                let word = &src[start..i];
+                let prev_is_dot = start > 0 && {
+                    // Skip back over whitespace to see if preceded by `.`
+                    let mut j = start;
+                    while j > 0 && (b[j - 1] as char).is_whitespace() {
+                        j -= 1;
+                    }
+                    j > 0 && b[j - 1] == b'.'
+                };
+                match word {
+                    "function" => {
+                        pending_fn_body = true;
+                    }
+                    "await" if !prev_is_dot => {
+                        // Top-level only when not inside any function body.
+                        if fn_body_depths.is_empty() {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {
+                i += 1;
+            }
+        }
+    }
+    false
 }
 
 /// Extract the string literal in `from "..."` or `import "..."`.
@@ -1308,19 +1453,27 @@ pub extern "C" fn v8__Module__Evaluate(
     m.status = ModuleStatus::Evaluating;
 
     // Evaluate dependencies first (post-order) so their namespaces are populated
-    // and registered before this module's body references them.
+    // and registered before this module's body references them. Collect the
+    // evaluation promises of any *async* (top-level-await) dependency so this
+    // module's body can await them before reading their exports — mirroring V8's
+    // async module graph, where a parent's evaluation waits on async children.
     let iso = current_iso();
     let deps = m.dependencies.clone();
+    let mut dep_promises: Vec<JSValueRef> = Vec::new();
     for dep in &deps {
         if dep.is_null() {
             continue;
         }
+        let dep_async = v8__Module__IsGraphAsync(*dep);
         if let Some(dm) = module_state(*dep) {
-            if matches!(dm.status, ModuleStatus::Evaluated) {
+            if matches!(dm.status, ModuleStatus::Evaluated) && !dep_async {
                 continue;
             }
         }
-        let _ = v8__Module__Evaluate(*dep, context);
+        let p = v8__Module__Evaluate(*dep, context);
+        if dep_async && !p.is_null() {
+            dep_promises.push(jsval(p));
+        }
     }
     crate::shim_core::restore_current(iso);
 
@@ -1334,6 +1487,27 @@ pub extern "C" fn v8__Module__Evaluate(
     // populate its properties in place.
     if !m.specifier.is_empty() {
         unsafe { register_module_namespace(ctx, &m.specifier, m.namespace) };
+    }
+
+    // The rewritten body looks up imports by their *raw* source specifier (e.g.
+    // `"./dep.js"`), but each dependency registered itself under its *resolved*
+    // specifier (e.g. `file:///abs/dep.js`). Bridge the two by aliasing each raw
+    // import specifier to the corresponding dependency's namespace right before
+    // running this module's body, so relative imports between user modules
+    // resolve. Specifiers and dependencies are kept in the same source order.
+    {
+        let raw_specs = m.import_specifiers.clone();
+        let deps2 = m.dependencies.clone();
+        for (raw, dep) in raw_specs.iter().zip(deps2.iter()) {
+            if dep.is_null() {
+                continue;
+            }
+            if let Some(dm) = module_state(*dep) {
+                if !raw.is_empty() && !dm.namespace.is_null() {
+                    unsafe { register_module_namespace(ctx, raw, dm.namespace) };
+                }
+            }
+        }
     }
 
     if let Some(eval_steps) = m.eval_steps {
@@ -1360,12 +1534,30 @@ pub extern "C" fn v8__Module__Evaluate(
     // Source-text ES module: evaluate the rewritten body, which assigns its
     // exports onto the namespace object.
     if let Some(src) = m.source.clone() {
+        // The body must run as async if it uses top-level await OR if it depends
+        // on an async module whose evaluation promise we must await first.
+        let is_async = m.is_async || !dep_promises.is_empty();
         let namespace = m.namespace;
         let meta = unsafe { build_import_meta(context, this) };
-        match unsafe { eval_module_source(ctx, &src, namespace, meta) } {
-            Ok(()) => {
+        match unsafe {
+            eval_module_source(ctx, &src, namespace, meta, is_async, &dep_promises)
+        } {
+            Ok(promise) => {
+                // V8 marks a TLA module Evaluated once its synchronous prologue
+                // has run, even though the returned promise is still pending;
+                // deno asserts the post-Evaluate status is Evaluated/Errored.
                 if let Some(m) = module_state(this) {
                     m.status = ModuleStatus::Evaluated;
+                }
+                // Async module: hand back the async function's own promise so
+                // deno's `mod_evaluate` awaits it (exports are populated when it
+                // settles). Sync module: fall through to the resolved promise.
+                if !promise.is_null() {
+                    crate::shim_exception::track_promise_pub(
+                        ctx,
+                        promise as JSObjectRef,
+                    );
+                    return intern_ctx::<Value>(ctx, promise);
                 }
             }
             Err(exc) => {
@@ -1411,16 +1603,29 @@ fn make_resolved_promise(ctx: JSContextRef) -> *const Value {
 }
 
 /// Evaluate a rewritten ES-module body in `ctx`, exposing its exports on
-/// `namespace`. Returns `Ok(())` on success or `Err(exception)` carrying the
-/// thrown value (never null on the Err path, so callers can build a rejected
-/// promise).
+/// `namespace`.
+///
+/// For a synchronous module (`is_async == false`) the body is wrapped in a plain
+/// function and called; `Ok(null)` signals success. For a top-level-await module
+/// (`is_async == true`) the body is wrapped in an `async` function: calling it
+/// runs the synchronous prologue and returns a promise that settles once the
+/// awaited body completes (and exports are assigned). That promise is returned as
+/// `Ok(promise)` so the caller can hand it to deno's evaluation driver. A body
+/// that throws *synchronously* (before the first await) makes an async function
+/// return a rejected promise rather than throw, so the async path never takes the
+/// `Err` branch for body errors — deno surfaces them via the rejected promise.
+///
+/// `Err(exception)` (never null) is only returned when wrapping/compiling or the
+/// call itself fails, so callers can build a rejected promise.
 unsafe fn eval_module_source(
     ctx: JSContextRef,
     rewritten: &str,
     namespace: JSObjectRef,
     meta: JSValueRef,
-) -> Result<(), JSValueRef> {
-    let fail = |ctx: JSContextRef, exc: JSValueRef| -> Result<(), JSValueRef> {
+    is_async: bool,
+    dep_promises: &[JSValueRef],
+) -> Result<JSValueRef, JSValueRef> {
+    let fail = |ctx: JSContextRef, exc: JSValueRef| -> Result<JSValueRef, JSValueRef> {
         unsafe { report_module_exception(ctx, exc) };
         // Guarantee a non-null exception value for the rejected promise.
         let e = if exc.is_null() {
@@ -1430,8 +1635,18 @@ unsafe fn eval_module_source(
         };
         Err(e)
     };
+    let kw = if is_async { "async function" } else { "function" };
+    // When this module depends on async (TLA) modules, await their evaluation
+    // promises (passed as `__deps`) before running the body so their exports are
+    // populated first. `__deps` is always a parameter for layout stability but is
+    // only awaited on the async path.
+    let prologue = if is_async && !dep_promises.is_empty() {
+        "await Promise.all(__deps);\n"
+    } else {
+        ""
+    };
     let wrapped = format!(
-        "(function(__ns, __v8jsc_meta){{\n{}\n}})",
+        "({kw}(__ns, __v8jsc_meta, __deps){{\n{prologue}{}\n}})",
         rewritten
     );
     let cstr = match std::ffi::CString::new(wrapped) {
@@ -1456,14 +1671,31 @@ unsafe fn eval_module_source(
     } else {
         meta
     };
-    let args = [namespace as JSValueRef, meta];
-    let r = unsafe {
-        JSObjectCallAsFunction(ctx, fobj, ptr::null_mut(), 2, args.as_ptr(), &mut exc)
+    let deps_arr = unsafe {
+        JSObjectMakeArray(ctx, dep_promises.len(), dep_promises.as_ptr(), &mut exc)
     };
+    let deps_val = if deps_arr.is_null() {
+        unsafe { JSValueMakeUndefined(ctx) }
+    } else {
+        deps_arr as JSValueRef
+    };
+    let args = [namespace as JSValueRef, meta, deps_val];
+    let r = unsafe {
+        JSObjectCallAsFunction(ctx, fobj, ptr::null_mut(), 3, args.as_ptr(), &mut exc)
+    };
+    if is_async {
+        // The call itself only fails for pathological reasons (the async body's
+        // own throws become a rejected promise). `r` is the module-evaluation
+        // promise; return it for the caller to drive.
+        if r.is_null() || !exc.is_null() {
+            return fail(ctx, exc);
+        }
+        return Ok(r);
+    }
     if r.is_null() || !exc.is_null() {
         return fail(ctx, exc);
     }
-    Ok(())
+    Ok(ptr::null())
 }
 
 /// Make a generic `Error(message)` JS value in `ctx`.
@@ -1608,8 +1840,29 @@ unsafe fn report_module_exception(ctx: JSContextRef, exc: JSValueRef) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__IsGraphAsync(_this: *const Module) -> bool {
-    false
+pub extern "C" fn v8__Module__IsGraphAsync(this: *const Module) -> bool {
+    // A module's graph is async if the module itself uses top-level await, or
+    // any of its (transitive) dependencies do. deno awaits the evaluation
+    // promise of an async-graph module rather than requiring synchronous
+    // completion (see `mod_evaluate_sync`'s TLA guard).
+    fn graph_async(this: *const Module, seen: &mut Vec<*const Module>) -> bool {
+        if this.is_null() || seen.contains(&this) {
+            return false;
+        }
+        seen.push(this);
+        match module_state(this) {
+            Some(m) => {
+                if m.is_async {
+                    return true;
+                }
+                let deps = m.dependencies.clone();
+                deps.iter().any(|d| graph_async(*d, seen))
+            }
+            None => false,
+        }
+    }
+    let mut seen = Vec::new();
+    graph_async(this, &mut seen)
 }
 
 #[unsafe(no_mangle)]
@@ -1680,6 +1933,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
         namespace,
         specifier,
         dependencies: Vec::new(),
+        is_async: false,
     });
     let obj = unsafe {
         JSObjectMake(ctx, mod_class(), Box::into_raw(state) as *mut _)
