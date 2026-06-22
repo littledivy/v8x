@@ -472,6 +472,9 @@ pub extern "C" fn v8__Context__New(
     let ctx = unsafe { JSGlobalContextCreateInGroup(st.group, ptr::null_mut()) };
     st.owned_contexts.push(ctx);
     unsafe { install_context_compat_shims(ctx) };
+    // If deno already registered a promise-reject callback, wire this fresh
+    // context's unhandled-rejection bridge too.
+    unsafe { crate::shim_isolate::install_unhandled_rejection_bridge(ctx) };
     ctx as *const Context
 }
 

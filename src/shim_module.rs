@@ -77,6 +77,12 @@ unsafe extern "C" {
         arguments: *const JSValueRef,
         exception: *mut JSValueRef,
     ) -> JSValueRef;
+    fn JSObjectMakeError(
+        ctx: JSContextRef,
+        argumentCount: usize,
+        arguments: *const JSValueRef,
+        exception: *mut JSValueRef,
+    ) -> JSObjectRef;
 }
 
 #[repr(C)]
@@ -1356,12 +1362,23 @@ pub extern "C" fn v8__Module__Evaluate(
     if let Some(src) = m.source.clone() {
         let namespace = m.namespace;
         let meta = unsafe { build_import_meta(context, this) };
-        let ok = unsafe { eval_module_source(ctx, &src, namespace, meta) };
-        if let Some(m) = module_state(this) {
-            m.status = if ok { ModuleStatus::Evaluated } else { ModuleStatus::Errored };
-        }
-        if !ok {
-            return ptr::null();
+        match unsafe { eval_module_source(ctx, &src, namespace, meta) } {
+            Ok(()) => {
+                if let Some(m) = module_state(this) {
+                    m.status = ModuleStatus::Evaluated;
+                }
+            }
+            Err(exc) => {
+                if let Some(m) = module_state(this) {
+                    m.status = ModuleStatus::Errored;
+                }
+                // V8 semantics: a module that throws during evaluation still
+                // returns a Promise — a *rejected* one — rather than null. deno's
+                // `mod_evaluate` then drives `on_rejected`, surfacing the real
+                // error. Returning null instead makes deno treat the failure as
+                // "execution terminated" (the oneshot sender is dropped unsent).
+                return make_rejected_promise(ctx, exc);
+            }
         }
     } else if let Some(m) = module_state(this) {
         m.status = ModuleStatus::Evaluated;
@@ -1394,20 +1411,32 @@ fn make_resolved_promise(ctx: JSContextRef) -> *const Value {
 }
 
 /// Evaluate a rewritten ES-module body in `ctx`, exposing its exports on
-/// `namespace`. Returns true on success.
+/// `namespace`. Returns `Ok(())` on success or `Err(exception)` carrying the
+/// thrown value (never null on the Err path, so callers can build a rejected
+/// promise).
 unsafe fn eval_module_source(
     ctx: JSContextRef,
     rewritten: &str,
     namespace: JSObjectRef,
     meta: JSValueRef,
-) -> bool {
+) -> Result<(), JSValueRef> {
+    let fail = |ctx: JSContextRef, exc: JSValueRef| -> Result<(), JSValueRef> {
+        unsafe { report_module_exception(ctx, exc) };
+        // Guarantee a non-null exception value for the rejected promise.
+        let e = if exc.is_null() {
+            make_generic_error(ctx, "module evaluation failed")
+        } else {
+            exc
+        };
+        Err(e)
+    };
     let wrapped = format!(
         "(function(__ns, __v8jsc_meta){{\n{}\n}})",
         rewritten
     );
     let cstr = match std::ffi::CString::new(wrapped) {
         Ok(c) => c,
-        Err(_) => return false,
+        Err(_) => return fail(ctx, ptr::null()),
     };
     let mut exc: JSValueRef = ptr::null();
     let js = unsafe { JSStringCreateWithUTF8CString(cstr.as_ptr()) };
@@ -1416,13 +1445,11 @@ unsafe fn eval_module_source(
     };
     unsafe { JSStringRelease(js) };
     if f.is_null() {
-        report_module_exception(ctx, exc);
-        return false;
+        return fail(ctx, exc);
     }
     let fobj = unsafe { JSValueToObject(ctx, f, &mut exc) };
     if fobj.is_null() {
-        report_module_exception(ctx, exc);
-        return false;
+        return fail(ctx, exc);
     }
     let meta = if meta.is_null() {
         unsafe { JSValueMakeUndefined(ctx) }
@@ -1434,10 +1461,70 @@ unsafe fn eval_module_source(
         JSObjectCallAsFunction(ctx, fobj, ptr::null_mut(), 2, args.as_ptr(), &mut exc)
     };
     if r.is_null() || !exc.is_null() {
-        report_module_exception(ctx, exc);
-        return false;
+        return fail(ctx, exc);
     }
-    true
+    Ok(())
+}
+
+/// Make a generic `Error(message)` JS value in `ctx`.
+unsafe fn make_generic_error(ctx: JSContextRef, message: &str) -> JSValueRef {
+    let mut exc: JSValueRef = ptr::null();
+    let msg = std::ffi::CString::new(message).unwrap_or_default();
+    let s = unsafe { JSStringCreateWithUTF8CString(msg.as_ptr()) };
+    let arg = unsafe { JSValueMakeString(ctx, s) };
+    unsafe { JSStringRelease(s) };
+    let args = [arg];
+    let e = unsafe { JSObjectMakeError(ctx, 1, args.as_ptr(), &mut exc) };
+    if e.is_null() {
+        unsafe { JSValueMakeUndefined(ctx) }
+    } else {
+        e as JSValueRef
+    }
+}
+
+/// Build a Promise pre-rejected with `exc`, mirroring V8's behavior of returning
+/// a rejected promise from `Module::Evaluate` when the body throws.
+fn make_rejected_promise(ctx: JSContextRef, exc: JSValueRef) -> *const Value {
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let exc = if exc.is_null() {
+        unsafe { JSValueMakeUndefined(ctx) }
+    } else {
+        exc
+    };
+    // Use Promise.reject via the global so the promise is a genuine JSC promise
+    // that our promise tracking and deno's `.then`/`.catch` handlers observe.
+    let mut e: JSValueRef = ptr::null();
+    let p = unsafe {
+        let global = JSContextGetGlobalObject(ctx);
+        let pkey = JSStringCreateWithUTF8CString(c"Promise".as_ptr());
+        let promise_ctor = JSObjectGetProperty(ctx, global, pkey, &mut e);
+        JSStringRelease(pkey);
+        if promise_ctor.is_null() || !JSValueIsObject(ctx, promise_ctor) {
+            return intern_ctx::<Value>(ctx, JSValueMakeUndefined(ctx));
+        }
+        let rkey = JSStringCreateWithUTF8CString(c"reject".as_ptr());
+        let reject = JSObjectGetProperty(ctx, promise_ctor as JSObjectRef, rkey, &mut e);
+        JSStringRelease(rkey);
+        if reject.is_null() || !JSValueIsObject(ctx, reject) {
+            return intern_ctx::<Value>(ctx, JSValueMakeUndefined(ctx));
+        }
+        let args = [exc];
+        JSObjectCallAsFunction(
+            ctx,
+            reject as JSObjectRef,
+            promise_ctor as JSObjectRef,
+            1,
+            args.as_ptr(),
+            &mut e,
+        )
+    };
+    if p.is_null() {
+        return intern_ctx::<Value>(ctx, unsafe { JSValueMakeUndefined(ctx) });
+    }
+    crate::shim_exception::track_promise_pub(ctx, p as JSObjectRef);
+    intern_ctx::<Value>(ctx, p)
 }
 
 /// Register `namespace` into `globalThis.__v8jsc_modules[specifier]` so other

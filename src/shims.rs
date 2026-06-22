@@ -72,8 +72,6 @@ pub extern "C" fn v8__Object__DeletePrivate() { unimplemented!("v8__Object__Dele
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetCreationContext() { unimplemented!("v8__Object__GetCreationContext") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__GetOwnPropertyDescriptor() { unimplemented!("v8__Object__GetOwnPropertyDescriptor") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetRealNamedProperty() { unimplemented!("v8__Object__GetRealNamedProperty") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetRealNamedPropertyAttributes() { unimplemented!("v8__Object__GetRealNamedPropertyAttributes") }
@@ -123,8 +121,6 @@ pub extern "C" fn v8__Symbol__Description() { unimplemented!("v8__Symbol__Descri
 pub extern "C" fn v8__Symbol__New() { unimplemented!("v8__Symbol__New") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TryCatch__Message() { unimplemented!("v8__TryCatch__Message") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TypedArray__Length() { unimplemented!("v8__TypedArray__Length") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Uint8ClampedArray__New() { unimplemented!("v8__Uint8ClampedArray__New") }
 #[unsafe(no_mangle)]

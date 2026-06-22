@@ -107,6 +107,14 @@ unsafe extern "C" {
         propertyKey: JSValueRef,
         exception: *mut JSValueRef,
     ) -> bool;
+    fn JSObjectCallAsFunction(
+        ctx: JSContextRef,
+        object: JSObjectRef,
+        thisObject: JSObjectRef,
+        argumentCount: usize,
+        arguments: *const JSValueRef,
+        exception: *mut JSValueRef,
+    ) -> JSValueRef;
 }
 
 type JSPropertyNameArrayRef = *mut OpaqueJSPropertyNameArray;
@@ -687,4 +695,67 @@ pub extern "C" fn v8__Object__IsApiWrapper(this: *const Object) -> bool {
         let map = t.borrow();
         map.keys().any(|(w, _)| *w == this as usize)
     })
+}
+
+// ===================================================================
+// Object::GetOwnPropertyDescriptor — return a descriptor object
+// `{ value?, get?, set?, writable?, enumerable, configurable }` or undefined.
+// Implemented by delegating to the global `Object.getOwnPropertyDescriptor`,
+// which JSC provides natively and which correctly handles data vs accessor
+// descriptors, symbol/string keys, and own (not inherited) lookup.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetOwnPropertyDescriptor(
+    this: *const Object,
+    context: *const Context,
+    key: *const Name,
+) -> *const Value {
+    if this.is_null() {
+        return ptr::null();
+    }
+    let ctx = ctx_of(context) as JSContextRef;
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let obj = obj_of(ctx, this);
+    if obj.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        // Resolve `Object.getOwnPropertyDescriptor`.
+        let global = JSContextGetGlobalObject(ctx);
+        let object_key = JSStringCreateWithUTF8CString(c"Object".as_ptr());
+        let mut exc: JSValueRef = ptr::null();
+        let object_ctor = JSObjectGetProperty(ctx, global, object_key, &mut exc);
+        JSStringRelease(object_key);
+        if object_ctor.is_null() || !JSValueIsObject(ctx, object_ctor) {
+            return ptr::null();
+        }
+        let gopd_key =
+            JSStringCreateWithUTF8CString(c"getOwnPropertyDescriptor".as_ptr());
+        let gopd =
+            JSObjectGetProperty(ctx, object_ctor as JSObjectRef, gopd_key, &mut exc);
+        JSStringRelease(gopd_key);
+        if gopd.is_null() || !JSValueIsObject(ctx, gopd) {
+            return ptr::null();
+        }
+        let args = [obj as JSValueRef, jsval(key)];
+        let r = JSObjectCallAsFunction(
+            ctx,
+            gopd as JSObjectRef,
+            object_ctor as JSObjectRef,
+            2,
+            args.as_ptr(),
+            &mut exc,
+        );
+        if r.is_null() {
+            if !exc.is_null() {
+                crate::shim_core::record_pending_exception(ctx, exc);
+            }
+            return ptr::null();
+        }
+        // V8 returns Undefined (not null/empty) when no own descriptor exists.
+        intern_ctx::<Value>(ctx, r)
+    }
 }

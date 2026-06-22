@@ -76,6 +76,11 @@ unsafe extern "C" {
         object: JSObjectRef,
         exception: *mut JSValueRef,
     ) -> usize;
+    fn JSObjectGetTypedArrayLength(
+        ctx: JSContextRef,
+        object: JSObjectRef,
+        exception: *mut JSValueRef,
+    ) -> usize;
     fn JSObjectGetTypedArrayByteOffset(
         ctx: JSContextRef,
         object: JSObjectRef,
@@ -614,6 +619,16 @@ pub extern "C" fn v8__ArrayBufferView__ByteOffset(this: *const ArrayBufferView) 
         return 0;
     }
     unsafe { JSObjectGetTypedArrayByteOffset(ctx, jsval(this) as JSObjectRef, ptr::null_mut()) }
+}
+
+/// TypedArray::Length — element count of the view (not bytes).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TypedArray__Length(this: *const crate::TypedArray) -> usize {
+    let ctx = current_ctx();
+    if ctx.is_null() || this.is_null() {
+        return 0;
+    }
+    unsafe { JSObjectGetTypedArrayLength(ctx, jsval(this) as JSObjectRef, ptr::null_mut()) }
 }
 
 #[unsafe(no_mangle)]

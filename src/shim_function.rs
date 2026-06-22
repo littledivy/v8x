@@ -161,12 +161,37 @@ struct FnTemplate {
     parent: *const FnTemplate,
     // properties set via Template::Set: (name, value, attr)
     props: Vec<(JSValueRef, JSValueRef, u32)>,
+    /// The materialized `.prototype` object, created on first use and cached so
+    /// that `GetFunction` (which installs methods onto it) and `NewInstance`
+    /// (which wires it as the instance's `__proto__`) share the SAME object.
+    /// Without sharing, instances would get a fresh empty prototype and miss the
+    /// methods that JS later attaches to `Class.prototype`. JSValueProtected for
+    /// the template's lifetime.
+    cached_proto: JSValueRef,
+}
+
+/// An accessor (getter/setter) declared on a template via SetAccessorProperty.
+/// `getter`/`setter` are FunctionTemplate handles (Rust box pointers) to be
+/// materialized into JS functions when the template is instantiated.
+struct TemplAccessor {
+    key: JSValueRef,
+    getter: *const FnTemplate,
+    setter: *const FnTemplate,
+    attr: u32,
 }
 
 /// ObjectTemplate config object.
 struct ObjTemplate {
     internal_field_count: i32,
     props: Vec<(JSValueRef, JSValueRef, u32)>,
+    accessors: Vec<TemplAccessor>,
+    /// If this ObjectTemplate is the *instance* template of a FunctionTemplate,
+    /// a back-pointer to that FunctionTemplate. Used by `NewInstance` to wire the
+    /// created object's prototype chain to the function's `.prototype` (which
+    /// carries the prototype-template methods), matching V8 semantics where
+    /// `instance_template.new_instance()` yields an object whose `__proto__` is
+    /// the function's prototype. Null for standalone ObjectTemplates.
+    parent_fn: *const FnTemplate,
 }
 
 // Class used to make callable function objects carrying an FnBridge.
@@ -213,6 +238,10 @@ unsafe extern "C" fn fn_finalize(object: JSObjectRef) {
 }
 
 /// Invoke a stored v8 callback, building a `CbInfo` for it.
+///
+/// If the callback throws (via `Isolate::ThrowException` / a recorded pending
+/// exception), the thrown value is written to `*out_exc` and the JSC runtime is
+/// signalled to propagate it (by the caller returning while `*out_exc` is set).
 unsafe fn dispatch(
     ctx: JSContextRef,
     bridge: &FnBridge,
@@ -221,13 +250,18 @@ unsafe fn dispatch(
     is_construct: bool,
     argc: usize,
     argv: *const JSValueRef,
+    out_exc: *mut JSValueRef,
 ) -> JSValueRef {
     let mut args = Vec::with_capacity(argc);
     for i in 0..argc {
         args.push(unsafe { *argv.add(i) });
     }
+    // Clear any stale pending exception so we only observe one thrown by THIS
+    // callback invocation.
+    let iso = current_iso();
+    crate::shim_core::clear_pending_exception(iso);
     let info = Box::new(CbInfo {
-        isolate: current_iso(),
+        isolate: iso,
         ctx,
         this,
         data: bridge.data,
@@ -242,6 +276,15 @@ unsafe fn dispatch(
     // Recover return value.
     let info = unsafe { Box::from_raw(info_ptr as *mut CbInfo) };
     let ret = *info.return_slot;
+    // If the callback recorded a pending exception, forward it to JSC.
+    let pending = crate::shim_core::peek_pending_exception(iso);
+    if !pending.is_null() {
+        if !out_exc.is_null() {
+            unsafe { *out_exc = pending };
+        }
+        crate::shim_core::clear_pending_exception(iso);
+        return unsafe { JSValueMakeUndefined(ctx) };
+    }
     if ret.is_null() {
         unsafe { JSValueMakeUndefined(ctx) }
     } else {
@@ -255,7 +298,7 @@ unsafe extern "C" fn fn_trampoline(
     this_object: JSObjectRef,
     argc: usize,
     argv: *const JSValueRef,
-    _exception: *mut JSValueRef,
+    exception: *mut JSValueRef,
 ) -> JSValueRef {
     let bridge = unsafe { JSObjectGetPrivate(function) } as *const FnBridge;
     if bridge.is_null() {
@@ -270,6 +313,7 @@ unsafe extern "C" fn fn_trampoline(
             false,
             argc,
             argv,
+            exception,
         )
     }
 }
@@ -279,7 +323,7 @@ unsafe extern "C" fn fn_construct_trampoline(
     function: JSObjectRef,
     argc: usize,
     argv: *const JSValueRef,
-    _exception: *mut JSValueRef,
+    exception: *mut JSValueRef,
 ) -> JSObjectRef {
     let bridge = unsafe { JSObjectGetPrivate(function) } as *const FnBridge;
     if bridge.is_null() {
@@ -307,8 +351,13 @@ unsafe extern "C" fn fn_construct_trampoline(
             true,
             argc,
             argv,
+            exception,
         )
     };
+    // If a constructor callback threw, signal JSC via the exception out-param.
+    if !exception.is_null() && !unsafe { *exception }.is_null() {
+        return unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
+    }
     // If callback returned an object, use it; else use `this`.
     if !r.is_null() && unsafe { JSValueIsObject(ctx, r) } {
         r as JSObjectRef
@@ -912,10 +961,14 @@ pub extern "C" fn v8__FunctionTemplate__New(
     let proto = Box::into_raw(Box::new(ObjTemplate {
         internal_field_count: 0,
         props: Vec::new(),
+        accessors: Vec::new(),
+        parent_fn: ptr::null(),
     }));
     let instance = Box::into_raw(Box::new(ObjTemplate {
         internal_field_count: 0,
         props: Vec::new(),
+        accessors: Vec::new(),
+        parent_fn: ptr::null(),
     }));
     register_template(proto as usize, TemplKind::Obj);
     register_template(instance as usize, TemplKind::Obj);
@@ -928,7 +981,12 @@ pub extern "C" fn v8__FunctionTemplate__New(
         instance,
         parent: ptr::null(),
         props: Vec::new(),
+        cached_proto: ptr::null(),
     }));
+    // Wire the instance template back to its FunctionTemplate so NewInstance can
+    // install the function's prototype (carrying prototype-template methods) as
+    // the created object's `__proto__`.
+    unsafe { (*instance).parent_fn = t };
     register_template(t as usize, TemplKind::Func);
     t as *const FunctionTemplate
 }
@@ -973,11 +1031,7 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
     // v8 functions ALWAYS have a `.prototype` object (deno's setUpAsyncStub does
     // `tmplFn.prototype[opName] = fn`), so install one even when the prototype
     // template has no props.
-    let proto = unsafe { &*t.proto };
-    let proto_obj = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
-    if !proto.props.is_empty() {
-        apply_props(ctx, proto_obj, &proto.props);
-    }
+    let proto_obj = unsafe { build_prototype_object(ctx, this as *const FnTemplate) };
     let key = unsafe { JSStringCreateWithUTF8CString(c"prototype".as_ptr()) };
     let mut exc: JSValueRef = ptr::null();
     unsafe {
@@ -986,6 +1040,39 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
     }
 
     intern_ctx::<Function>(ctx, f as JSValueRef)
+}
+
+/// Return the `.prototype` object for a FunctionTemplate, creating it once and
+/// caching it on the template. The object carries the prototype-template's props
+/// (methods/accessors). If the FunctionTemplate `Inherit`s a parent, the parent's
+/// prototype object is spliced in as this prototype's `__proto__`, so inherited
+/// methods are reachable up the chain (matching V8's prototype inheritance).
+///
+/// Caching is essential: `GetFunction` installs this object as the function's
+/// `.prototype` (and JS code then attaches methods to it), while `NewInstance`
+/// wires it as a created instance's `__proto__`. Both must reference the SAME
+/// object or instances would miss methods.
+unsafe fn build_prototype_object(ctx: JSContextRef, tp: *const FnTemplate) -> JSObjectRef {
+    let t = unsafe { &mut *(tp as *mut FnTemplate) };
+    if !t.cached_proto.is_null() {
+        return t.cached_proto as JSObjectRef;
+    }
+    let proto_obj = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
+    let proto = unsafe { &*t.proto };
+    if !proto.props.is_empty() {
+        apply_props(ctx, proto_obj, &proto.props);
+    }
+    apply_accessors(ctx, proto_obj, &proto.accessors);
+    // Splice the parent template's prototype into this one's chain.
+    if !t.parent.is_null() {
+        let parent_proto = unsafe { build_prototype_object(ctx, t.parent) };
+        unsafe { JSObjectSetPrototype(ctx, proto_obj, parent_proto as JSValueRef) };
+    }
+    // Protect for the template's lifetime and cache.
+    let gctx = unsafe { JSContextGetGlobalContext(ctx) };
+    unsafe { JSValueProtect(gctx, proto_obj as JSValueRef) };
+    t.cached_proto = proto_obj as JSValueRef;
+    proto_obj
 }
 
 fn apply_props(
@@ -1131,6 +1218,8 @@ pub extern "C" fn v8__ObjectTemplate__New(
     let t = Box::into_raw(Box::new(ObjTemplate {
         internal_field_count: 0,
         props: Vec::new(),
+        accessors: Vec::new(),
+        parent_fn: ptr::null(),
     }));
     register_template(t as usize, TemplKind::Obj);
     t as *const ObjectTemplate
@@ -1148,7 +1237,18 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
     let obj = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
     if !this.is_null() {
         let t = unsafe { &*(this as *const ObjTemplate) };
+        // If this is the instance template of a FunctionTemplate, set the created
+        // object's prototype to the function's `.prototype` object so the
+        // prototype-template methods (e.g. crypto.getRandomValues) are reachable.
+        // This mirrors V8, where `instance_template.new_instance()` yields an
+        // object whose `__proto__` is the FunctionTemplate's prototype.
+        if !t.parent_fn.is_null() {
+            let proto_obj = unsafe { build_prototype_object(ctx, t.parent_fn) };
+            unsafe { JSObjectSetPrototype(ctx, obj, proto_obj as JSValueRef) };
+        }
+        // Instance-template props go directly on the instance.
         apply_props(ctx, obj, &t.props);
+        apply_accessors(ctx, obj, &t.accessors);
     }
     intern_ctx::<Object>(ctx, obj as JSValueRef)
 }
@@ -1161,9 +1261,99 @@ pub extern "C" fn v8__ObjectTemplate__SetAccessorProperty(
     setter: *const FunctionTemplate,
     attr: PropertyAttribute,
 ) {
-    // TODO(v82jsc): accessor properties on object templates not yet bridged
-    // (would require defineProperty with getter/setter at instantiation).
-    let _ = (this, key, getter, setter, attr);
+    if this.is_null() {
+        return;
+    }
+    let t = unsafe { &mut *(this as *mut ObjTemplate) };
+    t.accessors.push(TemplAccessor {
+        key: jsval(key),
+        getter: getter as *const FnTemplate,
+        setter: setter as *const FnTemplate,
+        attr: attr.as_u32_lenient(),
+    });
+}
+
+/// Install template-declared accessors onto a live object via
+/// `Object.defineProperty(obj, key, { get, set, enumerable, configurable })`.
+/// Getters/setters are FunctionTemplate handles materialized into JS functions.
+fn apply_accessors(ctx: JSContextRef, obj: JSObjectRef, accessors: &[TemplAccessor]) {
+    if accessors.is_empty() {
+        return;
+    }
+    unsafe {
+        // Resolve Object.defineProperty once.
+        let global = JSContextGetGlobalObject(ctx);
+        let okey = JSStringCreateWithUTF8CString(c"Object".as_ptr());
+        let mut exc: JSValueRef = ptr::null();
+        let object_ctor = JSObjectGetProperty(ctx, global, okey, &mut exc);
+        JSStringRelease(okey);
+        if object_ctor.is_null() || !JSValueIsObject(ctx, object_ctor) {
+            return;
+        }
+        let dpkey = JSStringCreateWithUTF8CString(c"defineProperty".as_ptr());
+        let define = JSObjectGetProperty(ctx, object_ctor as JSObjectRef, dpkey, &mut exc);
+        JSStringRelease(dpkey);
+        if define.is_null() || !JSValueIsObject(ctx, define) {
+            return;
+        }
+
+        let get_str = JSStringCreateWithUTF8CString(c"get".as_ptr());
+        let set_str = JSStringCreateWithUTF8CString(c"set".as_ptr());
+        let enum_str = JSStringCreateWithUTF8CString(c"enumerable".as_ptr());
+        let conf_str = JSStringCreateWithUTF8CString(c"configurable".as_ptr());
+
+        for acc in accessors {
+            if acc.key.is_null() {
+                continue;
+            }
+            let desc = JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut());
+            if !acc.getter.is_null() {
+                let gf = v8__FunctionTemplate__GetFunction(
+                    acc.getter as *const FunctionTemplate,
+                    ctx as *const Context,
+                );
+                if !gf.is_null() {
+                    JSObjectSetProperty(ctx, desc, get_str, jsval(gf), 0, &mut exc);
+                }
+            }
+            if !acc.setter.is_null() {
+                let sf = v8__FunctionTemplate__GetFunction(
+                    acc.setter as *const FunctionTemplate,
+                    ctx as *const Context,
+                );
+                if !sf.is_null() {
+                    JSObjectSetProperty(ctx, desc, set_str, jsval(sf), 0, &mut exc);
+                }
+            }
+            // PropertyAttribute bits: DontEnum=2, DontDelete=4 (v8). Map to
+            // enumerable/configurable for the descriptor.
+            let enumerable = (acc.attr & 2) == 0;
+            let configurable = (acc.attr & 4) == 0;
+            JSObjectSetProperty(
+                ctx, desc, enum_str,
+                JSValueMakeBoolean(ctx, enumerable), 0, &mut exc,
+            );
+            JSObjectSetProperty(
+                ctx, desc, conf_str,
+                JSValueMakeBoolean(ctx, configurable), 0, &mut exc,
+            );
+
+            let args = [obj as JSValueRef, acc.key, desc as JSValueRef];
+            JSObjectCallAsFunction(
+                ctx,
+                define as JSObjectRef,
+                object_ctor as JSObjectRef,
+                3,
+                args.as_ptr(),
+                &mut exc,
+            );
+        }
+
+        JSStringRelease(get_str);
+        JSStringRelease(set_str);
+        JSStringRelease(enum_str);
+        JSStringRelease(conf_str);
+    }
 }
 
 #[unsafe(no_mangle)]

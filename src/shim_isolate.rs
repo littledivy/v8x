@@ -22,6 +22,15 @@ use std::ptr;
 
 use crate::support::int;
 
+type JSObjectCallAsFunctionCallback = unsafe extern "C" fn(
+    ctx: JSContextRef,
+    function: JSObjectRef,
+    thisObject: JSObjectRef,
+    argumentCount: usize,
+    arguments: *const JSValueRef,
+    exception: *mut JSValueRef,
+) -> JSValueRef;
+
 // JSC C API functions not declared in jsc_sys.rs.
 unsafe extern "C" {
     fn JSObjectIsFunction(ctx: JSContextRef, object: JSObjectRef) -> bool;
@@ -33,6 +42,58 @@ unsafe extern "C" {
         arguments: *const JSValueRef,
         exception: *mut JSValueRef,
     ) -> JSValueRef;
+    fn JSObjectMakeFunctionWithCallback(
+        ctx: JSContextRef,
+        name: JSStringRef,
+        callAsFunction: JSObjectCallAsFunctionCallback,
+    ) -> JSObjectRef;
+    /// JSC reports unhandled promise rejections by invoking `callback(reason,
+    /// promise)`. macOS exposes this; it is the bridge we use to drive deno's
+    /// `PromiseRejectCallback`.
+    fn JSGlobalContextSetUnhandledRejectionCallback(
+        ctx: JSGlobalContextRef,
+        function: JSObjectRef,
+        exception: *mut JSValueRef,
+    );
+}
+
+// The deno-registered PromiseRejectCallback, plus a flag tracking whether we've
+// installed the JSC unhandled-rejection bridge for the current context.
+thread_local! {
+    static PROMISE_REJECT_CB: std::cell::Cell<
+        Option<crate::isolate::PromiseRejectCallback>,
+    > = const { std::cell::Cell::new(None) };
+}
+
+/// JSC unhandled-rejection trampoline: receives `(reason, promise)` and forwards
+/// to deno's PromiseRejectCallback as a `PromiseRejectMessage` ([promise, value,
+/// event] = [usize; 3]).
+unsafe extern "C" fn unhandled_rejection_trampoline(
+    _ctx: JSContextRef,
+    _function: JSObjectRef,
+    _this: JSObjectRef,
+    argc: usize,
+    argv: *const JSValueRef,
+    _exception: *mut JSValueRef,
+) -> JSValueRef {
+    if std::env::var("V82JSC_DEBUG").is_ok() {
+        eprintln!("[v82jsc] unhandled_rejection_trampoline fired argc={}", argc);
+    }
+    let cb = PROMISE_REJECT_CB.with(|c| c.get());
+    if let Some(cb) = cb {
+        let promise = if argc >= 2 { unsafe { *argv.add(1) } } else { ptr::null() };
+        let reason = if argc >= 1 { unsafe { *argv } } else { ptr::null() };
+        // event 0 == PromiseRejectWithNoHandler. PromiseRejectMessage has the
+        // layout `[usize; 3]` (promise, value, event) and is passed by value.
+        let msg: [usize; 3] = [promise as usize, reason as usize, 0];
+        unsafe {
+            cb(std::mem::transmute::<
+                [usize; 3],
+                crate::promise::PromiseRejectMessage,
+            >(msg));
+        }
+    }
+    unsafe { JSValueMakeUndefined(_ctx) }
 }
 
 // ===================================================================
@@ -281,13 +342,16 @@ pub extern "C" fn v8__Isolate__ThrowException(
     _isolate: *mut RealIsolate,
     exception: *const Value,
 ) -> *const Value {
-    // TODO(v82jsc): there is no isolate-global "pending exception" slot in the
-    // JSC C API outside of a native callback's JSValueRef* out-param. We simply
-    // echo the exception back; TryCatch integration is handled elsewhere.
+    // Record the value as the isolate's pending exception. Our function
+    // trampolines (shim_function.rs) read this after a v8 callback returns and
+    // forward it to JSC via the callback's `exception` out-param, so a throw
+    // from inside a native callback propagates as a real JS exception. A
+    // surrounding TryCatch also observes it.
     let ctx = current_ctx();
     if ctx.is_null() || exception.is_null() {
         return exception;
     }
+    crate::shim_core::record_pending_exception(ctx, jsval(exception));
     intern_ctx::<Value>(ctx, jsval(exception))
 }
 
@@ -361,14 +425,25 @@ pub extern "C" fn v8__Isolate__SetMicrotasksPolicy(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(isolate: *mut RealIsolate) {
-    // JSC runs its own microtask (job) queue automatically; a GC pump is the
-    // closest safe nudge. TODO(v82jsc): no explicit drainMicrotasks in C API.
+    // Drain JSC's microtask/job queue. This also lets JSC surface unhandled
+    // promise rejections (firing the unhandled-rejection bridge -> deno's
+    // PromiseRejectCallback), which is how module-evaluation throws and other
+    // uncaught async errors get reported.
     if isolate.is_null() {
         return;
     }
     let ctx = current_ctx();
     if !ctx.is_null() {
-        unsafe { JSGarbageCollect(ctx) };
+        // JSC has no public microtask-drain entry point, but it runs its job
+        // queue to completion at the end of every JSEvaluateScript. Evaluating a
+        // trivial script therefore flushes any pending microtasks (promise
+        // continuations, unhandled-rejection surfacing).
+        unsafe {
+            let src = JSStringCreateWithUTF8CString(c"0".as_ptr());
+            let mut exc: JSValueRef = ptr::null();
+            JSEvaluateScript(ctx, src, ptr::null_mut(), ptr::null_mut(), 0, &mut exc);
+            JSStringRelease(src);
+        }
     }
 }
 
@@ -448,9 +523,51 @@ pub extern "C" fn v8__Isolate__SetHostCreateShadowRealmContextCallback(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetPromiseRejectCallback(
     _isolate: *mut RealIsolate,
-    _callback: crate::isolate::PromiseRejectCallback,
+    callback: crate::isolate::PromiseRejectCallback,
 ) {
-    // TODO(v82jsc): no unhandled-rejection hook in the JSC C API. Inert.
+    // Store deno's callback and install the JSC unhandled-rejection bridge on the
+    // isolate's context(s). JSC calls the bridge with `(reason, promise)` when a
+    // promise rejects without a handler; the bridge forwards to `callback`.
+    PROMISE_REJECT_CB.with(|c| c.set(Some(callback)));
+    let iso = if _isolate.is_null() { current_iso() } else { _isolate };
+    if iso.is_null() {
+        return;
+    }
+    let st = iso_state(iso);
+    let ctxs: Vec<JSGlobalContextRef> = st
+        .owned_contexts
+        .iter()
+        .chain(st.contexts.iter())
+        .copied()
+        .collect();
+    if std::env::var("V82JSC_DEBUG").is_ok() {
+        eprintln!("[v82jsc] SetPromiseRejectCallback: {} ctxs", ctxs.len());
+    }
+    for gctx in ctxs {
+        if gctx.is_null() {
+            continue;
+        }
+        unsafe { install_unhandled_rejection_bridge(gctx) };
+    }
+}
+
+/// Install (idempotently) the JSC unhandled-rejection callback on `gctx`.
+pub(crate) unsafe fn install_unhandled_rejection_bridge(gctx: JSGlobalContextRef) {
+    unsafe {
+        let name =
+            JSStringCreateWithUTF8CString(c"__v8jsc_onUnhandledRejection".as_ptr());
+        let f = JSObjectMakeFunctionWithCallback(
+            gctx,
+            name,
+            unhandled_rejection_trampoline,
+        );
+        JSStringRelease(name);
+        if f.is_null() {
+            return;
+        }
+        let mut exc: JSValueRef = ptr::null();
+        JSGlobalContextSetUnhandledRejectionCallback(gctx, f, &mut exc);
+    }
 }
 
 #[unsafe(no_mangle)]
