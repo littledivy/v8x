@@ -5,7 +5,7 @@
 +v8x = { version = "0.155.0", features = ["jsc"] }
 ```
 
-Support engines:
+Supported engines:
 
 - V8 14.9.207.2-rusty
 - JavaScriptCore / WebKit 625.1+ and System-framework path uses the OS's JSC.
