@@ -13,6 +13,18 @@ mod shim_string;
 mod shim_value;
 mod shim_simdutf;
 mod shim_inspector;
+mod fam_arraybuffer;
+mod fam_exception;
+mod fam_function;
+mod fam_isolate;
+mod fam_misc;
+mod fam_module;
+mod fam_object;
+mod fam_primitive;
+mod fam_property;
+mod fam_serializer;
+mod fam_string;
+mod fam_value;
 mod shims;
 
 #[cfg(test)]
