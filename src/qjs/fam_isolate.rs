@@ -55,13 +55,20 @@ pub extern "C" fn v8__Context_IsCodeGenerationFromStringsAllowed(_this: *const C
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__FromSnapshot(
-    _isolate: *mut RealIsolate,
+    isolate: *mut RealIsolate,
     _context_snapshot_index: usize,
     _global_object: *const Value,
     _microtask_queue: *mut MicrotaskQueue,
 ) -> *const Context {
-    // TODO(qjs): no snapshot support; cannot restore a context.
-    ptr::null()
+    // QuickJS has no snapshot format. Returning null here makes deno_core treat
+    // the context as un-deserialized; instead we hand back this isolate's fresh
+    // context (same as `Context::New`). deno_core then re-runs the extension
+    // bootstrap from source (`init_mode == New`), which is exactly what we want
+    // since nothing was actually restored from a snapshot.
+    if isolate.is_null() {
+        return ptr::null();
+    }
+    super::shim_core::intern_ctx(super::shim_core::iso_state(isolate).ctx)
 }
 
 #[unsafe(no_mangle)]
@@ -142,9 +149,15 @@ fn embedder_slots_with<R>(
     grow_to: Option<usize>,
     f: impl FnOnce(&mut Vec<*mut c_void>) -> R,
 ) -> R {
+    // Key by the *decoded* `*mut JSContext`, which is stable across the many
+    // distinct Context handles (arena slots) that encode the same underlying
+    // context. Keying by the handle pointer would miss, because deno sets data
+    // on one handle and reads it back via a freshly-created `GetCurrentContext`
+    // handle.
+    let key = super::shim_core::ctx_of(this) as usize;
     EMBEDDER_DATA.with(|m| {
         let mut map = m.borrow_mut();
-        let v = map.entry(this as usize).or_default();
+        let v = map.entry(key).or_default();
         if let Some(n) = grow_to {
             if v.len() < n {
                 v.resize(n, ptr::null_mut());
@@ -585,10 +598,8 @@ pub extern "C" fn v8__Isolate__GetEnteredOrMicrotaskContext(
         return ptr::null();
     }
     let st = iso_state(isolate);
-    st.contexts
-        .last()
-        .copied()
-        .unwrap_or(st.ctx) as *const Context
+    let ctx = st.contexts.last().copied().unwrap_or(st.ctx);
+    super::shim_core::intern_ctx(ctx)
 }
 
 // ===================================================================

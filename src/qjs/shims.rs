@@ -59,9 +59,6 @@
 #[unsafe(no_mangle)] pub extern "C" fn v8__Object__SetIntegrityLevel() { unimplemented!("v8__Object__SetIntegrityLevel") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Object__Unwrap() { unimplemented!("v8__Object__Unwrap") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Object__Wrap() { unimplemented!("v8__Object__Wrap") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__Platform__NewCustomPlatform() { unimplemented!("v8__Platform__NewCustomPlatform") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__Platform__NewSingleThreadedDefaultPlatform() { unimplemented!("v8__Platform__NewSingleThreadedDefaultPlatform") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__Platform__NewUnprotectedDefaultPlatform() { unimplemented!("v8__Platform__NewUnprotectedDefaultPlatform") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Private__New() { unimplemented!("v8__Private__New") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__PropertyCallbackInfo__GetIsolate() { unimplemented!("v8__PropertyCallbackInfo__GetIsolate") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__PropertyCallbackInfo__GetReturnValue() { unimplemented!("v8__PropertyCallbackInfo__GetReturnValue") }
@@ -91,9 +88,6 @@
 #[unsafe(no_mangle)] pub extern "C" fn v8__UnboundScript__BindToCurrentContext() { unimplemented!("v8__UnboundScript__BindToCurrentContext") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__UnboundScript__GetSourceMappingURL() { unimplemented!("v8__UnboundScript__GetSourceMappingURL") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__V8__IsSandboxEnabled() { unimplemented!("v8__V8__IsSandboxEnabled") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__V8__SetFatalErrorHandler() { unimplemented!("v8__V8__SetFatalErrorHandler") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__V8__SetFlagsFromCommandLine() { unimplemented!("v8__V8__SetFlagsFromCommandLine") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__V8__SetFlagsFromString() { unimplemented!("v8__V8__SetFlagsFromString") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Value__BooleanValue() { unimplemented!("v8__Value__BooleanValue") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Value__InstanceOf() { unimplemented!("v8__Value__InstanceOf") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Value__IntegerValue() { unimplemented!("v8__Value__IntegerValue") }

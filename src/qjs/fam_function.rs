@@ -124,6 +124,11 @@ struct FnTemplate {
     callback: FunctionCallback,
     /// Owned (+1) data JSValue, protected for the template's lifetime.
     data: JSValue,
+    /// `true` if the template may be used as a constructor (`new F()`); `false`
+    /// for `ConstructorBehavior::Throw` (deno ops — call-only functions). A
+    /// `Throw` function created as a QuickJS constructor would reject every
+    /// plain call with "must be called with new".
+    constructable: bool,
     length: i32,
     class_name: Option<std::string::String>,
     proto: *mut ObjTemplate,
@@ -853,11 +858,12 @@ pub extern "C" fn v8__FunctionTemplate__New(
     let _ = (
         isolate,
         signature_or_null,
-        constructor_behavior,
         side_effect_type,
         c_functions,
         c_functions_len,
     );
+    let constructable =
+        matches!(constructor_behavior, crate::ConstructorBehavior::Allow);
     // Dup+protect the data JSValue for the template's lifetime.
     let data = {
         let ctx = current_ctx();
@@ -885,6 +891,7 @@ pub extern "C" fn v8__FunctionTemplate__New(
     let t = Box::into_raw(Box::new(FnTemplate {
         callback,
         data,
+        constructable,
         length,
         class_name: None,
         proto,
@@ -911,8 +918,10 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
         return ptr::null();
     }
     let t = unsafe { &*(this as *const FnTemplate) };
-    // FunctionTemplates can be `new`'d, so make a constructor-capable function.
-    let f = unsafe { make_function_len(ctx, t.callback, t.data, t.length, true) };
+    // Constructor-capable only when the template allows it; `Throw`-behavior
+    // templates (deno ops) must be plain callables.
+    let f =
+        unsafe { make_function_len(ctx, t.callback, t.data, t.length, t.constructable) };
 
     // Class name -> function `name`.
     if let Some(name) = &t.class_name {

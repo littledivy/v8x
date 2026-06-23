@@ -185,6 +185,12 @@ pub extern "C" fn v8__Global__New(
     if data.is_null() {
         return ptr::null();
     }
+    // Template handles are raw box pointers, not JSValues; a Global of a
+    // template must preserve pointer identity (and never be refcounted/freed as
+    // a value). Hand it back unchanged — `Global::Reset` no-ops on it below.
+    if super::shim_core::is_non_value_handle(data) {
+        return data;
+    }
     let ctx = stable_ctx();
     if ctx.is_null() {
         return ptr::null();
@@ -215,6 +221,11 @@ pub extern "C" fn v8__Global__NewWeak(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Global__Reset(data: *const Data) {
     if data.is_null() {
+        return;
+    }
+    // Template handles were handed back by identity in `New`; there is no cell
+    // to reclaim and the template box is owned for the whole run.
+    if super::shim_core::is_non_value_handle(data) {
         return;
     }
     // Reclaim the standalone cell created by New/NewWeak: free its one refcount
