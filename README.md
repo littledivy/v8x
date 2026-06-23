@@ -6,8 +6,11 @@
 ```
 
 Support engines:
-* JavaScriptCore
-* QuickJS-NG
+
+- V8 14.9.207.2-rusty
+- JavaScriptCore / WebKit 625.1+ and System-framework path uses the OS's JSC.
+- QuickJS-ng 0.15.1 
+
 
 Swap the engine under Deno without touching `deno_core`:
 
