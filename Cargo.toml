@@ -18,6 +18,9 @@ path = "src/lib.rs"
 default = ["engine_jsc"]
 engine_jsc = []
 engine_quickjs = []
+# Short aliases (README-facing).
+jsc = ["engine_jsc"]
+quickjs = ["engine_quickjs", "link_quickjs"]
 # Compile + statically link the vendored QuickJS-ng sources (engine_quickjs).
 link_quickjs = []
 # Build JavaScriptCore from the vendored WebKit (JSCOnly port) and link that
