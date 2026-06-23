@@ -65,10 +65,10 @@ fn build_vendored_jsc(manifest_dir: &std::path::Path) {
         .unwrap_or_else(|| webkit.join("WebKitBuild/JSCOnly/Release"));
     let lib_dir = build_dir.join("lib");
 
-    // Build only if the libraries aren't already present.
-    if !lib_dir.join("libJavaScriptCore.a").exists()
-        && env::var_os("JSC_VENDOR_BUILD_DIR").is_none()
-    {
+    // The JSCOnly macOS port builds `lib/JavaScriptCore.framework` (WTF/bmalloc
+    // are linked inside it). Build it if it isn't there yet.
+    let framework = lib_dir.join("JavaScriptCore.framework");
+    if !framework.exists() && env::var_os("JSC_VENDOR_BUILD_DIR").is_none() {
         let status = std::process::Command::new(webkit.join("Tools/Scripts/build-jsc"))
             .args(["--jsc-only", "--release"])
             .current_dir(&webkit)
@@ -79,29 +79,23 @@ fn build_vendored_jsc(manifest_dir: &std::path::Path) {
         }
     }
 
-    println!("cargo:rustc-link-search=native={}", lib_dir.display());
-    // JSCOnly static libs (link order matters: JSC -> WTF -> bmalloc).
-    println!("cargo:rustc-link-lib=static=JavaScriptCore");
-    println!("cargo:rustc-link-lib=static=WTF");
-    println!("cargo:rustc-link-lib=static=bmalloc");
-    println!("cargo:rustc-link-lib=c++");
+    // Link the VENDORED framework (not the system one) and set an rpath so the
+    // dylib loads at runtime.
+    println!("cargo:rustc-link-search=framework={}", lib_dir.display());
+    println!("cargo:rustc-link-lib=framework=JavaScriptCore");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+    println!("cargo:rerun-if-changed={}", framework.display());
+
+    // SDK lib path for -liconv (see the system-framework branch).
     #[cfg(target_os = "macos")]
+    if let Ok(out) = std::process::Command::new("xcrun")
+        .args(["--show-sdk-path"])
+        .output()
     {
-        // ICU + the CoreFoundation/Security frameworks WTF/JSC depend on.
-        println!("cargo:rustc-link-lib=icucore");
-        for fw in ["CoreFoundation", "Foundation", "Security"] {
-            println!("cargo:rustc-link-lib=framework={fw}");
-        }
-        if let Ok(out) = std::process::Command::new("xcrun")
-            .args(["--show-sdk-path"])
-            .output()
-        {
-            if let Ok(sdk) = String::from_utf8(out.stdout) {
-                println!("cargo:rustc-link-search=native={}/usr/lib", sdk.trim());
-            }
+        if let Ok(sdk) = String::from_utf8(out.stdout) {
+            println!("cargo:rustc-link-search=native={}/usr/lib", sdk.trim());
         }
     }
-    println!("cargo:rerun-if-changed={}", lib_dir.display());
 }
 
 #[allow(dead_code)]

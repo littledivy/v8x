@@ -5,6 +5,28 @@
 use crate::Name;
 use std::os::raw::{c_char, c_int, c_void};
 
+/// Symbols the vendored v8 source references but deno dead-strips (so they only
+/// surface as undefined when linking a test binary). Inert.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__V8__IsSandboxEnabled() -> bool {
+    false
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__DisallowJavascriptExecutionScope__CONSTRUCT(
+    _buf: *mut c_void,
+    _isolate: *mut c_void,
+) {
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__DisallowJavascriptExecutionScope__DESTRUCT(_this: *mut c_void) {}
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBuffer__Allocator__NewRustAllocator(
+    _handle: *mut c_void,
+    _vtable: *const c_void,
+) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
 /// ICU default locale lookup (crate's icu module). Return a fixed default.
 #[unsafe(no_mangle)]
 pub extern "C" fn icu_get_default_locale(output: *mut c_char, output_len: usize) -> usize {

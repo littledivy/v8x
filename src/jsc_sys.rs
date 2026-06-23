@@ -117,3 +117,29 @@ unsafe extern "C" {
     pub fn JSValueUnprotect(ctx: JSContextRef, value: JSValueRef);
     pub fn JSGarbageCollect(ctx: JSContextRef);
 }
+
+#[cfg(test)]
+mod jsc_eval_smoke {
+    use super::*;
+    use std::ffi::CString;
+    use std::ptr;
+
+    /// Prove the linked JSC (system OR vendored framework, depending on the
+    /// vendor_jsc feature) actually evaluates JS through our FFI.
+    #[test]
+    fn eval_one_plus_one() {
+        unsafe {
+            let group = JSContextGroupCreate();
+            let ctx = JSGlobalContextCreateInGroup(group, ptr::null_mut());
+            let src = CString::new("1 + 1").unwrap();
+            let js = JSStringCreateWithUTF8CString(src.as_ptr());
+            let mut exc: JSValueRef = ptr::null();
+            let r = JSEvaluateScript(ctx, js, ptr::null_mut(), ptr::null_mut(), 0, &mut exc);
+            JSStringRelease(js);
+            assert!(exc.is_null());
+            assert_eq!(JSValueToNumber(ctx, r, ptr::null_mut()), 2.0);
+            JSGlobalContextRelease(ctx);
+            JSContextGroupRelease(group);
+        }
+    }
+}
