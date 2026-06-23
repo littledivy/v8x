@@ -3,9 +3,9 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 SYMS="${1:-/tmp/qjs_union.txt}"
 P='(v8__|v8_inspector__|std__|simdutf__|cppgc__)[A-Za-z0-9_]+'
-cat src/qjs/shim_core.rs src/qjs/shim_*.rs 2>/dev/null \
+cat src/qjs/shim_core.rs src/qjs/shim_*.rs src/qjs/fam_*.rs 2>/dev/null \
   | { grep -oE "extern \"C\" fn ${P}" || true; } | sed -E 's/.* //' | sort -u > /tmp/qjs_impl.txt
-cat src/qjs/shim_core.rs src/qjs/shim_*.rs 2>/dev/null \
+cat src/qjs/shim_core.rs src/qjs/shim_*.rs src/qjs/fam_*.rs 2>/dev/null \
   | { grep -oE "!\(${P}" || true; } | sed -E 's/^!\(//' | sort -u >> /tmp/qjs_impl.txt
 sort -u /tmp/qjs_impl.txt -o /tmp/qjs_impl.txt
 {
