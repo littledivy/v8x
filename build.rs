@@ -70,17 +70,16 @@ fn build_vendored_jsc(manifest_dir: &std::path::Path) {
     // binary so it's self-contained (no dylib, no rpath). Build if missing.
     let jsc_a = lib_dir.join("libJavaScriptCore.a");
     if !jsc_a.exists() && env::var_os("JSC_VENDOR_BUILD_DIR").is_none() {
-        let status = std::process::Command::new(webkit.join("Tools/Scripts/build-jsc"))
-            .args([
-                "--jsc-only",
-                "--release",
-                "--cmakeargs=-DENABLE_STATIC_JSC=ON -DUSE_THIN_ARCHIVES=OFF",
-            ])
-            .current_dir(&webkit)
+        // tools/setup_webkit.sh inits the pinned submodule, applies the patches,
+        // and runs the static JSCOnly build — everything needed for a fresh tree.
+        let _ = &webkit;
+        let status = std::process::Command::new("bash")
+            .arg(manifest_dir.join("tools/setup_webkit.sh"))
+            .current_dir(manifest_dir)
             .status();
         match status {
             Ok(s) if s.success() => {}
-            other => panic!("WebKit JSCOnly static build failed: {other:?}"),
+            other => panic!("tools/setup_webkit.sh (WebKit JSC build) failed: {other:?}"),
         }
     }
 

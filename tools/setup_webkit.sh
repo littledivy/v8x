@@ -1,25 +1,24 @@
 #!/usr/bin/env bash
-# Clone + patch + build the vendored WebKit JavaScriptCore (JSCOnly port) so the
-# `vendor_jsc` feature can link it. WebKit main uses newer clang warning flags
-# that Apple clang rejects under -Werror; we patch those out. ~1GB clone (shallow)
-# + a multi-minute build. Re-run is incremental (ninja).
+# Init the pinned WebKit submodule, apply our patches, and build the static
+# JSCOnly JavaScriptCore the `vendor_jsc` feature links. WebKit main uses newer
+# clang warning flags Apple clang rejects under -Werror; the patches drop them.
+# Submodule init fetches WebKit at the pinned commit (~GB); build is multi-minute
+# (incremental on re-run).
 set -euo pipefail
 cd "$(dirname "$0")/.."
 WK=vendor/webkit
 
-if [ ! -d "$WK/.git" ] && [ ! -d "$WK/Source/JavaScriptCore" ]; then
-  git clone --depth 1 https://github.com/WebKit/WebKit.git "$WK"
+# Fetch WebKit at the pinned submodule commit.
+if [ ! -d "$WK/Source/JavaScriptCore" ]; then
+  git submodule update --init --depth 1 "$WK"
 fi
 
-# Patch 1: C++ compiles go through clang-wrapper — inject -Wno-unknown-warning-option.
-WRAP="$WK/Source/cmake/clang-wrapper"
-if ! grep -q "v82jsc" "$WRAP"; then
-  perl -0pi -e 's/if \[\[ "\$WK_UNIFIED_SOURCES_BUNDLE_POLICY" != NoBundle \]\]; then\n    exec "\$\@"\nfi/if [[ "\$WK_UNIFIED_SOURCES_BUNDLE_POLICY" != NoBundle ]]; then\n    # v82jsc: tolerate unknown warning flags under -Werror.\n    __cc="\$1"; shift\n    exec "\$__cc" -Wno-unknown-warning-option "\$\@"\nfi/' "$WRAP"
-fi
-
-# Patch 2: C compiles bypass the wrapper — drop the unsupported flag at the source.
-FLAGS="$WK/Source/cmake/WebKitCompilerFlags.cmake"
-sed -i '' 's/^    WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS(-Wno-character-conversion)/    # v82jsc: removed (Apple clang lacks this flag)\n    # WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS(-Wno-character-conversion)/' "$FLAGS"
+# Apply our WebKit patches (idempotent — skip if already applied).
+for p in webkit-patches/*.patch; do
+  if ! git -C "$WK" apply --reverse --check "$p" 2>/dev/null; then
+    git -C "$WK" apply "$p" || echo "warn: $p may already be applied"
+  fi
+done
 
 # Static build. USE_THIN_ARCHIVES=OFF makes the build emit real, self-contained
 # archives — including a proper libJavaScriptCoreJIT.a for the split-out JIT
