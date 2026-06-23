@@ -224,6 +224,16 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     // QuickJS-ng's default stack is small; bump it so deeper evals don't trip
     // the stack guard. Harmless for the eval-path test.
     unsafe { JS_SetMaxStackSize(rt, 8 * 1024 * 1024) };
+    // Install a module loader so QuickJS can resolve static imports
+    // (`import x from "ext:..."`) by looking up source stashed in CompileModule.
+    unsafe {
+        JS_SetModuleLoaderFunc(
+            rt,
+            None,
+            Some(super::fam_module::module_loader_callback),
+            ptr::null_mut(),
+        )
+    };
     let ctx = unsafe { JS_NewContext(rt) };
     assert!(!ctx.is_null(), "JS_NewContext failed");
     let state = Box::new(IsoState {
@@ -401,9 +411,110 @@ pub extern "C" fn v8__Context__New(
     if isolate.is_null() {
         return ptr::null();
     }
+    let ctx = iso_state(isolate).ctx;
+    install_default_globals(ctx);
     // QuickJS has one context per isolate here; hand back a Context handle that
     // encodes its pointer (see `intern_ctx` / `JS_TAG_V8_CONTEXT`).
-    intern_ctx(iso_state(isolate).ctx)
+    intern_ctx(ctx)
+}
+
+/// Install globals that V8 provides out-of-the-box but QuickJS does not. deno's
+/// `01_core.js` bootstrap reads `globalThis.console` (V8 installs it via the
+/// inspector) and calls `ObjectKeys` on it; a missing `console` throws
+/// `Cannot convert undefined or null to object` and aborts bootstrap. We install
+/// a plain empty object — `wrapConsole` copies its (zero) keys, leaving deno's
+/// own CoreConsole methods intact.
+pub(crate) fn install_default_globals(ctx: *mut JSContext) {
+    if ctx.is_null() {
+        return;
+    }
+    unsafe {
+        let global = JS_GetGlobalObject(ctx);
+        // Only install if absent, so we don't clobber a real console later.
+        let existing = JS_GetPropertyStr(ctx, global, c"console".as_ptr());
+        let absent = jsv_is_undefined(&existing) || existing.tag == JS_TAG_NULL;
+        JS_FreeValue(ctx, existing);
+        if absent {
+            let console = JS_NewObject(ctx);
+            // JS_SetPropertyStr consumes the console refcount.
+            JS_SetPropertyStr(ctx, global, c"console".as_ptr(), console);
+        }
+        // QuickJS-ng (this vendored build) ships without Intl. deno's runtime
+        // bootstrap (`99_main.js`) touches `Intl` at module top level
+        // (`delete Intl.v8BreakIterator`) and various web APIs reference
+        // `Intl.*` formatters. Install a minimal stub so the global exists.
+        let intl = JS_GetPropertyStr(ctx, global, c"Intl".as_ptr());
+        let intl_absent = jsv_is_undefined(&intl) || intl.tag == JS_TAG_NULL;
+        JS_FreeValue(ctx, intl);
+        if intl_absent {
+            install_intl_stub(ctx, global);
+        }
+        JS_FreeValue(ctx, global);
+    }
+}
+
+/// Install a minimal `Intl` stub. QuickJS-ng has no Intl in this build; deno's
+/// bootstrap and web APIs expect `Intl` plus its common formatter constructors
+/// to exist. We evaluate a tiny polyfill that provides pass-through behaviour
+/// (formatters echo their input / locale identity), which is enough to let
+/// bootstrap proceed. Real ECMA-402 behaviour is out of scope here.
+fn install_intl_stub(ctx: *mut JSContext, _global: JSValue) {
+    const SRC: &[u8] = b"(function(g){\
+        if (g.Intl) return;\
+        function id(x){return x;}\
+        function DateTimeFormat(l,o){ if(!(this instanceof DateTimeFormat)) return new DateTimeFormat(l,o); this._l=l; this._o=o; }\
+        DateTimeFormat.prototype.format=function(d){ return String(new Date(d)); };\
+        DateTimeFormat.prototype.formatToParts=function(d){ return [{type:'literal',value:String(new Date(d))}]; };\
+        DateTimeFormat.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US'),timeZone:'UTC'}; };\
+        DateTimeFormat.supportedLocalesOf=function(l){ return Array.isArray(l)?l:(l?[l]:[]); };\
+        function NumberFormat(l,o){ if(!(this instanceof NumberFormat)) return new NumberFormat(l,o); this._l=l; this._o=o; }\
+        NumberFormat.prototype.format=function(n){ return String(n); };\
+        NumberFormat.prototype.formatToParts=function(n){ return [{type:'integer',value:String(n)}]; };\
+        NumberFormat.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US')}; };\
+        NumberFormat.supportedLocalesOf=function(l){ return Array.isArray(l)?l:(l?[l]:[]); };\
+        function Collator(l,o){ if(!(this instanceof Collator)) return new Collator(l,o); this._l=l; }\
+        Collator.prototype.compare=function(a,b){ return a<b?-1:(a>b?1:0); };\
+        Collator.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US')}; };\
+        Collator.supportedLocalesOf=function(l){ return Array.isArray(l)?l:(l?[l]:[]); };\
+        function PluralRules(l,o){ if(!(this instanceof PluralRules)) return new PluralRules(l,o); this._l=l; }\
+        PluralRules.prototype.select=function(){ return 'other'; };\
+        PluralRules.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US')}; };\
+        PluralRules.supportedLocalesOf=function(l){ return Array.isArray(l)?l:(l?[l]:[]); };\
+        function ListFormat(l,o){ if(!(this instanceof ListFormat)) return new ListFormat(l,o); this._l=l; }\
+        ListFormat.prototype.format=function(a){ return Array.isArray(a)?a.join(', '):String(a); };\
+        ListFormat.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US')}; };\
+        function RelativeTimeFormat(l,o){ if(!(this instanceof RelativeTimeFormat)) return new RelativeTimeFormat(l,o); this._l=l; }\
+        RelativeTimeFormat.prototype.format=function(v,u){ return String(v)+' '+String(u); };\
+        RelativeTimeFormat.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US')}; };\
+        function Segmenter(l,o){ if(!(this instanceof Segmenter)) return new Segmenter(l,o); this._l=l; }\
+        Segmenter.prototype.segment=function(s){ return String(s); };\
+        Segmenter.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US')}; };\
+        g.Intl={\
+            DateTimeFormat:DateTimeFormat,\
+            NumberFormat:NumberFormat,\
+            Collator:Collator,\
+            PluralRules:PluralRules,\
+            ListFormat:ListFormat,\
+            RelativeTimeFormat:RelativeTimeFormat,\
+            Segmenter:Segmenter,\
+            getCanonicalLocales:function(l){ return Array.isArray(l)?l.slice():(l?[l]:[]); },\
+        };\
+    })(globalThis);\0";
+    unsafe {
+        let r = JS_Eval(
+            ctx,
+            SRC.as_ptr() as *const std::os::raw::c_char,
+            SRC.len() - 1,
+            c"<intl-stub>".as_ptr(),
+            JS_EVAL_TYPE_GLOBAL,
+        );
+        if r.tag == JS_TAG_EXCEPTION {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+        } else {
+            JS_FreeValue(ctx, r);
+        }
+    }
 }
 
 #[unsafe(no_mangle)]

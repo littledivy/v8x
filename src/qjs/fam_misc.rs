@@ -146,6 +146,68 @@ pub extern "C" fn v8__CppHeap__DELETE(_heap: *mut c_void) {
     // TODO(qjs): no cppgc heap. No-op.
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__GetCppHeap(_isolate: *mut RealIsolate) -> *mut c_void {
+    // deno wraps native-backed objects (CryptoKey, etc.) through the CppHeap.
+    // Return the dummy thread heap so the wrapping path doesn't see null.
+    current_cpp_heap()
+}
+
+/// Allocate a cppgc-managed object of `8 + additional_bytes` bytes (the 8 leading
+/// bytes mirror real V8's vtable slot, which our shim never invokes), aligned to
+/// `align`. Without real cppgc we use the system allocator and leak the object —
+/// there is no GC to sweep it, which is acceptable for running scripts.
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__make_garbage_collectable(
+    _heap: *mut c_void,
+    additional_bytes: usize,
+    align: usize,
+) -> *mut c_void {
+    const RUST_OBJ_SIZE: usize = 8;
+    let size = RUST_OBJ_SIZE + additional_bytes;
+    let align = align.max(8);
+    let Ok(layout) = std::alloc::Layout::from_size_align(size, align) else {
+        return ptr::null_mut();
+    };
+    unsafe { std::alloc::alloc_zeroed(layout) as *mut c_void }
+}
+
+// cppgc Persistent<T> — a strong cross-scope reference. We model it like a
+// Member: a single pointer slot holding the raw object pointer (no GC, so no
+// tracing needed). Layout: one pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__Persistent__CONSTRUCT(
+    persistent: *mut *mut c_void,
+    obj: *mut c_void,
+) {
+    if !persistent.is_null() {
+        unsafe { *persistent = obj };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__Persistent__DESTRUCT(persistent: *mut *mut c_void) {
+    if !persistent.is_null() {
+        unsafe { *persistent = ptr::null_mut() };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__Persistent__Get(persistent: *const *mut c_void) -> *mut c_void {
+    if persistent.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe { *persistent }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__Visitor__Trace__TracedReference(
+    _visitor: *mut c_void,
+    _ref_: *const c_void,
+) {
+    // No tracing GC; nothing to trace.
+}
+
 // ===================================================================
 // Global<T> — a value pinned for the Global's whole life, independent of
 // handle scopes.
@@ -239,6 +301,101 @@ pub extern "C" fn v8__Global__Reset(data: *const Data) {
         }
         drop(Box::from_raw(cell));
     }
+}
+
+// ===================================================================
+// TracedReference — a GC-traced handle. We model it exactly like our Global: a
+// standalone heap cell (`Box<JSValue>`) owning one independent refcount, freed
+// on DESTRUCT/Reset. The vendored buffer is a single usize slot holding the
+// cell pointer (0 == empty).
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TracedReference__CONSTRUCT(this: *mut usize) {
+    if !this.is_null() {
+        unsafe { *this = 0 };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TracedReference__DESTRUCT(this: *mut usize) {
+    if this.is_null() {
+        return;
+    }
+    unsafe {
+        let cell = *this as *mut JSValue;
+        if !cell.is_null() {
+            let v = *cell;
+            let ctx = stable_ctx();
+            if !ctx.is_null() {
+                JS_FreeValue(ctx, v);
+            }
+            drop(Box::from_raw(cell));
+            *this = 0;
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TracedReference__Reset(
+    this: *mut usize,
+    _isolate: *mut RealIsolate,
+    data: *const Data,
+) {
+    if this.is_null() {
+        return;
+    }
+    let ctx = stable_ctx();
+    unsafe {
+        // Release any previously held cell.
+        let old = *this as *mut JSValue;
+        if !old.is_null() {
+            if !ctx.is_null() {
+                JS_FreeValue(ctx, *old);
+            }
+            drop(Box::from_raw(old));
+            *this = 0;
+        }
+        if data.is_null() || ctx.is_null() {
+            return;
+        }
+        // Template handles aren't JSValues and have no refcount; TracedReference
+        // is only ever used for ordinary values in deno, so we don't store them
+        // (leaving the slot empty is safe — Get returns null).
+        if super::shim_core::is_non_value_handle(data) {
+            return;
+        }
+        let dup = JS_DupValue(ctx, jsval_of(data));
+        if std::env::var_os("QJS_DEBUG_TR").is_some() {
+            eprintln!("[QJS TracedRef::Reset] store tag={} ptr={:?}", dup.tag, dup.u.ptr);
+        }
+        let cell = Box::into_raw(Box::new(dup));
+        *this = cell as usize;
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TracedReference__Get(
+    this: *const usize,
+    _isolate: *mut RealIsolate,
+) -> *const Data {
+    if this.is_null() {
+        return ptr::null();
+    }
+    let slot = unsafe { *this };
+    if slot == 0 {
+        if std::env::var_os("QJS_DEBUG_TR").is_some() {
+            eprintln!("[QJS TracedRef::Get] EMPTY");
+        }
+        return ptr::null();
+    }
+    if std::env::var_os("QJS_DEBUG_TR").is_some() {
+        let v = unsafe { *(slot as *const JSValue) };
+        eprintln!("[QJS TracedRef::Get] tag={} ptr={:?}", v.tag, unsafe { v.u.ptr });
+    }
+    // The cell is a `Box<JSValue>`; its address is itself a valid v8 Data handle
+    // (Local::new reads it via jsval_of, dups into the current scope).
+    slot as *const Data
 }
 
 // ===================================================================

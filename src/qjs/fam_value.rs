@@ -24,7 +24,7 @@
 use crate::qjs::quickjs_sys::*;
 use crate::qjs::shim_core::{ctx_of, current_ctx, intern, intern_dup, jsval_of};
 use crate::support::Maybe;
-use crate::{BigInt, Boolean, Context, Integer, Object, RealIsolate, Value};
+use crate::{BigInt, Boolean, Context, Integer, Object, RealIsolate, String as V8String, Value};
 use std::os::raw::c_char;
 use std::ptr;
 
@@ -214,6 +214,15 @@ pub extern "C" fn v8__Value__IsTrue(this: *const Value) -> bool {
     }
     let v = jsval_of(this);
     jsv_is_bool(&v) && unsafe { v.u.int32 != 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsFalse(this: *const Value) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let v = jsval_of(this);
+    jsv_is_bool(&v) && unsafe { v.u.int32 == 0 }
 }
 
 #[unsafe(no_mangle)]
@@ -431,11 +440,11 @@ pub extern "C" fn v8__Value__IsModuleNamespaceObject(this: *const Value) -> bool
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsExternal(this: *const Value) -> bool {
-    // TODO(qjs): External values are modeled by the function/external family
-    // (a private JSClass). Until that wiring exists here, report false rather
-    // than risk treating an arbitrary object as an embedder pointer.
-    let _ = this;
-    false
+    // External values are objects of our private `ext_class` (see fam_function).
+    if this.is_null() {
+        return false;
+    }
+    super::fam_function::value_is_external(jsval_of(this))
 }
 
 #[unsafe(no_mangle)]
@@ -689,3 +698,35 @@ pub extern "C" fn v8__Value__Int32Value(
 // ---------------------------------------------------------------------------
 // Pre-existing ToString shim (kept from the original qjs shim_value.rs).
 // v8__Value__ToString is defined by the foundation (shim_value.rs).
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__TypeOf(
+    this: *const Value,
+    _isolate: *mut RealIsolate,
+) -> *const V8String {
+    let ctx = current_ctx();
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let v = jsval_of(this);
+    // Map QuickJS tags to JS `typeof` strings.
+    let s: &[u8] = match v.tag {
+        JS_TAG_UNDEFINED | JS_TAG_UNINITIALIZED => b"undefined\0",
+        JS_TAG_NULL => b"object\0",
+        JS_TAG_BOOL => b"boolean\0",
+        JS_TAG_INT | JS_TAG_FLOAT64 => b"number\0",
+        JS_TAG_STRING | JS_TAG_STRING_ROPE => b"string\0",
+        JS_TAG_SYMBOL => b"symbol\0",
+        JS_TAG_BIG_INT | JS_TAG_SHORT_BIG_INT => b"bigint\0",
+        JS_TAG_OBJECT => {
+            if unsafe { JS_IsFunction(ctx, v) } != 0 {
+                b"function\0"
+            } else {
+                b"object\0"
+            }
+        }
+        _ => b"object\0",
+    };
+    let js = unsafe { JS_NewString(ctx, s.as_ptr() as *const c_char) };
+    intern::<V8String>(js)
+}

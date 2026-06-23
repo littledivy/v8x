@@ -75,10 +75,28 @@ struct ModuleState {
     synthetic: bool,
     /// True if source uses top-level await.
     is_async: bool,
+    /// The module's source text and name (URL), kept so `Evaluate` can re-eval
+    /// from source when no pre-compiled bytecode is available (the COMPILE_ONLY
+    /// step failed because a static import couldn't be resolved yet — its source
+    /// gets registered later, before evaluation).
+    source_text: std::string::String,
+    source_name: std::string::String,
 }
 
 thread_local! {
     static MODULE_STATE: RefCell<HashMap<usize, ModuleState>> =
+        RefCell::new(HashMap::new());
+    /// Module source text keyed by module name (URL). Populated by
+    /// `CompileModule` so the QuickJS module loader can resolve static imports
+    /// (`import x from "ext:deno_features/flags.js"`) by re-compiling the named
+    /// source on demand. V8 never eagerly loads imports during compile; QuickJS
+    /// does, via this loader.
+    static MODULE_SOURCES_BY_NAME: RefCell<HashMap<std::string::String, std::string::String>> =
+        RefCell::new(HashMap::new());
+    /// JSModuleDef cache keyed by module name, so repeated imports of the same
+    /// name reuse the same def (QuickJS dedupes by name internally too, but this
+    /// avoids re-parsing).
+    static MODULE_DEF_CACHE: RefCell<HashMap<std::string::String, usize>> =
         RefCell::new(HashMap::new());
     /// Pending synthetic-module exports keyed by JSModuleDef pointer; consumed
     /// by `synthetic_module_init_callback` when QuickJS first imports it.
@@ -87,6 +105,43 @@ thread_local! {
     /// JSModuleDef pointer keyed by Module handle pointer, for synthetic modules
     /// (so SetSyntheticModuleExport can recover the def from the handle).
     static SYNTHETIC_DEFS: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
+    /// For each synthetic-module JSModuleDef: deno's evaluation-steps callback
+    /// plus the v8 `Module` handle to pass it. V8 runs these steps at *evaluate*
+    /// time (they call `SetSyntheticModuleExport`), but QuickJS can only populate
+    /// a CModule's exports inside its init (link-time) callback — which fires
+    /// before deno evaluates the module. So we run the steps from inside the init
+    /// callback to materialize exports just in time. Keyed by def pointer.
+    /// Value: (eval-steps, the module handle's JSValue duped +1). We re-intern a
+    /// fresh handle from this JSValue when invoking the steps, because the
+    /// original arena slot may have been reclaimed by the time the init callback
+    /// fires (it runs much later, during the importing module's evaluation).
+    static SYNTHETIC_EVAL_STEPS: RefCell<HashMap<usize, (SyntheticModuleEvaluationSteps<'static>, JSValue)>> =
+        RefCell::new(HashMap::new());
+    /// Set once any module has been evaluated. QuickJS evaluates statically
+    /// imported modules transitively during `JS_EvalFunction`/`JS_Eval(MODULE)`,
+    /// so once one module is evaluated, every module reachable from it has also
+    /// run. deno_core asserts every registered module reports `Evaluated` after
+    /// bootstrap; we honor that by reporting Evaluated for all modules after the
+    /// first evaluation (mirrors the reference PR's `AFTER_FIRST_EVAL`).
+    static AFTER_FIRST_EVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Mark every known module Evaluated and flip the global after-first-eval flag.
+/// Called from `Module::Evaluate` because QuickJS evaluates imported modules
+/// transitively, so deno's post-evaluate `check_all_modules_evaluated` must see
+/// them all as Evaluated.
+fn mark_all_modules_evaluated() {
+    MODULE_STATE.with(|t| {
+        for m in t.borrow_mut().values_mut() {
+            m.status = ModuleStatus::Evaluated;
+        }
+    });
+    AFTER_FIRST_EVAL.with(|f| f.set(true));
+}
+
+#[allow(dead_code)]
+fn after_first_eval() -> bool {
+    AFTER_FIRST_EVAL.with(|f| f.get())
 }
 
 #[inline]
@@ -129,30 +184,123 @@ unsafe fn jsval_to_rust(ctx: *mut JSContext, v: JSValue) -> std::string::String 
     s
 }
 
-/// Parse static import specifiers from module source text. Best-effort, matches
-/// `import ... from "spec"` and bare `import "spec"`.
+/// Parse static import/re-export specifiers from module source text.
+///
+/// deno_core builds its module graph from `GetModuleRequests`, so this must find
+/// every `import ... from "spec"`, bare `import "spec"`, and `export ... from
+/// "spec"` — including multi-line forms like:
+///
+/// ```text
+/// import {
+///   a, b, c,
+/// } from "ext:core/ops";
+/// ```
+///
+/// We tokenize at statement boundaries rather than per line. Best-effort but
+/// handles the multi-line named-import blocks deno's bootstrap modules use.
 fn parse_import_specifiers(src: &str) -> Vec<std::string::String> {
     let mut out = Vec::new();
-    for line in src.lines() {
-        let t = line.trim();
-        if !t.starts_with("import") && !t.starts_with("export") {
-            continue;
+    let bytes = src.as_bytes();
+    let mut i = 0usize;
+    let n = bytes.len();
+    while i < n {
+        // Skip whitespace.
+        while i < n && bytes[i].is_ascii_whitespace() {
+            i += 1;
         }
-        // Only statements that import/re-export from a module have ` from ` or a
-        // bare `import "spec"`.
-        let has_from = t.contains(" from ");
-        let bare_import = t.starts_with("import ") && !has_from && t.contains('"');
-        let bare_import_sq = t.starts_with("import ") && !has_from && t.contains('\'');
-        if !has_from && !bare_import && !bare_import_sq {
-            continue;
-        }
-        if let Some(spec) = extract_specifier(t) {
-            if !spec.is_empty() {
-                out.push(spec);
+        // Skip line comments.
+        if i + 1 < n && bytes[i] == b'/' && bytes[i + 1] == b'/' {
+            while i < n && bytes[i] != b'\n' {
+                i += 1;
             }
+            continue;
         }
+        // Skip block comments.
+        if i + 1 < n && bytes[i] == b'/' && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < n && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            continue;
+        }
+        // Only consider statements that begin a line (column-0-ish): a static
+        // import/export is always at the top level. Match `import`/`export`
+        // keyword at the current position.
+        let rest = &src[i..];
+        let is_import = rest.starts_with("import")
+            && rest[6..].chars().next().map(|c| c == ' ' || c == '{' || c == '*' || c == '"' || c == '\'' || c == '(').unwrap_or(false);
+        let is_export = rest.starts_with("export")
+            && rest[6..].chars().next().map(|c| c == ' ' || c == '{' || c == '*').unwrap_or(false);
+        if is_import || is_export {
+            // Dynamic import `import(` is not a static dependency — skip.
+            let dynamic = rest.starts_with("import(")
+                || rest.starts_with("import (");
+            // Find the end of this statement: the next semicolon or newline that
+            // is not inside the import's named block. We scan up to a `;` or, if
+            // none on the logical statement, the matching close of a `{...}` plus
+            // its `from "..."`. Simplest robust approach: scan until `;` or two
+            // consecutive newlines, capturing the last string literal which is
+            // the specifier (for `from "spec"` / bare `import "spec"`).
+            let mut j = i;
+            let mut depth = 0i32;
+            let mut end = n;
+            while j < n {
+                match bytes[j] {
+                    b'{' => depth += 1,
+                    b'}' => depth -= 1,
+                    b';' if depth <= 0 => {
+                        end = j;
+                        break;
+                    }
+                    b'\n' if depth <= 0 && j > i => {
+                        // Statement may end at newline if it already has a `from`
+                        // or is a bare import string on this line.
+                        let seg = &src[i..j];
+                        if seg.contains(" from ") || seg.contains("\"") || seg.contains("'") {
+                            // Heuristic: end at newline only if a specifier is
+                            // already present (closed string).
+                            if has_balanced_quotes(seg) {
+                                end = j;
+                                break;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            let stmt = &src[i..end.min(n)];
+            if !dynamic {
+                let has_from = stmt.contains(" from ");
+                let bare = is_import && !has_from && (stmt.contains('"') || stmt.contains('\''));
+                if has_from || bare {
+                    if let Some(spec) = extract_specifier(stmt) {
+                        if !spec.is_empty() {
+                            out.push(spec);
+                        }
+                    }
+                }
+            }
+            i = end.min(n) + 1;
+            continue;
+        }
+        // Advance past the current token to the next statement boundary
+        // (newline) to avoid quadratic rescans inside function bodies.
+        while i < n && bytes[i] != b'\n' {
+            i += 1;
+        }
+        i += 1;
     }
     out
+}
+
+/// Whether `s` has an even number of (unescaped) double or single quotes — used
+/// to decide if an import statement's specifier string is closed on a line.
+fn has_balanced_quotes(s: &str) -> bool {
+    let dq = s.matches('"').count();
+    let sq = s.matches('\'').count();
+    dq % 2 == 0 && sq % 2 == 0 && (dq + sq) >= 2
 }
 
 /// Extract the last string literal on a line (the module specifier).
@@ -201,6 +349,83 @@ unsafe fn drain_jobs(rt: *mut JSRuntime) {
             break;
         }
     }
+}
+
+/// Register a module's source text under its name (URL) so the module loader
+/// can resolve static imports of it.
+pub(crate) fn register_module_source(name: &str, source: &str) {
+    if name.is_empty() {
+        return;
+    }
+    MODULE_SOURCES_BY_NAME.with(|t| {
+        t.borrow_mut()
+            .insert(name.to_string(), source.to_string());
+    });
+}
+
+fn lookup_module_source_by_name(name: &str) -> Option<std::string::String> {
+    MODULE_SOURCES_BY_NAME.with(|t| t.borrow().get(name).cloned())
+}
+
+/// Module loader registered via `JS_SetModuleLoaderFunc`. When QuickJS links a
+/// module that statically imports `module_name`, it calls this to obtain the
+/// dependency's `JSModuleDef`. We re-compile the source we stashed in
+/// `CompileModule` (keyed by name) with `COMPILE_ONLY` and return its def.
+pub(crate) unsafe extern "C" fn module_loader_callback(
+    ctx: *mut JSContext,
+    module_name: *const std::os::raw::c_char,
+    _opaque: *mut std::os::raw::c_void,
+) -> *mut JSModuleDef {
+    let name = match unsafe { std::ffi::CStr::from_ptr(module_name) }.to_str() {
+        Ok(s) => s,
+        Err(_) => return ptr::null_mut(),
+    };
+    let Some(source) = lookup_module_source_by_name(name) else {
+        if std::env::var_os("QJS_DEBUG_EXC").is_some() {
+            eprintln!("[QJS module loader] no source for {name}");
+        }
+        return ptr::null_mut();
+    };
+    let Ok(src_c) = CString::new(source) else {
+        return ptr::null_mut();
+    };
+    let Ok(name_c) = CString::new(name) else {
+        return ptr::null_mut();
+    };
+    let result = unsafe {
+        JS_Eval(
+            ctx,
+            src_c.as_ptr(),
+            src_c.as_bytes().len(),
+            name_c.as_ptr(),
+            JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+        )
+    };
+    if result.tag == JS_TAG_EXCEPTION {
+        if std::env::var_os("QJS_DEBUG_EXC").is_some() {
+            unsafe {
+                let exc = JS_GetException(ctx);
+                let mut l = 0usize;
+                let s = JS_ToCStringLen(ctx, &mut l, exc);
+                if !s.is_null() {
+                    let b = std::slice::from_raw_parts(s as *const u8, l);
+                    eprintln!(
+                        "[QJS module loader] parse failed for {name}: {}",
+                        std::string::String::from_utf8_lossy(b)
+                    );
+                    JS_FreeCString(ctx, s);
+                }
+                JS_FreeValue(ctx, exc);
+            }
+        }
+        return ptr::null_mut();
+    }
+    let m = unsafe { result.u.ptr } as *mut JSModuleDef;
+    MODULE_DEF_CACHE.with(|c| {
+        c.borrow_mut().insert(name.to_string(), m as usize);
+    });
+    // Ownership of the JSModuleDef transfers to QuickJS; don't free `result`.
+    m
 }
 
 // ===================================================================
@@ -466,54 +691,58 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
     let import_specifiers = parse_import_specifiers(&text);
     let is_async = has_top_level_await(&text);
 
-    let Ok(csrc) = CString::new(text) else {
-        return ptr::null();
-    };
-    let Ok(cname) = CString::new(fname) else {
-        return ptr::null();
-    };
-    let len = csrc.as_bytes().len();
-    // COMPILE_ONLY yields a JS_TAG_MODULE value owned at +1; its u.ptr is the
-    // JSModuleDef. We keep the bytecode value to evaluate later.
-    let bytecode = unsafe {
-        JS_Eval(
-            ctx,
-            csrc.as_ptr(),
-            len,
-            cname.as_ptr(),
-            JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
-        )
-    };
-    if bytecode.tag == JS_TAG_EXCEPTION {
-        let exc = unsafe { JS_GetException(ctx) };
-        unsafe { JS_FreeValue(ctx, exc) };
-        return ptr::null();
+    // Stash the source by name so the module loader can resolve static imports
+    // of this module from other modules.
+    register_module_source(&fname, &text);
+    if std::env::var_os("QJS_DEBUG_MOD").is_some() {
+        eprintln!("[QJS CompileModule] {fname} imports={import_specifiers:?}");
     }
-    let module_def = unsafe { bytecode.u.ptr } as *mut JSModuleDef;
+
+    // We deliberately do NOT eagerly compile the module here.
+    //
+    // QuickJS resolves (and loads, via the module loader) every static import
+    // during COMPILE — see quickjs.c `js_resolve_module`, called even with
+    // COMPILE_ONLY. deno_core compiles a module *before* loading its
+    // dependencies (it reads `GetModuleRequests` off the compiled module to
+    // discover them), so a forward-referenced dependency's source isn't yet
+    // registered and the compile fails. Worse, eagerly compiling each module
+    // registers a `JSModuleDef` in QuickJS's per-runtime loaded-module list
+    // keyed by name; mixing those deno-compiled defs (which deno never
+    // evaluates — it relies on transitive evaluation) with the fresh defs the
+    // loader compiles at evaluation time produces an inconsistent graph and
+    // `[uninitialized]` binding errors.
+    //
+    // Instead we defer ALL compilation to `Module::Evaluate`. By the time deno
+    // evaluates the entry-point module, every module's source has been
+    // registered (deno calls CompileModule for each before evaluating any), so
+    // a single `JS_Eval(MODULE)` of the entry point resolves, links and runs the
+    // whole graph consistently via the loader. The textual import list feeds
+    // deno's `GetModuleRequests`; `mark_all_modules_evaluated` reconciles the
+    // lifecycle table afterward. This mirrors the reference PR's deferral.
 
     // The Module handle: a fresh object so it has stable pointer identity to key
     // our side table on.
     let handle_val = unsafe { JS_NewObject(ctx) };
     if handle_val.tag == JS_TAG_EXCEPTION {
-        unsafe { JS_FreeValue(ctx, bytecode) };
         let exc = unsafe { JS_GetException(ctx) };
         unsafe { JS_FreeValue(ctx, exc) };
         return ptr::null();
     }
     let this = intern::<Module>(handle_val);
     if this.is_null() {
-        unsafe { JS_FreeValue(ctx, bytecode) };
         return ptr::null();
     }
     record_module_state(
         this,
         ModuleState {
             status: ModuleStatus::Uninstantiated,
-            module_def,
-            bytecode: Some(bytecode),
+            module_def: ptr::null_mut(),
+            bytecode: None,
             import_specifiers,
             synthetic: false,
             is_async,
+            source_text: text,
+            source_name: fname,
         },
     );
     this
@@ -768,22 +997,33 @@ pub extern "C" fn v8__Module__Evaluate(
         iso_state(iso).rt
     };
 
-    // Take the bytecode (consumed once) and mark Evaluated.
-    let bytecode = with_module_state(this, |m| {
+    // Take the bytecode (consumed once) and mark Evaluated. Also grab the
+    // source text/name for the deferred-compile fallback.
+    let (bytecode, source_text, source_name) = with_module_state(this, |m| {
         m.status = ModuleStatus::Evaluated;
-        m.bytecode.take()
+        (
+            m.bytecode.take(),
+            m.source_text.clone(),
+            m.source_name.clone(),
+        )
     })
-    .flatten();
+    .unwrap_or((None, std::string::String::new(), std::string::String::new()));
 
+    if std::env::var_os("QJS_DEBUG_MOD").is_some() {
+        eprintln!(
+            "[QJS Evaluate] {} (precompiled={})",
+            source_name,
+            bytecode.is_some()
+        );
+    }
     if let Some(bc) = bytecode {
-        // JS_EvalFunction consumes one ref of the bytecode value. We own it (+1),
-        // so hand it straight over (no dup, no extra free).
+        // Pre-compiled bytecode path. JS_EvalFunction consumes one ref of the
+        // bytecode value. We own it (+1), so hand it straight over (no dup).
         let result = unsafe { JS_EvalFunction(ctx, bc) };
         unsafe { drain_jobs(rt) };
         if result.tag == JS_TAG_EXCEPTION {
             let exc = unsafe { JS_GetException(ctx) };
             if !iso.is_null() {
-                // Surface the rejection reason for debugging.
                 let s = unsafe { jsval_to_rust(ctx, exc) };
                 if !s.is_empty() {
                     eprintln!("[qjs] Module::evaluate exception: {s}");
@@ -793,7 +1033,70 @@ pub extern "C" fn v8__Module__Evaluate(
         } else {
             unsafe { JS_FreeValue(ctx, result) };
         }
+    } else if !source_text.is_empty() {
+        // Deferred-compile path: COMPILE_ONLY failed at compile time (an import
+        // wasn't loadable yet). By now every dependency's source has been
+        // registered with the loader, so a full module eval resolves, links and
+        // runs the whole graph. JS_Eval(MODULE) returns the module's top-level
+        // promise (or undefined). We consume the result.
+        let csrc = CString::new(source_text).ok();
+        let cname = CString::new(if source_name.is_empty() {
+            "<module>".to_string()
+        } else {
+            source_name
+        })
+        .ok();
+        if let (Some(csrc), Some(cname)) = (csrc, cname) {
+            let result = unsafe {
+                JS_Eval(
+                    ctx,
+                    csrc.as_ptr(),
+                    csrc.as_bytes().len(),
+                    cname.as_ptr(),
+                    JS_EVAL_TYPE_MODULE,
+                )
+            };
+            unsafe { drain_jobs(rt) };
+            if result.tag == JS_TAG_EXCEPTION {
+                let exc = unsafe { JS_GetException(ctx) };
+                let s = unsafe { jsval_to_rust(ctx, exc) };
+                if !s.is_empty() {
+                    eprintln!("[qjs] Module::evaluate (deferred) exception: {s}");
+                }
+                unsafe { JS_FreeValue(ctx, exc) };
+            } else {
+                if std::env::var_os("QJS_DEBUG_MOD").is_some() {
+                    // If the module eval returned a promise, inspect its state —
+                    // a rejected top-level promise means the body failed.
+                    if result.tag == JS_TAG_OBJECT && unsafe { JS_IsPromise(result) } != 0 {
+                        let state = unsafe { JS_PromiseState(ctx, result) };
+                        eprintln!("[QJS Evaluate-result] promise state={state}");
+                        if state == 2 {
+                            let pr = unsafe { JS_PromiseResult(ctx, result) };
+                            let s = unsafe { jsval_to_rust(ctx, pr) };
+                            eprintln!("[QJS Evaluate-result] rejection: {s}");
+                            let stk = unsafe { JS_GetPropertyStr(ctx, pr, c"stack".as_ptr()) };
+                            if !jsv_is_undefined(&stk) {
+                                let ss = unsafe { jsval_to_rust(ctx, stk) };
+                                eprintln!("[QJS Evaluate-result] stack:\n{ss}");
+                            }
+                            unsafe { JS_FreeValue(ctx, stk) };
+                            unsafe { JS_FreeValue(ctx, pr) };
+                        }
+                    } else {
+                        eprintln!("[QJS Evaluate-result] tag={}", result.tag);
+                    }
+                }
+                if result.tag != JS_TAG_UNDEFINED {
+                    unsafe { JS_FreeValue(ctx, result) };
+                }
+            }
+        }
     }
+
+    // QuickJS evaluated all statically-imported modules transitively; reflect
+    // that so deno's post-evaluate assertion sees every module as Evaluated.
+    mark_all_modules_evaluated();
 
     // Hand back a resolved promise (deno awaits the module-evaluation promise).
     let mut funcs: [JSValue; 2] = [jsv_undefined(), jsv_undefined()];
@@ -837,7 +1140,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
     module_name: *const V8String,
     export_names_len: usize,
     export_names_raw: *const *const V8String,
-    _evaluation_steps: SyntheticModuleEvaluationSteps,
+    evaluation_steps: SyntheticModuleEvaluationSteps,
 ) -> *const Module {
     let iso = isolate as *mut RealIsolate;
     if iso.is_null() {
@@ -888,8 +1191,23 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
     if this.is_null() {
         return ptr::null();
     }
+    if std::env::var_os("QJS_DEBUG_MOD").is_some() {
+        let nm = unsafe { jsval_to_rust(ctx, jsval_of(module_name)) };
+        eprintln!("[QJS CreateSyntheticModule] {nm} def={def:?} n_export_names={export_names_len}");
+    }
     SYNTHETIC_DEFS.with(|t| {
         t.borrow_mut().insert(handle_key(this), def as usize);
+    });
+    // Stash deno's evaluation steps + this Module handle so the CModule init
+    // callback can run them to populate exports at link time (see the
+    // SYNTHETIC_EVAL_STEPS doc-comment).
+    let steps: SyntheticModuleEvaluationSteps<'static> =
+        unsafe { std::mem::transmute(evaluation_steps) };
+    // Dup the handle's JSValue so we can re-intern a fresh, valid handle later
+    // (the original arena slot will be gone by init-callback time).
+    let handle_dup = unsafe { JS_DupValue(ctx, handle_val) };
+    SYNTHETIC_EVAL_STEPS.with(|t| {
+        t.borrow_mut().insert(def as usize, (steps, handle_dup));
     });
     record_module_state(
         this,
@@ -900,6 +1218,8 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
             import_specifiers: Vec::new(),
             synthetic: true,
             is_async: false,
+            source_text: std::string::String::new(),
+            source_name: std::string::String::new(),
         },
     );
     this
@@ -911,7 +1231,34 @@ unsafe extern "C" fn synthetic_module_init_callback(
     ctx: *mut JSContext,
     m: *mut JSModuleDef,
 ) -> std::os::raw::c_int {
+    // Run deno's evaluation steps first: they call `SetSyntheticModuleExport`
+    // for each export, which stashes (name, value) pairs into SYNTHETIC_EXPORTS
+    // keyed by this def. V8 runs these at evaluate time; QuickJS needs the
+    // exports now (link time), so we drive them here.
+    let steps = SYNTHETIC_EVAL_STEPS.with(|t| t.borrow().get(&(m as usize)).copied());
+    if let Some((eval_steps, handle_jsval)) = steps {
+        let cur_ctx = current_ctx();
+        let ctx_for_call = if cur_ctx.is_null() { ctx } else { cur_ctx };
+        // Re-intern fresh handles for the call: the original Context/Module
+        // arena slots are long gone. `intern_dup` dups the stored module JSValue
+        // into a new slot in the current handle scope so its identity (and thus
+        // deno's Global<Module> key) matches what deno recorded.
+        let ctx_handle = super::shim_core::intern_ctx(ctx_for_call);
+        let mod_handle = super::shim_core::intern_dup::<Module>(ctx_for_call, handle_jsval);
+        unsafe {
+            if let (Some(ctx_l), Some(mod_l)) = (
+                crate::Local::from_raw(ctx_handle),
+                crate::Local::from_raw(mod_handle),
+            ) {
+                let _ = eval_steps(ctx_l, mod_l);
+            }
+        }
+    }
+
     let exports = SYNTHETIC_EXPORTS.with(|t| t.borrow_mut().remove(&(m as usize)).unwrap_or_default());
+    if std::env::var_os("QJS_DEBUG_MOD").is_some() {
+        eprintln!("[QJS synthetic init] def={:?} n_exports={}", m, exports.len());
+    }
     for (name, value) in exports {
         let Ok(name_c) = CString::new(name) else {
             // Drop the owned value we stashed to avoid a leak.
@@ -950,6 +1297,9 @@ pub extern "C" fn v8__Module__SetSyntheticModuleExport(
     let name = unsafe { jsval_to_rust(ctx, jsval_of(export_name)) };
     // Dup the value so the stash owns its own refcount (the caller keeps theirs).
     let val = unsafe { JS_DupValue(ctx, jsval_of(export_value)) };
+    if std::env::var_os("QJS_DEBUG_MOD").is_some() {
+        eprintln!("[QJS SetSyntheticExport] def={def:?} name={name}");
+    }
     SYNTHETIC_EXPORTS.with(|t| {
         t.borrow_mut()
             .entry(def as usize)
