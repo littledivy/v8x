@@ -22,7 +22,14 @@ fn main() {
     );
     println!("cargo:rerun-if-changed={}", binding_path.display());
 
-    // --- JSC backend: link Apple's system JavaScriptCore framework ---
+    // --- JSC backend: vendored WebKit JSCOnly build, or system framework ---
+    if env::var_os("CARGO_FEATURE_ENGINE_JSC").is_some()
+        && env::var_os("CARGO_FEATURE_VENDOR_JSC").is_some()
+    {
+        build_vendored_jsc(&manifest_dir);
+        return;
+    }
+
     #[cfg(target_os = "macos")]
     if env::var_os("CARGO_FEATURE_ENGINE_JSC").is_some() {
         println!("cargo:rustc-link-lib=framework=JavaScriptCore");
@@ -46,6 +53,55 @@ fn main() {
     if env::var_os("CARGO_FEATURE_LINK_QUICKJS").is_some() {
         build_quickjs(&manifest_dir);
     }
+}
+
+/// Build JavaScriptCore from the vendored WebKit (JSCOnly port) and link it.
+/// Override the build with `JSC_VENDOR_BUILD_DIR` pointing at a prebuilt
+/// `WebKitBuild/JSCOnly/Release` (containing `lib/`).
+fn build_vendored_jsc(manifest_dir: &std::path::Path) {
+    let webkit = manifest_dir.join("vendor/webkit");
+    let build_dir = env::var_os("JSC_VENDOR_BUILD_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| webkit.join("WebKitBuild/JSCOnly/Release"));
+    let lib_dir = build_dir.join("lib");
+
+    // Build only if the libraries aren't already present.
+    if !lib_dir.join("libJavaScriptCore.a").exists()
+        && env::var_os("JSC_VENDOR_BUILD_DIR").is_none()
+    {
+        let status = std::process::Command::new(webkit.join("Tools/Scripts/build-jsc"))
+            .args(["--jsc-only", "--release"])
+            .current_dir(&webkit)
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            other => panic!("WebKit JSCOnly build failed: {other:?}"),
+        }
+    }
+
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    // JSCOnly static libs (link order matters: JSC -> WTF -> bmalloc).
+    println!("cargo:rustc-link-lib=static=JavaScriptCore");
+    println!("cargo:rustc-link-lib=static=WTF");
+    println!("cargo:rustc-link-lib=static=bmalloc");
+    println!("cargo:rustc-link-lib=c++");
+    #[cfg(target_os = "macos")]
+    {
+        // ICU + the CoreFoundation/Security frameworks WTF/JSC depend on.
+        println!("cargo:rustc-link-lib=icucore");
+        for fw in ["CoreFoundation", "Foundation", "Security"] {
+            println!("cargo:rustc-link-lib=framework={fw}");
+        }
+        if let Ok(out) = std::process::Command::new("xcrun")
+            .args(["--show-sdk-path"])
+            .output()
+        {
+            if let Ok(sdk) = String::from_utf8(out.stdout) {
+                println!("cargo:rustc-link-search=native={}/usr/lib", sdk.trim());
+            }
+        }
+    }
+    println!("cargo:rerun-if-changed={}", lib_dir.display());
 }
 
 #[allow(dead_code)]

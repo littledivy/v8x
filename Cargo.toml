@@ -20,6 +20,9 @@ engine_jsc = []
 engine_quickjs = []
 # Compile + statically link the vendored QuickJS-ng sources (engine_quickjs).
 link_quickjs = []
+# Build JavaScriptCore from the vendored WebKit (JSCOnly port) and link that
+# instead of the system framework. Same C API, so jsc_sys.rs is unchanged.
+vendor_jsc = []
 
 # v8-crate feature flags Deno toggles; inert here.
 use_custom_libcxx = []
