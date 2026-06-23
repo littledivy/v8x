@@ -118,10 +118,56 @@ pub(crate) fn jsval_of<T>(p: *const T) -> JSValue {
     unsafe { *(p as *const JSValue) }
 }
 
-/// Reinterpret a `*const Context` as its backing `*mut JSContext`.
+/// Private JSValue tag for a v8 `Context` handle. A `*mut JSContext` is **not**
+/// a `JSValue` (unlike JSC, where a context ref is a protectable value), so a
+/// Context handle cannot be an ordinary arena slot — `jsval_of`/`JS_DupValue`
+/// run by `Local::new`/`Global::new` would read/refcount it as garbage. Instead
+/// we box a `JSValue` that *encodes* the ctx pointer under this tag. The tag is
+/// positive, so QuickJS's `JS_DupValue`/`JS_FreeValue` (which only refcount the
+/// negative heap tags) treat it as a plain immediate: dup/free are no-ops and
+/// the encoded pointer round-trips losslessly through the handle machinery.
+pub(crate) const JS_TAG_V8_CONTEXT: i64 = 0x7632; // 'v2'
+
+/// Encode a `*mut JSContext` as a non-refcounted `JSValue` (see
+/// [`JS_TAG_V8_CONTEXT`]).
+#[inline(always)]
+pub(crate) fn ctx_to_jsval(ctx: *mut JSContext) -> JSValue {
+    make_value(JS_TAG_V8_CONTEXT, JSValueUnion { ptr: ctx as *mut c_void })
+}
+
+/// Move a context pointer into a fresh arena slot and return it as a v8
+/// `Context` handle.
+#[inline(always)]
+pub(crate) fn intern_ctx(ctx: *mut JSContext) -> *const Context {
+    intern::<Context>(ctx_to_jsval(ctx))
+}
+
+/// Is `p` a non-JSValue handle (a raw template box pointer) that must be
+/// passed through `Local::new`/`Global::new` by identity rather than read and
+/// duped as a `JSValue`? Mirrors the JSC backend's `is_non_value_handle`.
+#[inline(always)]
+pub(crate) fn is_non_value_handle<T>(p: *const T) -> bool {
+    !p.is_null() && super::fam_function::is_template_ptr(p as *const c_void)
+}
+
+/// Recover the `*mut JSContext` backing a `*const Context` handle.
+///
+/// Accepts both representations for robustness: an arena slot holding a
+/// [`JS_TAG_V8_CONTEXT`]-encoded value (the canonical form), or — as a
+/// fallback — a raw `*mut JSContext` reinterpreted directly (internal callers
+/// that pass `ctx as *const Context` straight into another shim).
 #[inline(always)]
 pub(crate) fn ctx_of(c: *const Context) -> *mut JSContext {
-    c as *mut JSContext
+    if c.is_null() {
+        return ptr::null_mut();
+    }
+    let v = unsafe { *(c as *const JSValue) };
+    if v.tag == JS_TAG_V8_CONTEXT {
+        unsafe { v.u.ptr as *mut JSContext }
+    } else {
+        // Raw `*mut JSContext` passed directly (not an arena slot).
+        c as *mut JSContext
+    }
 }
 
 /// The context to root a fresh handle against, when none was supplied.
@@ -224,7 +270,9 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
             drop(Box::from_raw(slot));
         }
         JS_FreeContext(st.ctx);
-        JS_FreeRuntime(st.rt);
+        if std::env::var_os("QJS_SKIP_FREE_RT").is_none() {
+            JS_FreeRuntime(st.rt);
+        }
     }
     set_current(ptr::null_mut());
     clear_last_iso(this);
@@ -274,7 +322,7 @@ pub extern "C" fn v8__Isolate__GetCurrentContext(isolate: *mut RealIsolate) -> *
     }
     let st = iso_state(isolate);
     let ctx = st.contexts.last().copied().unwrap_or(st.ctx);
-    ctx as *const Context
+    intern_ctx(ctx)
 }
 
 // ===================================================================
@@ -313,6 +361,16 @@ pub extern "C" fn v8__HandleScope__DESTRUCT(this: *mut usize) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Local__New(isolate: *mut RealIsolate, other: *const Data) -> *const Data {
+    if other.is_null() {
+        return ptr::null();
+    }
+    // FunctionTemplate / ObjectTemplate handles are raw `Box<…Template>`
+    // pointers, NOT arena JSValue slots — reading them as a JSValue and duping
+    // would corrupt the template (e.g. yield a null `proto`). Like the JSC
+    // backend's `intern`, hand such non-value handles back by identity.
+    if is_non_value_handle(other) {
+        return other;
+    }
     // Clone the handle into the current scope: dup the JSValue into a fresh slot.
     let ctx = if isolate.is_null() {
         current_ctx()
@@ -343,9 +401,9 @@ pub extern "C" fn v8__Context__New(
     if isolate.is_null() {
         return ptr::null();
     }
-    // QuickJS has one context per isolate here; hand its pointer back as the
-    // v8 Context handle.
-    iso_state(isolate).ctx as *const Context
+    // QuickJS has one context per isolate here; hand back a Context handle that
+    // encodes its pointer (see `intern_ctx` / `JS_TAG_V8_CONTEXT`).
+    intern_ctx(iso_state(isolate).ctx)
 }
 
 #[unsafe(no_mangle)]
@@ -426,10 +484,35 @@ pub extern "C" fn v8__Script__Run(
     let result = unsafe { JS_Eval(ctx, cstr, len, fname.as_ptr(), JS_EVAL_TYPE_GLOBAL) };
     unsafe { JS_FreeCString(ctx, cstr) };
     if result.tag == JS_TAG_EXCEPTION {
-        // Drop the exception for now (TryCatch wiring is a later task) and
-        // signal failure to the vendored layer with a null handle.
-        let exc = unsafe { JS_GetException(ctx) };
-        unsafe { JS_FreeValue(ctx, exc) };
+        if std::env::var_os("QJS_DEBUG_EXC").is_some() {
+            unsafe {
+                let exc = JS_GetException(ctx);
+                let mut l = 0usize;
+                let s = JS_ToCStringLen(ctx, &mut l, exc);
+                if !s.is_null() {
+                    let bytes = std::slice::from_raw_parts(s as *const u8, l);
+                    eprintln!("[QJS_DEBUG_EXC] {}", String::from_utf8_lossy(bytes));
+                    JS_FreeCString(ctx, s);
+                }
+                // Print .stack if present.
+                let stk = JS_GetPropertyStr(ctx, exc, c"stack".as_ptr());
+                if !jsv_is_undefined(&stk) {
+                    let mut sl = 0usize;
+                    let ss = JS_ToCStringLen(ctx, &mut sl, stk);
+                    if !ss.is_null() {
+                        let sb = std::slice::from_raw_parts(ss as *const u8, sl);
+                        eprintln!("[QJS_DEBUG_STACK]\n{}", String::from_utf8_lossy(sb));
+                        JS_FreeCString(ctx, ss);
+                    }
+                }
+                JS_FreeValue(ctx, stk);
+                // Re-arm so TryCatch still sees it.
+                JS_Throw(ctx, exc);
+            }
+        }
+        // Leave the exception armed in QuickJS's pending slot so a surrounding
+        // v8 TryCatch (which reads `JS_HasException`/`JS_GetException`) observes
+        // it. Returning a null handle signals failure to the vendored layer.
         return ptr::null();
     }
     // `result` is owned (+1); move it into an arena slot.

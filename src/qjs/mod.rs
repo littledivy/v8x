@@ -26,6 +26,7 @@ mod fam_serializer;
 mod fam_string;
 mod fam_value;
 mod shim_cli_extra;
+mod shim_runtime;
 mod shims;
 
 #[cfg(test)]

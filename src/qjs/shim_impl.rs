@@ -28,6 +28,56 @@ pub extern "C" fn v8__V8__GetVersion() -> *const c_char {
     c"12.0.0 (v82jsc/QuickJS-ng)".as_ptr()
 }
 
+/// V8 command-line flag parsing has no QuickJS analogue. QuickJS ignores v8
+/// flags, so report every flag as consumed by collapsing `argv` to just the
+/// binary name (index 0); deno then sees no "unrecognized" leftovers and does
+/// not exit(1).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__V8__SetFlagsFromCommandLine(
+    argc: *mut c_int,
+    _argv: *mut *mut c_char,
+    _usage: *const c_char,
+) {
+    if !argc.is_null() {
+        unsafe {
+            if *argc > 1 {
+                *argc = 1;
+            }
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__V8__SetFlagsFromString(_flags: *const u8, _length: usize) {}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__V8__SetEntropySource(_callback: *const std::ffi::c_void) {}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Platform__NewCustomPlatform(
+    _thread_pool_size: c_int,
+    _idle_task_support: bool,
+    _unprotected: bool,
+    _context: *mut std::ffi::c_void,
+) -> *mut Platform {
+    Box::into_raw(Box::new(0u8)) as *mut Platform
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Platform__NewSingleThreadedDefaultPlatform(
+    _idle_task_support: bool,
+) -> *mut Platform {
+    Box::into_raw(Box::new(0u8)) as *mut Platform
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Platform__NewUnprotectedDefaultPlatform(
+    _thread_pool_size: c_int,
+    _idle_task_support: bool,
+) -> *mut Platform {
+    Box::into_raw(Box::new(0u8)) as *mut Platform
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__NewDefaultPlatform(
     _thread_pool_size: c_int,
