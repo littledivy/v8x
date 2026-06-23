@@ -148,6 +148,9 @@ fn build_quickjs(manifest_dir: &std::path::Path) {
     }
     build
         .define("_GNU_SOURCE", None)
+        // Real QuickJS ships with NDEBUG; it also drops the JS_FreeRuntime
+        // gc_obj_list assert so a (temporary) refcount leak doesn't abort.
+        .define("NDEBUG", None)
         .flag_if_supported("-Wno-implicit-fallthrough")
         .flag_if_supported("-Wno-sign-compare")
         .flag_if_supported("-Wno-unused-parameter")

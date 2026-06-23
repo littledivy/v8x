@@ -743,3 +743,67 @@ pub extern "C" fn v8__Array__Length(array: *const Array) -> u32 {
     }
     len as u32
 }
+
+// ===================================================================
+// Object::Wrap / Unwrap / IsApiWrapper — associate a cppgc-managed RustObj
+// pointer with a JS wrapper object (deno wraps native-backed objects like
+// CryptoKey). QuickJS has no V8 wrappable internal slots, so we keep a side
+// table. CRITICAL: a v8 handle is a transient arena slot pointer, so we key by
+// the *object's identity* (its JSValue `u.ptr` payload), not the handle address —
+// different handles to the same object must resolve to the same wrapped pointer.
+// ===================================================================
+
+thread_local! {
+    static WRAP_TABLE: std::cell::RefCell<
+        std::collections::HashMap<(usize, u16), usize>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[inline]
+fn wrap_key(wrapper: *const Object) -> usize {
+    // Object identity = the heap object pointer behind the handle's JSValue.
+    unsafe { jsval_of(wrapper).u.ptr as usize }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__Wrap(
+    _isolate: *const RealIsolate,
+    wrapper: *const Object,
+    value: *const crate::binding::RustObj,
+    tag: u16,
+) {
+    if wrapper.is_null() {
+        return;
+    }
+    let key = wrap_key(wrapper);
+    WRAP_TABLE.with(|t| {
+        t.borrow_mut().insert((key, tag), value as usize);
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__Unwrap(
+    _isolate: *const RealIsolate,
+    wrapper: *const Object,
+    tag: u16,
+) -> *mut crate::binding::RustObj {
+    if wrapper.is_null() {
+        return ptr::null_mut();
+    }
+    let key = wrap_key(wrapper);
+    WRAP_TABLE.with(|t| {
+        t.borrow()
+            .get(&(key, tag))
+            .map(|&p| p as *mut crate::binding::RustObj)
+            .unwrap_or(ptr::null_mut())
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__IsApiWrapper(this: *const Object) -> bool {
+    if this.is_null() {
+        return false;
+    }
+    let key = wrap_key(this);
+    WRAP_TABLE.with(|t| t.borrow().keys().any(|(w, _)| *w == key))
+}

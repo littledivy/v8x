@@ -1,11 +1,6 @@
 //! AUTO-GENERATED QuickJS link stubs (tools/gen_qjs_shims.sh). Not yet implemented.
 #![allow(non_snake_case)]
 
-#[unsafe(no_mangle)] pub extern "C" fn cppgc__make_garbage_collectable() { unimplemented!("cppgc__make_garbage_collectable") }
-#[unsafe(no_mangle)] pub extern "C" fn cppgc__Persistent__CONSTRUCT() { unimplemented!("cppgc__Persistent__CONSTRUCT") }
-#[unsafe(no_mangle)] pub extern "C" fn cppgc__Persistent__DESTRUCT() { unimplemented!("cppgc__Persistent__DESTRUCT") }
-#[unsafe(no_mangle)] pub extern "C" fn cppgc__Persistent__Get() { unimplemented!("cppgc__Persistent__Get") }
-#[unsafe(no_mangle)] pub extern "C" fn cppgc__Visitor__Trace__TracedReference() { unimplemented!("cppgc__Visitor__Trace__TracedReference") }
 #[unsafe(no_mangle)] pub extern "C" fn std__shared_ptr__v8__BackingStore__use_count() { unimplemented!("std__shared_ptr__v8__BackingStore__use_count") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__ArrayBuffer__Allocator__NewRustAllocator() { unimplemented!("v8__ArrayBuffer__Allocator__NewRustAllocator") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__ArrayBuffer__SetDetachKey() { unimplemented!("v8__ArrayBuffer__SetDetachKey") }
@@ -34,7 +29,6 @@
 #[unsafe(no_mangle)] pub extern "C" fn v8__Isolate__AddNearHeapLimitCallback() { unimplemented!("v8__Isolate__AddNearHeapLimitCallback") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Isolate__AdjustAmountOfExternalAllocatedMemory() { unimplemented!("v8__Isolate__AdjustAmountOfExternalAllocatedMemory") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Isolate__DateTimeConfigurationChangeNotification() { unimplemented!("v8__Isolate__DateTimeConfigurationChangeNotification") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__Isolate__GetCppHeap() { unimplemented!("v8__Isolate__GetCppHeap") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Isolate__GetHeapCodeAndMetadataStatistics() { unimplemented!("v8__Isolate__GetHeapCodeAndMetadataStatistics") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Isolate__GetHeapSpaceStatistics() { unimplemented!("v8__Isolate__GetHeapSpaceStatistics") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Isolate__LowMemoryNotification() { unimplemented!("v8__Isolate__LowMemoryNotification") }
@@ -54,11 +48,8 @@
 #[unsafe(no_mangle)] pub extern "C" fn v8__Object__HasIndex() { unimplemented!("v8__Object__HasIndex") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Object__HasPrivate() { unimplemented!("v8__Object__HasPrivate") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Object__HasRealNamedProperty() { unimplemented!("v8__Object__HasRealNamedProperty") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__Object__IsApiWrapper() { unimplemented!("v8__Object__IsApiWrapper") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Object__PreviewEntries() { unimplemented!("v8__Object__PreviewEntries") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Object__SetIntegrityLevel() { unimplemented!("v8__Object__SetIntegrityLevel") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__Object__Unwrap() { unimplemented!("v8__Object__Unwrap") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__Object__Wrap() { unimplemented!("v8__Object__Wrap") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Private__New() { unimplemented!("v8__Private__New") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__PropertyCallbackInfo__GetIsolate() { unimplemented!("v8__PropertyCallbackInfo__GetIsolate") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__PropertyCallbackInfo__GetReturnValue() { unimplemented!("v8__PropertyCallbackInfo__GetReturnValue") }
@@ -78,10 +69,6 @@
 #[unsafe(no_mangle)] pub extern "C" fn v8__String__ValueView_SIZE() { unimplemented!("v8__String__ValueView_SIZE") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Symbol__Description() { unimplemented!("v8__Symbol__Description") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Symbol__New() { unimplemented!("v8__Symbol__New") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__TracedReference__CONSTRUCT() { unimplemented!("v8__TracedReference__CONSTRUCT") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__TracedReference__DESTRUCT() { unimplemented!("v8__TracedReference__DESTRUCT") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__TracedReference__Get() { unimplemented!("v8__TracedReference__Get") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__TracedReference__Reset() { unimplemented!("v8__TracedReference__Reset") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__TryCatch__Message() { unimplemented!("v8__TryCatch__Message") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__TypedArray__Length() { unimplemented!("v8__TypedArray__Length") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Uint8ClampedArray__New() { unimplemented!("v8__Uint8ClampedArray__New") }
@@ -91,10 +78,8 @@
 #[unsafe(no_mangle)] pub extern "C" fn v8__Value__BooleanValue() { unimplemented!("v8__Value__BooleanValue") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Value__InstanceOf() { unimplemented!("v8__Value__InstanceOf") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Value__IntegerValue() { unimplemented!("v8__Value__IntegerValue") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__Value__IsFalse() { unimplemented!("v8__Value__IsFalse") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Value__IsFloat16Array() { unimplemented!("v8__Value__IsFloat16Array") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Value__IsName() { unimplemented!("v8__Value__IsName") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Value__SameValue() { unimplemented!("v8__Value__SameValue") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Value__ToNumber() { unimplemented!("v8__Value__ToNumber") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__Value__TypeOf() { unimplemented!("v8__Value__TypeOf") }
 #[unsafe(no_mangle)] pub extern "C" fn v8__Value__Uint32Value() { unimplemented!("v8__Value__Uint32Value") }

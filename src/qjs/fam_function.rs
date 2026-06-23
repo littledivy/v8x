@@ -267,9 +267,15 @@ unsafe extern "C" fn fn_trampoline(
     }
 }
 
-/// Constructor trampoline (`JS_CFUNC_constructor_magic`). `this_val` is the
-/// new.target (the constructor function); QuickJS expects us to return the new
-/// object.
+/// Constructor-or-call trampoline (`JS_CFUNC_constructor_or_func_magic`).
+///
+/// QuickJS calls this for BOTH `new F()` and plain `F()` on a
+/// constructor-capable function (v8's `ConstructorBehavior::Allow` functions are
+/// callable either way — using `JS_CFUNC_constructor_magic` would wrongly throw
+/// "must be called with new" for the plain-call case). When constructing,
+/// `this_val` is the new.target (an object); when called plainly, QuickJS passes
+/// `this_val = undefined` (see quickjs.c `js_call_c_function`,
+/// `JS_CFUNC_constructor_or_func_magic`).
 unsafe extern "C" fn fn_construct_trampoline(
     ctx: *mut JSContext,
     new_target: JSValue,
@@ -280,11 +286,39 @@ unsafe extern "C" fn fn_construct_trampoline(
     let Some((callback, data)) = lookup_dispatch(magic) else {
         return unsafe { JS_NewObject(ctx) };
     };
-    // Fresh `this` whose prototype is the constructor's `.prototype`, so instance
-    // methods are reachable (matches `new F()`).
+    // Plain call (not `new`): QuickJS passes `this_val = undefined`. Dispatch as
+    // an ordinary function call with `this = undefined`.
+    if jsv_is_undefined(&new_target) {
+        return unsafe {
+            dispatch(
+                ctx,
+                callback,
+                data,
+                jsv_undefined(),
+                jsv_undefined(),
+                false,
+                argc,
+                argv,
+            )
+        };
+    }
+    // Construction (`new F()`): fresh `this` whose prototype is the constructor's
+    // `.prototype`, so instance methods are reachable.
     let this = unsafe { JS_NewObject(ctx) };
     unsafe {
         let proto = JS_GetPropertyStr(ctx, new_target, c"prototype".as_ptr());
+        if std::env::var_os("QJS_DEBUG_TMPL").is_some() {
+            let is_obj = jsv_is_object(&proto);
+            let has_log = if is_obj {
+                let l = JS_GetPropertyStr(ctx, proto, c"log".as_ptr());
+                let f = !jsv_is_undefined(&l);
+                JS_FreeValue(ctx, l);
+                f
+            } else {
+                false
+            };
+            eprintln!("[QJS construct] proto_is_obj={is_obj} proto_has_log={has_log}");
+        }
         if jsv_is_object(&proto) {
             JS_SetPrototype(ctx, this, proto);
         }
@@ -298,13 +332,30 @@ unsafe extern "C" fn fn_construct_trampoline(
         return r;
     }
     // If the callback returned an object, use it; else use `this`.
-    if jsv_is_object(&r) {
+    let result = if jsv_is_object(&r) {
         unsafe { JS_FreeValue(ctx, this) };
         r
     } else {
         unsafe { JS_FreeValue(ctx, r) };
         this
+    };
+    if std::env::var_os("QJS_DEBUG_TMPL").is_some() {
+        unsafe {
+            let l = JS_GetPropertyStr(ctx, result, c"log".as_ptr());
+            let has = !jsv_is_undefined(&l);
+            let proto = JS_GetPrototype(ctx, result);
+            let pl = if jsv_is_object(&proto) {
+                let x = JS_GetPropertyStr(ctx, proto, c"log".as_ptr());
+                let h = !jsv_is_undefined(&x);
+                JS_FreeValue(ctx, x);
+                h
+            } else { false };
+            eprintln!("[QJS construct ret] result_has_log={has} proto_has_log={pl} returned_this={}", jsv_is_object(&r));
+            JS_FreeValue(ctx, l);
+            JS_FreeValue(ctx, proto);
+        }
     }
+    result
 }
 
 /// Transmute our magic-trampoline into the `JSCFunction` pointer type
@@ -356,7 +407,7 @@ unsafe fn make_function_len(
     };
     let magic = register_dispatch(callback, data_owned);
     let cproto = if construct {
-        JS_CFUNC_CONSTRUCTOR_MAGIC
+        JS_CFUNC_CONSTRUCTOR_OR_FUNC_MAGIC
     } else {
         JS_CFUNC_GENERIC_MAGIC
     };
@@ -370,10 +421,12 @@ unsafe fn make_function_len(
     }
 }
 
-// `JS_CFUNC_constructor_magic` lives between constructor (2) and
-// constructor_or_func (4): quickjs enum order is generic=0, generic_magic=1,
-// constructor=2, constructor_magic=3, constructor_or_func=4, ...
+// quickjs JSCFunctionEnum order: generic=0, generic_magic=1, constructor=2,
+// constructor_magic=3, constructor_or_func=4, constructor_or_func_magic=5, ...
+// We use constructor_or_func_magic so a constructor-capable function is callable
+// BOTH as `new F()` and as `F()` (v8 ConstructorBehavior::Allow semantics).
 const JS_CFUNC_CONSTRUCTOR_MAGIC: c_int = 3;
+const JS_CFUNC_CONSTRUCTOR_OR_FUNC_MAGIC: c_int = 5;
 
 #[inline]
 fn cbinfo<'a>(this: *const FunctionCallbackInfo) -> &'a mut CbInfo {
@@ -522,6 +575,21 @@ pub extern "C" fn v8__Function__Call(
         JS_Call(ctx, func, recv_v, n as c_int, args.as_mut_ptr())
     };
     if jsv_is_exception(&r) {
+        if std::env::var("V82JSC_DEBUG").is_ok() {
+            unsafe {
+                let exc = JS_GetException(ctx);
+                let cs = JS_ToCString(ctx, exc);
+                if !cs.is_null() {
+                    eprintln!(
+                        "[qjs] Function__Call threw: {}",
+                        std::ffi::CStr::from_ptr(cs).to_string_lossy()
+                    );
+                    JS_FreeCString(ctx, cs);
+                }
+                // re-throw so TryCatch still sees it
+                JS_Throw(ctx, exc);
+            }
+        }
         // Leave the QuickJS exception pending so a surrounding TryCatch (the
         // exception family) can observe it via JS_GetException.
         return ptr::null();
@@ -956,6 +1024,14 @@ unsafe fn build_prototype_object(ctx: *mut JSContext, tp: *const FnTemplate) -> 
     }
     let proto_obj = unsafe { JS_NewObject(ctx) };
     let proto = unsafe { &*t.proto };
+    if std::env::var_os("QJS_DEBUG_TMPL").is_some() {
+        eprintln!(
+            "[QJS build_proto] class={:?} n_props={} n_accessors={}",
+            t.class_name,
+            proto.props.len(),
+            proto.accessors.len()
+        );
+    }
     if !proto.props.is_empty() {
         apply_props(ctx, proto_obj, &proto.props);
     }
