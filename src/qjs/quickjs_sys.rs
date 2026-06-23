@@ -281,13 +281,9 @@ unsafe extern "C" {
   pub fn JS_DupValue(ctx: *mut JSContext, v: JSValue) -> JSValue;
   pub fn JS_DupValueRT(rt: *mut JSRuntime, v: JSValue) -> JSValue;
 
-  // Primitive constructors.
-  pub fn JS_NewBool(ctx: *mut JSContext, val: c_int) -> JSValue;
-  pub fn JS_NewInt32(ctx: *mut JSContext, val: i32) -> JSValue;
-  pub fn JS_NewUint32(ctx: *mut JSContext, val: u32) -> JSValue;
-  pub fn JS_NewInt64(ctx: *mut JSContext, val: i64) -> JSValue;
-  pub fn JS_NewFloat64(ctx: *mut JSContext, val: f64) -> JSValue;
-  pub fn JS_NewString(ctx: *mut JSContext, str: *const c_char) -> JSValue;
+  // (Primitive constructors JS_NewBool/Int32/.. are `static inline` in
+  // quickjs.h — no exported symbol — so they are reimplemented as Rust fns
+  // below, not declared here.)
   pub fn JS_NewStringLen(
     ctx: *mut JSContext,
     str: *const c_char,
@@ -620,4 +616,41 @@ pub unsafe fn JS_DeletePropertyStr(
     JS_FreeAtom(ctx, atom);
     r
   }
+}
+
+// --- Rust reimplementations of quickjs.h `static inline` constructors ---
+// These have no exported symbol in libquickjs; the C inline bodies just build a
+// JSValue, which we do directly. Same signatures as the family shims expect.
+#[inline]
+pub unsafe fn JS_NewBool(_ctx: *mut JSContext, val: c_int) -> JSValue {
+    jsv_bool(val != 0)
+}
+#[inline]
+pub unsafe fn JS_NewInt32(_ctx: *mut JSContext, val: i32) -> JSValue {
+    jsv_int32(val)
+}
+#[inline]
+pub unsafe fn JS_NewUint32(_ctx: *mut JSContext, val: u32) -> JSValue {
+    if val <= i32::MAX as u32 { jsv_int32(val as i32) } else { jsv_float64(val as f64) }
+}
+#[inline]
+pub unsafe fn JS_NewInt64(_ctx: *mut JSContext, val: i64) -> JSValue {
+    if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
+        jsv_int32(val as i32)
+    } else {
+        jsv_float64(val as f64)
+    }
+}
+#[inline]
+pub unsafe fn JS_NewFloat64(_ctx: *mut JSContext, val: f64) -> JSValue {
+    jsv_float64(val)
+}
+#[inline]
+pub unsafe fn JS_NewString(ctx: *mut JSContext, s: *const c_char) -> JSValue {
+    let len = if s.is_null() { 0 } else { unsafe { libc_strlen(s) } };
+    unsafe { JS_NewStringLen(ctx, s, len) }
+}
+unsafe extern "C" {
+    #[link_name = "strlen"]
+    fn libc_strlen(s: *const c_char) -> usize;
 }
