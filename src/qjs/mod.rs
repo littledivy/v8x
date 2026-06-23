@@ -6,6 +6,11 @@
 //! implementations land incrementally, same pattern as the JSC backend).
 
 pub(crate) mod quickjs_sys;
+mod shim_arraybuffer;
+mod shim_core;
+mod shim_impl;
+mod shim_string;
+mod shim_value;
 mod shims;
 
 #[cfg(test)]
@@ -45,5 +50,40 @@ mod raw_smoke_test {
             JS_FreeRuntime(rt);
             let _ = ptr::null::<u8>();
         }
+    }
+}
+
+/// End-to-end proof that the vendored v8 (rusty_v8) API surface evaluates
+/// `1 + 1` through the QuickJS shim_core. Exercises the real `v8::` types —
+/// the same surface deno_core uses — modeled on the doctest in `src/lib.rs`.
+#[cfg(test)]
+#[cfg(feature = "link_quickjs")]
+mod api_test {
+    use crate as v8;
+
+    #[test]
+    fn qjs_api_eval() {
+        let platform = v8::new_default_platform(0, false).make_shared();
+        v8::V8::initialize_platform(platform);
+        v8::V8::initialize();
+
+        {
+            let isolate = &mut v8::Isolate::new(Default::default());
+
+            let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+            let scope = &mut scope.init();
+            let context = v8::Context::new(scope, Default::default());
+            let scope = &mut v8::ContextScope::new(scope, context);
+
+            let code = v8::String::new(scope, "1 + 1").unwrap();
+            let script = v8::Script::compile(scope, code, None).unwrap();
+            let result = script.run(scope).unwrap();
+            assert_eq!(result.to_rust_string_lossy(scope), "2");
+        }
+
+        unsafe {
+            v8::V8::dispose();
+        }
+        v8::V8::dispose_platform();
     }
 }
