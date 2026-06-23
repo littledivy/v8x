@@ -65,35 +65,64 @@ fn build_vendored_jsc(manifest_dir: &std::path::Path) {
         .unwrap_or_else(|| webkit.join("WebKitBuild/JSCOnly/Release"));
     let lib_dir = build_dir.join("lib");
 
-    // The JSCOnly macOS port builds `lib/JavaScriptCore.framework` (WTF/bmalloc
-    // are linked inside it). Build it if it isn't there yet.
-    let framework = lib_dir.join("JavaScriptCore.framework");
-    if !framework.exists() && env::var_os("JSC_VENDOR_BUILD_DIR").is_none() {
+    // Bundled = STATIC: the JSCOnly port with -DENABLE_STATIC_JSC=ON emits
+    // libJavaScriptCore.a + libWTF.a + libbmalloc.a; we link them into the
+    // binary so it's self-contained (no dylib, no rpath). Build if missing.
+    let jsc_a = lib_dir.join("libJavaScriptCore.a");
+    if !jsc_a.exists() && env::var_os("JSC_VENDOR_BUILD_DIR").is_none() {
         let status = std::process::Command::new(webkit.join("Tools/Scripts/build-jsc"))
-            .args(["--jsc-only", "--release"])
+            .args([
+                "--jsc-only",
+                "--release",
+                "--cmakeargs=-DENABLE_STATIC_JSC=ON",
+            ])
             .current_dir(&webkit)
             .status();
         match status {
             Ok(s) if s.success() => {}
-            other => panic!("WebKit JSCOnly build failed: {other:?}"),
+            other => panic!("WebKit JSCOnly static build failed: {other:?}"),
         }
     }
 
-    // Link the VENDORED framework (not the system one) and set an rpath so the
-    // dylib loads at runtime.
-    println!("cargo:rustc-link-search=framework={}", lib_dir.display());
-    println!("cargo:rustc-link-lib=framework=JavaScriptCore");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
-    println!("cargo:rerun-if-changed={}", framework.display());
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    // JSC has dense internal cross-references; the default static-archive
+    // member-pulling misses some, so force-load the whole JSC + WTF archives.
+    println!(
+        "cargo:rustc-link-arg=-Wl,-force_load,{}",
+        lib_dir.join("libJavaScriptCore.a").display()
+    );
+    println!(
+        "cargo:rustc-link-arg=-Wl,-force_load,{}",
+        lib_dir.join("libWTF.a").display()
+    );
+    // WebKit splits JSC into JavaScriptCore + JavaScriptCoreJIT targets; the JIT
+    // objects aren't archived by the build, so tools/setup_webkit.sh bundles
+    // them into libJavaScriptCoreJIT.a. Force-load it too.
+    let jit_a = lib_dir.join("libJavaScriptCoreJIT.a");
+    if jit_a.exists() {
+        println!("cargo:rustc-link-arg=-Wl,-force_load,{}", jit_a.display());
+    }
+    println!(
+        "cargo:rustc-link-arg=-Wl,-force_load,{}",
+        lib_dir.join("libbmalloc.a").display()
+    );
+    println!("cargo:rustc-link-lib=c++");
+    println!("cargo:rerun-if-changed={}", jsc_a.display());
 
-    // SDK lib path for -liconv (see the system-framework branch).
     #[cfg(target_os = "macos")]
-    if let Ok(out) = std::process::Command::new("xcrun")
-        .args(["--show-sdk-path"])
-        .output()
     {
-        if let Ok(sdk) = String::from_utf8(out.stdout) {
-            println!("cargo:rustc-link-search=native={}/usr/lib", sdk.trim());
+        // ICU + the system frameworks WTF/JSC depend on.
+        println!("cargo:rustc-link-lib=icucore");
+        for fw in ["CoreFoundation", "Foundation", "Security"] {
+            println!("cargo:rustc-link-lib=framework={fw}");
+        }
+        if let Ok(out) = std::process::Command::new("xcrun")
+            .args(["--show-sdk-path"])
+            .output()
+        {
+            if let Ok(sdk) = String::from_utf8(out.stdout) {
+                println!("cargo:rustc-link-search=native={}/usr/lib", sdk.trim());
+            }
         }
     }
 }
