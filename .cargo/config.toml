@@ -1,0 +1,20 @@
+# The `engine_jsc` build runs `bindgen` in build.rs (see `generate_jsc_bindings`).
+# bindgen pulls in the `libc` crate, which on macOS link-requests `-liconv`.
+# rustc links binaries (including build-script binaries) with `-nodefaultlibs`,
+# and on recent macOS the iconv stub lives only in the SDK (the dylib was moved
+# into the dyld shared cache), so the build-script binary fails to find iconv
+# unless the SDK lib dir is on the linker search path.
+#
+# The crate's own link gets this path from build.rs via `rustc-link-search`, but
+# that does not apply to the build-script binary's own link, so add it here.
+# Both the Xcode and Command Line Tools SDK lib dirs are listed; a missing one
+# is harmless (the linker only warns about absent `-L` directories).
+#
+# This config is scoped to builds rooted in this crate; it is not picked up when
+# the crate is consumed as a dependency (e.g. via `[patch]` from Deno), since
+# cargo discovers config by walking up from the invocation directory.
+[target.aarch64-apple-darwin]
+rustflags = [
+    "-L", "native=/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk/usr/lib",
+    "-L", "native=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/lib",
+]

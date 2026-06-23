@@ -22,6 +22,13 @@ fn main() {
     );
     println!("cargo:rerun-if-changed={}", binding_path.display());
 
+    // --- JSC backend: generate full FFI bindings from the SDK header. ---
+    // `src/jsc_sys.rs` `include!`s the output, so the complete JavaScriptCore
+    // C API is available without hand-written externs.
+    if env::var_os("CARGO_FEATURE_ENGINE_JSC").is_some() {
+        generate_jsc_bindings();
+    }
+
     // --- JSC backend: vendored WebKit JSCOnly build, or system framework ---
     if env::var_os("CARGO_FEATURE_ENGINE_JSC").is_some()
         && env::var_os("CARGO_FEATURE_VENDOR_JSC").is_some()
@@ -124,6 +131,74 @@ fn build_vendored_jsc(manifest_dir: &std::path::Path) {
             }
         }
     }
+}
+
+/// Run bindgen over the SDK's JavaScriptCore C API umbrella header to produce
+/// the complete set of declarations (`JSValueRef`, `JSEvaluateScript`,
+/// `JSType`/`kJSType*`, `JSTypedArrayType`/`kJSTypedArrayType*`, ...). The
+/// generated names are identical to the C names, so `src/jsc_sys.rs` just
+/// `include!`s the output and the shim code keeps compiling.
+fn generate_jsc_bindings() {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let out_path = out_dir.join("jsc_bindings.rs");
+
+    let sdk = String::from_utf8(
+        std::process::Command::new("xcrun")
+            .args(["--show-sdk-path"])
+            .output()
+            .expect("xcrun --show-sdk-path failed")
+            .stdout,
+    )
+    .expect("sdk path not utf8");
+    let sdk = sdk.trim();
+    let frameworks = format!("{sdk}/System/Library/Frameworks");
+    let header = format!("{frameworks}/JavaScriptCore.framework/Headers/JavaScript.h");
+
+    // bindgen locates libclang via the `clang-sys` crate. On a stock Xcode
+    // install it lives in the toolchain lib dir; point LIBCLANG_PATH there if
+    // it isn't already set so the build works out of the box.
+    if env::var_os("LIBCLANG_PATH").is_none() {
+        if let Ok(out) = std::process::Command::new("xcrun")
+            .args(["--find", "clang"])
+            .output()
+        {
+            if let Ok(clang) = String::from_utf8(out.stdout) {
+                // .../usr/bin/clang -> .../usr/lib
+                if let Some(libdir) = PathBuf::from(clang.trim())
+                    .parent()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("lib"))
+                {
+                    if libdir.join("libclang.dylib").exists() {
+                        unsafe { env::set_var("LIBCLANG_PATH", &libdir) };
+                    }
+                }
+            }
+        }
+    }
+
+    let bindings = bindgen::Builder::default()
+        .header(&header)
+        .clang_arg("-isysroot")
+        .clang_arg(sdk)
+        .clang_arg(format!("-F{frameworks}"))
+        .allowlist_function("JS.*")
+        .allowlist_type("JS.*|Opaque.*")
+        .allowlist_var("kJS.*")
+        .generate()
+        .expect("bindgen failed to generate JavaScriptCore bindings");
+
+    // Edition 2024 requires `extern` blocks to be `unsafe extern`. bindgen 0.70
+    // still emits bare `extern "C" {`, so rewrite the block headers. (Function
+    // pointer typedefs already use `unsafe extern "C" fn(...)` and are skipped
+    // because the pattern below only matches a block-opening brace.)
+    let src = bindings
+        .to_string()
+        .replace("extern \"C\" {", "unsafe extern \"C\" {");
+
+    std::fs::write(&out_path, src).expect("failed to write jsc_bindings.rs");
+
+    println!("cargo:rerun-if-changed={header}");
 }
 
 #[allow(dead_code)]

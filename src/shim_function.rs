@@ -17,11 +17,16 @@ use std::os::raw::{c_char, c_void};
 use std::ptr;
 
 // ===================================================================
-// Extra JSC C API we need (declared locally; jsc_sys.rs is owned by others).
+// JSC C API functions come from `crate::jsc_sys` (bindgen) via the glob import.
+//
+// `FnJSClassDefinition` is a layout-compatible mirror of bindgen's
+// `JSClassDefinition` with the callback fields type-erased to `*const c_void`
+// (the callbacks are set with raw fn-pointer casts). It is passed to
+// `JSClassCreate` via a cast.
 // ===================================================================
 
 #[repr(C)]
-struct JSClassDefinition {
+struct FnJSClassDefinition {
     version: std::os::raw::c_int,
     attributes: u32,
     className: *const c_char,
@@ -39,67 +44,6 @@ struct JSClassDefinition {
     callAsConstructor: *const c_void,
     hasInstance: *const c_void,
     convertToType: *const c_void,
-}
-
-type JSObjectCallAsFunctionCallback = unsafe extern "C" fn(
-    ctx: JSContextRef,
-    function: JSObjectRef,
-    thisObject: JSObjectRef,
-    argumentCount: usize,
-    arguments: *const JSValueRef,
-    exception: *mut JSValueRef,
-) -> JSValueRef;
-
-unsafe extern "C" {
-    fn JSClassCreate(definition: *const JSClassDefinition) -> JSClassRef;
-    fn JSObjectMake(
-        ctx: JSContextRef,
-        jsClass: JSClassRef,
-        data: *mut c_void,
-    ) -> JSObjectRef;
-    fn JSObjectGetPrivate(object: JSObjectRef) -> *mut c_void;
-    fn JSObjectSetPrivate(object: JSObjectRef, data: *mut c_void) -> bool;
-    fn JSObjectIsFunction(ctx: JSContextRef, object: JSObjectRef) -> bool;
-    fn JSObjectCallAsFunction(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        thisObject: JSObjectRef,
-        argumentCount: usize,
-        arguments: *const JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSValueRef;
-    fn JSObjectCallAsConstructor(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        argumentCount: usize,
-        arguments: *const JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSObjectRef;
-    fn JSObjectMakeConstructor(
-        ctx: JSContextRef,
-        jsClass: JSClassRef,
-        callAsConstructor: *const c_void,
-    ) -> JSObjectRef;
-    fn JSObjectSetProperty(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        propertyName: JSStringRef,
-        value: JSValueRef,
-        attributes: u32,
-        exception: *mut JSValueRef,
-    );
-    fn JSObjectGetProperty(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        propertyName: JSStringRef,
-        exception: *mut JSValueRef,
-    ) -> JSValueRef;
-    fn JSObjectSetPrototype(ctx: JSContextRef, object: JSObjectRef, value: JSValueRef);
-    fn JSObjectMakeFunctionWithCallback(
-        ctx: JSContextRef,
-        name: JSStringRef,
-        callAsFunction: JSObjectCallAsFunctionCallback,
-    ) -> JSObjectRef;
 }
 
 // ===================================================================
@@ -205,7 +149,7 @@ fn fn_class() -> JSClassRef {
         if !existing.is_null() {
             return existing;
         }
-        let def = JSClassDefinition {
+        let def = FnJSClassDefinition {
             version: 0,
             attributes: 0,
             className: c"v8jsc_fn".as_ptr(),
@@ -224,7 +168,7 @@ fn fn_class() -> JSClassRef {
             hasInstance: ptr::null(),
             convertToType: ptr::null(),
         };
-        let cls = unsafe { JSClassCreate(&def) };
+        let cls = unsafe { JSClassCreate(&def as *const _ as *const JSClassDefinition) };
         c.set(cls);
         cls
     })
@@ -475,7 +419,7 @@ fn ext_class() -> JSClassRef {
         if !existing.is_null() {
             return existing;
         }
-        let def = JSClassDefinition {
+        let def = FnJSClassDefinition {
             version: 0,
             attributes: 0,
             className: c"v8jsc_external".as_ptr(),
@@ -494,7 +438,7 @@ fn ext_class() -> JSClassRef {
             hasInstance: ptr::null(),
             convertToType: ptr::null(),
         };
-        let cls = unsafe { JSClassCreate(&def) };
+        let cls = unsafe { JSClassCreate(&def as *const _ as *const JSClassDefinition) };
         c.set(cls);
         cls
     })
@@ -506,14 +450,6 @@ pub extern "C" fn v8__External__Value(this: *const External) -> *mut c_void {
         return ptr::null_mut();
     }
     unsafe { JSObjectGetPrivate(jsval(this) as JSObjectRef) }
-}
-
-unsafe extern "C" {
-    fn JSValueIsObjectOfClass(
-        ctx: JSContextRef,
-        value: JSValueRef,
-        js_class: JSClassRef,
-    ) -> bool;
 }
 
 /// Whether `v` is one of our `External` objects (used by `v8__Value__IsExternal`

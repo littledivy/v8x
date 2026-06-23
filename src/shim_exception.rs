@@ -21,45 +21,7 @@ use std::ptr;
 #[allow(non_camel_case_types)]
 type TryCatch = usize;
 
-// Extra JSC C functions not declared in jsc_sys.rs.
-unsafe extern "C" {
-    fn JSObjectMakeError(
-        ctx: JSContextRef,
-        argument_count: usize,
-        arguments: *const JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSObjectRef;
-    fn JSObjectMakeDeferredPromise(
-        ctx: JSContextRef,
-        resolve: *mut JSObjectRef,
-        reject: *mut JSObjectRef,
-        exception: *mut JSValueRef,
-    ) -> JSObjectRef;
-    fn JSValueToObject(
-        ctx: JSContextRef,
-        value: JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSObjectRef;
-    fn JSObjectCallAsFunction(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        this_object: JSObjectRef,
-        argument_count: usize,
-        arguments: *const JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSValueRef;
-    fn JSObjectGetProperty(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        property_name: JSStringRef,
-        exception: *mut JSValueRef,
-    ) -> JSValueRef;
-    fn JSValueIsObjectOfClass(
-        ctx: JSContextRef,
-        value: JSValueRef,
-        js_class: JSClassRef,
-    ) -> bool;
-}
+// All JSC C functions come from `crate::jsc_sys` (bindgen) via the glob import.
 
 // ===================================================================
 // Helpers
@@ -86,24 +48,11 @@ unsafe fn make_named_error(message: *const String, name: &str) -> *const Value {
         let key = JSStringCreateWithUTF8CString(b"name\0".as_ptr() as *const c_char);
         let name_str = JSStringCreateWithUTF8CString(cname.as_ptr());
         let name_val = JSValueMakeString(ctx, name_str);
-        // JSObjectSetProperty is not declared locally; reuse eval-free path via
-        // a declared setter. Fall back: set via JSObjectSetProperty.
         JSObjectSetProperty(ctx, err, key, name_val, 0, ptr::null_mut());
         JSStringRelease(key);
         JSStringRelease(name_str);
     }
     intern_ctx::<Value>(ctx, err as JSValueRef)
-}
-
-unsafe extern "C" {
-    fn JSObjectSetProperty(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        property_name: JSStringRef,
-        value: JSValueRef,
-        attributes: u32,
-        exception: *mut JSValueRef,
-    );
 }
 
 // ===================================================================

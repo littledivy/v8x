@@ -22,34 +22,15 @@ use std::ptr;
 
 use crate::support::int;
 
-type JSObjectCallAsFunctionCallback = unsafe extern "C" fn(
-    ctx: JSContextRef,
-    function: JSObjectRef,
-    thisObject: JSObjectRef,
-    argumentCount: usize,
-    arguments: *const JSValueRef,
-    exception: *mut JSValueRef,
-) -> JSValueRef;
-
-// JSC C API functions not declared in jsc_sys.rs.
+// Most JSC C API functions (JSObjectIsFunction, JSObjectCallAsFunction,
+// JSObjectMakeFunctionWithCallback, ...) come from `crate::jsc_sys` (bindgen).
+//
+// `JSGlobalContextSetUnhandledRejectionCallback` is WebKit SPI and is NOT in
+// the public `<JavaScriptCore/JavaScript.h>` umbrella header, so bindgen does
+// not emit it. Declare it by hand. JSC reports unhandled promise rejections by
+// invoking `callback(reason, promise)`; this is the bridge we use to drive
+// deno's `PromiseRejectCallback`.
 unsafe extern "C" {
-    fn JSObjectIsFunction(ctx: JSContextRef, object: JSObjectRef) -> bool;
-    fn JSObjectCallAsFunction(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        thisObject: JSObjectRef,
-        argumentCount: usize,
-        arguments: *const JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSValueRef;
-    fn JSObjectMakeFunctionWithCallback(
-        ctx: JSContextRef,
-        name: JSStringRef,
-        callAsFunction: JSObjectCallAsFunctionCallback,
-    ) -> JSObjectRef;
-    /// JSC reports unhandled promise rejections by invoking `callback(reason,
-    /// promise)`. macOS exposes this; it is the bridge we use to drive deno's
-    /// `PromiseRejectCallback`.
     fn JSGlobalContextSetUnhandledRejectionCallback(
         ctx: JSGlobalContextRef,
         function: JSObjectRef,
@@ -121,22 +102,6 @@ pub extern "C" fn v8__Context__FromSnapshot(
 ) -> *const Context {
     // TODO(v82jsc): JSC has no snapshot support; cannot restore a context.
     ptr::null()
-}
-
-unsafe extern "C" {
-    fn JSObjectMake(
-        ctx: JSContextRef,
-        class: *mut std::ffi::c_void,
-        data: *mut std::ffi::c_void,
-    ) -> JSObjectRef;
-    fn JSObjectSetProperty(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        property_name: JSStringRef,
-        value: JSValueRef,
-        attributes: u32,
-        exception: *mut JSValueRef,
-    );
 }
 
 #[unsafe(no_mangle)]
@@ -575,7 +540,7 @@ pub(crate) unsafe fn install_unhandled_rejection_bridge(gctx: JSGlobalContextRef
         let f = JSObjectMakeFunctionWithCallback(
             gctx,
             name,
-            unhandled_rejection_trampoline,
+            Some(unhandled_rejection_trampoline),
         );
         JSStringRelease(name);
         if f.is_null() {

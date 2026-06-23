@@ -12,21 +12,7 @@ use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
 
-// Extra JSC C functions not declared in jsc_sys.rs.
-unsafe extern "C" {
-    fn JSValueIsStrictEqual(ctx: JSContextRef, a: JSValueRef, b: JSValueRef) -> bool;
-    fn JSValueToObject(
-        ctx: JSContextRef,
-        value: JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSObjectRef;
-    fn JSObjectGetProperty(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        propertyName: JSStringRef,
-        exception: *mut JSValueRef,
-    ) -> JSValueRef;
-}
+// JSC C API functions come from `crate::jsc_sys` (bindgen) via the glob import.
 
 // Evaluate a JS source string in `ctx` and return the resulting JSValueRef
 // (or null on failure / empty ctx).

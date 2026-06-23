@@ -29,61 +29,12 @@ use crate::script::ScriptOrigin;
 use crate::script_compiler::{CachedData, CompileOptions, NoCacheReason, Source};
 use crate::support::{Maybe, MaybeBool, int};
 
-// Extra JSC C functions not declared in jsc_sys.rs.
-unsafe extern "C" {
-    fn JSValueToObject(
-        ctx: JSContextRef,
-        value: JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSObjectRef;
-    fn JSObjectGetPropertyAtIndex(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        property_index: u32,
-        exception: *mut JSValueRef,
-    ) -> JSValueRef;
-    fn JSObjectGetProperty(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        property_name: JSStringRef,
-        exception: *mut JSValueRef,
-    ) -> JSValueRef;
-    fn JSObjectSetProperty(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        propertyName: JSStringRef,
-        value: JSValueRef,
-        attributes: u32,
-        exception: *mut JSValueRef,
-    );
-    fn JSObjectMake(
-        ctx: JSContextRef,
-        jsClass: JSClassRef,
-        data: *mut std::os::raw::c_void,
-    ) -> JSObjectRef;
-    fn JSObjectGetPrivate(object: JSObjectRef) -> *mut std::os::raw::c_void;
-    fn JSClassCreate(definition: *const ModJSClassDefinition) -> JSClassRef;
-    fn JSObjectMakeArray(
-        ctx: JSContextRef,
-        argumentCount: usize,
-        arguments: *const JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSObjectRef;
-    fn JSObjectCallAsFunction(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        thisObject: JSObjectRef,
-        argumentCount: usize,
-        arguments: *const JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSValueRef;
-    fn JSObjectMakeError(
-        ctx: JSContextRef,
-        argumentCount: usize,
-        arguments: *const JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSObjectRef;
-}
+// JSC C API functions come from `crate::jsc_sys` (bindgen) via the glob import.
+//
+// `ModJSClassDefinition` below is a layout-compatible mirror of bindgen's
+// `JSClassDefinition` that type-erases the callback fields to `*const c_void`
+// (more convenient than spelling out each `Option<extern fn>`). It is passed to
+// `JSClassCreate` via a cast.
 
 #[repr(C)]
 struct ModJSClassDefinition {
@@ -183,7 +134,7 @@ fn mod_class() -> JSClassRef {
             hasInstance: ptr::null(),
             convertToType: ptr::null(),
         };
-        let cls = unsafe { JSClassCreate(&def) };
+        let cls = unsafe { JSClassCreate(&def as *const _ as *const JSClassDefinition) };
         c.set(cls);
         cls
     })
