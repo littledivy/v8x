@@ -11,6 +11,8 @@ mod shim_core;
 mod shim_impl;
 mod shim_string;
 mod shim_value;
+mod shim_simdutf;
+mod shim_inspector;
 mod shims;
 
 #[cfg(test)]
