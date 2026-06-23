@@ -74,7 +74,7 @@ fn build_vendored_jsc(manifest_dir: &std::path::Path) {
             .args([
                 "--jsc-only",
                 "--release",
-                "--cmakeargs=-DENABLE_STATIC_JSC=ON",
+                "--cmakeargs=-DENABLE_STATIC_JSC=ON -DUSE_THIN_ARCHIVES=OFF",
             ])
             .current_dir(&webkit)
             .status();
