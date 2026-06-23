@@ -1,0 +1,4 @@
+[submodule "vendor/webkit"]
+	path = vendor/webkit
+	url = https://github.com/WebKit/WebKit.git
+	shallow = true
