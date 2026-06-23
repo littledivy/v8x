@@ -22,10 +22,9 @@ fn main() {
     );
     println!("cargo:rerun-if-changed={}", binding_path.display());
 
-    // Link Apple's system JavaScriptCore. Our shim translates the v8__* C ABI
-    // onto its API.
+    // --- JSC backend: link Apple's system JavaScriptCore framework ---
     #[cfg(target_os = "macos")]
-    {
+    if env::var_os("CARGO_FEATURE_ENGINE_JSC").is_some() {
         println!("cargo:rustc-link-lib=framework=JavaScriptCore");
         // lld with -nodefaultlibs doesn't search the SDK, where macOS now keeps
         // the .tbd stubs for system libs like iconv (the .dylib files were moved
@@ -42,4 +41,39 @@ fn main() {
             }
         }
     }
+
+    // --- QuickJS-ng backend: compile + statically link the vendored sources ---
+    if env::var_os("CARGO_FEATURE_LINK_QUICKJS").is_some() {
+        build_quickjs(&manifest_dir);
+    }
+}
+
+#[allow(dead_code)]
+fn build_quickjs(manifest_dir: &std::path::Path) {
+    // Honor a prebuilt tree first.
+    if let Some(dir) = env::var_os("QUICKJS_NG_LIB_DIR") {
+        println!("cargo:rustc-link-search=native={}", PathBuf::from(dir).display());
+        println!("cargo:rustc-link-lib=static=quickjs");
+        return;
+    }
+    let qjs = manifest_dir.join("vendor/quickjs-ng");
+    // The four core sources matching upstream CMake `qjs_sources`.
+    let sources = ["quickjs.c", "libregexp.c", "libunicode.c", "cutils.c", "dtoa.c"];
+    let mut build = cc::Build::new();
+    build.include(&qjs);
+    for s in sources {
+        let p = qjs.join(s);
+        if p.exists() {
+            build.file(p);
+        }
+    }
+    build
+        .define("_GNU_SOURCE", None)
+        .flag_if_supported("-Wno-implicit-fallthrough")
+        .flag_if_supported("-Wno-sign-compare")
+        .flag_if_supported("-Wno-unused-parameter")
+        .flag_if_supported("-Wno-unused-but-set-variable")
+        .opt_level(2)
+        .compile("quickjs");
+    println!("cargo:rerun-if-changed={}", qjs.display());
 }

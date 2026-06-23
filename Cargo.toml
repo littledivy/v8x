@@ -1,11 +1,11 @@
 [package]
 # Package name is `v8` so it can replace the real crate via `[patch]` in
-# downstream projects (Deno). The project itself is "v82jsc": a rusty_v8 API
-# surface backed by JavaScriptCore.
+# downstream projects (Deno). The project is a v8 C-ABI compat layer with
+# pluggable JS-engine backends (JavaScriptCore, QuickJS-ng).
 name = "v8"
 version = "149.4.0"
 edition = "2024"
-description = "rusty_v8 API surface implemented on JavaScriptCore (v82jsc)"
+description = "rusty_v8 API surface backed by a pluggable JS engine (JSC / QuickJS)"
 build = "build.rs"
 
 [lib]
@@ -13,7 +13,15 @@ name = "v8"
 path = "src/lib.rs"
 
 [features]
-default = []
+# Exactly ONE engine backend must be active (they each define the v8__* C ABI;
+# two would collide at link time). `engine_jsc` is the default.
+default = ["engine_jsc"]
+engine_jsc = []
+engine_quickjs = []
+# Compile + statically link the vendored QuickJS-ng sources (engine_quickjs).
+link_quickjs = []
+
+# v8-crate feature flags Deno toggles; inert here.
 use_custom_libcxx = []
 simdutf = []
 v8_enable_pointer_compression = []
@@ -24,5 +32,8 @@ v8_enable_v8_checks = []
 bitflags = "2.5"
 paste = "1.0"
 temporal_capi = { version = "0.2.3", features = ["zoneinfo64"] }
+
+[build-dependencies]
+cc = "1.0"
 
 [dev-dependencies]
