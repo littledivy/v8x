@@ -9,6 +9,18 @@ Support engines:
 * JavaScriptCore
 * QuickJS-NG
 
-Deno on JSC: ✅ runs — `deno eval`/`run`, `Deno.serve` HTTP, TypeScript, Web Crypto, top-level await. HTTP throughput on par with stock V8 deno; startup slower (JSC has no V8-style heap snapshot). System framework or vendored WebKit (`vendor_jsc`).
+Swap the engine under Deno without touching `deno_core`:
 
-Deno on QuickJS-NG: 🚧 in progress — engine linked, `1 + 1` evaluates through the real v8 API; C-ABI shims being ported from [denoland/deno#34033](https://github.com/denoland/deno/pull/34033).
+```toml
+# deno's workspace Cargo.toml
+[patch.crates-io]
+v8 = { package = "v8x", features = ["jsc"] }
+```
+
+```diff
+- cargo build -p deno
++ cargo build -p deno --features hmr
+```
+
+`v8x` vendors the real `v8` crate's Rust source and implements the `v8__*` C ABI
+on the chosen engine, so the swap is a drop-in — `deno_core` compiles unchanged.
