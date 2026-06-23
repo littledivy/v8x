@@ -41,5 +41,6 @@ temporal_capi = { version = "0.2.3", features = ["zoneinfo64"] }
 
 [build-dependencies]
 cc = "1.0"
+bindgen = "0.70"
 
 [dev-dependencies]

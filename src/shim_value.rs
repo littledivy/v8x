@@ -1,6 +1,9 @@
 // Family: "value" — v8::Value predicates (Is*), conversions (To*, *Value),
 // and comparisons (StrictEquals). JSC-backed definitions.
-#![allow(non_snake_case, unused)]
+// `non_upper_case_globals`: the `kJSType*` constants (re-exported from jsc_sys
+// to match the C spelling) are used as `match` patterns below; the lint flags
+// the lowercase-prefixed names.
+#![allow(non_snake_case, non_upper_case_globals, unused)]
 
 use crate::jsc_sys::*;
 use crate::support::Maybe;
@@ -12,64 +15,8 @@ use crate::shim_core::{ctx_of, current_ctx, intern, intern_ctx, jsval};
 use std::os::raw::{c_char, c_void};
 use std::ptr;
 
-// ---------------------------------------------------------------------------
-// Extra JSC C API functions not declared in jsc_sys.rs.
-// ---------------------------------------------------------------------------
-#[allow(non_camel_case_types)]
-#[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JSTypedArrayType {
-    Int8Array = 0,
-    Int16Array = 1,
-    Int32Array = 2,
-    Uint8Array = 3,
-    Uint8ClampedArray = 4,
-    Uint16Array = 5,
-    Uint32Array = 6,
-    Float32Array = 7,
-    Float64Array = 8,
-    ArrayBuffer = 9,
-    None = 10,
-    BigInt64Array = 11,
-    BigUint64Array = 12,
-}
-
-unsafe extern "C" {
-    fn JSValueToObject(
-        ctx: JSContextRef,
-        value: JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSObjectRef;
-    fn JSValueIsObjectOfClass(ctx: JSContextRef, value: JSValueRef, jsClass: JSClassRef) -> bool;
-    fn JSValueIsInstanceOfConstructor(
-        ctx: JSContextRef,
-        value: JSValueRef,
-        constructor: JSObjectRef,
-        exception: *mut JSValueRef,
-    ) -> bool;
-    fn JSObjectIsFunction(ctx: JSContextRef, object: JSObjectRef) -> bool;
-    fn JSValueGetTypedArrayType(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        exception: *mut JSValueRef,
-    ) -> JSTypedArrayType;
-    fn JSObjectGetProperty(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        propertyName: JSStringRef,
-        exception: *mut JSValueRef,
-    ) -> JSValueRef;
-    fn JSObjectCallAsFunction(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        thisObject: JSObjectRef,
-        argumentCount: usize,
-        arguments: *const JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSValueRef;
-    fn JSValueIsStrictEqual(ctx: JSContextRef, a: JSValueRef, b: JSValueRef) -> bool;
-    fn JSValueIsSymbol(ctx: JSContextRef, value: JSValueRef) -> bool;
-}
+// JSC C API functions and types (JSType, JSTypedArrayType, the `JS*` fns) come
+// from `crate::jsc_sys` (bindgen-generated) via the glob import above.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -84,7 +31,7 @@ fn ctx() -> JSContextRef {
 fn jsty(v: *const Value) -> JSType {
     let c = ctx();
     if c.is_null() {
-        return JSType::Undefined;
+        return kJSTypeUndefined;
     }
     unsafe { JSValueGetType(c, jsval(v)) }
 }
@@ -217,13 +164,13 @@ fn instance_of_global(v: *const Value, ctor_name: &[u8]) -> bool {
 fn typed_array_type(v: *const Value) -> JSTypedArrayType {
     let c = ctx();
     if c.is_null() || !is_obj(v) {
-        return JSTypedArrayType::None;
+        return kJSTypedArrayTypeNone;
     }
     unsafe {
         let mut exc: JSValueRef = ptr::null();
         let o = JSValueToObject(c, jsval(v), &mut exc);
         if o.is_null() {
-            return JSTypedArrayType::None;
+            return kJSTypedArrayTypeNone;
         }
         JSValueGetTypedArrayType(c, o, &mut exc)
     }
@@ -235,18 +182,18 @@ fn typed_array_type(v: *const Value) -> JSTypedArrayType {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsUndefined(this: *const Value) -> bool {
-    jsty(this) == JSType::Undefined
+    jsty(this) == kJSTypeUndefined
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsNull(this: *const Value) -> bool {
-    jsty(this) == JSType::Null
+    jsty(this) == kJSTypeNull
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsNullOrUndefined(this: *const Value) -> bool {
     let t = jsty(this);
-    t == JSType::Null || t == JSType::Undefined
+    t == kJSTypeNull || t == kJSTypeUndefined
 }
 
 #[unsafe(no_mangle)]
@@ -283,14 +230,14 @@ pub extern "C" fn v8__Value__TypeOf(
     // Map JS `typeof` semantics. JSC's JSType lumps function under Object, so
     // probe with JSObjectIsFunction.
     let s: &[u8] = match jsty(this) {
-        JSType::Undefined => b"undefined\0",
-        JSType::Null => b"object\0",
-        JSType::Boolean => b"boolean\0",
-        JSType::Number => b"number\0",
-        JSType::String => b"string\0",
-        JSType::Symbol => b"symbol\0",
-        JSType::BigInt => b"bigint\0",
-        JSType::Object => unsafe {
+        kJSTypeUndefined => b"undefined\0",
+        kJSTypeNull => b"object\0",
+        kJSTypeBoolean => b"boolean\0",
+        kJSTypeNumber => b"number\0",
+        kJSTypeString => b"string\0",
+        kJSTypeSymbol => b"symbol\0",
+        kJSTypeBigInt => b"bigint\0",
+        kJSTypeObject => unsafe {
             let o = jsval(this) as JSObjectRef;
             if JSObjectIsFunction(c, o) {
                 b"function\0"
@@ -310,12 +257,12 @@ pub extern "C" fn v8__Value__TypeOf(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsString(this: *const Value) -> bool {
-    jsty(this) == JSType::String
+    jsty(this) == kJSTypeString
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsSymbol(this: *const Value) -> bool {
-    jsty(this) == JSType::Symbol
+    jsty(this) == kJSTypeSymbol
 }
 
 #[unsafe(no_mangle)]
@@ -325,17 +272,17 @@ pub extern "C" fn v8__Value__IsObject(this: *const Value) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsBigInt(this: *const Value) -> bool {
-    jsty(this) == JSType::BigInt
+    jsty(this) == kJSTypeBigInt
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsBoolean(this: *const Value) -> bool {
-    jsty(this) == JSType::Boolean
+    jsty(this) == kJSTypeBoolean
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsNumber(this: *const Value) -> bool {
-    jsty(this) == JSType::Number
+    jsty(this) == kJSTypeNumber
 }
 
 #[unsafe(no_mangle)]
@@ -399,7 +346,7 @@ pub extern "C" fn v8__Value__IsArgumentsObject(this: *const Value) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsBigIntObject(this: *const Value) -> bool {
-    class_tag_is(this, "BigInt") && is_obj(this) && jsty(this) != JSType::BigInt
+    class_tag_is(this, "BigInt") && is_obj(this) && jsty(this) != kJSTypeBigInt
 }
 
 #[unsafe(no_mangle)]
@@ -523,7 +470,7 @@ pub extern "C" fn v8__Value__IsWasmModuleObject(this: *const Value) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsArrayBuffer(this: *const Value) -> bool {
-    typed_array_type(this) == JSTypedArrayType::ArrayBuffer
+    typed_array_type(this) == kJSTypedArrayTypeArrayBuffer
 }
 
 #[unsafe(no_mangle)]
@@ -535,62 +482,62 @@ pub extern "C" fn v8__Value__IsArrayBufferView(this: *const Value) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsTypedArray(this: *const Value) -> bool {
     let t = typed_array_type(this);
-    t != JSTypedArrayType::None && t != JSTypedArrayType::ArrayBuffer
+    t != kJSTypedArrayTypeNone && t != kJSTypedArrayTypeArrayBuffer
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsUint8Array(this: *const Value) -> bool {
-    typed_array_type(this) == JSTypedArrayType::Uint8Array
+    typed_array_type(this) == kJSTypedArrayTypeUint8Array
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsUint8ClampedArray(this: *const Value) -> bool {
-    typed_array_type(this) == JSTypedArrayType::Uint8ClampedArray
+    typed_array_type(this) == kJSTypedArrayTypeUint8ClampedArray
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsInt8Array(this: *const Value) -> bool {
-    typed_array_type(this) == JSTypedArrayType::Int8Array
+    typed_array_type(this) == kJSTypedArrayTypeInt8Array
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsUint16Array(this: *const Value) -> bool {
-    typed_array_type(this) == JSTypedArrayType::Uint16Array
+    typed_array_type(this) == kJSTypedArrayTypeUint16Array
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsInt16Array(this: *const Value) -> bool {
-    typed_array_type(this) == JSTypedArrayType::Int16Array
+    typed_array_type(this) == kJSTypedArrayTypeInt16Array
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsUint32Array(this: *const Value) -> bool {
-    typed_array_type(this) == JSTypedArrayType::Uint32Array
+    typed_array_type(this) == kJSTypedArrayTypeUint32Array
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsInt32Array(this: *const Value) -> bool {
-    typed_array_type(this) == JSTypedArrayType::Int32Array
+    typed_array_type(this) == kJSTypedArrayTypeInt32Array
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsFloat32Array(this: *const Value) -> bool {
-    typed_array_type(this) == JSTypedArrayType::Float32Array
+    typed_array_type(this) == kJSTypedArrayTypeFloat32Array
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsFloat64Array(this: *const Value) -> bool {
-    typed_array_type(this) == JSTypedArrayType::Float64Array
+    typed_array_type(this) == kJSTypedArrayTypeFloat64Array
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsBigInt64Array(this: *const Value) -> bool {
-    typed_array_type(this) == JSTypedArrayType::BigInt64Array
+    typed_array_type(this) == kJSTypedArrayTypeBigInt64Array
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsBigUint64Array(this: *const Value) -> bool {
-    typed_array_type(this) == JSTypedArrayType::BigUint64Array
+    typed_array_type(this) == kJSTypedArrayTypeBigUint64Array
 }
 
 #[unsafe(no_mangle)]
@@ -628,7 +575,7 @@ pub extern "C" fn v8__Value__ToBigInt(
     if c.is_null() {
         return ptr::null();
     }
-    if unsafe { JSValueGetType(c, jsval(this)) } == JSType::BigInt {
+    if unsafe { JSValueGetType(c, jsval(this)) } == kJSTypeBigInt {
         return intern_ctx::<BigInt>(c, jsval(this));
     }
     ptr::null()
@@ -747,7 +694,7 @@ pub extern "C" fn v8__Value__IsFalse(this: *const Value) -> bool {
 pub extern "C" fn v8__Value__IsName(this: *const Value) -> bool {
     // A Name is a String or a Symbol.
     let t = jsty(this);
-    t == JSType::String || t == JSType::Symbol
+    t == kJSTypeString || t == kJSTypeSymbol
 }
 
 #[unsafe(no_mangle)]

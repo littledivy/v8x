@@ -16,16 +16,7 @@ use crate::{Context, Data, Object, String as V8String, Value};
 use std::os::raw::{c_char, c_void};
 use std::ptr;
 
-// ---- Extra JSC C API functions we need (not declared in jsc_sys.rs) ----
-unsafe extern "C" {
-    fn JSValueMakeFromJSONString(ctx: JSContextRef, string: JSStringRef) -> JSValueRef;
-    fn JSValueCreateJSONString(
-        ctx: JSContextRef,
-        value: JSValueRef,
-        indent: u32,
-        exception: *mut JSValueRef,
-    ) -> JSStringRef;
-}
+// JSC C API functions come from `crate::jsc_sys` (bindgen) via the glob import.
 
 // `crate::Platform` is module-private to us; for these C-ABI symbols
 // we only need pointer/layout compatibility, so use an opaque marker. The

@@ -14,89 +14,9 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-// ===================================================================
-// Extra JSC C API not present in jsc_sys.rs
-// ===================================================================
-
-// `JSTypedArrayType` from JSValueRef.h (C enum, i32-sized).
-#[allow(non_camel_case_types)]
-type JSTypedArrayType = u32;
-const kJSTypedArrayTypeInt8Array: JSTypedArrayType = 0;
-const kJSTypedArrayTypeInt16Array: JSTypedArrayType = 1;
-const kJSTypedArrayTypeInt32Array: JSTypedArrayType = 2;
-const kJSTypedArrayTypeUint8Array: JSTypedArrayType = 3;
-const kJSTypedArrayTypeUint8ClampedArray: JSTypedArrayType = 4;
-const kJSTypedArrayTypeUint16Array: JSTypedArrayType = 5;
-const kJSTypedArrayTypeUint32Array: JSTypedArrayType = 6;
-const kJSTypedArrayTypeFloat32Array: JSTypedArrayType = 7;
-const kJSTypedArrayTypeFloat64Array: JSTypedArrayType = 8;
-const kJSTypedArrayTypeArrayBuffer: JSTypedArrayType = 9;
-const kJSTypedArrayTypeNone: JSTypedArrayType = 10;
-const kJSTypedArrayTypeBigInt64Array: JSTypedArrayType = 11;
-const kJSTypedArrayTypeBigUint64Array: JSTypedArrayType = 12;
-
-#[allow(non_camel_case_types)]
-type JSTypedArrayBytesDeallocator =
-    Option<unsafe extern "C" fn(bytes: *mut c_void, deallocator_context: *mut c_void)>;
-
-unsafe extern "C" {
-    fn JSObjectMakeTypedArrayWithArrayBufferAndOffset(
-        ctx: JSContextRef,
-        arrayType: JSTypedArrayType,
-        buffer: JSObjectRef,
-        byteOffset: usize,
-        length: usize,
-        exception: *mut JSValueRef,
-    ) -> JSObjectRef;
-    fn JSObjectMakeArrayBufferWithBytesNoCopy(
-        ctx: JSContextRef,
-        bytes: *mut c_void,
-        byteLength: usize,
-        bytesDeallocator: JSTypedArrayBytesDeallocator,
-        deallocatorContext: *mut c_void,
-        exception: *mut JSValueRef,
-    ) -> JSObjectRef;
-    fn JSObjectGetArrayBufferBytesPtr(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        exception: *mut JSValueRef,
-    ) -> *mut c_void;
-    fn JSObjectGetArrayBufferByteLength(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        exception: *mut JSValueRef,
-    ) -> usize;
-    fn JSObjectGetTypedArrayBytesPtr(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        exception: *mut JSValueRef,
-    ) -> *mut c_void;
-    fn JSObjectGetTypedArrayByteLength(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        exception: *mut JSValueRef,
-    ) -> usize;
-    fn JSObjectGetTypedArrayLength(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        exception: *mut JSValueRef,
-    ) -> usize;
-    fn JSObjectGetTypedArrayByteOffset(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        exception: *mut JSValueRef,
-    ) -> usize;
-    fn JSObjectGetTypedArrayBuffer(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        exception: *mut JSValueRef,
-    ) -> JSObjectRef;
-    fn JSValueGetTypedArrayType(
-        ctx: JSContextRef,
-        value: JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSTypedArrayType;
-}
+// JSC C API (JSTypedArrayType, kJSTypedArrayType* consts, the typed-array `JS*`
+// fns, JSTypedArrayBytesDeallocator) come from `crate::jsc_sys` (bindgen) via
+// the glob import above.
 
 // memory_span_t mirror (matches `crate::binding::memory_span_t`: { data: *mut u8, size: usize }).
 #[repr(C)]

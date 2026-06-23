@@ -10,38 +10,7 @@ use crate::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso
 use std::os::raw::c_void;
 use std::ptr;
 
-// Extra JSC C API functions not declared in jsc_sys.rs.
-unsafe extern "C" {
-    // UTF-16 string creation / access (JSStringRef.h)
-    fn JSStringCreateWithCharacters(chars: *const u16, num_chars: usize) -> JSStringRef;
-    fn JSStringGetCharactersPtr(string: JSStringRef) -> *const u16;
-    // Array helpers (JSObjectRef.h)
-    fn JSObjectMakeArray(
-        ctx: JSContextRef,
-        argument_count: usize,
-        arguments: *const JSValueRef,
-        exception: *mut JSValueRef,
-    ) -> JSObjectRef;
-    fn JSObjectSetPropertyAtIndex(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        property_index: u32,
-        value: JSValueRef,
-        exception: *mut JSValueRef,
-    );
-    fn JSObjectGetPropertyAtIndex(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        property_index: u32,
-        exception: *mut JSValueRef,
-    ) -> JSValueRef;
-    fn JSObjectGetProperty(
-        ctx: JSContextRef,
-        object: JSObjectRef,
-        property_name: JSStringRef,
-        exception: *mut JSValueRef,
-    ) -> JSValueRef;
-}
+// JSC C API functions come from `crate::jsc_sys` (bindgen) via the glob import.
 
 // ===================================================================
 // String creation

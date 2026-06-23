@@ -24,15 +24,7 @@ use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::os::raw::c_char;
 
-unsafe extern "C" {
-    fn JSValueCreateJSONString(
-        ctx: JSContextRef,
-        value: JSValueRef,
-        indent: u32,
-        exception: *mut JSValueRef,
-    ) -> JSStringRef;
-    fn JSValueMakeFromJSONString(ctx: JSContextRef, string: JSStringRef) -> JSValueRef;
-}
+// JSC C API functions come from `crate::jsc_sys` (bindgen) via the glob import.
 
 const MAGIC: &[u8; 4] = b"JSCS";
 
