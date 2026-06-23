@@ -808,16 +808,37 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
 pub extern "C" fn v8__UnboundScript__CreateCodeCache(
     _script: *const UnboundScript,
 ) -> *mut CachedData<'static> {
-    // TODO(qjs): no serializable bytecode cache surfaced via this path.
-    ptr::null_mut()
+    make_placeholder_code_cache()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__UnboundModuleScript__CreateCodeCache(
     _script: *const UnboundModuleScript,
 ) -> *mut CachedData<'static> {
-    // TODO(qjs): no serializable bytecode cache surfaced via this path.
-    ptr::null_mut()
+    make_placeholder_code_cache()
+}
+
+/// deno's `deno run` requires `create_code_cache()` to return Some; QuickJS has
+/// no serializable bytecode here, so return a 1-byte owned placeholder (never
+/// consumed — recompiles from source). BufferOwned so deno frees it.
+fn make_placeholder_code_cache() -> *mut CachedData<'static> {
+    #[repr(C)]
+    struct RawCachedData {
+        data: *const u8,
+        length: i32,
+        rejected: bool,
+        buffer_policy: i32,
+    }
+    let v = vec![0u8; 1].into_boxed_slice();
+    let len = v.len() as i32;
+    let data = Box::into_raw(v) as *const u8;
+    let boxed = Box::new(RawCachedData {
+        data,
+        length: len,
+        rejected: false,
+        buffer_policy: 1, // BufferOwned
+    });
+    Box::into_raw(boxed) as *mut CachedData<'static>
 }
 
 #[unsafe(no_mangle)]
