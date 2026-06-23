@@ -27,3 +27,10 @@ v8 = { package = "v8x", features = ["jsc"] }
 
 `v8x` vendors the real `v8` crate's Rust source and implements the `v8__*` C ABI
 on the chosen engine, so the swap is a drop-in — `deno_core` compiles unchanged.
+
+| engine | deno size | engine size |
+| --- | --- | --- |
+| Deno V8 14.9 | 78.7 MB | ~40 MB static |
+| Deno JSC | 80.7 MB | ~48 MB static |
+| Deno system JSC | 54.2 MB | 0 |
+| Deno quickjs-ng | 56.1 MB | ~1 MB static |
