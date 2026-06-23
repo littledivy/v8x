@@ -1,0 +1,17 @@
+diff --git a/Source/cmake/clang-wrapper b/Source/cmake/clang-wrapper
+index 7e6e5c6e13..c3ff4d9faa 100755
+--- a/Source/cmake/clang-wrapper
++++ b/Source/cmake/clang-wrapper
+@@ -23,7 +23,11 @@
+ # shebang below.
+ 
+ if [[ "$WK_UNIFIED_SOURCES_BUNDLE_POLICY" != NoBundle ]]; then
+-    exec "$@"
++    # v82jsc: Apple clang rejects WebKit-main's newer -Wno-character-conversion;
++    # inject -Wno-unknown-warning-option so unknown warning flags are silently
++    # ignored instead of being fatal under -Werror.
++    __cc="$1"; shift
++    exec "$__cc" -Wno-unknown-warning-option "$@"
+ fi
+ 
+ exec /usr/bin/perl -x "$0" "$@"
