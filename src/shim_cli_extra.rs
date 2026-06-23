@@ -62,3 +62,16 @@ pub extern "C" fn v8__Name__GetIdentityHash(this: *const Name) -> c_int {
 /// Fatal-error handler registration: JSC has no global fatal hook. Inert.
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__SetFatalErrorHandler(_that: *const c_void) {}
+
+// Static-JSC (vendor_jsc) is built for a newer macOS than the deno link target,
+// so it references a few newer libSystem symbols the versioned stub omits.
+// Provide thin shims over the older equivalents. Only for vendor_jsc — on the
+// system framework libSystem supplies the real symbol.
+#[cfg(feature = "vendor_jsc")]
+#[unsafe(no_mangle)]
+pub extern "C" fn os_unfair_lock_lock_with_flags(lock: *mut std::ffi::c_void, _flags: u32) {
+    unsafe extern "C" {
+        fn os_unfair_lock_lock(lock: *mut std::ffi::c_void);
+    }
+    unsafe { os_unfair_lock_lock(lock) }
+}

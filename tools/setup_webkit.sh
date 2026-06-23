@@ -21,5 +21,15 @@ fi
 FLAGS="$WK/Source/cmake/WebKitCompilerFlags.cmake"
 sed -i '' 's/^    WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS(-Wno-character-conversion)/    # v82jsc: removed (Apple clang lacks this flag)\n    # WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS(-Wno-character-conversion)/' "$FLAGS"
 
-"$WK/Tools/Scripts/build-jsc" --jsc-only --release
-echo "JSC built: $WK/WebKitBuild/JSCOnly/Release/lib/JavaScriptCore.framework"
+# Static build: emits libJavaScriptCore.a / libWTF.a / libbmalloc.a so the
+# `vendor_jsc` feature links JSC INTO the binary (self-contained, no dylib).
+"$WK/Tools/Scripts/build-jsc" --jsc-only --release --cmakeargs="-DENABLE_STATIC_JSC=ON"
+
+# WebKit splits JSC into JavaScriptCore + JavaScriptCoreJIT targets; the JIT
+# objects are linked directly into bin/jsc, never archived. Bundle them into
+# libJavaScriptCoreJIT.a so the Rust build can force_load them.
+REL="$WK/WebKitBuild/JSCOnly/Release"
+find "$REL/Source/JavaScriptCore/CMakeFiles/JavaScriptCoreJIT.dir" -name '*.o' \
+  ! -name '*pch_obj*' > /tmp/v8x_jitobjs.txt
+libtool -static -o "$REL/lib/libJavaScriptCoreJIT.a" -filelist /tmp/v8x_jitobjs.txt
+echo "Static JSC built: $REL/lib/{libJavaScriptCore,libJavaScriptCoreJIT,libWTF,libbmalloc}.a"
