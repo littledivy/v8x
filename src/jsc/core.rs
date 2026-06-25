@@ -430,9 +430,93 @@ pub extern "C" fn v8__Context__New(
   let ctx = unsafe { JSGlobalContextCreateInGroup(st.group, ptr::null_mut()) };
   st.owned_contexts.push(ctx);
   unsafe { install_context_compat_shims(ctx) };
+  unsafe { install_stacktrace_shim(ctx) };
 
   unsafe { crate::jsc::isolate::install_unhandled_rejection_bridge(ctx) };
   ctx as *const Context
+}
+
+/// V8-compatible structured stack traces. JSC's `Error.captureStackTrace` writes
+/// `.stack` as a STRING, ignoring `Error.prepareStackTrace`; many npm packages
+/// (express's `depd`, stack-trace, ...) do `Error.captureStackTrace(obj);
+/// obj.stack` and expect `prepareStackTrace(obj, callSites)` to run, then call
+/// `callSite.getFileName()` etc. Override `captureStackTrace` to install a lazy
+/// `stack` accessor that, when `prepareStackTrace` is set, parses JSC's native
+/// stack string into V8-shaped CallSite objects and passes them through.
+unsafe fn install_stacktrace_shim(ctx: JSGlobalContextRef) {
+  if ctx.is_null() {
+    return;
+  }
+  const SRC: &[u8] = b"(function(){\
+    'use strict';\
+    var E = Error;\
+    var nativeCapture = E.captureStackTrace;\
+    function parseFrames(s){\
+      if (typeof s !== 'string' || !s) return [];\
+      var out = [];\
+      var lines = s.split('\\n');\
+      for (var i=0;i<lines.length;i++){\
+        var ln = lines[i].trim();\
+        if (!ln) continue;\
+        if (ln.slice(0,3) === 'at ') ln = ln.slice(3);\
+        var fn='', loc=ln;\
+        var at = ln.lastIndexOf('@');\
+        if (at >= 0){ fn = ln.slice(0,at); loc = ln.slice(at+1); }\
+        var file=loc, line=0, col=0;\
+        var m = /^(.*):(\\d+):(\\d+)$/.exec(loc);\
+        if (m){ file=m[1]; line=+m[2]; col=+m[3]; }\
+        out.push({fn:fn, file:file, line:line, col:col, raw:lines[i]});\
+      }\
+      return out;\
+    }\
+    function makeCallSite(f){\
+      return {\
+        getFileName:function(){ return f.file || undefined; },\
+        getScriptNameOrSourceURL:function(){ return f.file || undefined; },\
+        getLineNumber:function(){ return f.line || undefined; },\
+        getColumnNumber:function(){ return f.col || undefined; },\
+        getFunctionName:function(){ return f.fn || null; },\
+        getMethodName:function(){ return f.fn || null; },\
+        getTypeName:function(){ return null; },\
+        getThis:function(){ return undefined; },\
+        getFunction:function(){ return undefined; },\
+        getEvalOrigin:function(){ return undefined; },\
+        isToplevel:function(){ return true; },\
+        isEval:function(){ return false; },\
+        isNative:function(){ return f.file === '[native code]'; },\
+        isConstructor:function(){ return false; },\
+        isAsync:function(){ return false; },\
+        isPromiseAll:function(){ return false; },\
+        getPromiseIndex:function(){ return null; },\
+        toString:function(){ return f.raw; }\
+      };\
+    }\
+    E.captureStackTrace = function(target, ctorOpt){\
+      var holder = {};\
+      try { if (nativeCapture) nativeCapture.call(E, holder, ctorOpt); } catch(e){}\
+      var raw = holder.stack;\
+      if (typeof raw !== 'string') raw = '';\
+      Object.defineProperty(target, 'stack', {\
+        configurable: true,\
+        get: function(){\
+          var prep = E.prepareStackTrace;\
+          if (typeof prep === 'function'){\
+            try { return prep(target, parseFrames(raw).map(makeCallSite)); } catch(e){ return raw; }\
+          }\
+          return raw;\
+        },\
+        set: function(v){ Object.defineProperty(target, 'stack', {value:v, writable:true, configurable:true}); }\
+      });\
+    };\
+  })()\0";
+  unsafe {
+    let js = JSStringCreateWithUTF8CString(
+      SRC.as_ptr() as *const std::os::raw::c_char
+    );
+    let mut exc: JSValueRef = ptr::null();
+    JSEvaluateScript(ctx, js, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+    JSStringRelease(js);
+  }
 }
 
 unsafe fn install_context_compat_shims(ctx: JSGlobalContextRef) {
