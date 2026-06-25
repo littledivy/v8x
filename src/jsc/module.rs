@@ -515,14 +515,156 @@ struct RewrittenModule {
   is_async: bool,
 }
 
+fn strip_js_comments(src: &str) -> std::string::String {
+  let b = src.as_bytes();
+  let n = b.len();
+  let mut out: Vec<u8> = Vec::with_capacity(n);
+  let mut i = 0usize;
+  let mut prev_sig = 0u8;
+  let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+  while i < n {
+    let c = b[i];
+    match c {
+      b'/' if i + 1 < n && b[i + 1] == b'/' => {
+        i += 2;
+        while i < n && b[i] != b'\n' {
+          i += 1;
+        }
+      }
+      b'/' if i + 1 < n && b[i + 1] == b'*' => {
+        i += 2;
+        while i + 1 < n && !(b[i] == b'*' && b[i + 1] == b'/') {
+          i += 1;
+        }
+        i += 2;
+      }
+      b'"' | b'\'' => {
+        let q = c;
+        out.push(c);
+        i += 1;
+        while i < n {
+          out.push(b[i]);
+          if b[i] == b'\\' && i + 1 < n {
+            out.push(b[i + 1]);
+            i += 2;
+            continue;
+          }
+          if b[i] == q {
+            i += 1;
+            break;
+          }
+          i += 1;
+        }
+        prev_sig = q;
+      }
+      b'`' => {
+        out.push(b'`');
+        i += 1;
+        while i < n {
+          out.push(b[i]);
+          if b[i] == b'\\' && i + 1 < n {
+            out.push(b[i + 1]);
+            i += 2;
+            continue;
+          }
+          if b[i] == b'`' {
+            i += 1;
+            break;
+          }
+          i += 1;
+        }
+        prev_sig = b'`';
+      }
+      b'/' => {
+        let regex_ok = matches!(
+          prev_sig,
+          0 | b'('
+            | b','
+            | b'='
+            | b':'
+            | b'['
+            | b'!'
+            | b'&'
+            | b'|'
+            | b'?'
+            | b'{'
+            | b'}'
+            | b';'
+            | b'+'
+            | b'-'
+            | b'*'
+            | b'%'
+            | b'<'
+            | b'>'
+            | b'^'
+            | b'~'
+        );
+        if regex_ok {
+          out.push(b'/');
+          i += 1;
+          let mut in_class = false;
+          while i < n {
+            out.push(b[i]);
+            if b[i] == b'\\' && i + 1 < n {
+              out.push(b[i + 1]);
+              i += 2;
+              continue;
+            }
+            match b[i] {
+              b'[' => in_class = true,
+              b']' => in_class = false,
+              b'/' if !in_class => {
+                i += 1;
+                break;
+              }
+              _ => {}
+            }
+            i += 1;
+          }
+          prev_sig = b'/';
+        } else {
+          out.push(b'/');
+          prev_sig = b'/';
+          i += 1;
+        }
+      }
+      _ => {
+        if !c.is_ascii_whitespace() {
+          prev_sig = if is_ident(c) { b'a' } else { c };
+        }
+        out.push(c);
+        i += 1;
+      }
+    }
+  }
+  std::string::String::from_utf8_lossy(&out).into_owned()
+}
+
 fn join_module_statements(src: &str) -> Vec<std::string::String> {
   let lines: Vec<&str> = src.lines().collect();
   let mut result: Vec<std::string::String> = Vec::new();
   let mut i = 0;
   while i < lines.len() {
     let trimmed = lines[i].trim();
-    let starts_brace_stmt = (trimmed.starts_with("import")
-      || trimmed.starts_with("export"))
+    // Only JOIN true named-binding lists (`import {`, `export {`, `import a,
+    // {`). A declaration like `export class X {` / `export function f() {` also
+    // "starts with export and has an unclosed {", but its `{` opens a body —
+    // joining to the next `}` would swallow the declaration into the `export {}`
+    // handler and drop the class/function header.
+    let after_kw = trimmed
+      .strip_prefix("import")
+      .or_else(|| trimmed.strip_prefix("export"))
+      .map(str::trim_start)
+      .unwrap_or("");
+    let import_binding = trimmed.starts_with("import")
+      && (after_kw.starts_with('{')
+        || after_kw
+          .split_once(',')
+          .map(|(_, r)| r.trim_start().starts_with('{'))
+          .unwrap_or(false));
+    let export_binding =
+      trimmed.starts_with("export") && after_kw.starts_with('{');
+    let starts_brace_stmt = (import_binding || export_binding)
       && trimmed.contains('{')
       && !trimmed.contains('}');
     if starts_brace_stmt {
@@ -563,6 +705,19 @@ fn join_module_statements(src: &str) -> Vec<std::string::String> {
   result
 }
 
+fn strip_leading_block_comments(mut s: &str) -> &str {
+  loop {
+    s = s.trim_start();
+    if let Some(rest) = s.strip_prefix("/*") {
+      if let Some(end) = rest.find("*/") {
+        s = &rest[end + 2..];
+        continue;
+      }
+    }
+    return s;
+  }
+}
+
 fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
   let mut out = std::string::String::new();
 
@@ -572,12 +727,13 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
   let mut export_names: Vec<std::string::String> = Vec::new();
   let mut imports: Vec<std::string::String> = Vec::new();
 
-  let logical = join_module_statements(src);
+  let cleaned = strip_js_comments(src);
+  let logical = join_module_statements(&cleaned);
 
   for raw_line in logical.iter() {
     let raw_line: &str = raw_line.as_str();
     let line = raw_line.trim_start();
-    let trimmed = line.trim();
+    let trimmed = strip_leading_block_comments(line.trim());
 
     if trimmed.starts_with("export *") {
       return None;
