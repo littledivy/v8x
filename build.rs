@@ -84,8 +84,7 @@ fn setup_vendor(manifest_dir: &std::path::Path) {
         other => panic!("tools/setup_vendor.sh (submodule init + patches) failed: {other:?}"),
     }
     println!("cargo:rerun-if-changed=tools/setup_vendor.sh");
-    println!("cargo:rerun-if-changed=quickjs-patches");
-    println!("cargo:rerun-if-changed=wamr-patches");
+    println!("cargo:rerun-if-changed=patches");
 }
 
 /// Build the vendored wasm-micro-runtime (WAMR) as an interpreter-only static
