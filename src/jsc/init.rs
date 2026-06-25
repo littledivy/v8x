@@ -14,7 +14,8 @@ use std::os::raw::{c_char, c_int};
 pub extern "C" fn v8__V8__InitializePlatform(_platform: *mut Platform) {}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__V8__Initialize() {}
+pub extern "C" fn v8__V8__Initialize() {
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__Dispose() -> bool {

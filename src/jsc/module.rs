@@ -135,9 +135,15 @@ pub unsafe extern "C" fn v82jsc_dynamic_import(
     };
     let empty_attrs =
       JSObjectMakeArray(ctx, 0, ptr::null(), ptr::null_mut()) as JSValueRef;
+    // deno reads host_defined_options as a PrimitiveArray and calls .length()
+    // (read_host_defined_options_kind); passing undefined makes it transmute a
+    // non-array and crash. V8 supplies an EMPTY PrimitiveArray when the host set
+    // none — mirror that with an empty JS array.
+    let empty_opts =
+      JSObjectMakeArray(ctx, 0, ptr::null(), ptr::null_mut()) as JSValueRef;
 
     let context = ctx as *const Context;
-    let host_opts = intern_ctx::<Data>(ctx, JSValueMakeUndefined(ctx));
+    let host_opts = intern_ctx::<Data>(ctx, empty_opts);
     let ref_h = intern_ctx::<crate::Value>(ctx, ref_val);
     let spec_h = intern_ctx::<V8String>(ctx, spec_val);
     let attr_h = intern_ctx::<FixedArray>(ctx, empty_attrs);

@@ -22,11 +22,22 @@ for p in patches/webkit-[0-9]*.patch; do
   fi
 done
 
-# Static build. USE_THIN_ARCHIVES=OFF makes the build emit real, self-contained
-# archives — including a proper libJavaScriptCoreJIT.a for the split-out JIT
-# target (with thin archives the JIT objects are never archived). The Rust build
-# (vendor_jsc) force_loads all four .a into the binary; no dylib, no rpath.
+# Static build. USE_THIN_ARCHIVES=OFF emits real self-contained archives.
 "$WK/Tools/Scripts/build-jsc" --jsc-only --release \
   --cmakeargs="-DENABLE_STATIC_JSC=ON -DUSE_THIN_ARCHIVES=OFF"
 REL="$WK/WebKitBuild/JSCOnly/Release"
+
+# The build emits libJavaScriptCore.a but NOT the split-out JavaScriptCoreJIT
+# target's archive (its objects — which include the LLInt/IPInt assembly deno
+# needs — are left loose). Bundle them into libJavaScriptCoreJIT.a ourselves.
+# IMPORTANT: link the final binary with Apple's ld (-fuse-ld=/usr/bin/ld), NOT
+# ld64.lld — lld reorders/strips the LLInt opcode assembly, breaking the exact-
+# offset RELEASE_ASSERT in IPInt::initialize() (SIGKILL at startup). And the
+# binary must be code-signed with the com.apple.security.cs.allow-jit
+# entitlement (JSC JIT). See the v82jsc README / deno [patch] notes.
+JITDIR="$REL/Source/JavaScriptCore/CMakeFiles/JavaScriptCoreJIT.dir"
+if [ -d "$JITDIR" ] && [ ! -f "$REL/lib/libJavaScriptCoreJIT.a" ]; then
+  find "$JITDIR" -name '*.o' -print0 \
+    | xargs -0 xcrun libtool -static -o "$REL/lib/libJavaScriptCoreJIT.a"
+fi
 echo "Static JSC built: $REL/lib/{libJavaScriptCore,libJavaScriptCoreJIT,libWTF,libbmalloc}.a"
