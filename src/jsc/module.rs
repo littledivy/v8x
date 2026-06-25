@@ -1237,7 +1237,7 @@ pub extern "C" fn v8__UnboundModuleScript__CreateCodeCache(
   make_placeholder_code_cache()
 }
 
-fn make_placeholder_code_cache() -> *mut CachedData<'static> {
+pub(crate) fn make_placeholder_code_cache() -> *mut CachedData<'static> {
   #[repr(C)]
   struct RawCachedData {
     data: *const u8,
