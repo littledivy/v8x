@@ -387,18 +387,13 @@ pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(
   let ctx = current_ctx();
   if !ctx.is_null() {
     unsafe {
-      let f = checkpoint_noop_fn(ctx);
-      if !f.is_null() {
-        let mut exc: JSValueRef = ptr::null();
-        JSObjectCallAsFunction(
-          ctx,
-          f,
-          ptr::null_mut(),
-          0,
-          ptr::null(),
-          &mut exc,
-        );
-      }
+      // JSC drains its microtask (promise-job) queue when a JS API entry
+      // unwinds back to the embedder, so a trivial JSEvaluateScript forces a
+      // drain — more correct than the previous inert no-op callback.
+      let mut exc: JSValueRef = ptr::null();
+      let s = JSStringCreateWithUTF8CString(c"0".as_ptr());
+      JSEvaluateScript(ctx, s, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+      JSStringRelease(s);
     }
   }
 }
