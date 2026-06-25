@@ -1002,27 +1002,62 @@ fn has_top_level_await(src: &str) -> bool {
     false
 }
 
-/// Extract the string literal in `from "..."` or `import "..."`.
+/// Extract the module specifier: the string literal following `from` (or the
+/// first string for a bare `import "x"`). NOT the last string on the line —
+/// import attributes (`import x from "./d.json" with { type: "json" }`) add a
+/// trailing string (`"json"`) that must not be taken as the specifier.
 fn extract_specifier(line: &str) -> Option<std::string::String> {
-    let bytes = line.as_bytes();
-    // Find the last quoted string on the line.
-    let mut quote = None;
+    let scan = match line.rfind(" from ") {
+        Some(p) => &line[p + 6..],
+        None => line,
+    };
+    let bytes = scan.as_bytes();
+    let mut open = None;
+    let mut q = b'"';
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'"' || b == b'\'' {
-            quote = Some((i, b));
-        }
-    }
-    let (start, q) = quote?;
-    // Find matching opening quote before `start`.
-    let mut open = None;
-    for i in (0..start).rev() {
-        if bytes[i] == q {
             open = Some(i);
+            q = b;
             break;
         }
     }
     let open = open?;
-    Some(line[open + 1..start].to_string())
+    for i in (open + 1)..bytes.len() {
+        if bytes[i] == q {
+            return Some(scan[open + 1..i].to_string());
+        }
+    }
+    None
+}
+
+/// Extract the `type` import attribute from `with { type: "json" }` / legacy
+/// `assert { type: "json" }`. Returns None when absent.
+fn extract_attr_type(stmt: &str) -> Option<std::string::String> {
+    let kw = stmt
+        .find(" with ")
+        .or_else(|| stmt.find(" with{"))
+        .or_else(|| stmt.find(" assert "))
+        .or_else(|| stmt.find(" assert{"))?;
+    let clause = &stmt[kw..];
+    let tpos = clause.find("type")?;
+    let after = &clause[tpos + 4..];
+    let bytes = after.as_bytes();
+    let mut open = None;
+    let mut q = b'"';
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'"' || b == b'\'' {
+            open = Some(i);
+            q = b;
+            break;
+        }
+    }
+    let open = open?;
+    for i in (open + 1)..bytes.len() {
+        if bytes[i] == q {
+            return Some(after[open + 1..i].to_string());
+        }
+    }
+    None
 }
 
 /// Return the substring between the first `open` and the matching `close`.
@@ -1992,4 +2027,71 @@ pub extern "C" fn v8__ModuleRequest__GetImportAttributes(
         return ptr::null();
     }
     intern_ctx::<FixedArray>(ctx, arr as JSValueRef)
+}
+
+// ===================================================================
+// ScriptCompiler::CompileUnboundScript / CachedDataVersionTag and
+// UnboundScript::BindToCurrentContext / GetSourceMappingURL.
+//
+// In this backend a Script/UnboundScript handle simply carries the
+// source-text JSValueRef (see v8__Script__Compile). So CompileUnboundScript
+// syntax-checks and returns the source value as an UnboundScript, and
+// BindToCurrentContext hands the same value back as a Script.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ScriptCompiler__CompileUnboundScript(
+    isolate: *mut RealIsolate,
+    source: *mut Source,
+    _options: CompileOptions,
+    _no_cache_reason: NoCacheReason,
+) -> *const UnboundScript {
+    let st = iso_state(isolate);
+    let ctx = st.contexts.last().copied().unwrap_or(ptr::null_mut()) as JSContextRef;
+    let src_val = unsafe { source_string_of(source) };
+    if ctx.is_null() || src_val.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let mut exc: JSValueRef = ptr::null();
+        let src_str = JSValueToStringCopy(ctx, src_val, &mut exc);
+        if src_str.is_null() {
+            return ptr::null();
+        }
+        let ok = JSCheckScriptSyntax(ctx, src_str, ptr::null_mut(), 1, &mut exc);
+        JSStringRelease(src_str);
+        if !ok {
+            return ptr::null();
+        }
+    }
+    intern_ctx::<UnboundScript>(ctx, src_val)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ScriptCompiler__CachedDataVersionTag() -> u32 {
+    // Any stable nonzero tag; our placeholder caches are always rejected, so the
+    // exact value only needs to be consistent within a run.
+    0x5643_4a53 // "JSCV"
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__UnboundScript__BindToCurrentContext(
+    script: *const UnboundScript,
+) -> *const Script {
+    if script.is_null() {
+        return ptr::null();
+    }
+    intern::<Script>(jsval(script))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__UnboundScript__GetSourceMappingURL(
+    _script: *const UnboundScript,
+) -> *const Value {
+    let ctx = current_ctx();
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let v = unsafe { JSValueMakeUndefined(ctx) };
+    intern_ctx::<Value>(ctx, v)
 }

@@ -178,6 +178,42 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+// --- Startup timing instrumentation (V82JSC_TIMING) ----------------------
+pub(crate) mod timing {
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+    thread_local! {
+        pub static ON: Cell<bool> = Cell::new(std::env::var_os("V82JSC_TIMING").is_some());
+        pub static GETFN_N: Cell<u64> = const { Cell::new(0) };
+        pub static GETFN_T: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        pub static PROTO_N: Cell<u64> = const { Cell::new(0) };
+        pub static PROTO_T: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+        pub static APPLY_N: Cell<u64> = const { Cell::new(0) };
+        pub static NEWINST_N: Cell<u64> = const { Cell::new(0) };
+        pub static NEWINST_T: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    }
+    #[inline]
+    pub fn on() -> bool { ON.with(|c| c.get()) }
+    pub fn now() -> Option<Instant> { if on() { Some(Instant::now()) } else { None } }
+    pub fn add(n: &'static std::thread::LocalKey<Cell<u64>>, t: &'static std::thread::LocalKey<Cell<Duration>>, start: Option<Instant>) {
+        if let Some(s) = start {
+            n.with(|c| c.set(c.get() + 1));
+            t.with(|c| c.set(c.get() + s.elapsed()));
+        }
+    }
+    pub fn dump() {
+        if !on() { return; }
+        let g = (GETFN_N.with(|c| c.get()), GETFN_T.with(|c| c.get()));
+        let p = (PROTO_N.with(|c| c.get()), PROTO_T.with(|c| c.get()));
+        let a = APPLY_N.with(|c| c.get());
+        let ni = (NEWINST_N.with(|c| c.get()), NEWINST_T.with(|c| c.get()));
+        eprintln!("[V82JSC_TIMING] GetFunction: {} calls, {:.2} ms", g.0, g.1.as_secs_f64()*1000.0);
+        eprintln!("[V82JSC_TIMING] build_prototype_object: {} calls, {:.2} ms", p.0, p.1.as_secs_f64()*1000.0);
+        eprintln!("[V82JSC_TIMING] ObjectTemplate::NewInstance: {} calls, {:.2} ms", ni.0, ni.1.as_secs_f64()*1000.0);
+        eprintln!("[V82JSC_TIMING] apply_props: {} calls", a);
+    }
+}
+
 fn register_dispatch(callback: FunctionCallback, data: JSValue) -> c_int {
     DISPATCH.with(|t| {
         let mut t = t.borrow_mut();
@@ -339,22 +375,6 @@ unsafe extern "C" fn fn_construct_trampoline(
         unsafe { JS_FreeValue(ctx, r) };
         this
     };
-    if std::env::var_os("QJS_DEBUG_TMPL").is_some() {
-        unsafe {
-            let l = JS_GetPropertyStr(ctx, result, c"log".as_ptr());
-            let has = !jsv_is_undefined(&l);
-            let proto = JS_GetPrototype(ctx, result);
-            let pl = if jsv_is_object(&proto) {
-                let x = JS_GetPropertyStr(ctx, proto, c"log".as_ptr());
-                let h = !jsv_is_undefined(&x);
-                JS_FreeValue(ctx, x);
-                h
-            } else { false };
-            eprintln!("[QJS construct ret] result_has_log={has} proto_has_log={pl} returned_this={}", jsv_is_object(&r));
-            JS_FreeValue(ctx, l);
-            JS_FreeValue(ctx, proto);
-        }
-    }
     result
 }
 
@@ -633,11 +653,25 @@ pub extern "C" fn v8__Function__SetName(this: *const Function, name: *const Stri
     if ctx.is_null() {
         return;
     }
-    // `JS_SetPropertyStr` consumes the value's refcount; dup so the caller's
-    // arena slot keeps its own.
+    // `function.name` is a non-writable property (ECMAScript: {writable:false,
+    // enumerable:false, configurable:true}), so a plain `[[Set]]` via
+    // JS_SetPropertyStr THROWS (JS_PROP_THROW) and leaves a pending exception —
+    // which a surrounding TryCatch (e.g. napi's per-call tc_scope) then treats
+    // as a real failure, aborting napi module registration. v8's SetName
+    // overwrites the internal name regardless, so DEFINE the property instead
+    // (re-using its `configurable` attribute to replace it).
+    const JS_PROP_CONFIGURABLE: c_int = 1 << 0;
+    // JS_DefinePropertyValueStr consumes the value's refcount; dup so the
+    // caller's arena slot keeps its own.
     let v = unsafe { JS_DupValue(ctx, jsval_of(name)) };
     unsafe {
-        JS_SetPropertyStr(ctx, jsval_of(this), c"name".as_ptr(), v);
+        JS_DefinePropertyValueStr(
+            ctx,
+            jsval_of(this),
+            c"name".as_ptr(),
+            v,
+            JS_PROP_CONFIGURABLE,
+        );
     }
 }
 
@@ -645,9 +679,12 @@ pub extern "C" fn v8__Function__SetName(this: *const Function, name: *const Stri
 pub extern "C" fn v8__Function__CreateCodeCache(
     script: *const Function,
 ) -> *mut crate::CachedData<'static> {
-    // TODO(qjs): QuickJS has no per-function code-cache serialization exposed.
+    // QuickJS has no per-function code-cache serialization, but node's CJS loader
+    // (`wrapSafe`) treats a null cache as a fatal "Unable to create code cache
+    // from function". Return the same 1-byte placeholder the script paths use
+    // (never consumed — recompiles from source).
     let _ = script;
-    ptr::null_mut()
+    super::fam_module::make_placeholder_code_cache()
 }
 
 // ===================================================================
@@ -709,6 +746,23 @@ pub extern "C" fn v8__FunctionCallbackInfo__This(
     }
     let info = cbinfo(this);
     intern_dup::<Object>(info.ctx, info.this)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionCallbackInfo__NewTarget(
+    this: *const FunctionCallbackInfo,
+) -> *const Value {
+    if this.is_null() {
+        return ptr::null();
+    }
+    let info = cbinfo(this);
+    // For a constructor call, new.target is the constructor; otherwise undefined.
+    let nt = if info.is_construct {
+        info.new_target
+    } else {
+        jsv_undefined()
+    };
+    intern_dup::<Value>(info.ctx, nt)
 }
 
 #[unsafe(no_mangle)]
@@ -902,10 +956,26 @@ pub extern "C" fn v8__Template__Set(
         return;
     }
     let raw = this as *const c_void as usize;
+    // A template property *value* is frequently itself a nested
+    // FunctionTemplate / ObjectTemplate (a raw Box pointer smuggled in a
+    // `*const Data`), NOT a real JSValue handle. `jsval_of` would read the
+    // template struct's first 16 bytes as a JSValue and corrupt the pointer, so
+    // `materialize_template_value` could never recover it (the resulting prop is
+    // a bogus object, not a callable). Encode such handles as a non-refcounted
+    // JSValue whose `u.ptr` IS the template pointer so materialization works.
+    let stored = if is_template_ptr(value as *const c_void) {
+        make_value(JS_TAG_TEMPLATE, JSValueUnion { ptr: value as *mut c_void })
+    } else {
+        jsval_of(value)
+    };
     with_template_props(raw, |props| {
-        props.push((jsval_of(key), jsval_of(value), attr.as_u32_lenient()));
+        props.push((jsval_of(key), stored, attr.as_u32_lenient()));
     });
 }
+
+/// Positive (immediate, non-refcounted) JSValue tag marking a slot whose
+/// `u.ptr` is a template Box pointer rather than a real JS value.
+const JS_TAG_TEMPLATE: i64 = 0x7633; // 'v3'
 
 // ===================================================================
 // FunctionTemplate
@@ -985,18 +1055,30 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
     if ctx.is_null() {
         return ptr::null();
     }
+    let _tm = timing::now();
     let t = unsafe { &*(this as *const FnTemplate) };
     // Constructor-capable only when the template allows it; `Throw`-behavior
     // templates (deno ops) must be plain callables.
     let f =
         unsafe { make_function_len(ctx, t.callback, t.data, t.length, t.constructable) };
 
-    // Class name -> function `name`.
+    // Class name -> function `name`. `name` is a non-writable property, so a
+    // plain `[[Set]]` (JS_SetPropertyStr uses JS_PROP_THROW) THROWS "'name' is
+    // read-only" and leaves a pending exception — which poisons a surrounding
+    // TryCatch (e.g. napi_define_class runs inside napi's per-call tc_scope).
+    // DEFINE it instead (re-using its `configurable` attribute), matching v8.
     if let Some(name) = &t.class_name {
         if let Ok(cname) = std::ffi::CString::new(name.as_str()) {
+            const JS_PROP_CONFIGURABLE: c_int = 1 << 0;
             let nameval = unsafe { JS_NewString(ctx, cname.as_ptr()) };
             unsafe {
-                JS_SetPropertyStr(ctx, f, c"name".as_ptr(), nameval);
+                JS_DefinePropertyValueStr(
+                    ctx,
+                    f,
+                    c"name".as_ptr(),
+                    nameval,
+                    JS_PROP_CONFIGURABLE,
+                );
             }
         }
     }
@@ -1011,6 +1093,7 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
         JS_SetPropertyStr(ctx, f, c"prototype".as_ptr(), proto_dup);
     }
 
+    timing::add(&timing::GETFN_N, &timing::GETFN_T, _tm);
     intern::<Function>(f)
 }
 
@@ -1022,6 +1105,7 @@ unsafe fn build_prototype_object(ctx: *mut JSContext, tp: *const FnTemplate) -> 
     if jsv_is_object(&t.cached_proto) {
         return t.cached_proto;
     }
+    let _tm = timing::now();
     let proto_obj = unsafe { JS_NewObject(ctx) };
     let proto = unsafe { &*t.proto };
     if std::env::var_os("QJS_DEBUG_TMPL").is_some() {
@@ -1044,6 +1128,7 @@ unsafe fn build_prototype_object(ctx: *mut JSContext, tp: *const FnTemplate) -> 
     }
     // Cache the owned (+1) object; it lives for the template's lifetime.
     t.cached_proto = proto_obj;
+    timing::add(&timing::PROTO_N, &timing::PROTO_T, _tm);
     proto_obj
 }
 
@@ -1052,6 +1137,7 @@ fn apply_props(
     obj: JSValue,
     props: &[(JSValue, JSValue, u32)],
 ) {
+    timing::APPLY_N.with(|c| c.set(c.get() + 1));
     for &(key, value, attr) in props {
         if jsv_is_undefined(&key) {
             continue;
@@ -1191,6 +1277,7 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
     if ctx.is_null() {
         return ptr::null();
     }
+    let _tm = timing::now();
     let obj = unsafe { JS_NewObject(ctx) };
     if !this.is_null() {
         let t = unsafe { &*(this as *const ObjTemplate) };
@@ -1203,6 +1290,7 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
         apply_props(ctx, obj, &t.props);
         apply_accessors(ctx, obj, &t.accessors);
     }
+    timing::add(&timing::NEWINST_N, &timing::NEWINST_T, _tm);
     intern::<Object>(obj)
 }
 
@@ -1353,4 +1441,52 @@ pub extern "C" fn v8__ObjectTemplate__SetNamedPropertyHandler(
         this, getter, setter, query, deleter, enumerator, definer, descriptor,
         data_or_null, flags,
     );
+}
+
+// ===================================================================
+// PropertyCallbackInfo — interceptors are not wired in this backend (see the
+// SetHandler TODOs above), so these accessors are only reached defensively.
+// `RawPropertyCallbackInfo` is a single opaque pointer; we treat a non-null one
+// as a pointer to a `CbInfo` (the same per-call struct functions use), which is
+// the shape an interceptor bridge would hand us once implemented.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__GetIsolate(
+    _this: *const c_void,
+) -> *mut RealIsolate {
+    current_iso()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__GetReturnValue(this: *const c_void) -> usize {
+    if this.is_null() {
+        // Hand back a stable thread-local scratch slot so the ReturnValue write
+        // has somewhere valid to land.
+        thread_local! {
+            static SCRATCH: std::cell::UnsafeCell<JSValue> =
+                const { std::cell::UnsafeCell::new(JSValue {
+                    u: JSValueUnion { int32: 0 },
+                    tag: JS_TAG_UNDEFINED,
+                }) };
+        }
+        return SCRATCH.with(|s| s.get() as usize);
+    }
+    let info = cbinfo(this as *const FunctionCallbackInfo);
+    (&mut *info.return_slot as *mut JSValue) as usize
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__Holder(this: *const c_void) -> *const Object {
+    if this.is_null() {
+        return ptr::null();
+    }
+    let info = cbinfo(this as *const FunctionCallbackInfo);
+    intern_dup::<Object>(info.ctx, info.this)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__ShouldThrowOnError(_this: *const c_void) -> bool {
+    // Non-strict semantics: failures return false rather than throw.
+    false
 }

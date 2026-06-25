@@ -301,3 +301,79 @@ pub extern "C" fn v8__PropertyDescriptor__set_configurable(
         pd.has_configurable = true;
     }
 }
+
+// ----- Apply a descriptor to an object (for v8__Object__DefineProperty) -----
+
+use std::os::raw::c_int;
+
+unsafe extern "C" {
+    // JSValueConst val/getter/setter: NOT consumed by JS_DefineProperty.
+    fn JS_DefineProperty(
+        ctx: *mut JSContext,
+        this_obj: JSValue,
+        prop: JSAtom,
+        val: JSValue,
+        getter: JSValue,
+        setter: JSValue,
+        flags: c_int,
+    ) -> c_int;
+}
+
+const JS_PROP_CONFIGURABLE: c_int = 1 << 0;
+const JS_PROP_WRITABLE: c_int = 1 << 1;
+const JS_PROP_ENUMERABLE: c_int = 1 << 2;
+const JS_PROP_HAS_CONFIGURABLE: c_int = 1 << 8;
+const JS_PROP_HAS_WRITABLE: c_int = 1 << 9;
+const JS_PROP_HAS_ENUMERABLE: c_int = 1 << 10;
+const JS_PROP_HAS_GET: c_int = 1 << 11;
+const JS_PROP_HAS_SET: c_int = 1 << 12;
+const JS_PROP_HAS_VALUE: c_int = 1 << 13;
+const JS_PROP_THROW: c_int = 1 << 14;
+
+/// Define the property described by `this` onto `obj` under `atom`, translating
+/// our `PdImpl` presence/flags into QuickJS `JS_DefineProperty` flags. Returns
+/// the `JS_DefineProperty` result (<0 = exception, 0 = false, >0 = true).
+pub(crate) fn pd_define(
+    ctx: *mut JSContext,
+    obj: JSValue,
+    atom: JSAtom,
+    this: *const PropertyDescriptor,
+) -> c_int {
+    let pd = unsafe { imp(this) };
+    let mut flags: c_int = JS_PROP_THROW;
+    let mut val = jsv_undefined();
+    let mut getter = jsv_undefined();
+    let mut setter = jsv_undefined();
+
+    if pd.has_value {
+        flags |= JS_PROP_HAS_VALUE;
+        val = pd.value;
+    }
+    if pd.has_get {
+        flags |= JS_PROP_HAS_GET;
+        getter = pd.get;
+    }
+    if pd.has_set {
+        flags |= JS_PROP_HAS_SET;
+        setter = pd.set;
+    }
+    if pd.has_writable {
+        flags |= JS_PROP_HAS_WRITABLE;
+        if pd.writable {
+            flags |= JS_PROP_WRITABLE;
+        }
+    }
+    if pd.has_enumerable {
+        flags |= JS_PROP_HAS_ENUMERABLE;
+        if pd.enumerable {
+            flags |= JS_PROP_ENUMERABLE;
+        }
+    }
+    if pd.has_configurable {
+        flags |= JS_PROP_HAS_CONFIGURABLE;
+        if pd.configurable {
+            flags |= JS_PROP_CONFIGURABLE;
+        }
+    }
+    unsafe { JS_DefineProperty(ctx, obj, atom, val, getter, setter, flags) }
+}

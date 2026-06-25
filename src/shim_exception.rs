@@ -705,3 +705,65 @@ pub extern "C" fn v8__TryCatch__ReThrow(this: *mut TryCatch) -> *const Value {
         v as *const Value
     }
 }
+
+// ===================================================================
+// Message::GetSourceLine — best-effort: read a `sourceLine` property if the
+// error carries one, else return null. (JSC errors rarely carry source text.)
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Message__GetSourceLine(
+    this: *const Message,
+    context: *const Context,
+) -> *const String {
+    let ctx = ctx_of(context) as JSContextRef;
+    if ctx.is_null() || this.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let mut exc: JSValueRef = ptr::null();
+        let obj = JSValueToObject(ctx, jsval(this), &mut exc);
+        if obj.is_null() {
+            return ptr::null();
+        }
+        let key = JSStringCreateWithUTF8CString(b"sourceLine\0".as_ptr() as *const c_char);
+        let v = JSObjectGetProperty(ctx, obj, key, &mut exc);
+        JSStringRelease(key);
+        if v.is_null() || !JSValueIsString(ctx, v) {
+            return ptr::null();
+        }
+        intern_ctx::<String>(ctx, v)
+    }
+}
+
+// ===================================================================
+// StackFrame::GetFunctionName — JSC C API exposes no structured frames, so we
+// have no per-frame function name. Return null (V8 returns an empty handle for
+// anonymous frames, which deno tolerates).
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__StackFrame__GetFunctionName(this: *const StackFrame) -> *const String {
+    let _ = this;
+    ptr::null()
+}
+
+// ===================================================================
+// TryCatch::Message — the pending exception value doubles as the Message
+// (see the Message__* family above, which read off the error value).
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__Message(this: *const TryCatch) -> *const Message {
+    if this.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let isolate = *(this as *const usize).add(0) as *mut RealIsolate;
+        let v = peek_pending_exception(isolate);
+        if v.is_null() {
+            return ptr::null();
+        }
+        intern::<Message>(v)
+    }
+}

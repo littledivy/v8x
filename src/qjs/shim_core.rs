@@ -229,13 +229,22 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     unsafe {
         JS_SetModuleLoaderFunc(
             rt,
-            None,
+            if std::env::var_os("QJS_NO_NORM").is_some() {
+                None
+            } else {
+                Some(super::fam_module::module_normalize_callback)
+            },
             Some(super::fam_module::module_loader_callback),
             ptr::null_mut(),
         )
     };
     let ctx = unsafe { JS_NewContext(rt) };
     assert!(!ctx.is_null(), "JS_NewContext failed");
+    // Install `globalThis.WebAssembly` (WAMR-backed). QuickJS ships no WASM
+    // engine; npm code (undici, etc.) needs it.
+    if std::env::var_os("QJS_NO_WASM").is_none() {
+        super::fam_wasm::install_webassembly(ctx);
+    }
     let state = Box::new(IsoState {
         rt,
         ctx,
@@ -367,6 +376,57 @@ pub extern "C" fn v8__HandleScope__DESTRUCT(this: *mut usize) {
             drop(Box::from_raw(slot));
         }
     }
+}
+
+// ===================================================================
+// EscapableHandleScope support.
+//
+// `v8__EscapeSlot__reserve` runs while the *parent* scope is current (before the
+// inner HandleScope is constructed). We push an `undefined` placeholder slot
+// onto the isolate handle stack at the parent depth and return its index. The
+// inner HandleScope's DESTRUCT only pops slots above its saved depth, so this
+// reserved slot survives. On escape we retarget the reserved slot to hold an
+// owned (+1) copy of the escaped value and hand back the slot pointer as the
+// parent-scoped `Local`.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__EscapeSlot__reserve(isolate: *mut RealIsolate) -> usize {
+    if isolate.is_null() {
+        return usize::MAX;
+    }
+    let st = iso_state(isolate);
+    let slot = Box::into_raw(Box::new(jsv_undefined()));
+    st.handles.push(slot);
+    st.handles.len() - 1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__EscapeSlot__escape(
+    isolate: *mut RealIsolate,
+    index: usize,
+    value: *const Data,
+) -> *const Data {
+    if isolate.is_null() || index == usize::MAX || value.is_null() {
+        return value;
+    }
+    // Non-value handles (template box pointers) carry no refcount; escape them
+    // by identity, exactly like Local::New.
+    if is_non_value_handle(value) {
+        return value;
+    }
+    let st = iso_state(isolate);
+    let ctx = st.contexts.last().copied().unwrap_or(st.ctx);
+    let Some(&slot) = st.handles.get(index) else {
+        return value;
+    };
+    let new_val = unsafe { JS_DupValue(ctx, jsval_of(value)) };
+    unsafe {
+        let old = *slot;
+        *slot = new_val;
+        JS_FreeValue(ctx, old);
+    }
+    slot as *const Data
 }
 
 #[unsafe(no_mangle)]

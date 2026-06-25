@@ -569,6 +569,11 @@ impl ValueSerializer<'_> {
       if ptr.is_null() {
         return Vec::new();
       }
+      // Engines whose serializer shim doesn't route through the V8
+      // ReallocateBufferMemory delegate (JSC / QuickJS) leave `buffer_size` at 0
+      // and instead return a buffer allocated to exactly `size` (align 1) from
+      // `v8__ValueSerializer__Release`. Treat `size` as the capacity then.
+      let capacity = if capacity == 0 { size } else { capacity };
       assert!(size <= capacity);
       // SAFETY: ptr is non-null, was allocated by us in `v8__ValueSerializer__Delegate__ReallocateBufferMemory`, and
       // the capacity is correctly updated during reallocation. Size is asserted to be valid above.

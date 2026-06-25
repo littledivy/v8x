@@ -7,7 +7,7 @@ use crate::jsc_sys::*;
 use crate::support::{Maybe, MaybeBool, SharedPtrBase, SharedRef, UniquePtr, long};
 use crate::{
     Allocator, ArrayBuffer, ArrayBufferView, BackingStore, BackingStoreDeleterCallback, Context,
-    DataView, RealIsolate, SharedArrayBuffer, Value,
+    DataView, RealIsolate, SharedArrayBuffer, Uint8ClampedArray, Value,
 };
 use crate::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
 use std::ffi::c_void;
@@ -700,3 +700,147 @@ typed_array_new!(v8__Float32Array__New, Float32Array, kJSTypedArrayTypeFloat32Ar
 typed_array_new!(v8__Float64Array__New, Float64Array, kJSTypedArrayTypeFloat64Array);
 typed_array_new!(v8__BigInt64Array__New, BigInt64Array, kJSTypedArrayTypeBigInt64Array);
 typed_array_new!(v8__BigUint64Array__New, BigUint64Array, kJSTypedArrayTypeBigUint64Array);
+
+// ===================================================================
+// ArrayBuffer detach key — V8 uses this as a guard token for Detach().
+// JSC has no equivalent; a detach key only gates who may detach, so a no-op
+// is sound (Detach itself is already implemented unconditionally).
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBuffer__SetDetachKey(_this: *const ArrayBuffer, _key: *const Value) {
+    // No-op: see comment above.
+}
+
+// ===================================================================
+// ArrayBufferView::CopyContents — copy min(view_len, byte_length) bytes from
+// the view's data into `dest`, returning the number of bytes copied.
+// Mirrors GetContents.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBufferView__CopyContents(
+    this: *const ArrayBufferView,
+    dest: *mut c_void,
+    byte_length: crate::support::int,
+) -> usize {
+    let ctx = current_ctx();
+    if ctx.is_null() || this.is_null() || dest.is_null() || byte_length <= 0 {
+        return 0;
+    }
+    let obj = jsval(this) as JSObjectRef;
+    let (ptr_bytes, len) = unsafe {
+        (
+            JSObjectGetTypedArrayBytesPtr(ctx, obj, ptr::null_mut()),
+            JSObjectGetTypedArrayByteLength(ctx, obj, ptr::null_mut()),
+        )
+    };
+    if ptr_bytes.is_null() {
+        return 0;
+    }
+    let n = len.min(byte_length as usize);
+    unsafe {
+        ptr::copy_nonoverlapping(ptr_bytes as *const u8, dest as *mut u8, n);
+    }
+    n
+}
+
+// ===================================================================
+// DataView
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__DataView__New(
+    arraybuffer: *const ArrayBuffer,
+    byte_offset: usize,
+    length: usize,
+) -> *const DataView {
+    let ctx = current_ctx();
+    if ctx.is_null() || arraybuffer.is_null() {
+        return ptr::null();
+    }
+    // JSC has no C constructor for DataView; build via JS:
+    //   new DataView(buffer, byteOffset, byteLength)
+    unsafe {
+        let mut exc: JSValueRef = ptr::null();
+        let src = b"(function(buf,off,len){return new DataView(buf,off,len);})\0";
+        let fs = JSStringCreateWithUTF8CString(src.as_ptr() as *const std::os::raw::c_char);
+        let fnv = JSEvaluateScript(ctx, fs, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+        JSStringRelease(fs);
+        if !exc.is_null() {
+            return ptr::null();
+        }
+        let fnobj = JSValueToObject(ctx, fnv, &mut exc);
+        if fnobj.is_null() {
+            return ptr::null();
+        }
+        let args = [
+            jsval(arraybuffer),
+            JSValueMakeNumber(ctx, byte_offset as f64),
+            JSValueMakeNumber(ctx, length as f64),
+        ];
+        let v = JSObjectCallAsFunction(ctx, fnobj, ptr::null_mut(), 3, args.as_ptr(), &mut exc);
+        if !exc.is_null() || v.is_null() {
+            return ptr::null();
+        }
+        intern_ctx::<DataView>(ctx, v)
+    }
+}
+
+// ===================================================================
+// SharedArrayBuffer::ByteLength — we back SABs with plain ArrayBuffers.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__SharedArrayBuffer__ByteLength(this: *const SharedArrayBuffer) -> usize {
+    let ctx = current_ctx();
+    if ctx.is_null() || this.is_null() {
+        return 0;
+    }
+    unsafe {
+        JSObjectGetArrayBufferByteLength(ctx, jsval(this) as JSObjectRef, ptr::null_mut())
+    }
+}
+
+// ===================================================================
+// Typed arrays JSC has no native kJSTypedArrayType for: Uint8ClampedArray has
+// a JSC type; Float16Array does not, so build it via JS.
+// ===================================================================
+
+typed_array_new!(v8__Uint8ClampedArray__New, Uint8ClampedArray, kJSTypedArrayTypeUint8ClampedArray);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Float16Array__New(
+    buf_ptr: *const ArrayBuffer,
+    byte_offset: usize,
+    length: usize,
+) -> *const crate::Float16Array {
+    let ctx = current_ctx();
+    if ctx.is_null() || buf_ptr.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let mut exc: JSValueRef = ptr::null();
+        let src = b"(function(buf,off,len){return new Float16Array(buf,off,len);})\0";
+        let fs = JSStringCreateWithUTF8CString(src.as_ptr() as *const std::os::raw::c_char);
+        let fnv = JSEvaluateScript(ctx, fs, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+        JSStringRelease(fs);
+        if !exc.is_null() {
+            return ptr::null();
+        }
+        let fnobj = JSValueToObject(ctx, fnv, &mut exc);
+        if fnobj.is_null() {
+            return ptr::null();
+        }
+        let args = [
+            jsval(buf_ptr),
+            JSValueMakeNumber(ctx, byte_offset as f64),
+            JSValueMakeNumber(ctx, length as f64),
+        ];
+        let v = JSObjectCallAsFunction(ctx, fnobj, ptr::null_mut(), 3, args.as_ptr(), &mut exc);
+        if !exc.is_null() || v.is_null() {
+            return ptr::null();
+        }
+        intern_ctx::<crate::Float16Array>(ctx, v)
+    }
+}

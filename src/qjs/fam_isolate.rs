@@ -437,27 +437,62 @@ pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(isolate: *mut RealIsol
     drain_jobs(st.rt);
 }
 
+thread_local! {
+    // Cached `(f) => { Promise.resolve().then(f); }` — schedules `f` onto
+    // QuickJS's job queue so it runs at the next microtask drain, NOT inline.
+    static ENQUEUE_HELPER: std::cell::Cell<Option<JSValue>> = const { std::cell::Cell::new(None) };
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__EnqueueMicrotask(
     _isolate: *mut RealIsolate,
     function: *const Function,
 ) {
-    // TODO(qjs): QuickJS has no public API to push a host job into the queue. As
-    // a best effort, invoke the function synchronously so it is not dropped.
+    // QuickJS has no public host-job API, but `Promise.resolve().then(f)` pushes
+    // `f` onto the internal job queue. Running it synchronously here would
+    // re-enter JS while an op holds deno_core's op-reentrancy guard (e.g.
+    // queueMicrotask() inside op_queue_microtask → fs.close → panic), so we must
+    // genuinely defer.
     let ctx = current_ctx();
     if ctx.is_null() || function.is_null() {
         return;
     }
     let f = jsval_of(function);
     unsafe {
-        if JS_IsFunction(ctx, f) != 0 {
-            let ret = JS_Call(ctx, f, jsv_undefined(), 0, ptr::null_mut());
-            if ret.tag == JS_TAG_EXCEPTION {
+        if JS_IsFunction(ctx, f) == 0 {
+            return;
+        }
+        let helper = ENQUEUE_HELPER.with(|c| {
+            if let Some(h) = c.get() {
+                return h;
+            }
+            let src = c"(f)=>{Promise.resolve().then(f);}";
+            let h = JS_Eval(
+                ctx,
+                src.as_ptr(),
+                src.to_bytes().len(),
+                c"<enqueue-microtask>".as_ptr(),
+                JS_EVAL_TYPE_GLOBAL,
+            );
+            if h.tag == JS_TAG_EXCEPTION {
                 let exc = JS_GetException(ctx);
                 JS_FreeValue(ctx, exc);
-            } else {
-                JS_FreeValue(ctx, ret);
+                return jsv_undefined();
             }
+            c.set(Some(h));
+            h
+        });
+        if JS_IsFunction(ctx, helper) == 0 {
+            return;
+        }
+        let mut argv = [JS_DupValue(ctx, f)];
+        let ret = JS_Call(ctx, helper, jsv_undefined(), 1, argv.as_mut_ptr());
+        JS_FreeValue(ctx, argv[0]);
+        if ret.tag == JS_TAG_EXCEPTION {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+        } else {
+            JS_FreeValue(ctx, ret);
         }
     }
 }
@@ -469,18 +504,21 @@ pub extern "C" fn v8__Isolate__EnqueueMicrotask(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetHostInitializeImportMetaObjectCallback(
     _isolate: *mut RealIsolate,
-    _callback: crate::isolate::HostInitializeImportMetaObjectCallback,
+    callback: crate::isolate::HostInitializeImportMetaObjectCallback,
 ) {
-    // TODO(qjs): import.meta population is handled by the module family's loader
-    // (module.rs); no per-isolate hook stored here. Inert.
+    // Store deno's callback; the module family invokes it after compiling a
+    // module to populate `import.meta` (url/main/resolve) before the body runs.
+    super::fam_module::set_import_meta_callback(callback);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetHostImportModuleDynamicallyCallback(
     _isolate: *mut RealIsolate,
-    _callback: crate::isolate::RawHostImportModuleDynamicallyCallback,
+    callback: crate::isolate::RawHostImportModuleDynamicallyCallback,
 ) {
-    // TODO(qjs): dynamic import() hook handled by the module family. Inert here.
+    // Store deno's async dynamic-import callback + install the QuickJS hook that
+    // bridges `import()` to it (see fam_module::dynamic_import_hook).
+    super::fam_module::set_dynamic_import_callback(callback);
 }
 
 #[unsafe(no_mangle)]
@@ -857,4 +895,35 @@ pub extern "C" fn v8__AllowJavascriptExecutionScope__CONSTRUCT(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__AllowJavascriptExecutionScope__DESTRUCT(_this: *mut std::ffi::c_void) {
     // Inert; nothing to tear down.
+}
+
+// ===================================================================
+// DisallowJavascriptExecutionScope — inert construct/destruct (QuickJS has no
+// "disallow JS execution" enforcement state).
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__DisallowJavascriptExecutionScope__CONSTRUCT(
+    buf: *mut std::ffi::c_void,
+    _isolate: *mut RealIsolate,
+    _on_failure: crate::scope::OnFailure,
+) {
+    // Zero the opaque buffer so DESTRUCT/Drop sees a defined state.
+    if !buf.is_null() {
+        unsafe { ptr::write_bytes(buf as *mut u8, 0, 2 * std::mem::size_of::<usize>()) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__DisallowJavascriptExecutionScope__DESTRUCT(_this: *mut std::ffi::c_void) {
+    // Inert; nothing to tear down.
+}
+
+// ===================================================================
+// V8 sandbox — not supported by this backend.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__V8__IsSandboxEnabled() -> bool {
+    false
 }

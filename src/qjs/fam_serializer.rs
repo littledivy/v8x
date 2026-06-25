@@ -138,21 +138,34 @@ pub extern "C" fn v8__ValueSerializer__Release(
     ptr: *mut *mut u8,
     size: *mut usize,
 ) {
-    // The crate's `ValueSerializer::release()` reconstructs the buffer with
-    // `Vec::from_raw_parts(ptr, size, capacity)` where `capacity` comes from a
-    // separate atomic only updated via V8's ReallocateBufferMemory delegate
-    // callback. Under QuickJS that callback never runs, so capacity is always 0
-    // and any non-zero `size` would trip the `size <= capacity` assertion /
-    // cause an unsound Vec reconstruction.
-    //
-    // To stay sound we return a null pointer and zero size, which makes
-    // `release()` return an empty Vec without touching the (bogus) capacity.
-    // The encoded bytes still live in our SerState until DESTRUCT.
-    // TODO(qjs): wire the heap buffer-size atomic so Release can hand back the
-    // real serialized bytes.
+    // Hand the encoded bytes back to the crate's `release()`, which rebuilds a
+    // `Vec<u8>` via `Vec::from_raw_parts(ptr, size, capacity)`. We allocate
+    // exactly `len` bytes through the global allocator with `align = 1` — the
+    // same layout `Vec<u8>` uses to free, and the same the crate's
+    // ReallocateBufferMemory/FreeBufferMemory use — so the reconstructed Vec
+    // owns and frees it soundly. The crate's `release()` was patched to use
+    // `size` as the capacity when its buffer-size atomic is 0 (our case: we
+    // never go through the V8 reallocate delegate).
+    let st = unsafe { ser_state(this) };
+    let len = st.buf.len();
+    if len == 0 {
+        unsafe {
+            *ptr = std::ptr::null_mut();
+            *size = 0;
+        }
+        return;
+    }
     unsafe {
-        *ptr = std::ptr::null_mut();
-        *size = 0;
+        let layout = std::alloc::Layout::from_size_align(len, 1).unwrap();
+        let out = std::alloc::alloc(layout);
+        if out.is_null() {
+            *ptr = std::ptr::null_mut();
+            *size = 0;
+            return;
+        }
+        std::ptr::copy_nonoverlapping(st.buf.as_ptr(), out, len);
+        *ptr = out;
+        *size = len;
     }
 }
 

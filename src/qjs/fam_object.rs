@@ -261,9 +261,51 @@ pub extern "C" fn v8__Object__Set(
     let r = unsafe { JS_SetProperty(ctx, jsval_of(this), atom, v) };
     unsafe { JS_FreeAtom(ctx, atom) };
     if r < 0 {
+        // QuickJS's JS_SetProperty uses JS_PROP_THROW, so an ordinary `[[Set]]`
+        // onto a non-writable data property (e.g. a function's read-only `name`)
+        // or a non-extensible object THROWS. v8's `Object::Set` is a kDontThrow
+        // set: it returns `Just(false)` for those cases without leaving a pending
+        // exception (only a *throwing setter* propagates). napi relies on this —
+        // each napi call runs inside a TryCatch, and a spurious "'name' is
+        // read-only" poisons module registration. So swallow write-rejection
+        // exceptions into `Just(false)`; re-arm anything else as `Nothing`.
+        if unsafe { swallow_write_rejection(ctx) } {
+            return MaybeBool::JustFalse;
+        }
         return MaybeBool::Nothing;
     }
     just_bool(r != 0)
+}
+
+/// Inspect the pending exception after a failed `[[Set]]`. If it's a write
+/// rejection (read-only property / non-extensible object), clear it and return
+/// true (caller maps to `Just(false)`). Otherwise leave it pending and return
+/// false (caller propagates as `Nothing`).
+unsafe fn swallow_write_rejection(ctx: *mut JSContext) -> bool {
+    if unsafe { JS_HasException(ctx) } == 0 {
+        // No exception pending: a plain `false` result. Treat as Just(false).
+        return true;
+    }
+    let exc = unsafe { JS_GetException(ctx) }; // +1, clears slot
+    let cs = unsafe { JS_ToCString(ctx, exc) };
+    let is_write_reject = if cs.is_null() {
+        false
+    } else {
+        let msg = unsafe { std::ffi::CStr::from_ptr(cs) }.to_string_lossy();
+        let m = msg.as_ref();
+        m.contains("read-only") || m.contains("not extensible") || m.contains("non-extensible")
+    };
+    if !cs.is_null() {
+        unsafe { JS_FreeCString(ctx, cs) };
+    }
+    if is_write_reject {
+        unsafe { JS_FreeValue(ctx, exc) };
+        true
+    } else {
+        // Re-arm the original exception for the caller to propagate.
+        unsafe { JS_Throw(ctx, exc) };
+        false
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -362,10 +404,51 @@ pub extern "C" fn v8__Object__DefineProperty(
     key: *const Name,
     desc: *const PropertyDescriptor,
 ) -> MaybeBool {
-    // TODO(qjs): full v8 PropertyDescriptor (get/set/value/writable/enumerable/
-    // configurable flag tri-states) requires reading the opaque descriptor
-    // layout. Inert: report failure rather than silently mis-defining.
-    MaybeBool::Nothing
+    let ctx = ctx_of(context);
+    if ctx.is_null() || this.is_null() || desc.is_null() {
+        return MaybeBool::Nothing;
+    }
+    let atom = key_atom(ctx, key);
+    if atom == 0 {
+        return MaybeBool::Nothing;
+    }
+    let r = super::fam_property::pd_define(ctx, jsval_of(this), atom, desc);
+    unsafe { JS_FreeAtom(ctx, atom) };
+    if r < 0 {
+        return MaybeBool::Nothing;
+    }
+    just_bool(r != 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetOwnPropertyDescriptor(
+    this: *const Object,
+    context: *const Context,
+    key: *const Name,
+) -> *const Value {
+    let ctx = ctx_of(context);
+    if ctx.is_null() || this.is_null() {
+        return ptr::null();
+    }
+    // Route through the JS builtin `Object.getOwnPropertyDescriptor(obj, key)`,
+    // which returns a plain `{value|get|set, writable, enumerable, configurable}`
+    // object (or `undefined`) — exactly the v8 contract.
+    unsafe {
+        let global = JS_GetGlobalObject(ctx);
+        let object_ctor = JS_GetPropertyStr(ctx, global, c"Object".as_ptr());
+        JS_FreeValue(ctx, global);
+        let func =
+            JS_GetPropertyStr(ctx, object_ctor, c"getOwnPropertyDescriptor".as_ptr());
+        JS_FreeValue(ctx, object_ctor);
+        let mut args = [jsval_of(this), jsval_of(key)];
+        let res = JS_Call(ctx, func, jsv_undefined(), 2, args.as_mut_ptr());
+        JS_FreeValue(ctx, func);
+        if res.tag == JS_TAG_EXCEPTION {
+            return ptr::null();
+        }
+        // intern takes ownership of the +1 returned by JS_Call.
+        intern::<Value>(res)
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -463,28 +546,41 @@ pub extern "C" fn v8__Object__GetConstructorName(this: *const Object) -> *const 
     if ctx.is_null() || this.is_null() {
         return ptr::null();
     }
-    // Read this.constructor.name.
+    // v8's GetConstructorName ALWAYS returns a String (the caller unwraps it),
+    // defaulting to "Object" for objects with no usable constructor (e.g. a
+    // null-prototype namespace like `Deno`). Read this.constructor.name and fall
+    // back to "Object" on any miss, never null — returning null panics the
+    // caller (object.rs get_constructor_name) and crashes console.log.
     unsafe {
+        let fallback = || intern::<V8String>(JS_NewString(ctx, c"Object".as_ptr()));
+        // Clear any exception left by a failed lookup so it doesn't leak.
+        let drain_exc = || {
+            if JS_HasException(ctx) != 0 {
+                JS_FreeValue(ctx, JS_GetException(ctx));
+            }
+        };
         let ctor_atom = JS_NewAtom(ctx, c"constructor".as_ptr());
         let ctor = JS_GetProperty(ctx, jsval_of(this), ctor_atom);
         JS_FreeAtom(ctx, ctor_atom);
         if ctor.tag == JS_TAG_EXCEPTION {
-            return ptr::null();
+            drain_exc();
+            return fallback();
         }
         if !jsv_is_object(&ctor) {
             JS_FreeValue(ctx, ctor);
-            return ptr::null();
+            return fallback();
         }
         let name_atom = JS_NewAtom(ctx, c"name".as_ptr());
         let name = JS_GetProperty(ctx, ctor, name_atom);
         JS_FreeAtom(ctx, name_atom);
         JS_FreeValue(ctx, ctor);
         if name.tag == JS_TAG_EXCEPTION {
-            return ptr::null();
+            drain_exc();
+            return fallback();
         }
         if !jsv_is_string(&name) {
             JS_FreeValue(ctx, name);
-            return ptr::null();
+            return fallback();
         }
         // name is +1; move into a slot.
         intern::<V8String>(name)
@@ -503,6 +599,22 @@ pub extern "C" fn v8__Object__GetIdentityHash(this: *const Object) -> int {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn v8__Name__GetIdentityHash(this: *const Name) -> int {
+    // Hash by the value's atom: stable per distinct string/symbol and nonzero.
+    let ctx = current_ctx();
+    if ctx.is_null() || this.is_null() {
+        return 1;
+    }
+    let atom = unsafe { JS_ValueToAtom(ctx, jsval_of(this)) };
+    if atom == 0 {
+        return 1;
+    }
+    unsafe { JS_FreeAtom(ctx, atom) };
+    let h = (atom ^ 0x9e37_79b9).wrapping_mul(2654435761);
+    ((h & 0x7fff_ffff) | 1) as int
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetOwnPropertyNames(
     this: *const Object,
     context: *const Context,
@@ -511,22 +623,7 @@ pub extern "C" fn v8__Object__GetOwnPropertyNames(
 ) -> *const Array {
     // v8 GetOwnPropertyNames default: string keys only (SKIP_SYMBOLS by
     // default in deno usage). Honour SKIP_SYMBOLS / SKIP_STRINGS filter bits.
-    let f = read_filter(&filter);
-    let mut gpn = 0;
-    // SKIP_STRINGS = 8, SKIP_SYMBOLS = 16 (see object.rs PropertyFilter).
-    if f & 8 == 0 {
-        gpn |= JS_GPN_STRING_MASK;
-    }
-    if f & 16 == 0 {
-        // v8 GetOwnPropertyNames historically returns string keys only unless
-        // symbols explicitly requested; default filter is ALL_PROPERTIES(0),
-        // which for this entry point means strings. Keep strings-only when no
-        // skip flags are present to match v8's default observable behaviour.
-    }
-    if gpn == 0 {
-        gpn = JS_GPN_STRING_MASK;
-    }
-    property_names_array(this, context, gpn)
+    property_names_array(this, context, gpn_from_filter(&filter))
 }
 
 #[unsafe(no_mangle)]
@@ -538,10 +635,40 @@ pub extern "C" fn v8__Object__GetPropertyNames(
     index_filter: IndexFilter,
     key_conversion: KeyConversionMode,
 ) -> *const Array {
-    // TODO(qjs): mode (own vs include-prototypes) and index_filter are not
-    // honoured; QuickJS JS_GetOwnPropertyNames is own-only. Return own string
-    // keys, which covers the common deno serde path.
-    property_names_array(this, context, JS_GPN_STRING_MASK)
+    // TODO(qjs): mode (own vs include-prototypes) is not honoured; QuickJS
+    // JS_GetOwnPropertyNames is own-only — fine for the common deno path. We DO
+    // honour the property filter: the console inspector asks once for enumerable
+    // keys and again (for hidden) without the filter, so ignoring ONLY_ENUMERABLE
+    // makes every property render twice.
+    let _ = (mode, key_conversion);
+    // IndexFilter::SkipIndices == 1.
+    let skip_indices = index_filter as u32 == 1;
+    property_names_array_filtered(
+        this,
+        context,
+        gpn_from_filter(&property_filter),
+        skip_indices,
+    )
+}
+
+/// Map a v8 `PropertyFilter` bitset onto QuickJS `JS_GPN_*` flags.
+/// v8 bits: ONLY_ENUMERABLE=2, SKIP_STRINGS=8, SKIP_SYMBOLS=16.
+fn gpn_from_filter(filter: &PropertyFilter) -> c_int {
+    let f = read_filter(filter);
+    let mut gpn = 0;
+    if f & 8 == 0 {
+        gpn |= JS_GPN_STRING_MASK;
+    }
+    if f & 16 == 0 {
+        gpn |= JS_GPN_SYMBOL_MASK;
+    }
+    if gpn == 0 {
+        gpn = JS_GPN_STRING_MASK;
+    }
+    if f & 2 != 0 {
+        gpn |= JS_GPN_ENUM_ONLY;
+    }
+    gpn
 }
 
 #[inline]
@@ -554,6 +681,18 @@ fn property_names_array(
     this: *const Object,
     context: *const Context,
     gpn_flags: c_int,
+) -> *const Array {
+    property_names_array_filtered(this, context, gpn_flags, false)
+}
+
+/// QuickJS marks integer (array-index) atoms with the high bit `JS_ATOM_TAG_INT`.
+const JS_ATOM_TAG_INT: u32 = 1 << 31;
+
+fn property_names_array_filtered(
+    this: *const Object,
+    context: *const Context,
+    gpn_flags: c_int,
+    skip_indices: bool,
 ) -> *const Array {
     let ctx = ctx_of(context);
     if ctx.is_null() || this.is_null() {
@@ -574,11 +713,18 @@ fn property_names_array(
         return ptr::null();
     }
     unsafe {
+        let mut out = 0u32;
         for i in 0..len as usize {
             let atom = (*tab.add(i)).atom;
+            // SkipIndices: drop integer (array-index) atoms so e.g. an array's
+            // "0"/"1"/.. don't show up as extra named properties.
+            if skip_indices && (atom & JS_ATOM_TAG_INT) != 0 {
+                continue;
+            }
             // JS_AtomToValue returns +1; JS_SetPropertyUint32 consumes it.
             let key_val = JS_AtomToValue(ctx, atom);
-            JS_SetPropertyUint32(ctx, arr, i as u32, key_val);
+            JS_SetPropertyUint32(ctx, arr, out, key_val);
+            out += 1;
         }
         JS_FreePropertyEnum(ctx, tab, len);
     }
@@ -634,6 +780,318 @@ pub extern "C" fn v8__Object__SetPrivate(
         return MaybeBool::Nothing;
     }
     just_bool(r != 0)
+}
+
+/// Atom (+1) for an array index. Caller must `JS_FreeAtom`. 0 on failure.
+#[inline]
+fn index_atom(ctx: *mut JSContext, index: u32) -> JSAtom {
+    let v = unsafe { JS_NewInt64(ctx, index as i64) };
+    let a = unsafe { JS_ValueToAtom(ctx, v) };
+    unsafe { JS_FreeValue(ctx, v) };
+    a
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__HasIndex(
+    this: *const Object,
+    context: *const Context,
+    index: u32,
+) -> MaybeBool {
+    let ctx = ctx_of(context);
+    if ctx.is_null() || this.is_null() {
+        return MaybeBool::Nothing;
+    }
+    let atom = index_atom(ctx, index);
+    if atom == 0 {
+        return MaybeBool::Nothing;
+    }
+    let r = unsafe { JS_HasProperty(ctx, jsval_of(this), atom) };
+    unsafe { JS_FreeAtom(ctx, atom) };
+    if r < 0 {
+        return MaybeBool::Nothing;
+    }
+    just_bool(r != 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__DeleteIndex(
+    this: *const Object,
+    context: *const Context,
+    index: u32,
+) -> MaybeBool {
+    let ctx = ctx_of(context);
+    if ctx.is_null() || this.is_null() {
+        return MaybeBool::Nothing;
+    }
+    let atom = index_atom(ctx, index);
+    if atom == 0 {
+        return MaybeBool::Nothing;
+    }
+    let r = unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, JS_PROP_THROW) };
+    unsafe { JS_FreeAtom(ctx, atom) };
+    if r < 0 {
+        return MaybeBool::Nothing;
+    }
+    just_bool(r != 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__HasPrivate(
+    this: *const Object,
+    context: *const Context,
+    key: *const Private,
+) -> MaybeBool {
+    let ctx = ctx_of(context);
+    if ctx.is_null() || this.is_null() {
+        return MaybeBool::Nothing;
+    }
+    let atom = key_atom(ctx, key);
+    if atom == 0 {
+        return MaybeBool::Nothing;
+    }
+    let r = unsafe { JS_HasProperty(ctx, jsval_of(this), atom) };
+    unsafe { JS_FreeAtom(ctx, atom) };
+    if r < 0 {
+        return MaybeBool::Nothing;
+    }
+    just_bool(r != 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__DeletePrivate(
+    this: *const Object,
+    context: *const Context,
+    key: *const Private,
+) -> MaybeBool {
+    let ctx = ctx_of(context);
+    if ctx.is_null() || this.is_null() {
+        return MaybeBool::Nothing;
+    }
+    let atom = key_atom(ctx, key);
+    if atom == 0 {
+        return MaybeBool::Nothing;
+    }
+    let r = unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, JS_PROP_THROW) };
+    unsafe { JS_FreeAtom(ctx, atom) };
+    if r < 0 {
+        return MaybeBool::Nothing;
+    }
+    just_bool(r != 0)
+}
+
+// "Real" named property accessors. V8 distinguishes these from interceptor-aware
+// lookups; QuickJS has no interceptors, so they reduce to the ordinary lookups.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetRealNamedProperty(
+    this: *const Object,
+    context: *const Context,
+    key: *const Name,
+) -> *const Value {
+    let ctx = ctx_of(context);
+    if ctx.is_null() || this.is_null() {
+        return ptr::null();
+    }
+    let atom = key_atom(ctx, key);
+    if atom == 0 {
+        return ptr::null();
+    }
+    let v = unsafe { JS_GetProperty(ctx, jsval_of(this), atom) };
+    unsafe { JS_FreeAtom(ctx, atom) };
+    if v.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return ptr::null();
+    }
+    // A missing real property should report empty, not `undefined`.
+    if jsv_is_undefined(&v) {
+        unsafe { JS_FreeValue(ctx, v) };
+        return ptr::null();
+    }
+    intern::<Value>(v)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__HasRealNamedProperty(
+    this: *const Object,
+    context: *const Context,
+    key: *const Name,
+) -> MaybeBool {
+    let ctx = ctx_of(context);
+    if ctx.is_null() || this.is_null() {
+        return MaybeBool::Nothing;
+    }
+    let atom = key_atom(ctx, key);
+    if atom == 0 {
+        return MaybeBool::Nothing;
+    }
+    let r = unsafe { JS_HasProperty(ctx, jsval_of(this), atom) };
+    unsafe { JS_FreeAtom(ctx, atom) };
+    if r < 0 {
+        return MaybeBool::Nothing;
+    }
+    just_bool(r != 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetRealNamedPropertyAttributes(
+    this: *const Object,
+    context: *const Context,
+    key: *const Name,
+    out: *mut Maybe<PropertyAttribute>,
+) {
+    // QuickJS has no public per-property attribute query that walks the chain;
+    // report NONE when the property exists, else no value (mirrors
+    // GetPropertyAttributes).
+    let ctx = ctx_of(context);
+    if ctx.is_null() || this.is_null() {
+        unsafe { maybe_attr_none(out) };
+        return;
+    }
+    let atom = key_atom(ctx, key);
+    if atom == 0 {
+        unsafe { maybe_attr_none(out) };
+        return;
+    }
+    let r = unsafe { JS_HasProperty(ctx, jsval_of(this), atom) };
+    unsafe { JS_FreeAtom(ctx, atom) };
+    if r == 1 {
+        unsafe { maybe_attr_set(out, 0) }; // PropertyAttribute::NONE
+    } else {
+        unsafe { maybe_attr_none(out) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetCreationContext(this: *const Object) -> *const Context {
+    // Single-context model: every object belongs to the current context.
+    let _ = this;
+    let ctx = current_ctx();
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    super::shim_core::intern_ctx(ctx)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__SetIntegrityLevel(
+    this: *const Object,
+    context: *const Context,
+    level: crate::IntegrityLevel,
+) -> MaybeBool {
+    let ctx = ctx_of(context);
+    if ctx.is_null() || this.is_null() {
+        return MaybeBool::Nothing;
+    }
+    // Apply via Object.freeze / Object.seal.
+    let method: &[u8] = match level {
+        crate::IntegrityLevel::Frozen => b"freeze\0",
+        crate::IntegrityLevel::Sealed => b"seal\0",
+    };
+    unsafe {
+        let global = JS_GetGlobalObject(ctx);
+        let object_ctor = JS_GetPropertyStr(ctx, global, c"Object".as_ptr());
+        JS_FreeValue(ctx, global);
+        let func = JS_GetPropertyStr(ctx, object_ctor, method.as_ptr() as *const c_char);
+        JS_FreeValue(ctx, object_ctor);
+        if !jsv_is_object(&func) {
+            JS_FreeValue(ctx, func);
+            return MaybeBool::Nothing;
+        }
+        let mut args = [JS_DupValue(ctx, jsval_of(this))];
+        let r = JS_Call(ctx, func, jsv_undefined(), 1, args.as_mut_ptr());
+        JS_FreeValue(ctx, func);
+        JS_FreeValue(ctx, args[0]);
+        if r.tag == JS_TAG_EXCEPTION {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+            return MaybeBool::Nothing;
+        }
+        JS_FreeValue(ctx, r);
+        MaybeBool::JustTrue
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__PreviewEntries(
+    this: *const Object,
+    is_key_value: *mut bool,
+) -> *const Array {
+    // Used by the inspector to preview Map/Set/iterator contents. We synthesize
+    // the entries array via JS: for Map/Set, `[...obj]`; for iterators, drain a
+    // clone. This is best-effort; on any failure we report an empty array.
+    let ctx = current_ctx();
+    if ctx.is_null() || this.is_null() {
+        if !is_key_value.is_null() {
+            unsafe { *is_key_value = false };
+        }
+        return ptr::null();
+    }
+    unsafe {
+        // Determine if it's a Map (key/value pairs) vs Set/array (values) by
+        // testing for a `.set` method (Map/WeakMap) — best effort.
+        let is_map = {
+            let m = JS_GetPropertyStr(ctx, jsval_of(this), c"set".as_ptr());
+            let is_fn = JS_IsFunction(ctx, m) != 0;
+            JS_FreeValue(ctx, m);
+            is_fn
+        };
+        if !is_key_value.is_null() {
+            *is_key_value = is_map;
+        }
+        // `Array.from(this)` collects entries from any iterable.
+        let global = JS_GetGlobalObject(ctx);
+        let array_ctor = JS_GetPropertyStr(ctx, global, c"Array".as_ptr());
+        JS_FreeValue(ctx, global);
+        let from = JS_GetPropertyStr(ctx, array_ctor, c"from".as_ptr());
+        if !jsv_is_object(&from) {
+            JS_FreeValue(ctx, from);
+            JS_FreeValue(ctx, array_ctor);
+            return ptr::null();
+        }
+        let mut args = [JS_DupValue(ctx, jsval_of(this))];
+        let r = JS_Call(ctx, from, array_ctor, 1, args.as_mut_ptr());
+        JS_FreeValue(ctx, from);
+        JS_FreeValue(ctx, array_ctor);
+        JS_FreeValue(ctx, args[0]);
+        if r.tag == JS_TAG_EXCEPTION {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+            return ptr::null();
+        }
+        intern::<Array>(r)
+    }
+}
+
+#[inline]
+unsafe fn maybe_attr_set(out: *mut Maybe<PropertyAttribute>, bits: u32) {
+    if out.is_null() {
+        return;
+    }
+    // Maybe<T> is #[repr(C)] { has_value: bool, value: T }; PropertyAttribute is
+    // a #[repr(C)] u32 wrapper.
+    unsafe {
+        let p = out as *mut u8;
+        *(p as *mut bool) = true;
+        let voff = std::mem::offset_of!(MaybeAttrMirror, value);
+        *(p.add(voff) as *mut u32) = bits;
+    }
+}
+
+#[inline]
+unsafe fn maybe_attr_none(out: *mut Maybe<PropertyAttribute>) {
+    if out.is_null() {
+        return;
+    }
+    unsafe {
+        *(out as *mut bool) = false;
+    }
+}
+
+#[repr(C)]
+struct MaybeAttrMirror {
+    has_value: bool,
+    value: PropertyAttribute,
 }
 
 #[unsafe(no_mangle)]

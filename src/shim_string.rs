@@ -48,16 +48,16 @@ pub extern "C" fn v8__String__NewFromUtf8(
     if length < 0 || data.is_null() {
         return ptr::null();
     }
-    // The input is not guaranteed NUL-terminated, so copy into a buffer and
-    // terminate it before handing to JSStringCreateWithUTF8CString.
     let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, length as usize) };
-    let mut buf: Vec<u8> = Vec::with_capacity(bytes.len() + 1);
-    buf.extend_from_slice(bytes);
-    buf.push(0);
+    // V8's `NewFromUtf8` (Normal type) does LOSSY decoding — invalid sequences
+    // become U+FFFD — and copies the full length (embedded NULs included).
+    // `JSStringCreateWithUTF8CString` does neither (it rejects invalid UTF-8 and
+    // stops at the first NUL), which made `TextDecoder.decode` of any invalid or
+    // NUL-containing bytes return "". Decode lossily and build via UTF-16.
+    let cow = std::string::String::from_utf8_lossy(bytes);
+    let utf16: Vec<u16> = cow.encode_utf16().collect();
     unsafe {
-        let s = JSStringCreateWithUTF8CString(buf.as_ptr() as *const char);
-        let v = JSValueMakeString(ctx, s);
-        JSStringRelease(s);
+        let v = make_string_from_utf16(ctx, utf16.as_ptr(), utf16.len());
         intern_ctx::<V8String>(ctx, v)
     }
 }
@@ -276,6 +276,32 @@ pub extern "C" fn v8__String__WriteOneByte_v2(
     }
 }
 
+/// Given a complete UTF-8 byte slice, return `(byte_count, utf16_units)` for the
+/// longest prefix made of WHOLE code points that fits within `cap` bytes. A
+/// 4-byte (astral) sequence counts as 2 UTF-16 code units.
+fn utf8_complete_prefix(s: &[u8], cap: usize) -> (usize, size_t) {
+    let mut i = 0usize;
+    let mut units: size_t = 0;
+    while i < s.len() {
+        let b = s[i];
+        let seq = if b < 0x80 {
+            1
+        } else if b < 0xE0 {
+            2
+        } else if b < 0xF0 {
+            3
+        } else {
+            4
+        };
+        if i + seq > cap {
+            break;
+        }
+        units += if seq == 4 { 2 } else { 1 };
+        i += seq;
+    }
+    (i, units)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__WriteUtf8_v2(
     this: *const V8String,
@@ -309,7 +335,19 @@ pub extern "C" fn v8__String__WriteUtf8_v2(
         JSStringRelease(s);
         // `written` counts the trailing NUL.
         let utf8_len = written.saturating_sub(1);
-        let copy = utf8_len.min(capacity);
+
+        // Copy whole UTF-8 sequences only. If the destination can't hold the full
+        // encoding we must NOT truncate mid-character: V8's `WriteUtf8` writes
+        // only complete code points and reports `processed_characters` as the
+        // number of UTF-16 code units it fully encoded. Reporting a byte count (or
+        // counting a half-written char) makes deno's TextEncoder think the whole
+        // string was consumed and skip the retry-with-bigger-buffer, corrupting
+        // any multi-byte text.
+        let (copy, units) = if utf8_len <= capacity {
+            (utf8_len, char_count)
+        } else {
+            utf8_complete_prefix(&scratch[..utf8_len], capacity)
+        };
         if copy > 0 {
             ptr::copy_nonoverlapping(scratch.as_ptr(), buffer as *mut u8, copy);
         }
@@ -318,7 +356,7 @@ pub extern "C" fn v8__String__WriteUtf8_v2(
             *(buffer as *mut u8).add(copy) = 0;
         }
         if !processed_characters_return.is_null() {
-            *processed_characters_return = if copy >= utf8_len { char_count } else { copy };
+            *processed_characters_return = units;
         }
         copy as int
     }
@@ -602,4 +640,47 @@ pub extern "C" fn v8__PrimitiveArray__Get(
         let v = JSObjectGetPropertyAtIndex(ctx, obj, index as u32, ptr::null_mut());
         intern_ctx::<Primitive>(ctx, v)
     }
+}
+
+// ===================================================================
+// External strings — V8 keeps the embedder's buffer alive and calls `free`
+// when the string dies. JSC has no external-string C API, so we materialize a
+// copy and immediately invoke `free` (we no longer reference the buffer).
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__NewExternalOneByte(
+    isolate: *mut RealIsolate,
+    buffer: *mut char,
+    length: size_t,
+    free: unsafe extern "C" fn(*mut char, size_t),
+) -> *const V8String {
+    let ctx = current_ctx();
+    if buffer.is_null() {
+        return ptr::null();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, length as usize) };
+    let utf16: Vec<u16> = bytes.iter().map(|&b| b as u16).collect();
+    let v = unsafe { make_string_from_utf16(ctx, utf16.as_ptr(), utf16.len()) };
+    let out = intern_ctx::<V8String>(ctx, v);
+    // We copied; relinquish the embedder buffer.
+    unsafe { free(buffer, length) };
+    out
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__NewExternalTwoByte(
+    isolate: *mut RealIsolate,
+    buffer: *mut u16,
+    length: size_t,
+    free: unsafe extern "C" fn(*mut u16, size_t),
+) -> *const V8String {
+    let ctx = current_ctx();
+    if buffer.is_null() {
+        return ptr::null();
+    }
+    let v = unsafe { make_string_from_utf16(ctx, buffer, length as usize) };
+    let out = intern_ctx::<V8String>(ctx, v);
+    unsafe { free(buffer, length) };
+    out
 }

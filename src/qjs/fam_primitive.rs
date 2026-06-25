@@ -20,7 +20,7 @@ use crate::qjs::shim_core::{ctx_of, current_ctx, intern, iso_state, jsval_of};
 use crate::support::int;
 use crate::{
     BigInt, Boolean, Context, Data, Int32, Integer, Number, Primitive, Private, RealIsolate,
-    String as V8String, Symbol, Uint32,
+    String as V8String, Symbol, Uint32, Value,
 };
 use std::ffi::CString;
 use std::ptr;
@@ -460,6 +460,35 @@ pub extern "C" fn v8__Private__ForApi(
     intern::<Private>(v)
 }
 
+/// `Private::New` — a fresh, unique private (unlike `ForApi`, NOT registered, so
+/// two calls with the same name are distinct). Backed by a fresh unique Symbol.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Private__New(
+    isolate: *mut RealIsolate,
+    name: *const V8String,
+) -> *const Private {
+    let ctx = iso_ctx(isolate);
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let desc = if name.is_null() {
+        std::string::String::new()
+    } else {
+        unsafe { to_dec_string(ctx, jsval_of(name)) }
+    };
+    let Ok(cdesc) = CString::new(desc) else {
+        return ptr::null();
+    };
+    // Fresh, non-global symbol → unique private key.
+    let v = unsafe { JS_NewSymbol(ctx, cdesc.as_ptr(), 0) };
+    if v.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return ptr::null();
+    }
+    intern::<Private>(v)
+}
+
 // ===================================================================
 // Symbol
 // ===================================================================
@@ -481,6 +510,76 @@ pub extern "C" fn v8__Symbol__For(
     let escaped = desc.replace('\\', "\\\\").replace('"', "\\\"");
     let v = unsafe { eval(ctx, &format!("Symbol.for(\"{escaped}\")")) };
     intern::<Symbol>(v)
+}
+
+/// `Symbol(description)` — a fresh unique (non-registered) symbol.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Symbol__New(
+    isolate: *mut RealIsolate,
+    description: *const V8String,
+) -> *const Symbol {
+    let ctx = iso_ctx(isolate);
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    // JS_NewSymbol takes a NUL-terminated C string description; build one from
+    // the v8 String handle (or empty when none was supplied).
+    let desc = if description.is_null() {
+        std::string::String::new()
+    } else {
+        unsafe { to_dec_string(ctx, jsval_of(description)) }
+    };
+    let Ok(cdesc) = CString::new(desc) else {
+        return ptr::null();
+    };
+    // is_global = 0 → a fresh, unregistered Symbol (V8 `Symbol::New` semantics).
+    let v = unsafe { JS_NewSymbol(ctx, cdesc.as_ptr(), 0) };
+    if v.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return ptr::null();
+    }
+    intern::<Symbol>(v)
+}
+
+/// `symbol.description` — the symbol's description string, or `undefined`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Symbol__Description(
+    this: *const Symbol,
+    isolate: *mut RealIsolate,
+) -> *const Value {
+    let ctx = iso_ctx(isolate);
+    if ctx.is_null() || this.is_null() {
+        return ptr::null();
+    }
+    // A symbol is not an object, so we can't JS_GetPropertyStr it directly. Read
+    // `this.description` with the symbol bound as `this` via JS_EvalThis.
+    unsafe {
+        let desc = symbol_description(ctx, jsval_of(this));
+        if desc.tag == JS_TAG_EXCEPTION {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+            return ptr::null();
+        }
+        intern::<Value>(desc)
+    }
+}
+
+/// Invoke `Symbol.prototype.description`'s getter with `sym` as the receiver,
+/// returning an owned (+1) result. Uses `JS_EvalThis` so the accessor sees the
+/// symbol as `this`.
+unsafe fn symbol_description(ctx: *mut JSContext, sym: JSValue) -> JSValue {
+    const SRC: &[u8] = b"this.description\0";
+    unsafe {
+        JS_EvalThis(
+            ctx,
+            sym,
+            SRC.as_ptr() as *const std::os::raw::c_char,
+            SRC.len() - 1,
+            c"<sym-desc>".as_ptr(),
+            JS_EVAL_TYPE_GLOBAL,
+        )
+    }
 }
 
 /// Read a well-known symbol off the global `Symbol` constructor object,
