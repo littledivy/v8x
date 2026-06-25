@@ -23,9 +23,27 @@ pub extern "C" fn v8__V8__Dispose() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__DisposePlatform() {}
 
+/// `Deno.versions.v8` for this backend: the REAL quickjs-ng version (via
+/// `JS_GetVersion`, e.g. "0.15.1") tagged with the engine, instead of a
+/// fabricated V8 number. Built once and leaked so the `*const c_char` stays
+/// valid for the process lifetime.
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__GetVersion() -> *const c_char {
-    c"12.0.0 (v82jsc/QuickJS-ng)".as_ptr()
+    use std::sync::OnceLock;
+    static VERSION: OnceLock<std::ffi::CString> = OnceLock::new();
+    VERSION
+        .get_or_init(|| {
+            let raw = unsafe { crate::qjs::quickjs_sys::JS_GetVersion() };
+            let ver = if raw.is_null() {
+                "unknown".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(raw) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            std::ffi::CString::new(format!("{ver} (quickjs-ng)")).unwrap()
+        })
+        .as_ptr()
 }
 
 /// V8 command-line flag parsing has no QuickJS analogue. QuickJS ignores v8
