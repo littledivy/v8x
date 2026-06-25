@@ -491,6 +491,16 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
     unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
   unsafe { JSValueProtect(gctx, namespace as JSValueRef) };
 
+  // Register the namespace into the global registry NOW (at compile), not at
+  // Evaluate — a barrel module evaluates last, but its importers read its
+  // namespace earlier. Install live re-export getters so `export { X } from
+  // spec` resolves through to spec's namespace at access time (after spec's
+  // body runs), matching ESM live re-export bindings.
+  unsafe {
+    register_module_namespace(ctx, &specifier, namespace);
+    install_reexport_getters(ctx, namespace, &rewrite.reexports);
+  }
+
   let state = Box::new(SyntheticModule {
     ctx: gctx,
     status: ModuleStatus::Uninstantiated,
@@ -513,6 +523,15 @@ struct RewrittenModule {
   export_names: Vec<std::string::String>,
   imports: Vec<std::string::String>,
   is_async: bool,
+  // (exported, source spec, source local): `export { local as exported } from
+  // spec`. Installed as LIVE getters on the namespace at compile time so a
+  // barrel's re-exports resolve through to the source module even before the
+  // barrel's own body runs (ESM live re-export bindings).
+  reexports: Vec<(
+    std::string::String,
+    std::string::String,
+    std::string::String,
+  )>,
 }
 
 fn strip_js_comments(src: &str) -> std::string::String {
@@ -726,6 +745,17 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
   let mut exports_out = std::string::String::new();
   let mut export_names: Vec<std::string::String> = Vec::new();
   let mut imports: Vec<std::string::String> = Vec::new();
+  let mut reexports: Vec<(
+    std::string::String,
+    std::string::String,
+    std::string::String,
+  )> = Vec::new();
+  // localName -> (source spec, source export name) for every imported binding,
+  // so a later `export { localName }` can re-export it LIVE to the source.
+  let mut import_bindings: std::collections::HashMap<
+    std::string::String,
+    (std::string::String, std::string::String),
+  > = std::collections::HashMap::new();
 
   let cleaned = strip_js_comments(src);
   let logical = join_module_statements(&cleaned);
@@ -760,6 +790,8 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
         if !head.is_empty() {
           imports_out
             .push_str(&format!("const {} = {}.default;\n", head, module_expr));
+          import_bindings
+            .insert(head.to_string(), (spec.clone(), "default".to_string()));
         }
 
         let names = between(trimmed, '{', '}').unwrap_or_default();
@@ -771,8 +803,14 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
           }
           if let Some((l, r)) = part.split_once(" as ") {
             destructure.push(format!("{}: {}", l.trim(), r.trim()));
+            import_bindings.insert(
+              r.trim().to_string(),
+              (spec.clone(), l.trim().to_string()),
+            );
           } else {
             destructure.push(part.to_string());
+            import_bindings
+              .insert(part.to_string(), (spec.clone(), part.to_string()));
           }
         }
         imports_out.push_str(&format!(
@@ -784,10 +822,14 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
         let name = clause["* as ".len()..].trim();
         if !name.is_empty() {
           imports_out.push_str(&format!("const {} = {};\n", name, module_expr));
+          import_bindings
+            .insert(name.to_string(), (spec.clone(), "*".to_string()));
         }
       } else if !clause.is_empty() && trimmed.contains(" from ") {
         imports_out
           .push_str(&format!("const {} = {}.default;\n", clause, module_expr));
+        import_bindings
+          .insert(clause.to_string(), (spec.clone(), "default".to_string()));
       }
 
       continue;
@@ -817,10 +859,14 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
         };
         export_names.push(exported.clone());
         if let Some(spec) = &reexport_spec {
-          exports_out.push_str(&format!(
-                        "__ns[{:?}] = ((globalThis.__v8jsc_modules||{{}})[{:?}]||{{}})[{:?}];\n",
-                        exported, spec, local
-                    ));
+          // `export { local } from spec`: live re-export to spec.
+          reexports.push((exported.clone(), spec.clone(), local.clone()));
+        } else if let Some((spec, source)) = import_bindings.get(&local) {
+          // `import X from spec; export { X }` (barrel pattern): X is an
+          // imported binding, so re-export LIVE to its source module instead of
+          // snapshotting at body time (the barrel body runs last, after its
+          // importers already read the binding).
+          reexports.push((exported.clone(), spec.clone(), source.clone()));
         } else {
           exports_out.push_str(&format!("__ns[{:?}] = {};\n", exported, local));
         }
@@ -915,6 +961,7 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
     export_names,
     imports,
     is_async: has_top_level_await(src),
+    reexports,
   })
 }
 
@@ -1710,6 +1757,58 @@ fn make_rejected_promise(ctx: JSContextRef, exc: JSValueRef) -> *const Value {
   }
   crate::jsc::exception::track_promise_pub(ctx, p as JSObjectRef);
   intern_ctx::<Value>(ctx, p)
+}
+
+/// Install live re-export getters on `namespace`: for each `export { local as
+/// exported } from spec`, define `namespace[exported]` as a getter returning
+/// `__v8jsc_modules[spec][local]` evaluated lazily. Lets a barrel's re-exports
+/// resolve to the source module even before the barrel's own body runs.
+unsafe fn install_reexport_getters(
+  ctx: JSContextRef,
+  namespace: JSObjectRef,
+  reexports: &[(
+    std::string::String,
+    std::string::String,
+    std::string::String,
+  )],
+) {
+  if ctx.is_null() || namespace.is_null() || reexports.is_empty() {
+    return;
+  }
+  let mut body = std::string::String::from("(function(__ns){\n");
+  for (exported, spec, local) in reexports {
+    let value = if local == "*" {
+      format!("((globalThis.__v8jsc_modules||{{}})[{spec:?}]||{{}})")
+    } else {
+      format!("((globalThis.__v8jsc_modules||{{}})[{spec:?}]||{{}})[{local:?}]")
+    };
+    body.push_str(&format!(
+      "Object.defineProperty(__ns, {exported:?}, {{configurable:true, enumerable:true, get:function(){{ return {value}; }}}});\n"
+    ));
+  }
+  body.push_str("})");
+  let Ok(cstr) = std::ffi::CString::new(body) else {
+    return;
+  };
+  unsafe {
+    let mut exc: JSValueRef = ptr::null();
+    let js = JSStringCreateWithUTF8CString(cstr.as_ptr());
+    let f =
+      JSEvaluateScript(ctx, js, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+    JSStringRelease(js);
+    if f.is_null() || !JSValueIsObject(ctx, f) {
+      return;
+    }
+    let args = [namespace as JSValueRef];
+    JSObjectCallAsFunction(
+      ctx,
+      f as JSObjectRef,
+      ptr::null_mut(),
+      1,
+      args.as_ptr(),
+      &mut exc,
+    );
+  }
 }
 
 unsafe fn register_module_namespace(
