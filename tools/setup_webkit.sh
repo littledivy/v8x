@@ -13,10 +13,12 @@ if [ ! -d "$WK/Source/JavaScriptCore" ]; then
   git submodule update --init --depth 1 "$WK"
 fi
 
-# Apply our WebKit patches (idempotent — skip if already applied).
-for p in webkit-patches/*.patch; do
-  if ! git -C "$WK" apply --reverse --check "$p" 2>/dev/null; then
-    git -C "$WK" apply "$p" || echo "warn: $p may already be applied"
+# Apply our WebKit patches (idempotent — skip if already applied). Patch paths
+# are relative to the submodule dir, hence ../../ back to the repo root.
+for p in patches/webkit-[0-9]*.patch; do
+  [ -e "$p" ] || continue
+  if ! git -C "$WK" apply --reverse --check "../../$p" 2>/dev/null; then
+    git -C "$WK" apply "../../$p" || echo "warn: $p may already be applied"
   fi
 done
 
