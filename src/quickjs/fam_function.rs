@@ -26,8 +26,8 @@
 
 #![allow(non_snake_case, unused)]
 
-use crate::qjs::quickjs_sys::*;
-use crate::qjs::shim_core::{
+use crate::quickjs::quickjs_sys::*;
+use crate::quickjs::shim_core::{
     ctx_of, current_ctx, current_iso, intern, intern_dup, iso_state, jsval_of,
 };
 use crate::{

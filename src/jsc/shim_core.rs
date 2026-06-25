@@ -13,7 +13,7 @@
 //! - `jsval(p)` / `ctx_of(c)` — reinterpret a handle / context pointer.
 #![allow(non_snake_case)]
 
-use crate::jsc_sys::*;
+use crate::jsc::jsc_sys::*;
 use crate::{Context, Data, Object, Primitive, RealIsolate};
 use std::cell::RefCell;
 use std::os::raw::c_void;
@@ -141,7 +141,7 @@ fn fallback_ctx(iso: *mut RealIsolate) -> JSContextRef {
 /// such a pointer poisons JSC's GC root set and crashes the collector.
 #[inline]
 pub(crate) fn is_non_value_handle(iso: *mut RealIsolate, v: JSValueRef) -> bool {
-    if crate::shim_function::is_template_ptr(v as *const c_void) {
+    if crate::jsc::shim_function::is_template_ptr(v as *const c_void) {
         return true;
     }
     if iso.is_null() {
@@ -254,7 +254,7 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
         data_slots: [ptr::null_mut(); 4],
         pending_exception: None,
         import_meta_cb: None,
-        cpp_heap: crate::shim_misc::current_cpp_heap(),
+        cpp_heap: crate::jsc::shim_misc::current_cpp_heap(),
     });
     Box::into_raw(state) as *mut RealIsolate
 }
@@ -262,12 +262,12 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetCppHeap(isolate: *mut RealIsolate) -> *mut c_void {
     if isolate.is_null() {
-        return crate::shim_misc::current_cpp_heap();
+        return crate::jsc::shim_misc::current_cpp_heap();
     }
     let st = iso_state(isolate);
     if st.cpp_heap.is_null() {
         // Lazily adopt the process dummy heap so deno's cppgc wrapping works.
-        st.cpp_heap = crate::shim_misc::current_cpp_heap();
+        st.cpp_heap = crate::jsc::shim_misc::current_cpp_heap();
     }
     st.cpp_heap
 }
@@ -474,7 +474,7 @@ pub extern "C" fn v8__Context__New(
     unsafe { install_context_compat_shims(ctx) };
     // If deno already registered a promise-reject callback, wire this fresh
     // context's unhandled-rejection bridge too.
-    unsafe { crate::shim_isolate::install_unhandled_rejection_bridge(ctx) };
+    unsafe { crate::jsc::shim_isolate::install_unhandled_rejection_bridge(ctx) };
     ctx as *const Context
 }
 

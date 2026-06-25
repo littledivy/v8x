@@ -16,8 +16,8 @@
 //! every JSValue through the QuickJS refcount helpers in `shim_core`.
 #![allow(non_snake_case, unused)]
 
-use crate::qjs::quickjs_sys::*;
-use crate::qjs::shim_core::{
+use crate::quickjs::quickjs_sys::*;
+use crate::quickjs::shim_core::{
     ctx_of, current_ctx, current_iso, intern, intern_dup, iso_state, jsval_of,
 };
 use crate::{Context, Data, Object, RealIsolate, String as V8String, Value};
@@ -479,8 +479,8 @@ pub extern "C" fn v8__SnapshotCreator__CONSTRUCT(
     // drives a real isolate through this creator (set default context, run the
     // extension JS, then CreateBlob). So we must own a live, entered isolate:
     // create one and stash its pointer in the creator buffer (`[usize; 1]`).
-    let iso = crate::qjs::shim_core::v8__Isolate__New(ptr::null());
-    crate::qjs::shim_core::v8__Isolate__Enter(iso);
+    let iso = crate::quickjs::shim_core::v8__Isolate__New(ptr::null());
+    crate::quickjs::shim_core::v8__Isolate__Enter(iso);
     if !buf.is_null() {
         unsafe { *(buf as *mut *mut RealIsolate) = iso };
     }

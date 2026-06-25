@@ -1,30 +1,30 @@
-// Family: "property" — PropertyDescriptor construct/destruct/getters/setters.
+// Family: "property" — PropertyDescriptor construct/destruct/getters/setters,
+// QuickJS-ng backend.
 //
-// The vendored `PropertyDescriptor` is `#[repr(transparent)] struct([usize;1])`
-// — i.e. a single machine word that the C++ side normally uses to hold a
-// pointer to a private impl struct. We mirror that: the one usize stores a
-// raw pointer to a heap-allocated `PdImpl` that we own. CONSTRUCT boxes one
-// and writes the pointer into the out slot (placement-new semantics); DESTRUCT
-// frees it.
+// The vendored `PropertyDescriptor` is `#[repr(transparent)] struct([usize; 1])`
+// — a single machine word the C++ side normally uses to hold a pointer to a
+// private impl struct. We mirror that: the one usize stores a raw pointer to a
+// heap-allocated `PdImpl` that we own. CONSTRUCT boxes one and writes the
+// pointer into the out slot (placement-new semantics); DESTRUCT frees it.
 //
-// Stored js value handles (value/get/set) are JSC `JSValueRef`s protected
-// against the current context for the lifetime of the descriptor, and
-// unprotected on DESTRUCT. Getters re-intern them into the handle scope so the
-// returned `*const Value` is GC-rooted per the crate rule.
+// Unlike the JSC backend (where a `JSValueRef` is a pointer protected against
+// the context), QuickJS `JSValue` is a 16-byte struct that carries its own
+// refcount. So we store an OWNED (`JS_DupValue`'d) `JSValue` for value/get/set
+// and drop that refcount with `JS_FreeValue` on DESTRUCT. Presence is tracked
+// solely by the `has_*` booleans (a `JSValue` can't be a null pointer; absent
+// slots hold `undefined`). Getters re-intern the stored value into the current
+// handle scope so the returned `*const Value` is GC-rooted per the crate rule.
 #![allow(non_snake_case, unused)]
 
-use crate::jsc_sys::*;
-use crate::shim_core::{current_ctx, current_iso, intern, jsval};
-use crate::Value;
-
-// The vendored repr-transparent newtype around [usize; 1].
-#[repr(transparent)]
-pub struct PropertyDescriptor([usize; 1]);
+use crate::quickjs::quickjs_sys::*;
+use crate::quickjs::shim_core::{current_ctx, intern_dup, jsval_of};
+use crate::{PropertyDescriptor, Value};
 
 // Our private backing struct. Booleans track presence (`has_*`) and value of
 // each attribute, mirroring v8::PropertyDescriptor's PrivateData.
 struct PdImpl {
-    ctx: JSContextRef,
+    // Context owning the refcounts on value/get/set; used to free them.
+    ctx: *mut JSContext,
 
     has_enumerable: bool,
     enumerable: bool,
@@ -33,12 +33,12 @@ struct PdImpl {
     has_writable: bool,
     writable: bool,
 
-    // Protected JSValueRefs (or null if absent).
-    value: JSValueRef,
+    // Owned (+1) JSValues, valid only when the corresponding `has_*` is set.
+    value: JSValue,
     has_value: bool,
-    get: JSValueRef,
+    get: JSValue,
     has_get: bool,
-    set: JSValueRef,
+    set: JSValue,
     has_set: bool,
 }
 
@@ -52,11 +52,11 @@ impl PdImpl {
             configurable: false,
             has_writable: false,
             writable: false,
-            value: std::ptr::null(),
+            value: jsv_undefined(),
             has_value: false,
-            get: std::ptr::null(),
+            get: jsv_undefined(),
             has_get: false,
-            set: std::ptr::null(),
+            set: jsv_undefined(),
             has_set: false,
         }
     }
@@ -64,27 +64,30 @@ impl PdImpl {
 
 #[inline]
 unsafe fn imp<'a>(this: *const PropertyDescriptor) -> &'a PdImpl {
-    let p = (*this).0[0] as *const PdImpl;
+    let p = *(this as *const usize) as *const PdImpl;
     &*p
 }
 
 #[inline]
 unsafe fn imp_mut<'a>(this: *mut PropertyDescriptor) -> &'a mut PdImpl {
-    let p = (*this).0[0] as *mut PdImpl;
+    let p = *(this as *const usize) as *mut PdImpl;
     &mut *p
 }
 
 #[inline]
 unsafe fn write_impl(out: *mut PropertyDescriptor, pd: PdImpl) {
     let boxed = Box::into_raw(Box::new(pd));
-    (*out).0[0] = boxed as usize;
+    *(out as *mut usize) = boxed as usize;
 }
 
+/// Take an OWNED (+1) refcount on a borrowed handle's JSValue, for storage.
 #[inline]
-unsafe fn protect(ctx: JSContextRef, v: JSValueRef) {
-    if !v.is_null() {
-        JSValueProtect(ctx, v);
+unsafe fn dup_handle(ctx: *mut JSContext, v: *const Value) -> JSValue {
+    let jv = jsval_of(v);
+    if ctx.is_null() {
+        return jv;
     }
+    JS_DupValue(ctx, jv)
 }
 
 // ----- Constructors -----
@@ -103,9 +106,7 @@ pub extern "C" fn v8__PropertyDescriptor__CONSTRUCT__Value(
 ) {
     unsafe {
         let mut pd = PdImpl::empty();
-        let v = jsval(value);
-        protect(pd.ctx, v);
-        pd.value = v;
+        pd.value = dup_handle(pd.ctx, value);
         pd.has_value = true;
         write_impl(this as *mut PropertyDescriptor, pd);
     }
@@ -119,9 +120,7 @@ pub extern "C" fn v8__PropertyDescriptor__CONSTRUCT__Value_Writable(
 ) {
     unsafe {
         let mut pd = PdImpl::empty();
-        let v = jsval(value);
-        protect(pd.ctx, v);
-        pd.value = v;
+        pd.value = dup_handle(pd.ctx, value);
         pd.has_value = true;
         pd.writable = writable;
         pd.has_writable = true;
@@ -137,13 +136,9 @@ pub extern "C" fn v8__PropertyDescriptor__CONSTRUCT__Get_Set(
 ) {
     unsafe {
         let mut pd = PdImpl::empty();
-        let g = jsval(get);
-        let s = jsval(set);
-        protect(pd.ctx, g);
-        protect(pd.ctx, s);
-        pd.get = g;
+        pd.get = dup_handle(pd.ctx, get);
         pd.has_get = true;
-        pd.set = s;
+        pd.set = dup_handle(pd.ctx, set);
         pd.has_set = true;
         write_impl(this as *mut PropertyDescriptor, pd);
     }
@@ -152,21 +147,24 @@ pub extern "C" fn v8__PropertyDescriptor__CONSTRUCT__Get_Set(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__PropertyDescriptor__DESTRUCT(this: *mut PropertyDescriptor) {
     unsafe {
-        let raw = (*this).0[0] as *mut PdImpl;
+        let slot = this as *mut usize;
+        let raw = *slot as *mut PdImpl;
         if raw.is_null() {
             return;
         }
         let pd = Box::from_raw(raw);
-        if !pd.value.is_null() {
-            JSValueUnprotect(pd.ctx, pd.value);
+        if !pd.ctx.is_null() {
+            if pd.has_value {
+                JS_FreeValue(pd.ctx, pd.value);
+            }
+            if pd.has_get {
+                JS_FreeValue(pd.ctx, pd.get);
+            }
+            if pd.has_set {
+                JS_FreeValue(pd.ctx, pd.set);
+            }
         }
-        if !pd.get.is_null() {
-            JSValueUnprotect(pd.ctx, pd.get);
-        }
-        if !pd.set.is_null() {
-            JSValueUnprotect(pd.ctx, pd.set);
-        }
-        (*this).0[0] = 0;
+        *slot = 0;
         // pd dropped here, freeing the box.
     }
 }
@@ -199,11 +197,12 @@ pub extern "C" fn v8__PropertyDescriptor__value(
     this: *const PropertyDescriptor,
 ) -> *const Value {
     unsafe {
-        let v = imp(this).value;
-        if v.is_null() {
+        let pd = imp(this);
+        if !pd.has_value {
             return std::ptr::null();
         }
-        intern::<Value>(v)
+        // Borrowed read: dup into the current handle scope.
+        intern_dup::<Value>(pd.ctx, pd.value)
     }
 }
 
@@ -212,11 +211,11 @@ pub extern "C" fn v8__PropertyDescriptor__get(
     this: *const PropertyDescriptor,
 ) -> *const Value {
     unsafe {
-        let v = imp(this).get;
-        if v.is_null() {
+        let pd = imp(this);
+        if !pd.has_get {
             return std::ptr::null();
         }
-        intern::<Value>(v)
+        intern_dup::<Value>(pd.ctx, pd.get)
     }
 }
 
@@ -225,11 +224,11 @@ pub extern "C" fn v8__PropertyDescriptor__set(
     this: *const PropertyDescriptor,
 ) -> *const Value {
     unsafe {
-        let v = imp(this).set;
-        if v.is_null() {
+        let pd = imp(this);
+        if !pd.has_set {
             return std::ptr::null();
         }
-        intern::<Value>(v)
+        intern_dup::<Value>(pd.ctx, pd.set)
     }
 }
 
@@ -301,4 +300,80 @@ pub extern "C" fn v8__PropertyDescriptor__set_configurable(
         pd.configurable = configurable;
         pd.has_configurable = true;
     }
+}
+
+// ----- Apply a descriptor to an object (for v8__Object__DefineProperty) -----
+
+use std::os::raw::c_int;
+
+unsafe extern "C" {
+    // JSValueConst val/getter/setter: NOT consumed by JS_DefineProperty.
+    fn JS_DefineProperty(
+        ctx: *mut JSContext,
+        this_obj: JSValue,
+        prop: JSAtom,
+        val: JSValue,
+        getter: JSValue,
+        setter: JSValue,
+        flags: c_int,
+    ) -> c_int;
+}
+
+const JS_PROP_CONFIGURABLE: c_int = 1 << 0;
+const JS_PROP_WRITABLE: c_int = 1 << 1;
+const JS_PROP_ENUMERABLE: c_int = 1 << 2;
+const JS_PROP_HAS_CONFIGURABLE: c_int = 1 << 8;
+const JS_PROP_HAS_WRITABLE: c_int = 1 << 9;
+const JS_PROP_HAS_ENUMERABLE: c_int = 1 << 10;
+const JS_PROP_HAS_GET: c_int = 1 << 11;
+const JS_PROP_HAS_SET: c_int = 1 << 12;
+const JS_PROP_HAS_VALUE: c_int = 1 << 13;
+const JS_PROP_THROW: c_int = 1 << 14;
+
+/// Define the property described by `this` onto `obj` under `atom`, translating
+/// our `PdImpl` presence/flags into QuickJS `JS_DefineProperty` flags. Returns
+/// the `JS_DefineProperty` result (<0 = exception, 0 = false, >0 = true).
+pub(crate) fn pd_define(
+    ctx: *mut JSContext,
+    obj: JSValue,
+    atom: JSAtom,
+    this: *const PropertyDescriptor,
+) -> c_int {
+    let pd = unsafe { imp(this) };
+    let mut flags: c_int = JS_PROP_THROW;
+    let mut val = jsv_undefined();
+    let mut getter = jsv_undefined();
+    let mut setter = jsv_undefined();
+
+    if pd.has_value {
+        flags |= JS_PROP_HAS_VALUE;
+        val = pd.value;
+    }
+    if pd.has_get {
+        flags |= JS_PROP_HAS_GET;
+        getter = pd.get;
+    }
+    if pd.has_set {
+        flags |= JS_PROP_HAS_SET;
+        setter = pd.set;
+    }
+    if pd.has_writable {
+        flags |= JS_PROP_HAS_WRITABLE;
+        if pd.writable {
+            flags |= JS_PROP_WRITABLE;
+        }
+    }
+    if pd.has_enumerable {
+        flags |= JS_PROP_HAS_ENUMERABLE;
+        if pd.enumerable {
+            flags |= JS_PROP_ENUMERABLE;
+        }
+    }
+    if pd.has_configurable {
+        flags |= JS_PROP_HAS_CONFIGURABLE;
+        if pd.configurable {
+            flags |= JS_PROP_CONFIGURABLE;
+        }
+    }
+    unsafe { JS_DefineProperty(ctx, obj, atom, val, getter, setter, flags) }
 }

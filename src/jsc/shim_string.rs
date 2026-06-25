@@ -1,16 +1,16 @@
 // Family: "string" — v8::String creation/inspection + PrimitiveArray.
 #![allow(non_snake_case, unused)]
 
-use crate::jsc_sys::*;
+use crate::jsc::jsc_sys::*;
 use crate::isolate::RealIsolate;
 use crate::string::{Encoding, NewStringType};
 use crate::support::{char, int, size_t};
 use crate::{Primitive, PrimitiveArray, String as V8String, Value};
-use crate::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
+use crate::jsc::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
 use std::os::raw::c_void;
 use std::ptr;
 
-// JSC C API functions come from `crate::jsc_sys` (bindgen) via the glob import.
+// JSC C API functions come from `crate::jsc::jsc_sys` (bindgen) via the glob import.
 
 // ===================================================================
 // String creation

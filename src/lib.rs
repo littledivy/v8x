@@ -111,47 +111,11 @@ mod scope;
 mod script;
 // ---- JSC engine backend (feature `engine_jsc`, default) ----
 #[cfg(feature = "engine_jsc")]
-mod jsc_sys;
-#[cfg(feature = "engine_jsc")]
-mod shim_core;
-#[cfg(feature = "engine_jsc")]
-mod shim_impl;
-#[cfg(feature = "engine_jsc")]
-mod shim_cli_extra;
-#[cfg(feature = "engine_jsc")]
-mod shim_value;
-#[cfg(feature = "engine_jsc")]
-mod shim_string;
-#[cfg(feature = "engine_jsc")]
-mod shim_object;
-#[cfg(feature = "engine_jsc")]
-mod shim_primitive;
-#[cfg(feature = "engine_jsc")]
-mod shim_isolate;
-#[cfg(feature = "engine_jsc")]
-mod shim_arraybuffer;
-#[cfg(feature = "engine_jsc")]
-mod shim_function;
-#[cfg(feature = "engine_jsc")]
-mod shim_exception;
-#[cfg(feature = "engine_jsc")]
-mod shim_serializer;
-#[cfg(feature = "engine_jsc")]
-mod shim_module;
-#[cfg(feature = "engine_jsc")]
-mod shim_property;
-#[cfg(feature = "engine_jsc")]
-mod shim_misc;
-#[cfg(feature = "engine_jsc")]
-mod shim_inspector;
-#[cfg(feature = "engine_jsc")]
-mod shim_simdutf;
-#[cfg(feature = "engine_jsc")]
-mod shims;
+mod jsc;
 
 // ---- QuickJS-ng engine backend (feature `engine_quickjs`) ----
 #[cfg(feature = "engine_quickjs")]
-mod qjs;
+mod quickjs;
 
 #[path = "../vendor/rusty_v8/src/script_or_module.rs"]
 mod script_or_module;

@@ -21,8 +21,8 @@
 
 #![allow(non_snake_case)]
 
-use crate::qjs::quickjs_sys::*;
-use crate::qjs::shim_core::{ctx_of, current_ctx, intern, intern_dup, jsval_of};
+use crate::quickjs::quickjs_sys::*;
+use crate::quickjs::shim_core::{ctx_of, current_ctx, intern, intern_dup, jsval_of};
 use crate::support::Maybe;
 use crate::{
     BigInt, Boolean, Context, Integer, Number, Object, RealIsolate, String as V8String, Value,

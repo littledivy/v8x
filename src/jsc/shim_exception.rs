@@ -2,14 +2,14 @@
 // TryCatch / Promise / PromiseResolver / PromiseRejectMessage.
 #![allow(non_snake_case, unused)]
 
-use crate::jsc_sys::*;
+use crate::jsc::jsc_sys::*;
 use crate::promise::{PromiseRejectEvent, PromiseRejectMessage, PromiseState};
 use crate::support::{int, MaybeBool};
 use crate::{
     Context, Function, Location, Message, Promise, PromiseResolver, RealIsolate, StackFrame,
     StackTrace, String, Value,
 };
-use crate::shim_core::{
+use crate::jsc::shim_core::{
     clear_pending_exception, ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval,
     peek_pending_exception, record_pending_exception,
 };
@@ -21,7 +21,7 @@ use std::ptr;
 #[allow(non_camel_case_types)]
 type TryCatch = usize;
 
-// All JSC C functions come from `crate::jsc_sys` (bindgen) via the glob import.
+// All JSC C functions come from `crate::jsc::jsc_sys` (bindgen) via the glob import.
 
 // ===================================================================
 // Helpers

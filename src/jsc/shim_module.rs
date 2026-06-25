@@ -12,8 +12,8 @@
 use std::mem::MaybeUninit;
 use std::ptr;
 
-use crate::jsc_sys::*;
-use crate::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
+use crate::jsc::jsc_sys::*;
+use crate::jsc::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
 use crate::{
     Context, Data, FixedArray, Function, Message, Module, ModuleRequest, Object, Primitive,
     RealIsolate, Script, String as V8String, UnboundModuleScript, UnboundScript, Value,
@@ -29,7 +29,7 @@ use crate::script::ScriptOrigin;
 use crate::script_compiler::{CachedData, CompileOptions, NoCacheReason, Source};
 use crate::support::{Maybe, MaybeBool, int};
 
-// JSC C API functions come from `crate::jsc_sys` (bindgen) via the glob import.
+// JSC C API functions come from `crate::jsc::jsc_sys` (bindgen) via the glob import.
 //
 // `ModJSClassDefinition` below is a layout-compatible mirror of bindgen's
 // `JSClassDefinition` that type-erases the callback fields to `*const c_void`
@@ -1366,7 +1366,7 @@ pub extern "C" fn v8__Module__InstantiateModule(
 
     let mut deps: Vec<*const Module> = Vec::new();
     for spec in &specs {
-        crate::shim_core::restore_current(iso);
+        crate::jsc::shim_core::restore_current(iso);
         let dep = unsafe { resolve_dependency(context, cb, this, spec) };
         if dep.is_null() {
             // Unresolved import; leave inert (binding will be undefined).
@@ -1380,7 +1380,7 @@ pub extern "C" fn v8__Module__InstantiateModule(
         }
         deps.push(dep);
     }
-    crate::shim_core::restore_current(iso);
+    crate::jsc::shim_core::restore_current(iso);
     if let Some(m) = module_state(this) {
         m.dependencies = deps;
         m.status = ModuleStatus::Instantiated;
@@ -1461,7 +1461,7 @@ pub extern "C" fn v8__Module__Evaluate(
             dep_promises.push(jsval(p));
         }
     }
-    crate::shim_core::restore_current(iso);
+    crate::jsc::shim_core::restore_current(iso);
 
     let Some(m) = module_state(this) else {
         return ptr::null();
@@ -1539,7 +1539,7 @@ pub extern "C" fn v8__Module__Evaluate(
                 // deno's `mod_evaluate` awaits it (exports are populated when it
                 // settles). Sync module: fall through to the resolved promise.
                 if !promise.is_null() {
-                    crate::shim_exception::track_promise_pub(
+                    crate::jsc::shim_exception::track_promise_pub(
                         ctx,
                         promise as JSObjectRef,
                     );
@@ -1584,7 +1584,7 @@ fn make_resolved_promise(ctx: JSContextRef) -> *const Value {
         return intern_ctx::<Value>(ctx, v);
     }
     // Track so Promise::state()/result() observe it as fulfilled.
-    crate::shim_exception::track_promise_pub(ctx, p as JSObjectRef);
+    crate::jsc::shim_exception::track_promise_pub(ctx, p as JSObjectRef);
     intern_ctx::<Value>(ctx, p)
 }
 
@@ -1741,7 +1741,7 @@ fn make_rejected_promise(ctx: JSContextRef, exc: JSValueRef) -> *const Value {
     if p.is_null() {
         return intern_ctx::<Value>(ctx, unsafe { JSValueMakeUndefined(ctx) });
     }
-    crate::shim_exception::track_promise_pub(ctx, p as JSObjectRef);
+    crate::jsc::shim_exception::track_promise_pub(ctx, p as JSObjectRef);
     intern_ctx::<Value>(ctx, p)
 }
 
@@ -1822,7 +1822,7 @@ unsafe fn report_module_exception(ctx: JSContextRef, exc: JSValueRef) {
     if exc.is_null() {
         return;
     }
-    crate::shim_core::record_pending_exception(ctx, exc);
+    crate::jsc::shim_core::record_pending_exception(ctx, exc);
 }
 
 #[unsafe(no_mangle)]

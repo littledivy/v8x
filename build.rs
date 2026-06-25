@@ -72,7 +72,7 @@ fn main() {
         build_quickjs(&manifest_dir);
         // WebAssembly engine: build the vendored WAMR (interpreter-only) static
         // lib and link it; the WebAssembly.* JS API is implemented over its
-        // wasm-c-api in src/qjs/fam_wasm.rs.
+        // wasm-c-api in src/quickjs/fam_wasm.rs.
         build_wamr(&manifest_dir);
     }
 }

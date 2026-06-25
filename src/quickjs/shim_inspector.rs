@@ -427,8 +427,8 @@ mod cdp {
     use super::RawChannel;
     use super::RealStringBuffer;
     use crate::inspector::StringBuffer;
-    use crate::qjs::quickjs_sys::*;
-    use crate::qjs::shim_core::current_ctx;
+    use crate::quickjs::quickjs_sys::*;
+    use crate::quickjs::shim_core::current_ctx;
     use crate::support::UniquePtr;
     use crate::support::int;
     use std::collections::HashMap;

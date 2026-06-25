@@ -8,15 +8,15 @@
 //! shared_ptr<Platform> machinery are implemented for real.
 #![allow(non_snake_case, unused)]
 
-use crate::jsc_sys::*;
-use crate::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
+use crate::jsc::jsc_sys::*;
+use crate::jsc::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
 use crate::support::{SharedPtrBase, UniquePtr, long};
 use crate::{Context, Data, Object, String as V8String, Value};
 
 use std::os::raw::{c_char, c_void};
 use std::ptr;
 
-// JSC C API functions come from `crate::jsc_sys` (bindgen) via the glob import.
+// JSC C API functions come from `crate::jsc::jsc_sys` (bindgen) via the glob import.
 
 // `crate::Platform` is module-private to us; for these C-ABI symbols
 // we only need pointer/layout compatibility, so use an opaque marker. The
@@ -202,7 +202,7 @@ fn stable_protect_ctx() -> JSContextRef {
 }
 
 fn is_non_value_handle(v: JSValueRef) -> bool {
-    crate::shim_core::is_non_value_handle(current_iso(), v)
+    crate::jsc::shim_core::is_non_value_handle(current_iso(), v)
 }
 
 fn global_protect(v: JSValueRef) {
