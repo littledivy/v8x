@@ -1,15 +1,3 @@
-// Copyright 2018-2026 the Deno authors. MIT license.
-//
-// Hand-written FFI declarations for the QuickJS-ng C API.
-//
-// We do this by hand rather than bindgen to keep the build hermetic: the
-// declarations are checked at compile time against the libquickjs symbol
-// table when `--features link_quickjs` is on, and otherwise they're just
-// inert `extern "C"` forward decls that never resolve at link time.
-//
-// The header version we target is quickjs-ng 0.10+. Where the API diverges
-// between original quickjs and quickjs-ng we use the -ng spelling.
-
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
 #![allow(non_upper_case_globals)]
@@ -18,8 +6,6 @@
 use core::ffi::c_char;
 use core::ffi::c_int;
 use core::ffi::c_void;
-
-// ----- Opaque types -----------------------------------------------------
 
 #[repr(C)]
 pub struct JSRuntime {
@@ -44,12 +30,6 @@ pub struct JSClass {
 pub type JSClassID = u32;
 pub type JSAtom = u32;
 
-// ----- JSValue layout ---------------------------------------------------
-//
-// QuickJS-ng's `JSValue` is a 16-byte tagged union (`int64 tag; union { ... }`)
-// on 64-bit hosts. The `JS_VALUE_GET_*` macros decode it. We reproduce the
-// layout faithfully so it can be passed by value across the FFI boundary.
-
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub union JSValueUnion {
@@ -71,7 +51,6 @@ impl JSValue {
   }
 }
 
-// Tag constants — match quickjs-ng `quickjs.h` enum exactly.
 pub const JS_TAG_FIRST: i64 = -9;
 pub const JS_TAG_BIG_INT: i64 = -9;
 pub const JS_TAG_SYMBOL: i64 = -8;
@@ -151,8 +130,6 @@ pub fn jsv_is_number(v: &JSValue) -> bool {
 }
 #[inline]
 pub fn jsv_is_string(v: &JSValue) -> bool {
-  // QuickJS-ng lazily concatenates with rope strings (separate tag); both are
-  // observably JS strings (typeof === "string").
   v.tag == JS_TAG_STRING || v.tag == JS_TAG_STRING_ROPE
 }
 #[inline]
@@ -172,19 +149,11 @@ pub fn jsv_is_exception(v: &JSValue) -> bool {
   v.tag == JS_TAG_EXCEPTION
 }
 
-/// Extract the pointer payload of a tagged-pointer JSValue (`JS_TAG_OBJECT`,
-/// `JS_TAG_MODULE`, `JS_TAG_FUNCTION_BYTECODE`, `JS_TAG_STRING`, etc).
-///
-/// Returns `null` for non-pointer tags (numbers, booleans, undefined).
 #[inline]
 pub fn jsv_get_ptr(v: &JSValue) -> *mut c_void {
-  // Safe: for pointer-tagged values the union's `ptr` field is the live
-  // discriminant; for non-pointer tags the read still returns a defined
-  // bit pattern (we just don't promise it's a valid pointer).
   unsafe { v.u.ptr }
 }
 
-// Eval flags (quickjs.h).
 pub const JS_EVAL_TYPE_GLOBAL: c_int = 0;
 pub const JS_EVAL_TYPE_MODULE: c_int = 1;
 pub const JS_EVAL_TYPE_DIRECT: c_int = 2;
@@ -195,7 +164,6 @@ pub const JS_EVAL_FLAG_COMPILE_ONLY: c_int = 1 << 5;
 pub const JS_EVAL_FLAG_BACKTRACE_BARRIER: c_int = 1 << 6;
 pub const JS_EVAL_FLAG_ASYNC: c_int = 1 << 7;
 
-// Property flags (subset).
 pub const JS_PROP_CONFIGURABLE: c_int = 1 << 0;
 pub const JS_PROP_WRITABLE: c_int = 1 << 1;
 pub const JS_PROP_ENUMERABLE: c_int = 1 << 2;
@@ -204,13 +172,11 @@ pub const JS_PROP_C_W_E: c_int =
 pub const JS_PROP_THROW: c_int = 1 << 14;
 pub const JS_PROP_THROW_STRICT: c_int = 1 << 15;
 
-// Promise hook events.
 pub const JS_PROMISE_HOOK_INIT: c_int = 0;
 pub const JS_PROMISE_HOOK_BEFORE: c_int = 1;
 pub const JS_PROMISE_HOOK_AFTER: c_int = 2;
 pub const JS_PROMISE_HOOK_RESOLVE: c_int = 3;
 
-// Callback signatures.
 pub type JSCFunction = unsafe extern "C" fn(
   ctx: *mut JSContext,
   this_val: JSValue,
@@ -227,10 +193,8 @@ pub type JSCFunctionData = unsafe extern "C" fn(
   func_data: *mut JSValue,
 ) -> JSValue;
 
-pub type JSModuleInitFunc = unsafe extern "C" fn(
-  ctx: *mut JSContext,
-  m: *mut JSModuleDef,
-) -> c_int;
+pub type JSModuleInitFunc =
+  unsafe extern "C" fn(ctx: *mut JSContext, m: *mut JSModuleDef) -> c_int;
 pub type JSModuleNormalizeFunc = unsafe extern "C" fn(
   ctx: *mut JSContext,
   module_base_name: *const c_char,
@@ -244,8 +208,6 @@ pub type JSModuleLoaderFunc = unsafe extern "C" fn(
   opaque: *mut c_void,
 ) -> *mut JSModuleDef;
 
-/// v82jsc dynamic-import hook (quickjs.c). `resolving_funcs` points to a 2-element
-/// array: [0]=resolve, [1]=reject of the `import()` promise.
 pub type JSV82jscDynImportHook = unsafe extern "C" fn(
   ctx: *mut JSContext,
   basename: JSValue,
@@ -261,8 +223,6 @@ pub type JSHostPromiseRejectionTracker = unsafe extern "C" fn(
   is_handled: c_int,
   opaque: *mut c_void,
 );
-
-// ----- Runtime/context lifecycle ---------------------------------------
 
 unsafe extern "C" {
   pub fn JS_GetVersion() -> *const std::os::raw::c_char;
@@ -288,15 +248,11 @@ unsafe extern "C" {
   pub fn JS_GetContextOpaque(ctx: *mut JSContext) -> *mut c_void;
   pub fn JS_GetGlobalObject(ctx: *mut JSContext) -> JSValue;
 
-  // Value refcount.
   pub fn JS_FreeValue(ctx: *mut JSContext, v: JSValue);
   pub fn JS_FreeValueRT(rt: *mut JSRuntime, v: JSValue);
   pub fn JS_DupValue(ctx: *mut JSContext, v: JSValue) -> JSValue;
   pub fn JS_DupValueRT(rt: *mut JSRuntime, v: JSValue) -> JSValue;
 
-  // (Primitive constructors JS_NewBool/Int32/.. are `static inline` in
-  // quickjs.h — no exported symbol — so they are reimplemented as Rust fns
-  // below, not declared here.)
   pub fn JS_NewStringLen(
     ctx: *mut JSContext,
     str: *const c_char,
@@ -309,18 +265,19 @@ unsafe extern "C" {
     is_global: c_int,
   ) -> JSValue;
   pub fn JS_NewBigInt64(ctx: *mut JSContext, val: i64) -> JSValue;
-  pub fn JS_ToBigInt64(ctx: *mut JSContext, pres: *mut i64, v: JSValue) -> c_int;
+  pub fn JS_ToBigInt64(
+    ctx: *mut JSContext,
+    pres: *mut i64,
+    v: JSValue,
+  ) -> c_int;
   pub fn JS_NewBigUint64(ctx: *mut JSContext, val: u64) -> JSValue;
 
-  // Number extraction.
   pub fn JS_ToBool(ctx: *mut JSContext, v: JSValue) -> c_int;
   pub fn JS_ToInt32(ctx: *mut JSContext, pres: *mut i32, v: JSValue) -> c_int;
   pub fn JS_ToInt64(ctx: *mut JSContext, pres: *mut i64, v: JSValue) -> c_int;
   pub fn JS_ToFloat64(ctx: *mut JSContext, pres: *mut f64, v: JSValue)
   -> c_int;
-  // The exported symbol is `JS_ToCStringLen2`. `JS_ToCString` and
-  // `JS_ToCStringLen` are `static inline` wrappers in quickjs.h — see
-  // `JS_ToCString` / `JS_ToCStringLen` Rust wrappers below.
+
   pub fn JS_ToCStringLen2(
     ctx: *mut JSContext,
     plen: *mut usize,
@@ -329,23 +286,32 @@ unsafe extern "C" {
   ) -> *const c_char;
   pub fn JS_FreeCString(ctx: *mut JSContext, ptr: *const c_char);
 
-  // Objects, properties, calls.
   pub fn JS_NewObject(ctx: *mut JSContext) -> JSValue;
   pub fn JS_NewObjectClass(ctx: *mut JSContext, class_id: c_int) -> JSValue;
   pub fn JS_NewArray(ctx: *mut JSContext) -> JSValue;
-  // ArrayBuffer (for WebAssembly.Memory.buffer + reading wasm binaries).
+
   pub fn JS_NewArrayBuffer(
     ctx: *mut JSContext,
     buf: *mut u8,
     len: usize,
-    free_func: Option<unsafe extern "C" fn(*mut JSRuntime, *mut c_void, *mut c_void)>,
+    free_func: Option<
+      unsafe extern "C" fn(*mut JSRuntime, *mut c_void, *mut c_void),
+    >,
     opaque: *mut c_void,
     is_shared: bool,
   ) -> JSValue;
-  pub fn JS_NewArrayBufferCopy(ctx: *mut JSContext, buf: *const u8, len: usize) -> JSValue;
-  pub fn JS_GetArrayBuffer(ctx: *mut JSContext, psize: *mut usize, obj: JSValue) -> *mut u8;
+  pub fn JS_NewArrayBufferCopy(
+    ctx: *mut JSContext,
+    buf: *const u8,
+    len: usize,
+  ) -> JSValue;
+  pub fn JS_GetArrayBuffer(
+    ctx: *mut JSContext,
+    psize: *mut usize,
+    obj: JSValue,
+  ) -> *mut u8;
   pub fn JS_DetachArrayBuffer(ctx: *mut JSContext, obj: JSValue);
-  // Returns the underlying ArrayBuffer of a TypedArray + its offset/length.
+
   pub fn JS_GetTypedArrayBuffer(
     ctx: *mut JSContext,
     obj: JSValue,
@@ -353,7 +319,7 @@ unsafe extern "C" {
     pbyte_length: *mut usize,
     pbytes_per_element: *mut usize,
   ) -> JSValue;
-  // quickjs-ng: JS_IsArray takes ONLY the value (no ctx), returns bool.
+
   pub fn JS_IsArray(v: JSValue) -> bool;
   pub fn JS_IsFunction(ctx: *mut JSContext, v: JSValue) -> c_int;
   pub fn JS_IsConstructor(ctx: *mut JSContext, v: JSValue) -> c_int;
@@ -379,8 +345,7 @@ unsafe extern "C" {
     idx: u32,
     val: JSValue,
   ) -> c_int;
-  // QuickJS-ng exports the atom-based forms only; the str-based forms are
-  // provided as Rust wrappers below.
+
   pub fn JS_HasProperty(
     ctx: *mut JSContext,
     this_obj: JSValue,
@@ -405,14 +370,13 @@ unsafe extern "C" {
     argc: c_int,
     argv: *mut JSValue,
   ) -> JSValue;
-  // The exported symbol is `JS_NewCFunction2`. `JS_NewCFunction` is a
-  // `static inline` wrapper in quickjs.h — see Rust wrapper below.
+
   pub fn JS_NewCFunction2(
     ctx: *mut JSContext,
     func: JSCFunction,
     name: *const c_char,
     length: c_int,
-    cproto: c_int, // JSCFunctionEnum, 0 = JS_CFUNC_generic
+    cproto: c_int,
     magic: c_int,
   ) -> JSValue;
   pub fn JS_NewCFunctionData(
@@ -433,7 +397,6 @@ unsafe extern "C" {
     flags: c_int,
   ) -> c_int;
 
-  // Eval/script.
   pub fn JS_Eval(
     ctx: *mut JSContext,
     input: *const c_char,
@@ -451,7 +414,6 @@ unsafe extern "C" {
   ) -> JSValue;
   pub fn JS_EvalFunction(ctx: *mut JSContext, fun_obj: JSValue) -> JSValue;
 
-  // JSON (used by the CDP inspector backend to parse/serialize protocol msgs).
   pub fn JS_ParseJSON(
     ctx: *mut JSContext,
     buf: *const c_char,
@@ -465,7 +427,6 @@ unsafe extern "C" {
     space0: JSValue,
   ) -> JSValue;
 
-  // Bytecode (for the snapshot Option-A path).
   pub fn JS_WriteObject(
     ctx: *mut JSContext,
     psize: *mut usize,
@@ -479,10 +440,9 @@ unsafe extern "C" {
     flags: c_int,
   ) -> JSValue;
 
-  // Promises.
   pub fn JS_NewPromiseCapability(
     ctx: *mut JSContext,
-    resolving_funcs: *mut JSValue, // [resolve, reject]
+    resolving_funcs: *mut JSValue,
   ) -> JSValue;
   pub fn JS_PromiseState(ctx: *mut JSContext, promise: JSValue) -> c_int;
   pub fn JS_PromiseResult(ctx: *mut JSContext, promise: JSValue) -> JSValue;
@@ -493,7 +453,6 @@ unsafe extern "C" {
     opaque: *mut c_void,
   );
 
-  // Modules.
   pub fn JS_SetModuleLoaderFunc(
     rt: *mut JSRuntime,
     normalize: Option<JSModuleNormalizeFunc>,
@@ -501,12 +460,13 @@ unsafe extern "C" {
     opaque: *mut c_void,
   );
   pub fn JS_GetModuleName(ctx: *mut JSContext, m: *mut JSModuleDef) -> JSAtom;
-  // Returns the module's `import.meta` object (creating it on first call),
-  // owned (+1). We populate it via deno's import-meta host callback.
+
   pub fn JS_GetImportMeta(ctx: *mut JSContext, m: *mut JSModuleDef) -> JSValue;
-  // v82jsc custom helper (quickjs.c): 1 if the module's body already ran.
-  pub fn v82jsc_module_is_evaluated(m: *mut JSModuleDef) -> std::os::raw::c_int;
-  pub fn v82jsc_module_eval_started(m: *mut JSModuleDef) -> std::os::raw::c_int;
+
+  pub fn v82jsc_module_is_evaluated(m: *mut JSModuleDef)
+  -> std::os::raw::c_int;
+  pub fn v82jsc_module_eval_started(m: *mut JSModuleDef)
+  -> std::os::raw::c_int;
   pub fn v82jsc_has_loaded_module(
     ctx: *mut JSContext,
     name: *const std::os::raw::c_char,
@@ -515,7 +475,7 @@ unsafe extern "C" {
     ctx: *mut JSContext,
     name: *const std::os::raw::c_char,
   ) -> *mut JSModuleDef;
-  // v82jsc custom (quickjs.c): install the dynamic-import hook (deno bridge).
+
   pub fn JS_SetDynamicImportHook(fn_: JSV82jscDynImportHook);
   pub fn JS_GetModuleNamespace(
     ctx: *mut JSContext,
@@ -539,7 +499,6 @@ unsafe extern "C" {
     val: JSValue,
   ) -> c_int;
 
-  // Exception handling.
   pub fn JS_Throw(ctx: *mut JSContext, obj: JSValue) -> JSValue;
   pub fn JS_GetException(ctx: *mut JSContext) -> JSValue;
   pub fn JS_HasException(ctx: *mut JSContext) -> c_int;
@@ -571,12 +530,8 @@ unsafe extern "C" {
   ) -> JSValue;
   pub fn JS_ThrowOutOfMemory(ctx: *mut JSContext) -> JSValue;
 
-  // Atoms.
   pub fn JS_NewAtom(ctx: *mut JSContext, str: *const c_char) -> JSAtom;
-  // QuickJS-ng allocator. The module loader / normalizer contract requires
-  // returned strings to come from `js_malloc`/`js_strdup` because QuickJS
-  // will free them via `js_free`. Plain libc allocators won't work — the
-  // free side must match the malloc side.
+
   pub fn js_malloc(ctx: *mut JSContext, size: usize) -> *mut c_void;
   pub fn js_free(ctx: *mut JSContext, ptr: *mut c_void);
   pub fn js_strdup(ctx: *mut JSContext, s: *const c_char) -> *mut c_char;
@@ -591,26 +546,11 @@ unsafe extern "C" {
   pub fn JS_AtomToValue(ctx: *mut JSContext, atom: JSAtom) -> JSValue;
 }
 
-// ---- inline-wrapper FFI shims ------------------------------------------
-//
-// QuickJS-ng exposes some entry points only as `static inline` in
-// `quickjs.h`, so they don't appear in the linker's symbol table. We
-// re-implement the inline wrapper in Rust over the exported underlying
-// symbol. Names match the C API spelling so the rest of the crate (and
-// users who follow the QuickJS docs) can call the familiar function.
-
 pub const JS_CFUNC_GENERIC: c_int = 0;
 pub const JS_CFUNC_GENERIC_MAGIC: c_int = 1;
 pub const JS_CFUNC_CONSTRUCTOR: c_int = 2;
 pub const JS_CFUNC_CONSTRUCTOR_OR_FUNC: c_int = 4;
 
-/// Equivalent of the inline `JS_NewCFunction` in `quickjs.h`:
-/// `JS_NewCFunction2(ctx, func, name, length, JS_CFUNC_generic, 0)`.
-///
-/// # Safety
-///
-/// `ctx` must be a live `JSContext`; `name` must be a NUL-terminated string
-/// or `NULL`; `func` must be ABI-compatible with `JSCFunction`.
 #[inline]
 pub unsafe fn JS_NewCFunction(
   ctx: *mut JSContext,
@@ -621,26 +561,11 @@ pub unsafe fn JS_NewCFunction(
   unsafe { JS_NewCFunction2(ctx, func, name, length, JS_CFUNC_GENERIC, 0) }
 }
 
-/// Equivalent of the inline `JS_ToCString` in `quickjs.h`:
-/// `JS_ToCStringLen2(ctx, NULL, val, false)`. Caller must release the
-/// returned pointer with `JS_FreeCString`.
-///
-/// # Safety
-///
-/// `ctx` must be a live `JSContext`; `v` must be a JSValue owned (or
-/// borrowed) by the caller for the duration of this call.
 #[inline]
 pub unsafe fn JS_ToCString(ctx: *mut JSContext, v: JSValue) -> *const c_char {
   unsafe { JS_ToCStringLen2(ctx, std::ptr::null_mut(), v, false) }
 }
 
-/// Equivalent of the inline `JS_ToCStringLen` in `quickjs.h`:
-/// `JS_ToCStringLen2(ctx, plen, val, false)`.
-///
-/// # Safety
-///
-/// Same requirements as [`JS_ToCString`]; `plen` must be a writable
-/// `usize` or `NULL`.
 #[inline]
 pub unsafe fn JS_ToCStringLen(
   ctx: *mut JSContext,
@@ -650,14 +575,6 @@ pub unsafe fn JS_ToCStringLen(
   unsafe { JS_ToCStringLen2(ctx, plen, v, false) }
 }
 
-/// Wrapper for the str-keyed `JS_HasProperty` lookup that was inline in
-/// classic QuickJS but is not present in QuickJS-ng. Internally creates a
-/// transient atom for the property name.
-///
-/// # Safety
-///
-/// `ctx` must be a live `JSContext`; `prop` must be a NUL-terminated
-/// string; `this_obj` must be a JSValue owned (or borrowed) by the caller.
 #[inline]
 pub unsafe fn JS_HasPropertyStr(
   ctx: *mut JSContext,
@@ -672,11 +589,6 @@ pub unsafe fn JS_HasPropertyStr(
   }
 }
 
-/// Wrapper for the str-keyed `JS_DeleteProperty` that QuickJS-ng dropped.
-///
-/// # Safety
-///
-/// Same requirements as [`JS_HasPropertyStr`].
 #[inline]
 pub unsafe fn JS_DeletePropertyStr(
   ctx: *mut JSContext,
@@ -692,39 +604,44 @@ pub unsafe fn JS_DeletePropertyStr(
   }
 }
 
-// --- Rust reimplementations of quickjs.h `static inline` constructors ---
-// These have no exported symbol in libquickjs; the C inline bodies just build a
-// JSValue, which we do directly. Same signatures as the family shims expect.
 #[inline]
 pub unsafe fn JS_NewBool(_ctx: *mut JSContext, val: c_int) -> JSValue {
-    jsv_bool(val != 0)
+  jsv_bool(val != 0)
 }
 #[inline]
 pub unsafe fn JS_NewInt32(_ctx: *mut JSContext, val: i32) -> JSValue {
-    jsv_int32(val)
+  jsv_int32(val)
 }
 #[inline]
 pub unsafe fn JS_NewUint32(_ctx: *mut JSContext, val: u32) -> JSValue {
-    if val <= i32::MAX as u32 { jsv_int32(val as i32) } else { jsv_float64(val as f64) }
+  if val <= i32::MAX as u32 {
+    jsv_int32(val as i32)
+  } else {
+    jsv_float64(val as f64)
+  }
 }
 #[inline]
 pub unsafe fn JS_NewInt64(_ctx: *mut JSContext, val: i64) -> JSValue {
-    if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
-        jsv_int32(val as i32)
-    } else {
-        jsv_float64(val as f64)
-    }
+  if val >= i32::MIN as i64 && val <= i32::MAX as i64 {
+    jsv_int32(val as i32)
+  } else {
+    jsv_float64(val as f64)
+  }
 }
 #[inline]
 pub unsafe fn JS_NewFloat64(_ctx: *mut JSContext, val: f64) -> JSValue {
-    jsv_float64(val)
+  jsv_float64(val)
 }
 #[inline]
 pub unsafe fn JS_NewString(ctx: *mut JSContext, s: *const c_char) -> JSValue {
-    let len = if s.is_null() { 0 } else { unsafe { libc_strlen(s) } };
-    unsafe { JS_NewStringLen(ctx, s, len) }
+  let len = if s.is_null() {
+    0
+  } else {
+    unsafe { libc_strlen(s) }
+  };
+  unsafe { JS_NewStringLen(ctx, s, len) }
 }
 unsafe extern "C" {
-    #[link_name = "strlen"]
-    fn libc_strlen(s: *const c_char) -> usize;
+  #[link_name = "strlen"]
+  fn libc_strlen(s: *const c_char) -> usize;
 }

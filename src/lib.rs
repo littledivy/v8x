@@ -1,5 +1,3 @@
-// Copyright 2019-2021 the Deno authors. All rights reserved. MIT license.
-
 //! # Example
 //!
 //! ```rust
@@ -24,8 +22,6 @@
 //! ```
 
 #![allow(clippy::missing_safety_doc)]
-// Shim modules contain many unsafe ops inside unsafe fns; the C-ABI boundary is
-// inherently unsafe and individually-blocking each is noise.
 #![allow(unsafe_op_in_unsafe_fn)]
 
 #[macro_use]
@@ -109,11 +105,10 @@ mod regexp;
 mod scope;
 #[path = "../vendor/rusty_v8/src/script.rs"]
 mod script;
-// ---- JSC engine backend (feature `engine_jsc`, default) ----
+
 #[cfg(feature = "engine_jsc")]
 mod jsc;
 
-// ---- QuickJS-ng engine backend (feature `engine_quickjs`) ----
 #[cfg(feature = "engine_quickjs")]
 mod quickjs;
 
@@ -157,8 +152,7 @@ pub mod script_compiler;
 #[cfg(feature = "simdutf")]
 #[path = "../vendor/rusty_v8/src/simdutf.rs"]
 pub mod simdutf;
-// This module is intentionally named "V8" rather than "v8" to match the
-// C++ namespace "v8::V8".
+
 #[allow(non_snake_case)]
 #[path = "../vendor/rusty_v8/src/V8.rs"]
 pub mod V8;
@@ -224,7 +218,7 @@ pub use property_filter::*;
 pub use property_handler_flags::*;
 pub use regexp::RegExpCreationFlags;
 pub use scope::AllowJavascriptExecutionScope;
-// pub use scope::CallbackScope;
+
 pub use scope::CallbackScope;
 pub use scope::ContextScope;
 pub use scope::DisallowJavascriptExecutionScope;
@@ -233,7 +227,7 @@ pub use scope::PinCallbackScope;
 pub use scope::PinScope;
 pub use scope::PinnedRef;
 pub use scope::ScopeStorage;
-// pub use scope::HandleScope;
+
 pub use isolate::UnsafeRawIsolatePtr;
 pub use scope::HandleScope;
 pub use scope::OnFailure;
@@ -266,23 +260,19 @@ pub use wasm::ModuleCachingInterface;
 pub use wasm::WasmModuleCompilation;
 pub use wasm::WasmStreaming;
 
-/// https://v8.dev/docs/version-numbers
 pub const MAJOR_VERSION: u32 = binding::v8__MAJOR_VERSION;
-/// https://v8.dev/docs/version-numbers
-pub const MINOR_VERSION: u32 = binding::v8__MINOR_VERSION;
-/// https://v8.dev/docs/version-numbers
-pub const BUILD_NUMBER: u32 = binding::v8__BUILD_NUMBER;
-/// https://v8.dev/docs/version-numbers
-pub const PATCH_LEVEL: u32 = binding::v8__PATCH_LEVEL;
-/// https://v8.dev/docs/version-numbers
-pub const VERSION_STRING: &str =
-  // TODO: cleanup when Result::unwrap is const stable.
-  match binding::v8__VERSION_STRING.to_str() {
-    Ok(v) => v,
-    Err(_) => panic!("Unable to convert CStr to &str??"),
-  };
 
-// TODO(piscisaureus): Ideally this trait would not be exported.
+pub const MINOR_VERSION: u32 = binding::v8__MINOR_VERSION;
+
+pub const BUILD_NUMBER: u32 = binding::v8__BUILD_NUMBER;
+
+pub const PATCH_LEVEL: u32 = binding::v8__PATCH_LEVEL;
+
+pub const VERSION_STRING: &str = match binding::v8__VERSION_STRING.to_str() {
+  Ok(v) => v,
+  Err(_) => panic!("Unable to convert CStr to &str??"),
+};
+
 pub use support::MapFnTo;
 
 pub const TYPED_ARRAY_MAX_SIZE_IN_HEAP: usize =

@@ -8,5 +8,11 @@
 //! does reference them, they need real implementations.
 #![allow(non_snake_case)]
 
-#[unsafe(no_mangle)] pub extern "C" fn v8__HeapStatistics() { unimplemented!("v8__HeapStatistics") }
-#[unsafe(no_mangle)] pub extern "C" fn v8__String__ValueView_SIZE() { unimplemented!("v8__String__ValueView_SIZE") }
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__HeapStatistics() {
+  unimplemented!("v8__HeapStatistics")
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__ValueView_SIZE() {
+  unimplemented!("v8__String__ValueView_SIZE")
+}
