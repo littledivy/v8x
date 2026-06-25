@@ -470,8 +470,9 @@ pub extern "C" fn v8__Isolate__SetHostInitializeImportMetaObjectCallback(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetHostImportModuleDynamicallyCallback(
   _isolate: *mut RealIsolate,
-  _callback: crate::isolate::RawHostImportModuleDynamicallyCallback,
+  callback: crate::isolate::RawHostImportModuleDynamicallyCallback,
 ) {
+  crate::jsc::module::set_dynamic_import_callback(callback);
 }
 
 #[unsafe(no_mangle)]
