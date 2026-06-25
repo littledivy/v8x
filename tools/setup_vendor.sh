@@ -16,20 +16,24 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-apply_patch() {
-  local sub="$1" patch="$2"
-  # Fetch the submodule at its pinned commit if the tree isn't checked out yet.
+# Apply every patches/<prefix>-NN-*.patch onto a submodule, in numeric order.
+# Each patch is one logical change; the series is the full delta from the pinned
+# upstream commit. Idempotent: a patch that already reverse-applies is skipped.
+apply_series() {
+  local sub="$1" prefix="$2"
   if [ ! -e "$sub/.git" ]; then
     git submodule update --init "$sub"
   fi
-  # Apply (idempotent — skip if it already reverse-applies cleanly).
-  if ! git -C "$sub" apply --reverse --check "../../$patch" 2>/dev/null; then
-    git -C "$sub" apply "../../$patch" || echo "warn: $patch may already be applied"
-  fi
+  for p in patches/"$prefix"-[0-9]*.patch; do
+    [ -e "$p" ] || continue
+    if ! git -C "$sub" apply --reverse --check "../../$p" 2>/dev/null; then
+      git -C "$sub" apply "../../$p" || echo "warn: $p may already be applied"
+    fi
+  done
 }
 
-apply_patch vendor/quickjs-ng patches/quickjs-0001-v82jsc.patch
-apply_patch vendor/wamr       patches/wamr-0001-v82jsc.patch
+apply_series vendor/quickjs-ng quickjs
+apply_series vendor/wamr       wamr
 
 # WAMR: drop in our CMake driver (interpreter-only static vmlib). Not an upstream
 # file, so it ships as a plain copy rather than a patch.

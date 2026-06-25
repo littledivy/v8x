@@ -1,0 +1,34 @@
+diff --git a/quickjs.c b/quickjs.c
+index 11caae0..a5d29c7 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -8184,6 +8265,10 @@ static JSValue JS_ThrowReferenceErrorNotDefined(JSContext *ctx, JSAtom name)
+ static JSValue JS_ThrowReferenceErrorUninitialized(JSContext *ctx, JSAtom name)
+ {
+     char buf[ATOM_GET_STR_BUF_SIZE];
++    if (getenv("QJS_DBG_UNINIT"))
++        fprintf(stderr, "[uninit-throw] name=%s\n",
++                name == JS_ATOM_NULL ? "<null>" :
++                JS_AtomGetStr(ctx, buf, sizeof(buf), name));
+     return JS_ThrowReferenceError(ctx, "%s is not initialized",
+                                   name == JS_ATOM_NULL ? "lexical variable" :
+                                   JS_AtomGetStr(ctx, buf, sizeof(buf), name));
+@@ -18187,6 +18273,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             BREAK;
+ 
+         CASE(OP_throw):
++            if (getenv("QJS_DBG_UNINIT")
++                && JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_UNINITIALIZED) {
++                char fbuf[ATOM_GET_STR_BUF_SIZE];
++                int col = 0;
++                int line = find_line_num(ctx, b,
++                                         (uint32_t)(pc - b->byte_code_buf - 1),
++                                         &col);
++                const char *fn = b->filename != JS_ATOM_NULL
++                    ? JS_AtomGetStr(ctx, fbuf, sizeof(fbuf), b->filename) : "?";
++                fprintf(stderr, "[uninit-op-throw] file=%s line=%d col=%d\n",
++                        fn, line, col);
++            }
+             JS_Throw(ctx, *--sp);
+             goto exception;
+ 

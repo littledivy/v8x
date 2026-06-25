@@ -1,0 +1,56 @@
+diff --git a/core/iwasm/common/wasm_memory.c b/core/iwasm/common/wasm_memory.c
+index 3d1f1481..44fd5849 100644
+--- a/core/iwasm/common/wasm_memory.c
++++ b/core/iwasm/common/wasm_memory.c
+@@ -1675,9 +1688,11 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
+ #ifdef OS_ENABLE_HW_BOUND_CHECK
+     full_size_mmaped = true;
+ #elif WASM_ENABLE_SHARED_MEMORY != 0
+-    full_size_mmaped = shared_memory_is_shared(memory);
++    /* v82jsc: 32-bit memories are reserved at the full 4GB in
++     * `wasm_allocate_linear_memory`, so grow commits in-place (no relocation). */
++    full_size_mmaped = shared_memory_is_shared(memory) || !memory->is_memory64;
+ #else
+-    full_size_mmaped = false;
++    full_size_mmaped = !memory->is_memory64;
+ #endif
+ 
+     memory_data_old = memory->memory_data;
+@@ -2034,8 +2052,13 @@ wasm_deallocate_linear_memory(WASMMemoryInstance *memory_inst)
+     else
+ #endif
+     {
+-        map_size = (uint64)memory_inst->num_bytes_per_page
+-                   * memory_inst->cur_page_count;
++        /* v82jsc: must match the 4GB reserve made in
++         * `wasm_allocate_linear_memory` (mem64 keeps cur-size behavior). */
++        if (memory_inst->is_memory64)
++            map_size = (uint64)memory_inst->num_bytes_per_page
++                       * memory_inst->cur_page_count;
++        else
++            map_size = 4 * (uint64)BH_GB;
+     }
+ #else
+     map_size = 8 * (uint64)BH_GB;
+@@ -2076,7 +2099,20 @@ wasm_allocate_linear_memory(uint8 **data, bool is_shared_memory,
+     else
+ #endif
+     {
+-        map_size = init_page_count * num_bytes_per_page;
++        /* v82jsc: RESERVE the full wasm32 address space (4GB, PROT_NONE virtual)
++         * up front so `memory.grow` (opcode OR host) commits in-place and the
++         * linear-memory base NEVER moves. Without this WAMR mremaps/relocates on
++         * grow, dangling every external ArrayBuffer/Uint8Array view JS holds over
++         * wasm memory (deno's @deno/loader reads strings out of wasm via
++         * TextDecoder) → use-after-free segfault. The reserve is virtual address
++         * space (committed lazily), like the hw-bound-check path's 8GB. mem64 keeps
++         * the old grow-by-realloc behavior (its address space is too large to
++         * reserve). Must stay consistent with `wasm_enlarge_memory_internal`'s
++         * `full_size_mmaped` and `wasm_deallocate_linear_memory`'s munmap size. */
++        if (is_memory64)
++            map_size = init_page_count * num_bytes_per_page;
++        else
++            map_size = 4 * (uint64)BH_GB;
+     }
+ #else  /* else of OS_ENABLE_HW_BOUND_CHECK */
+     /* Totally 8G is mapped, the opcode load/store address range is 0 to 8G:

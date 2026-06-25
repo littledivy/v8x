@@ -1,0 +1,34 @@
+diff --git a/core/iwasm/common/wasm_memory.c b/core/iwasm/common/wasm_memory.c
+index 3d1f1481..44fd5849 100644
+--- a/core/iwasm/common/wasm_memory.c
++++ b/core/iwasm/common/wasm_memory.c
+@@ -1653,6 +1653,19 @@ wasm_mmap_linear_memory(uint64 map_size, uint64 commit_size)
+     return wasm_mremap_linear_memory(NULL, 0, map_size, commit_size);
+ }
+ 
++/* v82jsc: fired after any successful linear-memory grow (opcode OR host API), so
++ * the embedder can detach external ArrayBuffers it exposed to JS over the old,
++ * shorter size. wasm-bindgen only refetches `memory.buffer` once its cached view
++ * reports byteLength 0 (detached); without this its cached view keeps the stale
++ * length and overruns → "RangeError: out of bound". */
++typedef void (*v82jsc_mem_grow_cb_t)(void);
++static v82jsc_mem_grow_cb_t v82jsc_mem_grow_cb = NULL;
++void
++v82jsc_set_mem_grow_cb(v82jsc_mem_grow_cb_t cb)
++{
++    v82jsc_mem_grow_cb = cb;
++}
++
+ static bool
+ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
+                              WASMMemoryInstance *memory, uint32 inc_page_count)
+@@ -1825,6 +1840,9 @@ wasm_enlarge_memory_internal(WASMModuleInstanceCommon *module,
+ 
+     wasm_runtime_set_mem_bound_check_bytes(memory, total_size_new);
+ 
++    if (v82jsc_mem_grow_cb)
++        v82jsc_mem_grow_cb();
++
+ return_func:
+     if (!ret && module && enlarge_memory_error_cb) {
+         WASMExecEnv *exec_env = NULL;
