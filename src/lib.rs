@@ -32,44 +32,82 @@
 extern crate bitflags;
 extern crate temporal_capi;
 
+#[path = "../vendor/rusty_v8/src/array_buffer.rs"]
 mod array_buffer;
+#[path = "../vendor/rusty_v8/src/array_buffer_view.rs"]
 mod array_buffer_view;
+#[path = "../vendor/rusty_v8/src/bigint.rs"]
 mod bigint;
+#[path = "../vendor/rusty_v8/src/binding.rs"]
 mod binding;
+#[path = "../vendor/rusty_v8/src/context.rs"]
 mod context;
 pub use context::ContextOptions;
+#[path = "../vendor/rusty_v8/src/cppgc.rs"]
 pub mod cppgc;
+#[path = "../vendor/rusty_v8/src/data.rs"]
 mod data;
+#[path = "../vendor/rusty_v8/src/date.rs"]
 mod date;
+#[path = "../vendor/rusty_v8/src/exception.rs"]
 mod exception;
+#[path = "../vendor/rusty_v8/src/external.rs"]
 mod external;
+#[path = "../vendor/rusty_v8/src/external_references.rs"]
 mod external_references;
+#[path = "../vendor/rusty_v8/src/fast_api.rs"]
 pub mod fast_api;
+#[path = "../vendor/rusty_v8/src/fixed_array.rs"]
 mod fixed_array;
+#[path = "../vendor/rusty_v8/src/function.rs"]
 mod function;
+#[path = "../vendor/rusty_v8/src/gc.rs"]
 mod gc;
+#[path = "../vendor/rusty_v8/src/get_property_names_args_builder.rs"]
 mod get_property_names_args_builder;
+#[path = "../vendor/rusty_v8/src/handle.rs"]
 mod handle;
+#[path = "../vendor/rusty_v8/src/icu.rs"]
 pub mod icu;
+#[path = "../vendor/rusty_v8/src/isolate.rs"]
 mod isolate;
+#[path = "../vendor/rusty_v8/src/isolate_create_params.rs"]
 mod isolate_create_params;
+#[path = "../vendor/rusty_v8/src/microtask.rs"]
 mod microtask;
+#[path = "../vendor/rusty_v8/src/module.rs"]
 mod module;
+#[path = "../vendor/rusty_v8/src/name.rs"]
 mod name;
+#[path = "../vendor/rusty_v8/src/number.rs"]
 mod number;
+#[path = "../vendor/rusty_v8/src/object.rs"]
 mod object;
+#[path = "../vendor/rusty_v8/src/platform.rs"]
 mod platform;
+#[path = "../vendor/rusty_v8/src/primitive_array.rs"]
 mod primitive_array;
+#[path = "../vendor/rusty_v8/src/primitives.rs"]
 mod primitives;
+#[path = "../vendor/rusty_v8/src/private.rs"]
 mod private;
+#[path = "../vendor/rusty_v8/src/promise.rs"]
 mod promise;
+#[path = "../vendor/rusty_v8/src/property_attribute.rs"]
 mod property_attribute;
+#[path = "../vendor/rusty_v8/src/property_descriptor.rs"]
 mod property_descriptor;
+#[path = "../vendor/rusty_v8/src/property_filter.rs"]
 mod property_filter;
+#[path = "../vendor/rusty_v8/src/property_handler_flags.rs"]
 mod property_handler_flags;
+#[path = "../vendor/rusty_v8/src/proxy.rs"]
 mod proxy;
+#[path = "../vendor/rusty_v8/src/regexp.rs"]
 mod regexp;
+#[path = "../vendor/rusty_v8/src/scope.rs"]
 mod scope;
+#[path = "../vendor/rusty_v8/src/script.rs"]
 mod script;
 // ---- JSC engine backend (feature `engine_jsc`, default) ----
 #[cfg(feature = "engine_jsc")]
@@ -115,30 +153,50 @@ mod shims;
 #[cfg(feature = "engine_quickjs")]
 mod qjs;
 
+#[path = "../vendor/rusty_v8/src/script_or_module.rs"]
 mod script_or_module;
+#[path = "../vendor/rusty_v8/src/shared_array_buffer.rs"]
 mod shared_array_buffer;
+#[path = "../vendor/rusty_v8/src/snapshot.rs"]
 mod snapshot;
+#[path = "../vendor/rusty_v8/src/string.rs"]
 mod string;
+#[path = "../vendor/rusty_v8/src/support.rs"]
 mod support;
+#[path = "../vendor/rusty_v8/src/symbol.rs"]
 mod symbol;
+#[path = "../vendor/rusty_v8/src/template.rs"]
 mod template;
+#[path = "../vendor/rusty_v8/src/typed_array.rs"]
 mod typed_array;
+#[path = "../vendor/rusty_v8/src/unbound_module_script.rs"]
 mod unbound_module_script;
+#[path = "../vendor/rusty_v8/src/unbound_script.rs"]
 mod unbound_script;
+#[path = "../vendor/rusty_v8/src/value.rs"]
 mod value;
+#[path = "../vendor/rusty_v8/src/value_deserializer.rs"]
 mod value_deserializer;
+#[path = "../vendor/rusty_v8/src/value_serializer.rs"]
 mod value_serializer;
+#[path = "../vendor/rusty_v8/src/wasm.rs"]
 mod wasm;
 
+#[path = "../vendor/rusty_v8/src/crdtp.rs"]
 pub mod crdtp;
+#[path = "../vendor/rusty_v8/src/inspector.rs"]
 pub mod inspector;
+#[path = "../vendor/rusty_v8/src/json.rs"]
 pub mod json;
+#[path = "../vendor/rusty_v8/src/script_compiler.rs"]
 pub mod script_compiler;
 #[cfg(feature = "simdutf")]
+#[path = "../vendor/rusty_v8/src/simdutf.rs"]
 pub mod simdutf;
 // This module is intentionally named "V8" rather than "v8" to match the
 // C++ namespace "v8::V8".
 #[allow(non_snake_case)]
+#[path = "../vendor/rusty_v8/src/V8.rs"]
 pub mod V8;
 
 pub use array_buffer::*;
