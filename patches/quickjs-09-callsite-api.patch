@@ -1,0 +1,92 @@
+diff --git a/quickjs.c b/quickjs.c
+index 11caae0..a5d29c7 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62106,13 +62334,87 @@ static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int
+     return js_int32(*field);
+ }
+ 
++// v82jsc patch: the rest of V8's CallSite API. QuickJS-ng ships only
++// isNative/getFileName/getFunction/getFunctionName/get{Line,Column}Number, but
++// many npm packages (depd, stack-trace, source-map-support, …) call the other
++// methods on the CallSite objects passed to a user `Error.prepareStackTrace`.
++// We don't track this/typeName/eval-origin/method distinctions, so return V8's
++// documented defaults for a plain non-eval, non-constructor toplevel frame.
++static JSValue js_callsite_ret_undefined(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
++{
++    return JS_UNDEFINED;
++}
++
++static JSValue js_callsite_ret_null(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
++{
++    return JS_NULL;
++}
++
++static JSValue js_callsite_ret_false(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
++{
++    return js_bool(false);
++}
++
++static JSValue js_callsite_tostring(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
++{
++    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
++    if (!csd)
++        return JS_EXCEPTION;
++    DynBuf dbuf;
++    const char *fn = NULL, *file = NULL;
++    js_dbuf_init(ctx, &dbuf);
++    if (JS_IsString(csd->func_name))
++        fn = JS_ToCString(ctx, csd->func_name);
++    if (fn && fn[0])
++        dbuf_printf(&dbuf, "%s (", fn);
++    if (csd->native) {
++        dbuf_printf(&dbuf, "native");
++    } else {
++        if (JS_IsString(csd->filename))
++            file = JS_ToCString(ctx, csd->filename);
++        dbuf_printf(&dbuf, "%s", file ? file : "<anonymous>");
++        if (csd->line_num != -1)
++            dbuf_printf(&dbuf, ":%d:%d", csd->line_num, csd->col_num);
++    }
++    if (fn && fn[0])
++        dbuf_putc(&dbuf, ')');
++    if (fn)
++        JS_FreeCString(ctx, fn);
++    if (file)
++        JS_FreeCString(ctx, file);
++    JSValue r;
++    if (dbuf_error(&dbuf))
++        r = JS_NULL;
++    else
++        r = JS_NewStringLen(ctx, (char *)dbuf.buf, dbuf.size);
++    dbuf_free(&dbuf);
++    return r;
++}
++
+ static const JSCFunctionListEntry js_callsite_proto_funcs[] = {
+     JS_CFUNC_DEF("isNative", 0, js_callsite_isnative),
+     JS_CFUNC_MAGIC_DEF("getFileName", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),
++    JS_CFUNC_MAGIC_DEF("getScriptNameOrSourceURL", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),
+     JS_CFUNC_MAGIC_DEF("getFunction", 0, js_callsite_getfield, offsetof(JSCallSiteData, func)),
+     JS_CFUNC_MAGIC_DEF("getFunctionName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),
++    JS_CFUNC_MAGIC_DEF("getMethodName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),
+     JS_CFUNC_MAGIC_DEF("getColumnNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, col_num)),
+     JS_CFUNC_MAGIC_DEF("getLineNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, line_num)),
++    // v82jsc patch: remaining V8 CallSite surface (defaults for plain frames).
++    JS_CFUNC_DEF("getThis", 0, js_callsite_ret_undefined),
++    JS_CFUNC_DEF("getTypeName", 0, js_callsite_ret_null),
++    JS_CFUNC_DEF("getEvalOrigin", 0, js_callsite_ret_undefined),
++    JS_CFUNC_DEF("getPromiseIndex", 0, js_callsite_ret_null),
++    JS_CFUNC_DEF("getScriptHash", 0, js_callsite_ret_undefined),
++    JS_CFUNC_DEF("getPosition", 0, js_callsite_ret_undefined),
++    JS_CFUNC_DEF("getEnclosingColumnNumber", 0, js_callsite_ret_undefined),
++    JS_CFUNC_DEF("getEnclosingLineNumber", 0, js_callsite_ret_undefined),
++    JS_CFUNC_DEF("isEval", 0, js_callsite_ret_false),
++    JS_CFUNC_DEF("isToplevel", 0, js_callsite_ret_false),
++    JS_CFUNC_DEF("isConstructor", 0, js_callsite_ret_false),
++    JS_CFUNC_DEF("isAsync", 0, js_callsite_ret_false),
++    JS_CFUNC_DEF("isPromiseAll", 0, js_callsite_ret_false),
++    JS_CFUNC_DEF("toString", 0, js_callsite_tostring),
+     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "CallSite", JS_PROP_CONFIGURABLE ),
+ };
+ 

@@ -1,0 +1,63 @@
+diff --git a/quickjs.c b/quickjs.c
+index 11caae0..a5d29c7 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -988,6 +988,58 @@ struct JSModuleDef {
+     JSValue private_value; /* private value for C modules */
+ };
+ 
++/* v82jsc: report whether a module's body has already run (EVALUATED or the
++   async-evaluating terminal state). Used by the v8x Module::Evaluate shim to
++   decide whether reusing an already-loaded def is safe (no re-run of top-level
++   side effects) vs. a compiled-but-not-yet-evaluated def that still needs to
++   run in its importer's graph. */
++int v82jsc_module_is_evaluated(JSModuleDef *m) {
++    return m && (m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
++                 m->status == JS_MODULE_STATUS_EVALUATED);
++}
++
++/* v82jsc: report whether a module's evaluation has STARTED (it is currently
++   evaluating as part of some graph, or already finished). deno evaluates every
++   module as its own root; when it calls Module::Evaluate on a module that is
++   mid-evaluation inside another graph (e.g. a chunk reached via a dynamic
++   import's JS_Eval), re-running it with a fresh JS_Eval creates a DUPLICATE
++   module def and desyncs the cyclic live bindings -> "[uninitialized]". The shim
++   uses this to reuse the in-flight def instead. EVALUATING is the sync in-graph
++   state that v82jsc_module_is_evaluated deliberately excludes. */
++int v82jsc_module_eval_started(JSModuleDef *m) {
++    return m && (m->status == JS_MODULE_STATUS_EVALUATING ||
++                 m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
++                 m->status == JS_MODULE_STATUS_EVALUATED);
++}
++
++static JSModuleDef *js_find_loaded_module(JSContext *ctx, JSAtom name);
++/* v82jsc: 1 if a module with this exact (already-normalized) name is in the
++   context's loaded-module list. Lets the shim loader dedup defensively. */
++int v82jsc_has_loaded_module(JSContext *ctx, const char *name) {
++    JSAtom atom = JS_NewAtom(ctx, name);
++    if (atom == JS_ATOM_NULL)
++        return 0;
++    JSModuleDef *m = js_find_loaded_module(ctx, atom);
++    JS_FreeAtom(ctx, atom);
++    return m != NULL;
++}
++
++/* v82jsc: return the JSModuleDef already loaded under this exact name, or NULL.
++   The shim module loader uses this to dedup: returning the existing def instead
++   of JS_ReadObject'ing a fresh one from bytecode (which would create a SECOND
++   def for the same name and re-run its body — fatal for modules with
++   non-idempotent top-level side effects, e.g. node:stream's
++   ObjectDefineProperty(pipeline, customPromisify) with implicit
++   configurable:false). */
++void *v82jsc_get_loaded_module(JSContext *ctx, const char *name) {
++    JSAtom atom = JS_NewAtom(ctx, name);
++    if (atom == JS_ATOM_NULL)
++        return NULL;
++    JSModuleDef *m = js_find_loaded_module(ctx, atom);
++    JS_FreeAtom(ctx, atom);
++    return m;
++}
++
+ typedef struct JSJobEntry {
+     struct list_head link;
+     JSContext *ctx;
