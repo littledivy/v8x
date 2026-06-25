@@ -169,26 +169,23 @@ fn build_vendored_jsc(manifest_dir: &std::path::Path) {
   }
 
   println!("cargo:rustc-link-search=native={}", lib_dir.display());
-  // JSC has dense internal cross-references; the default static-archive
-  // member-pulling misses some, so whole-archive the JSC + WTF + JIT + bmalloc
-  // libs (force_load equivalent). Use the `+whole-archive` link-lib MODIFIER,
-  // not `rustc-link-arg=-Wl,-force_load` — the latter does NOT propagate from a
-  // library crate's build script to the final binary's link, so the symbols
-  // would be dropped (every JSValue* undefined). link-lib does propagate.
-  println!(
-    "cargo:rustc-link-lib=static:+whole-archive=JavaScriptCore"
-  );
-  println!("cargo:rustc-link-lib=static:+whole-archive=WTF");
-  // WebKit splits JSC into JavaScriptCore + JavaScriptCoreJIT targets; the JIT
-  // objects aren't archived by the build, so tools/setup_webkit.sh bundles
-  // them into libJavaScriptCoreJIT.a. Whole-archive it too.
+  // JavaScriptCore + JavaScriptCoreJIT are split cmake targets that DUPLICATE
+  // some objects (notably LLInt::initialize). Whole-archiving BOTH force-loads
+  // both copies -> the linker keeps mismatched LLInt/IPInt offset tables ->
+  // JSC::initialize() traps in IPInt::initialize() at startup (SIGKILL). Link
+  // them as NORMAL static libs (like the `jsc` CLI does) so the linker pulls a
+  // single, consistent copy. bmalloc/WTF have no such dup; whole-archiving them
+  // is unnecessary too. Repeat JavaScriptCore/JIT to satisfy mutual refs.
+  println!("cargo:rustc-link-lib=static=JavaScriptCore");
   let jit_a = lib_dir.join("libJavaScriptCoreJIT.a");
   if jit_a.exists() {
-    println!(
-      "cargo:rustc-link-lib=static:+whole-archive=JavaScriptCoreJIT"
-    );
+    println!("cargo:rustc-link-lib=static=JavaScriptCoreJIT");
+    // second pass: JIT <-> core have cyclic references
+    println!("cargo:rustc-link-lib=static=JavaScriptCore");
+    println!("cargo:rustc-link-lib=static=JavaScriptCoreJIT");
   }
-  println!("cargo:rustc-link-lib=static:+whole-archive=bmalloc");
+  println!("cargo:rustc-link-lib=static=WTF");
+  println!("cargo:rustc-link-lib=static=bmalloc");
   println!("cargo:rustc-link-lib=c++");
   println!("cargo:rerun-if-changed={}", jsc_a.display());
 
