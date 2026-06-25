@@ -829,12 +829,17 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
     }
 
     if trimmed.starts_with("export default ") {
+      // The default expression may span multiple lines (`export default {`
+      // ...multi-line object/class/function...). Emit a `const` binding inline
+      // in `out` so the body stays CONTIGUOUS with its opening, and assign the
+      // namespace slot from that binding at the end. (A prior single-line
+      // `__ns["default"] = (expr)` cut multi-line objects to `({)`.)
       let expr = &trimmed["export default ".len()..];
       export_names.push("default".to_string());
-      exports_out.push_str(&format!(
-        "__ns[\"default\"] = ({});\n",
-        expr.trim_end_matches(';')
-      ));
+      out.push_str("const __v8jsc_default = ");
+      out.push_str(expr);
+      out.push('\n');
+      exports_out.push_str("__ns[\"default\"] = __v8jsc_default;\n");
       continue;
     }
 
@@ -1518,7 +1523,6 @@ pub extern "C" fn v8__Module__Evaluate(
         if let Some(m) = module_state(this) {
           m.status = ModuleStatus::Errored;
         }
-
         return make_rejected_promise(ctx, exc);
       }
     }
