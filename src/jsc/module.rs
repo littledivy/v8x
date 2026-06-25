@@ -88,6 +88,11 @@ unsafe extern "C" fn mod_finalize(object: JSObjectRef) {
 thread_local! {
     static MOD_CLASS: std::cell::Cell<JSClassRef> =
         const { std::cell::Cell::new(ptr::null_mut()) };
+    // Modules whose body is currently executing. GetStatus reports these as
+    // Evaluated (not Evaluating) so a re-entrant require() in a cyclic graph
+    // sees the partial namespace instead of deno's cycle error.
+    static EVAL_BODY_RUNNING: std::cell::RefCell<Vec<*const Module>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 fn mod_class() -> JSClassRef {
@@ -1297,7 +1302,16 @@ pub extern "C" fn v8__Module__GetStatus(this: *const Module) -> ModuleStatus {
       ModuleStatus::Uninstantiated => ModuleStatus::Uninstantiated,
       ModuleStatus::Instantiating => ModuleStatus::Instantiating,
       ModuleStatus::Instantiated => ModuleStatus::Instantiated,
-      ModuleStatus::Evaluating => ModuleStatus::Evaluating,
+      ModuleStatus::Evaluating => {
+        // A module mid-body reports Evaluated so a re-entrant require() in a
+        // cyclic graph gets its partial namespace instead of deno's "require
+        // ES Module in a cycle" throw (matches the QuickJS backend).
+        if EVAL_BODY_RUNNING.with(|s| s.borrow().contains(&this)) {
+          ModuleStatus::Evaluated
+        } else {
+          ModuleStatus::Evaluating
+        }
+      }
       ModuleStatus::Evaluated => ModuleStatus::Evaluated,
       ModuleStatus::Errored => ModuleStatus::Errored,
     },
@@ -1574,9 +1588,22 @@ pub extern "C" fn v8__Module__Evaluate(
     let is_async = m.is_async || !dep_promises.is_empty();
     let namespace = m.namespace;
     let meta = unsafe { build_import_meta(context, this) };
-    match unsafe {
+    // Mark the body as running: while it executes, GetStatus reports this
+    // module as Evaluated (not Evaluating) so a re-entrant require()/import in a
+    // cyclic graph (node:process's loadExtScript chain) gets the partial
+    // namespace instead of deno's "require ES Module in a cycle" throw. Status
+    // stays Evaluating internally, so the async/promise return path is intact.
+    EVAL_BODY_RUNNING.with(|s| s.borrow_mut().push(this));
+    let eval_result = unsafe {
       eval_module_source(ctx, &src, namespace, meta, is_async, &dep_promises)
-    } {
+    };
+    EVAL_BODY_RUNNING.with(|s| {
+      let mut v = s.borrow_mut();
+      if let Some(pos) = v.iter().rposition(|&p| p == this) {
+        v.remove(pos);
+      }
+    });
+    match eval_result {
       Ok(promise) => {
         if let Some(m) = module_state(this) {
           m.status = ModuleStatus::Evaluated;
