@@ -1018,7 +1018,14 @@ fn has_top_level_await(src: &str) -> bool {
             pending_fn_body = true;
           }
           "await" if !prev_is_dot => {
-            if fn_body_depths.is_empty() {
+            // Genuine top-level await is at brace-depth 0 (a module-top
+            // statement). The function-body tracker misses async METHODS
+            // (`async foo() {}`, `async *g() {}`, `for await` inside them) —
+            // they have no `function` keyword/`=>`, so their await would
+            // false-positive as top-level and wrongly mark the module async,
+            // deadlocking its importers. Requiring depth 0 avoids that. (Misses
+            // the rare TLA inside a top-level `if`/`for` block; acceptable.)
+            if depth == 0 && fn_body_depths.is_empty() {
               return true;
             }
           }
