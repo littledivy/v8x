@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Regenerate src/shims.rs: a no-arg link stub for every C-ABI symbol Deno
-# references, EXCEPT those already implemented for real in src/shim_impl.rs.
+# references, EXCEPT those already implemented for real in src/jsc/shim_impl.rs.
 #
 # Usage: tools/gen_shims.sh            (uses /tmp/union.txt symbol list)
 #        tools/gen_shims.sh syms.txt   (custom symbol list, one per line)
@@ -8,15 +8,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SYMS="${1:-/tmp/union.txt}"
-OUT=src/shims.rs
+OUT=src/jsc/shims.rs
 
 # Symbols actually DEFINED in any hand-written shim_*.rs (but NOT the generated
 # shims.rs). A definition is either `extern "C" fn NAME(` or a macro invocation
 # `macro!(NAME, ...)`. Matching definition positions only (not bare mentions in
 # comments) avoids wrongly excluding an undefined symbol from the stub set.
 P='(v8__|v8_inspector__|std__|simdutf__|cppgc__)[A-Za-z0-9_]+'
-for f in src/shim_core.rs src/shim_impl.rs src/shim_*.rs; do
-  [ "$f" = src/shims.rs ] && continue
+for f in src/jsc/shim_core.rs src/jsc/shim_impl.rs src/shim_*.rs; do
+  [ "$f" = src/jsc/shims.rs ] && continue
   cat "$f" 2>/dev/null
 done > /tmp/all_shim_src.txt
 {

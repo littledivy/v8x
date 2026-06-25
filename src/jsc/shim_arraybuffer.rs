@@ -3,19 +3,19 @@
 // SharedArrayBuffer + typed-array `New` constructors, backed by JavaScriptCore.
 #![allow(non_snake_case, unused)]
 
-use crate::jsc_sys::*;
+use crate::jsc::jsc_sys::*;
 use crate::support::{Maybe, MaybeBool, SharedPtrBase, SharedRef, UniquePtr, long};
 use crate::{
     Allocator, ArrayBuffer, ArrayBufferView, BackingStore, BackingStoreDeleterCallback, Context,
     DataView, RealIsolate, SharedArrayBuffer, Uint8ClampedArray, Value,
 };
-use crate::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
+use crate::jsc::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // JSC C API (JSTypedArrayType, kJSTypedArrayType* consts, the typed-array `JS*`
-// fns, JSTypedArrayBytesDeallocator) come from `crate::jsc_sys` (bindgen) via
+// fns, JSTypedArrayBytesDeallocator) come from `crate::jsc::jsc_sys` (bindgen) via
 // the glob import above.
 
 // memory_span_t mirror (matches `crate::binding::memory_span_t`: { data: *mut u8, size: usize }).

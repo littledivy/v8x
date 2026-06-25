@@ -6,7 +6,7 @@
 #
 #   vendor/rusty_v8     denoland/rusty_v8 @ v149.4.0 — the Rust API surface this
 #                       crate IS. src/lib.rs #[path]-includes its modules; our
-#                       shims (src/shim_*.rs, src/qjs/) replace its C++ binding.cc
+#                       shims (src/jsc/, src/quickjs/) replace its C++ binding.cc
 #                       by defining the same ~570 v8__* C-ABI over JSC / QuickJS.
 #                       2 patches: EscapeSlot (Local==JSValueRef), serializer cap.
 #   vendor/quickjs-ng   quickjs-ng @ v0.15.1            (QuickJS backend)

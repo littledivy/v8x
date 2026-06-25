@@ -12,19 +12,19 @@
 // length-prefixed so the deserializer can recover them in order.
 #![allow(non_snake_case, unused)]
 
-use crate::jsc_sys::*;
+use crate::jsc::jsc_sys::*;
 use crate::support::MaybeBool;
 use crate::value_deserializer::{CxxValueDeserializer, CxxValueDeserializerDelegate};
 use crate::value_serializer::{CxxValueSerializer, CxxValueSerializerDelegate};
 use crate::{ArrayBuffer, Context, Local, Object, RealIsolate, SharedArrayBuffer, Value};
 
-use crate::shim_core::{ctx_of, current_ctx, intern_ctx, jsval};
+use crate::jsc::shim_core::{ctx_of, current_ctx, intern_ctx, jsval};
 
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::os::raw::c_char;
 
-// JSC C API functions come from `crate::jsc_sys` (bindgen) via the glob import.
+// JSC C API functions come from `crate::jsc::jsc_sys` (bindgen) via the glob import.
 
 const MAGIC: &[u8; 4] = b"JSCS";
 

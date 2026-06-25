@@ -15,8 +15,8 @@
 
 #![allow(non_snake_case)]
 
-use crate::qjs::quickjs_sys::*;
-use crate::qjs::shim_core::{ctx_of, current_ctx, intern, iso_state, jsval_of};
+use crate::quickjs::quickjs_sys::*;
+use crate::quickjs::shim_core::{ctx_of, current_ctx, intern, iso_state, jsval_of};
 use crate::support::int;
 use crate::{
     BigInt, Boolean, Context, Data, Int32, Integer, Number, Primitive, Private, RealIsolate,

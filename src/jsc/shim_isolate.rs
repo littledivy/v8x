@@ -9,8 +9,8 @@
 //! checkpoints / enqueue are best-effort.
 #![allow(non_snake_case, unused)]
 
-use crate::jsc_sys::*;
-use crate::shim_core::{
+use crate::jsc::jsc_sys::*;
+use crate::jsc::shim_core::{
     ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval,
 };
 use crate::{
@@ -23,7 +23,7 @@ use std::ptr;
 use crate::support::int;
 
 // Most JSC C API functions (JSObjectIsFunction, JSObjectCallAsFunction,
-// JSObjectMakeFunctionWithCallback, ...) come from `crate::jsc_sys` (bindgen).
+// JSObjectMakeFunctionWithCallback, ...) come from `crate::jsc::jsc_sys` (bindgen).
 //
 // `JSGlobalContextSetUnhandledRejectionCallback` is WebKit SPI and is NOT in
 // the public `<JavaScriptCore/JavaScript.h>` umbrella header, so bindgen does
@@ -332,7 +332,7 @@ pub extern "C" fn v8__Isolate__ThrowException(
     if ctx.is_null() || exception.is_null() {
         return exception;
     }
-    crate::shim_core::record_pending_exception(ctx, jsval(exception));
+    crate::jsc::shim_core::record_pending_exception(ctx, jsval(exception));
     intern_ctx::<Value>(ctx, jsval(exception))
 }
 
@@ -504,7 +504,7 @@ pub extern "C" fn v8__Isolate__SetHostInitializeImportMetaObjectCallback(
     // JSC has no module-loader hook, but our module rewriter synthesizes an
     // `import.meta` object per module and invokes this callback to populate it.
     if !isolate.is_null() {
-        crate::shim_core::iso_state(isolate).import_meta_cb = Some(callback);
+        crate::jsc::shim_core::iso_state(isolate).import_meta_cb = Some(callback);
     }
 }
 

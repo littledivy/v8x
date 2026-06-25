@@ -3,8 +3,8 @@
 //! Signature / External.
 #![allow(non_snake_case, unused)]
 
-use crate::jsc_sys::*;
-use crate::shim_core::{
+use crate::jsc::jsc_sys::*;
+use crate::jsc::shim_core::{
     ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval,
 };
 use crate::{
@@ -17,7 +17,7 @@ use std::os::raw::{c_char, c_void};
 use std::ptr;
 
 // ===================================================================
-// JSC C API functions come from `crate::jsc_sys` (bindgen) via the glob import.
+// JSC C API functions come from `crate::jsc::jsc_sys` (bindgen) via the glob import.
 //
 // `FnJSClassDefinition` is a layout-compatible mirror of bindgen's
 // `JSClassDefinition` with the callback fields type-erased to `*const c_void`
@@ -207,7 +207,7 @@ unsafe fn dispatch(
     // Clear any stale pending exception so we only observe one thrown by THIS
     // callback invocation.
     let iso = current_iso();
-    crate::shim_core::clear_pending_exception(iso);
+    crate::jsc::shim_core::clear_pending_exception(iso);
     let info = Box::new(CbInfo {
         isolate: iso,
         ctx,
@@ -225,12 +225,12 @@ unsafe fn dispatch(
     let info = unsafe { Box::from_raw(info_ptr as *mut CbInfo) };
     let ret = *info.return_slot;
     // If the callback recorded a pending exception, forward it to JSC.
-    let pending = crate::shim_core::peek_pending_exception(iso);
+    let pending = crate::jsc::shim_core::peek_pending_exception(iso);
     if !pending.is_null() {
         if !out_exc.is_null() {
             unsafe { *out_exc = pending };
         }
-        crate::shim_core::clear_pending_exception(iso);
+        crate::jsc::shim_core::clear_pending_exception(iso);
         return unsafe { JSValueMakeUndefined(ctx) };
     }
     if ret.is_null() {
@@ -586,7 +586,7 @@ pub extern "C" fn v8__Function__Call(
         // Record the thrown value as the isolate's pending exception so a
         // surrounding TryCatch (and deno's error reporting) can observe it.
         if !exc.is_null() {
-            crate::shim_core::record_pending_exception(ctx, exc);
+            crate::jsc::shim_core::record_pending_exception(ctx, exc);
         }
         return ptr::null();
     }
@@ -1426,7 +1426,7 @@ pub extern "C" fn v8__FunctionCallbackInfo__NewTarget(
 pub extern "C" fn v8__PropertyCallbackInfo__GetIsolate(
     _this: *const c_void,
 ) -> *mut RealIsolate {
-    crate::shim_core::current_iso()
+    crate::jsc::shim_core::current_iso()
 }
 
 #[unsafe(no_mangle)]

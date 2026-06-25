@@ -1,18 +1,18 @@
 // Family: "primitive" — Number/Integer/Int32/Uint32/Boolean/BigInt/Symbol/Name/Private/Data
 #![allow(non_snake_case, unused)]
 
-use crate::jsc_sys::*;
+use crate::jsc::jsc_sys::*;
 use crate::support::int;
 use crate::{
     BigInt, Boolean, Context, Data, Int32, Integer, Number, Primitive, Private, RealIsolate,
     String as V8String, Symbol, Value,
 };
-use crate::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
+use crate::jsc::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
 use std::ffi::CString;
 use std::os::raw::c_char;
 use std::ptr;
 
-// JSC C API functions come from `crate::jsc_sys` (bindgen) via the glob import.
+// JSC C API functions come from `crate::jsc::jsc_sys` (bindgen) via the glob import.
 
 // Evaluate a JS source string in `ctx` and return the resulting JSValueRef
 // (or null on failure / empty ctx).
@@ -576,18 +576,18 @@ pub extern "C" fn v8__Data__IsModule(this: *const Data) -> bool {
 pub extern "C" fn v8__Data__IsModuleRequest(this: *const Data) -> bool {
     // Our ModuleRequest objects (built in shim_module::GetModuleRequests) carry
     // a `__v8jsc_module_request` marker property.
-    let ctx = crate::shim_core::current_ctx();
+    let ctx = crate::jsc::shim_core::current_ctx();
     if ctx.is_null() || this.is_null() {
         return false;
     }
     unsafe {
-        let v = this as crate::jsc_sys::JSValueRef;
+        let v = this as crate::jsc::jsc_sys::JSValueRef;
         if !JSValueIsObject(ctx, v) {
             return false;
         }
-        let obj = v as crate::jsc_sys::JSObjectRef;
+        let obj = v as crate::jsc::jsc_sys::JSObjectRef;
         let key = JSStringCreateWithUTF8CString(c"__v8jsc_module_request".as_ptr());
-        let mut exc: crate::jsc_sys::JSValueRef = std::ptr::null();
+        let mut exc: crate::jsc::jsc_sys::JSValueRef = std::ptr::null();
         let prop = JSObjectGetProperty(ctx, obj, key, &mut exc);
         JSStringRelease(key);
         !prop.is_null() && JSValueToBoolean(ctx, prop)

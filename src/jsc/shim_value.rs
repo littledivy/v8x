@@ -5,18 +5,18 @@
 // the lowercase-prefixed names.
 #![allow(non_snake_case, non_upper_case_globals, unused)]
 
-use crate::jsc_sys::*;
+use crate::jsc::jsc_sys::*;
 use crate::support::Maybe;
 use crate::{
     BigInt, Boolean, Context, Int32, Integer, Number, Object, RealIsolate, String as V8String,
     Uint32, Value,
 };
-use crate::shim_core::{ctx_of, current_ctx, intern, intern_ctx, jsval};
+use crate::jsc::shim_core::{ctx_of, current_ctx, intern, intern_ctx, jsval};
 use std::os::raw::{c_char, c_void};
 use std::ptr;
 
 // JSC C API functions and types (JSType, JSTypedArrayType, the `JS*` fns) come
-// from `crate::jsc_sys` (bindgen-generated) via the glob import above.
+// from `crate::jsc::jsc_sys` (bindgen-generated) via the glob import above.
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -451,7 +451,7 @@ pub extern "C" fn v8__Value__IsExternal(this: *const Value) -> bool {
     // (`External::Value`). If this lied (always false / always true), deno would
     // either mis-handle op state or, worse, treat a raw Rust pointer as a JS
     // value and store it into a JS object — corrupting the JSC heap.
-    crate::shim_function::value_is_external(crate::shim_core::jsval(this))
+    crate::jsc::shim_function::value_is_external(crate::jsc::shim_core::jsval(this))
 }
 
 #[unsafe(no_mangle)]

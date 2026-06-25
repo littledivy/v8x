@@ -18,8 +18,8 @@ use std::ffi::{c_void, CString};
 use std::os::raw::c_int;
 use std::ptr;
 
-use crate::qjs::quickjs_sys::*;
-use crate::qjs::shim_core::current_ctx;
+use crate::quickjs::quickjs_sys::*;
+use crate::quickjs::shim_core::current_ctx;
 
 // ===================================================================
 // wasm-c-api FFI (WAMR)

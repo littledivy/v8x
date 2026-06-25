@@ -33,7 +33,7 @@ pub extern "C" fn v8__V8__GetVersion() -> *const c_char {
     static VERSION: OnceLock<std::ffi::CString> = OnceLock::new();
     VERSION
         .get_or_init(|| {
-            let raw = unsafe { crate::qjs::quickjs_sys::JS_GetVersion() };
+            let raw = unsafe { crate::quickjs::quickjs_sys::JS_GetVersion() };
             let ver = if raw.is_null() {
                 "unknown".to_string()
             } else {

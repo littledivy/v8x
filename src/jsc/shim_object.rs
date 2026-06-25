@@ -1,18 +1,18 @@
 // Family: object — v8::Object Get/Set/Has/Delete/CreateDataProperty/etc + v8::Array.
 #![allow(non_snake_case, unused)]
 
-use crate::jsc_sys::*;
+use crate::jsc::jsc_sys::*;
 use crate::support::{int, Maybe, MaybeBool};
 use crate::{
     Array, Context, IntegrityLevel, KeyCollectionMode, KeyConversionMode, IndexFilter, Map, Name,
     Object, Private, PropertyAttribute, PropertyDescriptor, PropertyFilter, RealIsolate, Set,
     String, Value,
 };
-use crate::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
+use crate::jsc::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
 use std::os::raw::{c_char, c_void};
 use std::ptr;
 
-// All JSC C API functions and types come from `crate::jsc_sys` (bindgen).
+// All JSC C API functions and types come from `crate::jsc::jsc_sys` (bindgen).
 
 
 // ---- helpers ----------------------------------------------------------------
@@ -711,7 +711,7 @@ pub extern "C" fn v8__Object__GetOwnPropertyDescriptor(
         );
         if r.is_null() {
             if !exc.is_null() {
-                crate::shim_core::record_pending_exception(ctx, exc);
+                crate::jsc::shim_core::record_pending_exception(ctx, exc);
             }
             return ptr::null();
         }

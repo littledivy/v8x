@@ -13,8 +13,8 @@
 // JSC backend does.
 #![allow(non_snake_case, unused)]
 
-use crate::qjs::quickjs_sys::*;
-use crate::qjs::shim_core::{ctx_of, current_ctx, current_iso, intern, iso_state, jsval_of};
+use crate::quickjs::quickjs_sys::*;
+use crate::quickjs::shim_core::{ctx_of, current_ctx, current_iso, intern, iso_state, jsval_of};
 use crate::binding::memory_span_t;
 use crate::support::{MaybeBool, SharedPtrBase, SharedRef, UniquePtr, long};
 use crate::{

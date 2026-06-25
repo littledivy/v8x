@@ -35,8 +35,8 @@ use std::ffi::CString;
 use std::mem::MaybeUninit;
 use std::ptr;
 
-use crate::qjs::quickjs_sys::*;
-use crate::qjs::shim_core::{
+use crate::quickjs::quickjs_sys::*;
+use crate::quickjs::shim_core::{
     ctx_of, current_ctx, current_iso, intern, intern_ctx, intern_dup, iso_state, jsval_of,
 };
 use crate::{
@@ -1942,7 +1942,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileUnboundScript(
     if isolate.is_null() {
         return ptr::null();
     }
-    let st = crate::qjs::shim_core::iso_state(isolate);
+    let st = crate::quickjs::shim_core::iso_state(isolate);
     let ctx = st.contexts.last().copied().unwrap_or(st.ctx);
     let src = unsafe { source_string_of(source) };
     if ctx.is_null() || src.is_null() {
@@ -2733,7 +2733,7 @@ pub extern "C" fn v8__Module__Evaluate(
             source_name_dbg,
             t0.elapsed().as_secs_f64() * 1000.0
         );
-        crate::qjs::fam_function::timing::dump();
+        crate::quickjs::fam_function::timing::dump();
     }
 
     // A still-pending async module body: return its real promise so deno's

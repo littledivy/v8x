@@ -23,8 +23,8 @@
 // JSValue which we hand to `intern` (moves ownership into the handle arena).
 #![allow(non_snake_case, unused)]
 
-use crate::qjs::quickjs_sys::*;
-use crate::qjs::shim_core::{ctx_of, current_ctx, current_iso, intern, jsval_of};
+use crate::quickjs::quickjs_sys::*;
+use crate::quickjs::shim_core::{ctx_of, current_ctx, current_iso, intern, jsval_of};
 
 use crate::support::MaybeBool;
 use crate::value_deserializer::{CxxValueDeserializer, CxxValueDeserializerDelegate};
