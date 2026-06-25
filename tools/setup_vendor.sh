@@ -1,24 +1,31 @@
 #!/usr/bin/env bash
-# Init the pinned quickjs-ng + WAMR submodules and apply our patches on top.
+# Init the pinned vendor submodules and apply our patches on top. Every vendored
+# dependency lives in vendor/<name> at an exact upstream commit (see .gitmodules /
+# the gitlinks); our edits ship as patches/<name>-NN-*.patch applied to the
+# submodule working tree — never committed into the vendored source.
 #
-# Both vendors track an exact upstream commit (see .gitmodules / the gitlinks):
-#   - vendor/quickjs-ng  -> tag v0.15.1
-#   - vendor/wamr        -> master snapshot 26756a5c (pre the 2026-06-25 fork merges)
-# Our changes live as patch files under patches/ applied to the pristine submodule
-# working tree — never committed into the vendored source — so bumping the pin is:
-# move the submodule, refresh the patch, done.
+#   vendor/rusty_v8     denoland/rusty_v8 @ v149.4.0 — the Rust API surface this
+#                       crate IS. src/lib.rs #[path]-includes its modules; our
+#                       shims (src/shim_*.rs, src/qjs/) replace its C++ binding.cc
+#                       by defining the same ~570 v8__* C-ABI over JSC / QuickJS.
+#                       2 patches: EscapeSlot (Local==JSValueRef), serializer cap.
+#   vendor/quickjs-ng   quickjs-ng @ v0.15.1            (QuickJS backend)
+#   vendor/wamr         wasm-micro-runtime @ 26756a5c   (WebAssembly for QuickJS)
 #
-# WAMR additionally needs our own CMake driver (vendor/wamr/v82jsc/CMakeLists.txt),
-# which has no upstream counterpart; it's stored under patches/ and copied in.
+# Bumping a pin: move the submodule to the new commit, re-run this; if a patch
+# rejects, upstream touched a patched file — reconcile by hand. New v8__* that
+# upstream declares surface as undefined-symbol link errors on the next build.
 #
-# Idempotent: re-running skips already-applied patches. build.rs calls this before
-# compiling either engine.
+# Usage: setup_vendor.sh [rusty_v8|quickjs]
+#   rusty_v8  (default) only the Rust API surface — enough for the JSC backend
+#   quickjs             also the QuickJS + WAMR engine submodules
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+MODE="${1:-rusty_v8}"
+
 # Apply every patches/<prefix>-NN-*.patch onto a submodule, in numeric order.
-# Each patch is one logical change; the series is the full delta from the pinned
-# upstream commit. Idempotent: a patch that already reverse-applies is skipped.
+# Idempotent: a patch that already reverse-applies is skipped.
 apply_series() {
   local sub="$1" prefix="$2"
   if [ ! -e "$sub/.git" ]; then
@@ -32,12 +39,15 @@ apply_series() {
   done
 }
 
-apply_series vendor/quickjs-ng quickjs
-apply_series vendor/wamr       wamr
+# rusty_v8 is always needed — it's the crate's own source, used by both backends.
+apply_series vendor/rusty_v8 rusty_v8
 
-# WAMR: drop in our CMake driver (interpreter-only static vmlib). Not an upstream
-# file, so it ships as a plain copy rather than a patch.
-mkdir -p vendor/wamr/v82jsc
-cp patches/wamr-v82jsc-CMakeLists.txt vendor/wamr/v82jsc/CMakeLists.txt
+if [ "$MODE" = quickjs ]; then
+  apply_series vendor/quickjs-ng quickjs
+  apply_series vendor/wamr       wamr
+  # WAMR's CMake driver has no upstream counterpart; copy it in.
+  mkdir -p vendor/wamr/v82jsc
+  cp patches/wamr-v82jsc-CMakeLists.txt vendor/wamr/v82jsc/CMakeLists.txt
+fi
 
-echo "vendor setup done: quickjs-ng + WAMR patched"
+echo "vendor setup done ($MODE)"

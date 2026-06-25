@@ -4,6 +4,12 @@ use std::path::PathBuf;
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
+    // Init the pinned rusty_v8 submodule + apply our 2 patches BEFORE compile:
+    // src/lib.rs `#[path]`-includes its modules, so the vendored Rust API surface
+    // must be materialized for either backend. (Engines are set up separately,
+    // only for the QuickJS path.)
+    setup_vendor(&manifest_dir, "rusty_v8");
+
     // The vendored crate's `binding.rs` does
     // `include!(env!("RUSTY_V8_SRC_BINDING_PATH"))` to pull in the bindgen
     // output (extern decls + SIZE consts). We point it at the pre-generated
@@ -61,7 +67,7 @@ fn main() {
         // Init the pinned quickjs-ng + WAMR submodules and apply our patches
         // (idempotent). Skipped when both engines are driven from prebuilt trees.
         if env::var_os("QUICKJS_NG_LIB_DIR").is_none() || env::var_os("WAMR_LIB_DIR").is_none() {
-            setup_vendor(&manifest_dir);
+            setup_vendor(&manifest_dir, "quickjs");
         }
         build_quickjs(&manifest_dir);
         // WebAssembly engine: build the vendored WAMR (interpreter-only) static
@@ -74,9 +80,10 @@ fn main() {
 /// Init the pinned quickjs-ng + WAMR submodules and apply our patch files on top
 /// (see tools/setup_vendor.sh). Idempotent; runs before either engine compiles so
 /// a fresh checkout builds without a manual submodule dance.
-fn setup_vendor(manifest_dir: &std::path::Path) {
+fn setup_vendor(manifest_dir: &std::path::Path, mode: &str) {
     let status = std::process::Command::new("bash")
         .arg(manifest_dir.join("tools/setup_vendor.sh"))
+        .arg(mode)
         .current_dir(manifest_dir)
         .status();
     match status {

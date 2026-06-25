@@ -11,3 +11,7 @@
 	path = vendor/wamr
 	url = https://github.com/bytecodealliance/wasm-micro-runtime.git
 	ignore = dirty
+[submodule "vendor/rusty_v8"]
+	path = vendor/rusty_v8
+	url = https://github.com/denoland/rusty_v8.git
+	ignore = dirty
