@@ -1,3 +1,10 @@
 /target
 /reference
 vendor/quickjs-ng/.git
+
+# Claude Code local state
+.claude/
+
+# scratch notes (local)
+DEMO.md
+SNAPSHOT_NOTES.md
