@@ -24,7 +24,9 @@
 use crate::qjs::quickjs_sys::*;
 use crate::qjs::shim_core::{ctx_of, current_ctx, intern, intern_dup, jsval_of};
 use crate::support::Maybe;
-use crate::{BigInt, Boolean, Context, Integer, Object, RealIsolate, String as V8String, Value};
+use crate::{
+    BigInt, Boolean, Context, Integer, Number, Object, RealIsolate, String as V8String, Value,
+};
 use std::os::raw::c_char;
 use std::ptr;
 
@@ -255,6 +257,16 @@ pub extern "C" fn v8__Value__IsSymbol(this: *const Value) -> bool {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsName(this: *const Value) -> bool {
+    // A v8 `Name` is a String or a Symbol.
+    if this.is_null() {
+        return false;
+    }
+    let v = jsval_of(this);
+    jsv_is_string(&v) || jsv_is_symbol(&v)
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsNumber(this: *const Value) -> bool {
     !this.is_null() && jsv_is_number(&jsval_of(this))
 }
@@ -313,7 +325,7 @@ pub extern "C" fn v8__Value__IsUint32(this: *const Value) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsArray(this: *const Value) -> bool {
     let c = ctx();
-    !c.is_null() && !this.is_null() && unsafe { JS_IsArray(c, jsval_of(this)) != 0 }
+    !c.is_null() && !this.is_null() && unsafe { JS_IsArray(jsval_of(this)) }
 }
 
 #[unsafe(no_mangle)]
@@ -632,6 +644,19 @@ pub extern "C" fn v8__Value__ToInteger(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__BooleanValue(
+    this: *const Value,
+    _isolate: *mut RealIsolate,
+) -> bool {
+    let c = ctx();
+    if c.is_null() || this.is_null() {
+        return false;
+    }
+    // JS_ToBool returns 1/0 (or -1 on error, coerced to false).
+    unsafe { JS_ToBool(c, jsval_of(this)) > 0 }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToBoolean(
     this: *const Value,
     _isolate: *mut RealIsolate,
@@ -667,6 +692,30 @@ pub extern "C" fn v8__Value__NumberValue(
             maybe_none(out);
         } else {
             maybe_set(out, n);
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__InstanceOf(
+    this: *const Value,
+    context: *const Context,
+    object: *const crate::Object,
+    out: *mut Maybe<bool>,
+) {
+    let c = ctx_of(context);
+    if c.is_null() || this.is_null() || object.is_null() {
+        unsafe { maybe_none(out) };
+        return;
+    }
+    unsafe {
+        let r = JS_IsInstanceOf(c, jsval_of(this), jsval_of(object));
+        if r < 0 {
+            let exc = JS_GetException(c);
+            JS_FreeValue(c, exc);
+            maybe_none(out);
+        } else {
+            maybe_set(out, r != 0);
         }
     }
 }
@@ -729,4 +778,126 @@ pub extern "C" fn v8__Value__TypeOf(
     };
     let js = unsafe { JS_NewString(ctx, s.as_ptr() as *const c_char) };
     intern::<V8String>(js)
+}
+
+// ===========================================================================
+// Additional conversions / comparisons.
+// ===========================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__ToNumber(this: *const Value, context: *const Context) -> *const Number {
+    let c = ctx_of(context);
+    if c.is_null() || this.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let mut n: f64 = 0.0;
+        if JS_ToFloat64(c, &mut n, jsval_of(this)) < 0 {
+            let exc = JS_GetException(c);
+            JS_FreeValue(c, exc);
+            return ptr::null();
+        }
+        let v = JS_NewFloat64(c, n);
+        intern::<Number>(v)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IntegerValue(
+    this: *const Value,
+    context: *const Context,
+    out: *mut Maybe<i64>,
+) {
+    let c = ctx_of(context);
+    if c.is_null() || this.is_null() {
+        unsafe { maybe_none(out) };
+        return;
+    }
+    unsafe {
+        // ECMAScript ToInteger via ToNumber then truncate toward zero.
+        let mut n: f64 = 0.0;
+        if JS_ToFloat64(c, &mut n, jsval_of(this)) < 0 {
+            let exc = JS_GetException(c);
+            JS_FreeValue(c, exc);
+            maybe_none(out);
+            return;
+        }
+        let i = if n.is_nan() {
+            0
+        } else if n >= i64::MAX as f64 {
+            i64::MAX
+        } else if n <= i64::MIN as f64 {
+            i64::MIN
+        } else {
+            n.trunc() as i64
+        };
+        maybe_set(out, i);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__Uint32Value(
+    this: *const Value,
+    context: *const Context,
+    out: *mut Maybe<u32>,
+) {
+    let c = ctx_of(context);
+    if c.is_null() || this.is_null() {
+        unsafe { maybe_none(out) };
+        return;
+    }
+    unsafe {
+        // ECMAScript ToUint32: JS_ToInt32 yields ToInt32; reinterpret the bits.
+        let mut i: i32 = 0;
+        if JS_ToInt32(c, &mut i, jsval_of(this)) < 0 {
+            let exc = JS_GetException(c);
+            JS_FreeValue(c, exc);
+            maybe_none(out);
+            return;
+        }
+        maybe_set(out, i as u32);
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__SameValue(this: *const Value, that: *const Value) -> bool {
+    // V8 SameValue == ECMAScript SameValue: like StrictEquals but NaN==NaN and
+    // +0 !== -0.
+    if this.is_null() || that.is_null() {
+        return false;
+    }
+    let a = jsval_of(this);
+    let b = jsval_of(that);
+    // Number special-casing.
+    if jsv_is_number(&a) && jsv_is_number(&b) {
+        let na = num_of(&a);
+        let nb = num_of(&b);
+        if na.is_nan() && nb.is_nan() {
+            return true;
+        }
+        if na == 0.0 && nb == 0.0 {
+            // Distinguish +0 / -0 by sign bit.
+            return na.is_sign_negative() == nb.is_sign_negative();
+        }
+        return na == nb;
+    }
+    let c = ctx();
+    if c.is_null() {
+        return false;
+    }
+    unsafe { JS_IsStrictEqual(c, a, b) }
+}
+
+#[inline]
+fn num_of(v: &JSValue) -> f64 {
+    if jsv_is_int(v) {
+        unsafe { v.u.int32 as f64 }
+    } else {
+        unsafe { v.u.float64 }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsFloat16Array(this: *const Value) -> bool {
+    typed_array_type(this) == JS_TYPED_ARRAY_FLOAT16
 }

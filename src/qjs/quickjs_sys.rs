@@ -151,7 +151,9 @@ pub fn jsv_is_number(v: &JSValue) -> bool {
 }
 #[inline]
 pub fn jsv_is_string(v: &JSValue) -> bool {
-  v.tag == JS_TAG_STRING
+  // QuickJS-ng lazily concatenates with rope strings (separate tag); both are
+  // observably JS strings (typeof === "string").
+  v.tag == JS_TAG_STRING || v.tag == JS_TAG_STRING_ROPE
 }
 #[inline]
 pub fn jsv_is_symbol(v: &JSValue) -> bool {
@@ -163,7 +165,7 @@ pub fn jsv_is_object(v: &JSValue) -> bool {
 }
 #[inline]
 pub fn jsv_is_bigint(v: &JSValue) -> bool {
-  v.tag == JS_TAG_BIG_INT
+  v.tag == JS_TAG_BIG_INT || v.tag == JS_TAG_SHORT_BIG_INT
 }
 #[inline]
 pub fn jsv_is_exception(v: &JSValue) -> bool {
@@ -242,6 +244,16 @@ pub type JSModuleLoaderFunc = unsafe extern "C" fn(
   opaque: *mut c_void,
 ) -> *mut JSModuleDef;
 
+/// v82jsc dynamic-import hook (quickjs.c). `resolving_funcs` points to a 2-element
+/// array: [0]=resolve, [1]=reject of the `import()` promise.
+pub type JSV82jscDynImportHook = unsafe extern "C" fn(
+  ctx: *mut JSContext,
+  basename: JSValue,
+  specifier: JSValue,
+  attributes: JSValue,
+  resolving_funcs: *const JSValue,
+);
+
 pub type JSHostPromiseRejectionTracker = unsafe extern "C" fn(
   ctx: *mut JSContext,
   promise: JSValue,
@@ -296,6 +308,7 @@ unsafe extern "C" {
     is_global: c_int,
   ) -> JSValue;
   pub fn JS_NewBigInt64(ctx: *mut JSContext, val: i64) -> JSValue;
+  pub fn JS_ToBigInt64(ctx: *mut JSContext, pres: *mut i64, v: JSValue) -> c_int;
   pub fn JS_NewBigUint64(ctx: *mut JSContext, val: u64) -> JSValue;
 
   // Number extraction.
@@ -319,7 +332,28 @@ unsafe extern "C" {
   pub fn JS_NewObject(ctx: *mut JSContext) -> JSValue;
   pub fn JS_NewObjectClass(ctx: *mut JSContext, class_id: c_int) -> JSValue;
   pub fn JS_NewArray(ctx: *mut JSContext) -> JSValue;
-  pub fn JS_IsArray(ctx: *mut JSContext, v: JSValue) -> c_int;
+  // ArrayBuffer (for WebAssembly.Memory.buffer + reading wasm binaries).
+  pub fn JS_NewArrayBuffer(
+    ctx: *mut JSContext,
+    buf: *mut u8,
+    len: usize,
+    free_func: Option<unsafe extern "C" fn(*mut JSRuntime, *mut c_void, *mut c_void)>,
+    opaque: *mut c_void,
+    is_shared: bool,
+  ) -> JSValue;
+  pub fn JS_NewArrayBufferCopy(ctx: *mut JSContext, buf: *const u8, len: usize) -> JSValue;
+  pub fn JS_GetArrayBuffer(ctx: *mut JSContext, psize: *mut usize, obj: JSValue) -> *mut u8;
+  pub fn JS_DetachArrayBuffer(ctx: *mut JSContext, obj: JSValue);
+  // Returns the underlying ArrayBuffer of a TypedArray + its offset/length.
+  pub fn JS_GetTypedArrayBuffer(
+    ctx: *mut JSContext,
+    obj: JSValue,
+    pbyte_offset: *mut usize,
+    pbyte_length: *mut usize,
+    pbytes_per_element: *mut usize,
+  ) -> JSValue;
+  // quickjs-ng: JS_IsArray takes ONLY the value (no ctx), returns bool.
+  pub fn JS_IsArray(v: JSValue) -> bool;
   pub fn JS_IsFunction(ctx: *mut JSContext, v: JSValue) -> c_int;
   pub fn JS_IsConstructor(ctx: *mut JSContext, v: JSValue) -> c_int;
   pub fn JS_GetPropertyStr(
@@ -389,6 +423,15 @@ unsafe extern "C" {
     data: *mut JSValue,
   ) -> JSValue;
 
+  pub fn JS_DefinePropertyGetSet(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: JSAtom,
+    getter: JSValue,
+    setter: JSValue,
+    flags: c_int,
+  ) -> c_int;
+
   // Eval/script.
   pub fn JS_Eval(
     ctx: *mut JSContext,
@@ -406,6 +449,20 @@ unsafe extern "C" {
     eval_flags: c_int,
   ) -> JSValue;
   pub fn JS_EvalFunction(ctx: *mut JSContext, fun_obj: JSValue) -> JSValue;
+
+  // JSON (used by the CDP inspector backend to parse/serialize protocol msgs).
+  pub fn JS_ParseJSON(
+    ctx: *mut JSContext,
+    buf: *const c_char,
+    buf_len: usize,
+    filename: *const c_char,
+  ) -> JSValue;
+  pub fn JS_JSONStringify(
+    ctx: *mut JSContext,
+    obj: JSValue,
+    replacer: JSValue,
+    space0: JSValue,
+  ) -> JSValue;
 
   // Bytecode (for the snapshot Option-A path).
   pub fn JS_WriteObject(
@@ -443,6 +500,22 @@ unsafe extern "C" {
     opaque: *mut c_void,
   );
   pub fn JS_GetModuleName(ctx: *mut JSContext, m: *mut JSModuleDef) -> JSAtom;
+  // Returns the module's `import.meta` object (creating it on first call),
+  // owned (+1). We populate it via deno's import-meta host callback.
+  pub fn JS_GetImportMeta(ctx: *mut JSContext, m: *mut JSModuleDef) -> JSValue;
+  // v82jsc custom helper (quickjs.c): 1 if the module's body already ran.
+  pub fn v82jsc_module_is_evaluated(m: *mut JSModuleDef) -> std::os::raw::c_int;
+  pub fn v82jsc_module_eval_started(m: *mut JSModuleDef) -> std::os::raw::c_int;
+  pub fn v82jsc_has_loaded_module(
+    ctx: *mut JSContext,
+    name: *const std::os::raw::c_char,
+  ) -> std::os::raw::c_int;
+  pub fn v82jsc_get_loaded_module(
+    ctx: *mut JSContext,
+    name: *const std::os::raw::c_char,
+  ) -> *mut JSModuleDef;
+  // v82jsc custom (quickjs.c): install the dynamic-import hook (deno bridge).
+  pub fn JS_SetDynamicImportHook(fn_: JSV82jscDynImportHook);
   pub fn JS_GetModuleNamespace(
     ctx: *mut JSContext,
     m: *mut JSModuleDef,

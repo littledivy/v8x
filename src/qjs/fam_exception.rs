@@ -675,3 +675,37 @@ pub extern "C" fn v8__TryCatch__ReThrow(this: *mut TryCatch) -> *const Value {
         }
     }
 }
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__Message(this: *const TryCatch) -> *const Message {
+    if this.is_null() {
+        return ptr::null();
+    }
+    // A v8 Message wraps the thrown value; our Message accessors read the error
+    // value directly, so back the Message handle with the pending exception.
+    unsafe {
+        let ctx = tc_ctx(this);
+        match peek_pending(ctx) {
+            Some(exc) => intern::<Message>(exc),
+            None => ptr::null(),
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Message__GetSourceLine(
+    this: *const Message,
+    context: *const Context,
+) -> *const String {
+    // QuickJS errors carry no source-line text; report empty (null Local).
+    let _ = (this, context);
+    ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__StackFrame__GetFunctionName(this: *const StackFrame) -> *const String {
+    // StackFrames are inert in this backend (StackTrace::GetFrame returns null),
+    // so there is no function name to report.
+    let _ = this;
+    ptr::null()
+}

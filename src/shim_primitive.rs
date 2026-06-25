@@ -593,3 +593,96 @@ pub extern "C" fn v8__Data__IsModuleRequest(this: *const Data) -> bool {
         !prop.is_null() && JSValueToBoolean(ctx, prop)
     }
 }
+
+// ===================================================================
+// Symbol / Private — back both onto JSC symbols.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Symbol__New(
+    isolate: *mut RealIsolate,
+    description: *const V8String,
+) -> *const Symbol {
+    let st = iso_state(isolate);
+    let ctx = st.contexts.last().copied().unwrap_or(ptr::null_mut()) as JSContextRef;
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        // JSValueMakeSymbol wants the description as a JSStringRef.
+        let desc_s = if description.is_null() {
+            JSStringCreateWithUTF8CString(b"\0".as_ptr() as *const c_char)
+        } else {
+            let mut exc: JSValueRef = ptr::null();
+            JSValueToStringCopy(ctx, jsval(description), &mut exc)
+        };
+        let v = JSValueMakeSymbol(ctx, desc_s);
+        if !desc_s.is_null() {
+            JSStringRelease(desc_s);
+        }
+        intern_ctx::<Symbol>(ctx, v)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Symbol__Description(
+    this: *const Symbol,
+    isolate: *mut RealIsolate,
+) -> *const Value {
+    let ctx = if isolate.is_null() {
+        current_ctx()
+    } else {
+        iso_state(isolate)
+            .contexts
+            .last()
+            .copied()
+            .unwrap_or(ptr::null_mut()) as JSContextRef
+    };
+    if ctx.is_null() || this.is_null() {
+        return ptr::null();
+    }
+    // Read sym.description via JS so we get the original (undefined-aware) value.
+    unsafe {
+        let mut exc: JSValueRef = ptr::null();
+        let src = b"(function(s){return s.description;})\0";
+        let fs = JSStringCreateWithUTF8CString(src.as_ptr() as *const c_char);
+        let fnv = JSEvaluateScript(ctx, fs, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+        JSStringRelease(fs);
+        let fnobj = JSValueToObject(ctx, fnv, &mut exc);
+        if fnobj.is_null() {
+            return ptr::null();
+        }
+        let args = [jsval(this)];
+        let v = JSObjectCallAsFunction(ctx, fnobj, ptr::null_mut(), 1, args.as_ptr(), &mut exc);
+        if !exc.is_null() || v.is_null() {
+            return ptr::null();
+        }
+        intern_ctx::<Value>(ctx, v)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Private__New(
+    isolate: *mut RealIsolate,
+    name: *const V8String,
+) -> *const Private {
+    // A v8 Private is modeled as a unique JSC Symbol used as a property key.
+    let st = iso_state(isolate);
+    let ctx = st.contexts.last().copied().unwrap_or(ptr::null_mut()) as JSContextRef;
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let desc_s = if name.is_null() {
+            JSStringCreateWithUTF8CString(b"v8jsc_private\0".as_ptr() as *const c_char)
+        } else {
+            let mut exc: JSValueRef = ptr::null();
+            JSValueToStringCopy(ctx, jsval(name), &mut exc)
+        };
+        let v = JSValueMakeSymbol(ctx, desc_s);
+        if !desc_s.is_null() {
+            JSStringRelease(desc_s);
+        }
+        intern_ctx::<Private>(ctx, v)
+    }
+}

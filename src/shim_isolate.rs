@@ -415,17 +415,61 @@ pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(isolate: *mut RealIsol
     }
     let ctx = current_ctx();
     if !ctx.is_null() {
-        // JSC has no public microtask-drain entry point, but it runs its job
-        // queue to completion at the end of every JSEvaluateScript. Evaluating a
-        // trivial script therefore flushes any pending microtasks (promise
-        // continuations, unhandled-rejection surfacing).
+        // Drain JSC's microtask/job queue by making one outermost JS API call: a
+        // cached no-op function. JSC runs the job queue to completion when the
+        // OUTERMOST API entry scope unwinds, and — crucially — that fresh entry
+        // scope gives the drained continuations a proper top-level execution
+        // context. (Calling `JSC::VM::drainMicrotasks()` directly drains the queue
+        // but WITHOUT an entry boundary, so a continuation that schedules another
+        // op — e.g. `await someOp(); setTimeout(...)` — runs in a broken
+        // re-entrant state and silently aborts after its first statement.)
+        // Reusing a cached function avoids the parse/compile cost of the old
+        // `eval("0")` trick while keeping the entry-scope semantics it relied on.
         unsafe {
-            let src = JSStringCreateWithUTF8CString(c"0".as_ptr());
-            let mut exc: JSValueRef = ptr::null();
-            JSEvaluateScript(ctx, src, ptr::null_mut(), ptr::null_mut(), 0, &mut exc);
-            JSStringRelease(src);
+            let f = checkpoint_noop_fn(ctx);
+            if !f.is_null() {
+                let mut exc: JSValueRef = ptr::null();
+                JSObjectCallAsFunction(ctx, f, ptr::null_mut(), 0, ptr::null(), &mut exc);
+            }
         }
     }
+}
+
+thread_local! {
+    // (global ctx, cached no-op function) — protected for the ctx's lifetime.
+    static CHECKPOINT_FN: std::cell::Cell<(JSGlobalContextRef, JSObjectRef)> =
+        const { std::cell::Cell::new((ptr::null_mut(), ptr::null_mut())) };
+}
+
+/// A cached `function(){}` for `ctx`'s global context, used purely as an
+/// outermost API-entry boundary that drains the microtask queue.
+unsafe fn checkpoint_noop_fn(ctx: JSContextRef) -> JSObjectRef {
+    let gctx = unsafe { JSContextGetGlobalContext(ctx) };
+    let cached = CHECKPOINT_FN.with(|c| c.get());
+    if cached.0 == gctx && !cached.1.is_null() {
+        return cached.1;
+    }
+    unsafe {
+        let name = JSStringCreateWithUTF8CString(c"".as_ptr());
+        let f = JSObjectMakeFunctionWithCallback(ctx, name, Some(checkpoint_noop_cb));
+        JSStringRelease(name);
+        if !f.is_null() {
+            JSValueProtect(gctx, f as JSValueRef);
+            CHECKPOINT_FN.with(|c| c.set((gctx, f)));
+        }
+        f
+    }
+}
+
+unsafe extern "C" fn checkpoint_noop_cb(
+    _ctx: JSContextRef,
+    _function: JSObjectRef,
+    _this: JSObjectRef,
+    _argc: usize,
+    _argv: *const JSValueRef,
+    _exception: *mut JSValueRef,
+) -> JSValueRef {
+    unsafe { JSValueMakeUndefined(_ctx) }
 }
 
 #[unsafe(no_mangle)]
@@ -858,4 +902,118 @@ pub extern "C" fn v8__AllowJavascriptExecutionScope__DESTRUCT(
     _this: *mut std::ffi::c_void,
 ) {
     // Inert; nothing to tear down.
+}
+
+// ===================================================================
+// Isolate — GC / heap / wasm / memory hooks. JSC has no public API for these,
+// so they are safe inert defaults.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__AddGCPrologueCallback(
+    _isolate: *mut RealIsolate,
+    _callback: *const c_void,
+    _data: *mut c_void,
+    _gc_type_filter: i32,
+) {
+    // No-op: JSC fires no V8-style GC prologue callbacks.
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__AddGCEpilogueCallback(
+    _isolate: *mut RealIsolate,
+    _callback: *const c_void,
+    _data: *mut c_void,
+    _gc_type_filter: i32,
+) {
+    // No-op: JSC fires no V8-style GC epilogue callbacks.
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__AdjustAmountOfExternalAllocatedMemory(
+    _isolate: *mut RealIsolate,
+    _change_in_bytes: i64,
+) -> i64 {
+    // We don't track external memory pressure; report zero total.
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__DateTimeConfigurationChangeNotification(
+    _isolate: *mut RealIsolate,
+    _time_zone_detection: i32,
+) {
+    // No-op: JSC re-reads the tz environment on demand.
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__LowMemoryNotification(_isolate: *mut RealIsolate) {
+    // No-op: no hook to force a JSC collection from the C API.
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__NumberOfHeapSpaces(_isolate: *mut RealIsolate) -> usize {
+    // We expose no enumerable heap spaces.
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__GetHeapSpaceStatistics(
+    _isolate: *mut RealIsolate,
+    space_statistics: *mut c_void,
+    _index: usize,
+) -> bool {
+    // Zero the out struct (v8::HeapSpaceStatistics is 40 bytes on this target).
+    if !space_statistics.is_null() {
+        unsafe { ptr::write_bytes(space_statistics as *mut u8, 0, 40) };
+    }
+    false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__GetHeapCodeAndMetadataStatistics(
+    _isolate: *mut RealIsolate,
+    code_statistics: *mut c_void,
+) -> bool {
+    // Zero the out struct (v8::HeapCodeStatistics is 32 bytes on this target).
+    if !code_statistics.is_null() {
+        unsafe { ptr::write_bytes(code_statistics as *mut u8, 0, 32) };
+    }
+    false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__SetAllowWasmCodeGenerationCallback(
+    _isolate: *mut RealIsolate,
+    _callback: *const c_void,
+) {
+    // No-op: wasm code generation is unconditionally permitted under JSC.
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__HeapProfiler__TakeHeapSnapshot(
+    _isolate: *mut RealIsolate,
+    _callback: *const c_void,
+    _arg: *mut c_void,
+) {
+    // No-op: no heap-snapshot serializer under JSC.
+}
+
+// ===================================================================
+// Context security token — V8 cross-context access guard. JSC has a single
+// security domain, so the token is informational: store/return a value.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__GetSecurityToken(_this: *const Context) -> *const Value {
+    // No per-context token tracked; report none (undefined-equivalent null).
+    ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__SetSecurityToken(
+    _this: *const Context,
+    _value: *const Value,
+) {
+    // No-op: single security domain.
 }

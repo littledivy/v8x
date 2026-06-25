@@ -104,6 +104,15 @@ pub extern "C" fn v8__String__NewFromTwoByte(
     intern::<V8String>(v)
 }
 
+/// v8 fast-path hint: is the string Latin-1 (one byte per code unit)?
+/// QuickJS doesn't expose its internal string width via the public API, so we
+/// conservatively report `false` (general / two-byte path). Callers use this
+/// only to pick an optimization; `false` is always correct, just not optimal.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__IsOneByte(_this: *const V8String) -> bool {
+    false
+}
+
 // ===================================================================
 // External strings.
 //
@@ -151,6 +160,62 @@ pub extern "C" fn v8__String__NewExternalOneByteStatic(
     let utf8: std::string::String =
         bytes.iter().map(|&b| b as u8 as ::std::primitive::char).collect();
     let v = unsafe { JS_NewStringLen(ctx, utf8.as_ptr() as *const c_char, utf8.len()) };
+    if v.tag == JS_TAG_EXCEPTION {
+        return ptr::null();
+    }
+    intern::<V8String>(v)
+}
+
+/// `String::NewExternalOneByte` — V8 takes ownership of `buffer` and frees it
+/// via `free` once it no longer needs it. QuickJS has no external strings, so we
+/// copy the bytes into an owned JS string and immediately invoke `free`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__NewExternalOneByte(
+    isolate: *mut RealIsolate,
+    buffer: *mut char,
+    length: usize,
+    free: unsafe extern "C" fn(*mut char, usize),
+) -> *const V8String {
+    let ctx = ctx_for(isolate);
+    if ctx.is_null() || buffer.is_null() {
+        // Still honor the ownership transfer.
+        if !buffer.is_null() {
+            unsafe { free(buffer, length) };
+        }
+        return ptr::null();
+    }
+    // Latin-1 bytes -> UTF-8.
+    let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, length) };
+    let utf8: std::string::String =
+        bytes.iter().map(|&b| b as ::std::primitive::char).collect();
+    let v = unsafe { JS_NewStringLen(ctx, utf8.as_ptr() as *const c_char, utf8.len()) };
+    // We've copied the data; release the embedder buffer.
+    unsafe { free(buffer, length) };
+    if v.tag == JS_TAG_EXCEPTION {
+        return ptr::null();
+    }
+    intern::<V8String>(v)
+}
+
+/// `String::NewExternalTwoByte` — same ownership contract over UTF-16 units.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__NewExternalTwoByte(
+    isolate: *mut RealIsolate,
+    buffer: *mut u16,
+    length: usize,
+    free: unsafe extern "C" fn(*mut u16, usize),
+) -> *const V8String {
+    let ctx = ctx_for(isolate);
+    if ctx.is_null() || buffer.is_null() {
+        if !buffer.is_null() {
+            unsafe { free(buffer, length) };
+        }
+        return ptr::null();
+    }
+    let units = unsafe { std::slice::from_raw_parts(buffer, length) };
+    let utf8 = std::string::String::from_utf16_lossy(units);
+    let v = unsafe { JS_NewStringLen(ctx, utf8.as_ptr() as *const c_char, utf8.len()) };
+    unsafe { free(buffer, length) };
     if v.tag == JS_TAG_EXCEPTION {
         return ptr::null();
     }

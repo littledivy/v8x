@@ -25,6 +25,7 @@ mod fam_property;
 mod fam_serializer;
 mod fam_string;
 mod fam_value;
+mod fam_wasm;
 mod shim_cli_extra;
 mod shim_runtime;
 mod shims;

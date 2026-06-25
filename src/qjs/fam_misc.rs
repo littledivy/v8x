@@ -18,7 +18,7 @@
 
 use crate::qjs::quickjs_sys::*;
 use crate::qjs::shim_core::{
-    ctx_of, current_ctx, current_iso, intern, iso_state, jsval_of,
+    ctx_of, current_ctx, current_iso, intern, intern_dup, iso_state, jsval_of,
 };
 use crate::{Context, Data, Object, RealIsolate, String as V8String, Value};
 
@@ -313,7 +313,9 @@ pub extern "C" fn v8__Global__Reset(data: *const Data) {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TracedReference__CONSTRUCT(this: *mut usize) {
     if !this.is_null() {
-        unsafe { *this = 0 };
+        // `TracedReference<T>` storage is `[u8; SIZE]` (align 1) and may be embedded
+        // at a misaligned address, so the inline payload must use unaligned access.
+        unsafe { this.write_unaligned(0) };
     }
 }
 
@@ -323,7 +325,7 @@ pub extern "C" fn v8__TracedReference__DESTRUCT(this: *mut usize) {
         return;
     }
     unsafe {
-        let cell = *this as *mut JSValue;
+        let cell = this.read_unaligned() as *mut JSValue;
         if !cell.is_null() {
             let v = *cell;
             let ctx = stable_ctx();
@@ -331,7 +333,7 @@ pub extern "C" fn v8__TracedReference__DESTRUCT(this: *mut usize) {
                 JS_FreeValue(ctx, v);
             }
             drop(Box::from_raw(cell));
-            *this = 0;
+            this.write_unaligned(0);
         }
     }
 }
@@ -348,13 +350,13 @@ pub extern "C" fn v8__TracedReference__Reset(
     let ctx = stable_ctx();
     unsafe {
         // Release any previously held cell.
-        let old = *this as *mut JSValue;
+        let old = this.read_unaligned() as *mut JSValue;
         if !old.is_null() {
             if !ctx.is_null() {
                 JS_FreeValue(ctx, *old);
             }
             drop(Box::from_raw(old));
-            *this = 0;
+            this.write_unaligned(0);
         }
         if data.is_null() || ctx.is_null() {
             return;
@@ -370,7 +372,7 @@ pub extern "C" fn v8__TracedReference__Reset(
             eprintln!("[QJS TracedRef::Reset] store tag={} ptr={:?}", dup.tag, dup.u.ptr);
         }
         let cell = Box::into_raw(Box::new(dup));
-        *this = cell as usize;
+        this.write_unaligned(cell as usize);
     }
 }
 
@@ -382,7 +384,7 @@ pub extern "C" fn v8__TracedReference__Get(
     if this.is_null() {
         return ptr::null();
     }
-    let slot = unsafe { *this };
+    let slot = unsafe { this.read_unaligned() };
     if slot == 0 {
         if std::env::var_os("QJS_DEBUG_TR").is_some() {
             eprintln!("[QJS TracedRef::Get] EMPTY");
@@ -470,20 +472,36 @@ pub(crate) struct RawStartupDataAbi {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__CONSTRUCT(
-    _buf: *mut c_void,
+    buf: *mut c_void,
     _params: *const c_void,
 ) {
-    // TODO(qjs): no snapshot support. No-op (buffer left as-is).
+    // QuickJS can't serialize a snapshot, but deno's snapshot *build* still
+    // drives a real isolate through this creator (set default context, run the
+    // extension JS, then CreateBlob). So we must own a live, entered isolate:
+    // create one and stash its pointer in the creator buffer (`[usize; 1]`).
+    let iso = crate::qjs::shim_core::v8__Isolate__New(ptr::null());
+    crate::qjs::shim_core::v8__Isolate__Enter(iso);
+    if !buf.is_null() {
+        unsafe { *(buf as *mut *mut RealIsolate) = iso };
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__DESTRUCT(_this: *mut c_void) {
-    // TODO(qjs): no snapshot support. No-op.
+    // The isolate is owned by the `OwnedIsolate` wrapper deno builds around us
+    // and is freed via `v8__Isolate__Dispose`; nothing to tear down here.
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__SnapshotCreator__GetIsolate(_this: *const c_void) -> *mut c_void {
-    // TODO(qjs): no snapshot creator isolate; fall back to the current one.
+pub extern "C" fn v8__SnapshotCreator__GetIsolate(this: *const c_void) -> *mut c_void {
+    // Return the isolate created+stashed by CONSTRUCT; fall back to the current
+    // one if called on a creator we didn't populate.
+    if !this.is_null() {
+        let iso = unsafe { *(this as *const *mut RealIsolate) };
+        if !iso.is_null() {
+            return iso as *mut c_void;
+        }
+    }
     current_iso() as *mut c_void
 }
 
@@ -657,12 +675,32 @@ pub extern "C" fn v8__WasmModuleObject__GetCompiledModule(_this: *const c_void) 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WasmModuleObject__Compile(
-    _isolate: *mut c_void,
-    _wire_bytes_data: *const u8,
-    _length: usize,
-) -> *mut c_void {
-    // TODO(qjs): no Wasm compilation support.
-    ptr::null_mut()
+    isolate: *mut RealIsolate,
+    wire_bytes_data: *const u8,
+    length: usize,
+) -> *const Object {
+    // WASM-ESM integration (`import source wasmMod from "./x.wasm"`): deno calls
+    // this to compile the wire bytes into a WasmModuleObject, then the generated
+    // wrapper does `new WebAssembly.Instance(wasmMod, imports)`. Compile via the
+    // WAMR-backed module store and hand back the same `__wasm_module_id` wrapper
+    // `new WebAssembly.Module` produces, which `obj_module_id` recognizes.
+    if isolate.is_null() || wire_bytes_data.is_null() {
+        return ptr::null();
+    }
+    let st = iso_state(isolate);
+    let ctx = st.contexts.last().copied().unwrap_or(st.ctx);
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(wire_bytes_data, length) };
+    let v = unsafe { super::fam_wasm::compile_module_object(ctx, bytes) };
+    if v.tag == JS_TAG_EXCEPTION {
+        // Drain the pending exception; deno only checks for a null return.
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return ptr::null();
+    }
+    intern::<Object>(v)
 }
 
 #[unsafe(no_mangle)]
@@ -679,4 +717,544 @@ pub extern "C" fn v8__WasmModuleCompilation__NEW() -> *mut c_void {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WasmModuleCompilation__DELETE(_this: *mut c_void) {
     // TODO(qjs): no Wasm compilation support. No-op.
+}
+
+// ===================================================================
+// JSON::Stringify — QuickJS JS_JSONStringify(obj, replacer, space).
+// ===================================================================
+
+unsafe extern "C" {
+    fn JS_JSONStringify(
+        ctx: *mut JSContext,
+        obj: JSValue,
+        replacer: JSValue,
+        space0: JSValue,
+    ) -> JSValue;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__JSON__Stringify(
+    context: *const Context,
+    json_object: *const Value,
+) -> *const V8String {
+    let ctx = ctx_of(context);
+    if ctx.is_null() || json_object.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        // replacer = undefined, space = "" (no indentation), matching v8.
+        let s = JS_JSONStringify(
+            ctx,
+            jsval_of(json_object),
+            jsv_undefined(),
+            jsv_undefined(),
+        );
+        if s.tag == JS_TAG_EXCEPTION {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+            return ptr::null();
+        }
+        intern::<V8String>(s)
+    }
+}
+
+// ===================================================================
+// Map / Set — built on the JS-visible Map/Set objects via small helpers.
+// ===================================================================
+
+/// Run `(function(x){ ... })(obj)` and return the owned (+1) result.
+unsafe fn call_unary_closure(ctx: *mut JSContext, src: &[u8], obj: JSValue) -> JSValue {
+    unsafe {
+        let f = JS_Eval(
+            ctx,
+            src.as_ptr() as *const c_char,
+            src.len() - 1,
+            c"<map-set>".as_ptr(),
+            JS_EVAL_TYPE_GLOBAL,
+        );
+        if f.tag == JS_TAG_EXCEPTION {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+            return jsv_exception();
+        }
+        let mut args = [JS_DupValue(ctx, obj)];
+        let r = JS_Call(ctx, f, jsv_undefined(), 1, args.as_mut_ptr());
+        JS_FreeValue(ctx, f);
+        JS_FreeValue(ctx, args[0]);
+        r
+    }
+}
+
+fn map_set_size(v: *const Object) -> usize {
+    let ctx = current_ctx();
+    if ctx.is_null() || v.is_null() {
+        return 0;
+    }
+    unsafe {
+        let sz = JS_GetPropertyStr(ctx, jsval_of(v), c"size".as_ptr());
+        if sz.tag == JS_TAG_EXCEPTION {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+            return 0;
+        }
+        let mut n: i64 = 0;
+        let rc = JS_ToInt64(ctx, &mut n, sz);
+        JS_FreeValue(ctx, sz);
+        if rc < 0 {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+            return 0;
+        }
+        n.max(0) as usize
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Map__Size(map: *const crate::Map) -> usize {
+    map_set_size(map as *const Object)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Set__Size(set: *const crate::Set) -> usize {
+    map_set_size(set as *const Object)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Map__As__Array(this: *const crate::Map) -> *const crate::Array {
+    let ctx = current_ctx();
+    if ctx.is_null() || this.is_null() {
+        return ptr::null();
+    }
+    // Flatten map entries to [k0,v0,k1,v1,...] (matches V8 Map::AsArray).
+    const SRC: &[u8] =
+        b"(function(m){var r=[];m.forEach(function(v,k){r.push(k);r.push(v);});return r;})\0";
+    let arr = unsafe { call_unary_closure(ctx, SRC, jsval_of(this)) };
+    if arr.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return ptr::null();
+    }
+    intern::<crate::Array>(arr)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Set__As__Array(this: *const crate::Set) -> *const crate::Array {
+    let ctx = current_ctx();
+    if ctx.is_null() || this.is_null() {
+        return ptr::null();
+    }
+    const SRC: &[u8] = b"(function(s){var r=[];s.forEach(function(v){r.push(v);});return r;})\0";
+    let arr = unsafe { call_unary_closure(ctx, SRC, jsval_of(this)) };
+    if arr.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return ptr::null();
+    }
+    intern::<crate::Array>(arr)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Set__New(isolate: *mut RealIsolate) -> *const crate::Set {
+    if isolate.is_null() {
+        return ptr::null();
+    }
+    let st = iso_state(isolate);
+    let ctx = st.contexts.last().copied().unwrap_or(st.ctx);
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let global = JS_GetGlobalObject(ctx);
+        let ctor = JS_GetPropertyStr(ctx, global, c"Set".as_ptr());
+        JS_FreeValue(ctx, global);
+        if JS_IsConstructor(ctx, ctor) == 0 {
+            JS_FreeValue(ctx, ctor);
+            return ptr::null();
+        }
+        let v = JS_CallConstructor(ctx, ctor, 0, ptr::null_mut());
+        JS_FreeValue(ctx, ctor);
+        if v.tag == JS_TAG_EXCEPTION {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+            return ptr::null();
+        }
+        intern::<crate::Set>(v)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Set__Add(
+    this: *const crate::Set,
+    context: *const Context,
+    key: *const Value,
+) -> *const crate::Set {
+    let ctx = ctx_of(context);
+    if ctx.is_null() || this.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let add = JS_GetPropertyStr(ctx, jsval_of(this), c"add".as_ptr());
+        if JS_IsFunction(ctx, add) == 0 {
+            JS_FreeValue(ctx, add);
+            return ptr::null();
+        }
+        let mut args = [JS_DupValue(ctx, jsval_of(key))];
+        let r = JS_Call(ctx, add, jsval_of(this), 1, args.as_mut_ptr());
+        JS_FreeValue(ctx, add);
+        JS_FreeValue(ctx, args[0]);
+        if r.tag == JS_TAG_EXCEPTION {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+            return ptr::null();
+        }
+        JS_FreeValue(ctx, r);
+        // `Set::Add` returns the set itself; dup it into a fresh slot.
+        intern::<crate::Set>(JS_DupValue(ctx, jsval_of(this)))
+    }
+}
+
+// ===================================================================
+// Date
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Date__New(context: *const Context, value: f64) -> *const crate::Date {
+    let ctx = ctx_of(context);
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let global = JS_GetGlobalObject(ctx);
+        let ctor = JS_GetPropertyStr(ctx, global, c"Date".as_ptr());
+        JS_FreeValue(ctx, global);
+        if JS_IsConstructor(ctx, ctor) == 0 {
+            JS_FreeValue(ctx, ctor);
+            return ptr::null();
+        }
+        let mut args = [JS_NewFloat64(ctx, value)];
+        let v = JS_CallConstructor(ctx, ctor, 1, args.as_mut_ptr());
+        JS_FreeValue(ctx, ctor);
+        if v.tag == JS_TAG_EXCEPTION {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+            return ptr::null();
+        }
+        intern::<crate::Date>(v)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Date__ValueOf(this: *const crate::Date) -> f64 {
+    let ctx = current_ctx();
+    if ctx.is_null() || this.is_null() {
+        return 0.0;
+    }
+    unsafe {
+        let vo = JS_GetPropertyStr(ctx, jsval_of(this), c"valueOf".as_ptr());
+        if JS_IsFunction(ctx, vo) == 0 {
+            JS_FreeValue(ctx, vo);
+            return 0.0;
+        }
+        let r = JS_Call(ctx, vo, jsval_of(this), 0, ptr::null_mut());
+        JS_FreeValue(ctx, vo);
+        if r.tag == JS_TAG_EXCEPTION {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+            return 0.0;
+        }
+        let mut n: f64 = 0.0;
+        JS_ToFloat64(ctx, &mut n, r);
+        JS_FreeValue(ctx, r);
+        n
+    }
+}
+
+// ===================================================================
+// Context embedder data / security token.
+//
+// Embedder data: store a small Vec of owned (+1) JSValues per context, keyed by
+// index, in a process-wide map keyed by the JSContext pointer.
+// ===================================================================
+
+use std::collections::HashMap;
+
+// JSValues are not Send (raw pointers); isolates are single-threaded here, so
+// keep the per-context stores in thread-local maps keyed by the JSContext ptr.
+thread_local! {
+    static EMBEDDER_DATA: std::cell::RefCell<HashMap<usize, Vec<JSValue>>> =
+        std::cell::RefCell::new(HashMap::new());
+    static SECURITY_TOKEN: std::cell::RefCell<HashMap<usize, JSValue>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__SetEmbedderData(
+    this: *const Context,
+    index: std::os::raw::c_int,
+    value: *const Value,
+) {
+    let ctx = ctx_of(this);
+    if ctx.is_null() || index < 0 {
+        return;
+    }
+    let owned = unsafe { JS_DupValue(ctx, jsval_of(value)) };
+    EMBEDDER_DATA.with(|m| {
+        let mut map = m.borrow_mut();
+        let slots = map.entry(ctx as usize).or_default();
+        let idx = index as usize;
+        while slots.len() <= idx {
+            slots.push(jsv_undefined());
+        }
+        let old = slots[idx];
+        if old.tag < 0 {
+            unsafe { JS_FreeValue(ctx, old) };
+        }
+        slots[idx] = owned;
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__GetEmbedderData(
+    this: *const Context,
+    index: std::os::raw::c_int,
+) -> *const Value {
+    let ctx = ctx_of(this);
+    if ctx.is_null() || index < 0 {
+        return ptr::null();
+    }
+    let found = EMBEDDER_DATA.with(|m| {
+        m.borrow()
+            .get(&(ctx as usize))
+            .and_then(|slots| slots.get(index as usize).copied())
+    });
+    match found {
+        Some(v) => intern_dup::<Value>(ctx, v),
+        // No data set: v8 returns an empty/undefined Local.
+        None => intern::<Value>(jsv_undefined()),
+    }
+}
+
+// Security token: QuickJS has a single security domain, so store/return the
+// token verbatim (keyed by ctx) without enforcing any check.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__SetSecurityToken(this: *const Context, value: *const Value) {
+    let ctx = ctx_of(this);
+    if ctx.is_null() {
+        return;
+    }
+    let owned = unsafe { JS_DupValue(ctx, jsval_of(value)) };
+    SECURITY_TOKEN.with(|m| {
+        if let Some(old) = m.borrow_mut().insert(ctx as usize, owned) {
+            if old.tag < 0 {
+                unsafe { JS_FreeValue(ctx, old) };
+            }
+        }
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__GetSecurityToken(this: *const Context) -> *const Value {
+    let ctx = ctx_of(this);
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    let found = SECURITY_TOKEN.with(|m| m.borrow().get(&(ctx as usize)).copied());
+    match found {
+        Some(v) => intern_dup::<Value>(ctx, v),
+        None => intern::<Value>(jsv_undefined()),
+    }
+}
+
+// ===================================================================
+// Eternal<Data> — V8 eternals never die. We back each with a heap-leaked,
+// process-wide protected JSValue, stored inline in the Eternal's pointer-sized
+// raw slot (a `*const Data` handle pointing at a Box<JSValue> we never free).
+// ===================================================================
+
+// NOTE on alignment: the C++ `v8::Eternal<T>` is mapped to a Rust struct whose
+// storage is `data: [u8; v8__Eternal_SIZE]` (see `handle.rs`), which has
+// **alignment 1**. Callers embed it inline — e.g. deno_core's webidl sequence
+// converter keeps `thread_local! { static NEXT_ETERNAL: v8::Eternal<v8::String> }`
+// — so the `Eternal` (and hence the `this` pointer handed to these shims) can sit
+// at an arbitrary, pointer-misaligned address. We therefore MUST access the
+// pointer-sized payload with `read_unaligned`/`write_unaligned`; a plain `*this`
+// is a misaligned-pointer dereference (UB; panics under debug) whenever the
+// embedding happens to land on an odd address.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Eternal__CONSTRUCT(this: *mut *const Data) {
+    if !this.is_null() {
+        unsafe { this.write_unaligned(ptr::null()) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Eternal__DESTRUCT(_this: *mut *const Data) {
+    // Eternals are never destroyed in V8 semantics; leak intentionally.
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Eternal__Get(this: *const *const Data, _isolate: *mut RealIsolate) -> *const Data {
+    if this.is_null() {
+        return ptr::null();
+    }
+    let stored = unsafe { this.read_unaligned() };
+    if stored.is_null() {
+        return ptr::null();
+    }
+    // `stored` points at a process-leaked Box<JSValue>; re-intern a dup into the
+    // current scope so the caller gets a scope-managed handle.
+    let ctx = current_ctx();
+    if ctx.is_null() {
+        return stored;
+    }
+    intern_dup::<Data>(ctx, jsval_of(stored))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Eternal__Set(
+    this: *mut *const Data,
+    _isolate: *mut RealIsolate,
+    data: *mut Data,
+) {
+    if this.is_null() {
+        return;
+    }
+    let ctx = current_ctx();
+    if ctx.is_null() || data.is_null() {
+        unsafe { this.write_unaligned(ptr::null()) };
+        return;
+    }
+    // Leak an owned (+1) copy so it outlives all handle scopes (eternal).
+    let owned = unsafe { JS_DupValue(ctx, jsval_of(data)) };
+    let boxed = Box::into_raw(Box::new(owned));
+    unsafe { this.write_unaligned(boxed as *const Data) };
+}
+
+// ===================================================================
+// GC prologue/epilogue/near-heap-limit callbacks — QuickJS exposes no GC
+// callback hooks, so these are inert (the callbacks simply never fire).
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__AddGCPrologueCallback(
+    _isolate: *mut RealIsolate,
+    _callback: crate::isolate::GcCallbackWithData,
+    _data: *mut c_void,
+    _gc_type_filter: crate::gc::GCType,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__AddGCEpilogueCallback(
+    _isolate: *mut RealIsolate,
+    _callback: crate::isolate::GcCallbackWithData,
+    _data: *mut c_void,
+    _gc_type_filter: crate::gc::GCType,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__AddNearHeapLimitCallback(
+    _isolate: *mut RealIsolate,
+    _callback: crate::isolate::NearHeapLimitCallback,
+    _data: *mut c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__AdjustAmountOfExternalAllocatedMemory(
+    _isolate: *mut RealIsolate,
+    change_in_bytes: i64,
+) -> i64 {
+    // V8 returns the running total of externally-allocated bytes. We have no GC
+    // pressure model; track a process-wide running sum so callers see monotone,
+    // self-consistent values.
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static TOTAL: AtomicI64 = AtomicI64::new(0);
+    TOTAL.fetch_add(change_in_bytes, Ordering::SeqCst) + change_in_bytes
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__LowMemoryNotification(isolate: *mut RealIsolate) {
+    // Best-effort: run a GC cycle.
+    if isolate.is_null() {
+        return;
+    }
+    let st = iso_state(isolate);
+    if !st.rt.is_null() {
+        unsafe { JS_RunGC(st.rt) };
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__NumberOfHeapSpaces(_isolate: *mut RealIsolate) -> usize {
+    // QuickJS has no V8-style heap spaces.
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__GetHeapSpaceStatistics(
+    _isolate: *mut RealIsolate,
+    space_statistics: *mut crate::binding::v8__HeapSpaceStatistics,
+    _index: usize,
+) -> bool {
+    if !space_statistics.is_null() {
+        unsafe {
+            ptr::write_bytes(
+                space_statistics as *mut u8,
+                0,
+                std::mem::size_of::<crate::binding::v8__HeapSpaceStatistics>(),
+            );
+        }
+    }
+    false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__GetHeapCodeAndMetadataStatistics(
+    _isolate: *mut RealIsolate,
+    code_statistics: *mut crate::binding::v8__HeapCodeStatistics,
+) -> bool {
+    if !code_statistics.is_null() {
+        unsafe {
+            ptr::write_bytes(
+                code_statistics as *mut u8,
+                0,
+                std::mem::size_of::<crate::binding::v8__HeapCodeStatistics>(),
+            );
+        }
+    }
+    false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__DateTimeConfigurationChangeNotification(
+    _isolate: *mut RealIsolate,
+    _time_zone_detection: crate::isolate::TimeZoneDetection,
+) {
+    // QuickJS reads the host timezone on demand; nothing to invalidate. No-op.
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__SetAllowWasmCodeGenerationCallback(
+    _isolate: *mut RealIsolate,
+    _callback: crate::isolate::AllowWasmCodeGenerationCallback,
+) {
+    // No Wasm in QuickJS-ng. No-op.
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__HeapProfiler__TakeHeapSnapshot(
+    _isolate: *mut RealIsolate,
+    _callback: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> bool,
+    _arg: *mut c_void,
+) {
+    // QuickJS has no heap-snapshot serializer. Emit nothing.
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ScriptCompiler__CachedDataVersionTag() -> u32 {
+    // A constant tag: any code cache we produce is keyed by it. Stable per build.
+    0x5145_4a53 // "QJS\x?" placeholder constant
 }

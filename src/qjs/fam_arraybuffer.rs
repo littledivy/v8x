@@ -102,6 +102,12 @@ struct BsInner {
     deleter_data: *mut c_void,
     /// `data` was allocated by us via malloc/calloc and must be freed.
     owns_malloc: bool,
+    /// When the backing store borrows a live QuickJS ArrayBuffer's bytes (e.g.
+    /// deno taking the backing store of a JS `Uint8Array` for a Response body),
+    /// we hold a duped ref to that buffer so QuickJS can't free/move it while
+    /// `data` is still referenced. Released on destroy. (ctx null = none.)
+    retained_ctx: *mut JSContext,
+    retained_val: JSValue,
 }
 
 unsafe extern "C" fn noop_deleter(_data: *mut c_void, _len: usize, _deleter_data: *mut c_void) {}
@@ -123,6 +129,8 @@ impl BsInner {
             deleter,
             deleter_data,
             owns_malloc,
+            retained_ctx: ptr::null_mut(),
+            retained_val: jsv_undefined(),
         }))
     }
 
@@ -148,6 +156,10 @@ impl BsInner {
             } else {
                 unsafe { (b.deleter)(b.data, b.byte_length, b.deleter_data) };
             }
+        }
+        // Release the borrowed QuickJS ArrayBuffer (if any), letting it be freed.
+        if !b.retained_ctx.is_null() {
+            unsafe { JS_FreeValue(b.retained_ctx, b.retained_val) };
         }
         // Box drop frees the BsInner allocation.
     }
@@ -200,6 +212,14 @@ fn backing_store_for_buffer(ctx: *mut JSContext, buf: JSValue) -> SharedRef<Back
     let mut len: usize = 0;
     let data = unsafe { JS_GetArrayBuffer(ctx, &mut len, buf) } as *mut c_void;
     let inner = BsInner::boxed(data, len, false, noop_deleter, ptr::null_mut(), false);
+    // Keep the underlying ArrayBuffer alive for the backing store's lifetime —
+    // deno may hold this backing store (e.g. a Response body built from a JS
+    // `Uint8Array`) long after the source view is GC'd; without a retained ref
+    // QuickJS frees the bytes and `data` dangles, corrupting the body.
+    unsafe {
+        (*inner).retained_ctx = ctx;
+        (*inner).retained_val = JS_DupValue(ctx, buf);
+    }
     make_shared_ref(inner)
 }
 
@@ -744,3 +764,173 @@ typed_array_new!(v8__Float32Array__New, Float32Array, JS_TYPED_ARRAY_FLOAT32);
 typed_array_new!(v8__Float64Array__New, Float64Array, JS_TYPED_ARRAY_FLOAT64);
 typed_array_new!(v8__BigInt64Array__New, BigInt64Array, JS_TYPED_ARRAY_BIG_INT64);
 typed_array_new!(v8__BigUint64Array__New, BigUint64Array, JS_TYPED_ARRAY_BIG_UINT64);
+typed_array_new!(v8__Uint8ClampedArray__New, Uint8ClampedArray, JS_TYPED_ARRAY_UINT8C);
+typed_array_new!(v8__Float16Array__New, Float16Array, JS_TYPED_ARRAY_FLOAT16);
+
+// ===================================================================
+// TypedArray::Length — element count (byteLength / bytesPerElement).
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TypedArray__Length(this: *const crate::TypedArray) -> usize {
+    let ctx = current_ctx();
+    if ctx.is_null() || this.is_null() {
+        return 0;
+    }
+    let mut byte_len: usize = 0;
+    let mut bpe: usize = 0;
+    let buf = unsafe {
+        JS_GetTypedArrayBuffer(ctx, jsval_of(this), ptr::null_mut(), &mut byte_len, &mut bpe)
+    };
+    if buf.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return 0;
+    }
+    unsafe { JS_FreeValue(ctx, buf) };
+    if bpe == 0 { byte_len } else { byte_len / bpe }
+}
+
+// ===================================================================
+// DataView — QuickJS-ng exposes no `JS_NewDataView` C entry point, so build
+// one through the global `DataView` constructor:
+//   new DataView(buffer, byteOffset, byteLength)
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__DataView__New(
+    buffer: *const ArrayBuffer,
+    byte_offset: usize,
+    length: usize,
+) -> *const DataView {
+    let ctx = current_ctx();
+    if ctx.is_null() || buffer.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let global = JS_GetGlobalObject(ctx);
+        let ctor = JS_GetPropertyStr(ctx, global, c"DataView".as_ptr());
+        JS_FreeValue(ctx, global);
+        if ctor.tag == JS_TAG_EXCEPTION || JS_IsConstructor(ctx, ctor) == 0 {
+            JS_FreeValue(ctx, ctor);
+            return ptr::null();
+        }
+        // Args are borrowed by JS_CallConstructor; dup the buffer so we keep ours.
+        let buf = JS_DupValue(ctx, jsval_of(buffer));
+        let mut args = [
+            buf,
+            JS_NewInt64(ctx, byte_offset as i64),
+            JS_NewInt64(ctx, length as i64),
+        ];
+        let v = JS_CallConstructor(ctx, ctor, 3, args.as_mut_ptr());
+        JS_FreeValue(ctx, ctor);
+        JS_FreeValue(ctx, args[0]);
+        if v.tag == JS_TAG_EXCEPTION {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+            return ptr::null();
+        }
+        intern::<DataView>(v)
+    }
+}
+
+// ===================================================================
+// ArrayBufferView::CopyContents — copy up to `byte_length` bytes of the view's
+// data into `dest`. Returns the number of bytes copied.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBufferView__CopyContents(
+    this: *const ArrayBufferView,
+    dest: *mut c_void,
+    byte_length: i32,
+) -> usize {
+    let ctx = current_ctx();
+    if ctx.is_null() || this.is_null() || dest.is_null() || byte_length <= 0 {
+        return 0;
+    }
+    let mut off: usize = 0;
+    let mut len: usize = 0;
+    let buf = unsafe {
+        JS_GetTypedArrayBuffer(ctx, jsval_of(this), &mut off, &mut len, ptr::null_mut())
+    };
+    if buf.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return 0;
+    }
+    let mut buf_len: usize = 0;
+    let base = unsafe { JS_GetArrayBuffer(ctx, &mut buf_len, buf) };
+    unsafe { JS_FreeValue(ctx, buf) };
+    if base.is_null() {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return 0;
+    }
+    let n = std::cmp::min(len, byte_length as usize);
+    unsafe {
+        ptr::copy_nonoverlapping(base.add(off), dest as *mut u8, n);
+    }
+    n
+}
+
+// ===================================================================
+// SharedArrayBuffer::ByteLength — SAB is backed by a plain ArrayBuffer here.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__SharedArrayBuffer__ByteLength(this: *const SharedArrayBuffer) -> usize {
+    let ctx = current_ctx();
+    if ctx.is_null() || this.is_null() {
+        return 0;
+    }
+    let mut len: usize = 0;
+    unsafe { JS_GetArrayBuffer(ctx, &mut len, jsval_of(this)) };
+    len
+}
+
+// ===================================================================
+// ArrayBuffer::SetDetachKey — QuickJS has no detach-key concept; no-op.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBuffer__SetDetachKey(this: *const ArrayBuffer, key: *const Value) {
+    let _ = (this, key);
+}
+
+// ===================================================================
+// std::shared_ptr<BackingStore>::use_count — report the BsInner refcount.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__BackingStore__use_count(
+    ptr: *const SharedPtrBase<BackingStore>,
+) -> long {
+    let inner = sp_get(ptr);
+    if inner.is_null() {
+        return 0;
+    }
+    unsafe { (*inner).refcount.load(Ordering::SeqCst) as long }
+}
+
+// ===================================================================
+// ArrayBuffer::Allocator::NewRustAllocator — V8 lets an embedder install a
+// custom allocator; QuickJS owns its own allocation, so we never route buffer
+// allocation through it. We immediately run the embedder's `drop` (the handle
+// is otherwise leaked) and return the same stateless sentinel as the default
+// allocator, so the existing `v8__ArrayBuffer__Allocator__DELETE`
+// (in shim_arraybuffer.rs) reclaims it correctly.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBuffer__Allocator__NewRustAllocator(
+    handle: *const c_void,
+    vtable: *const crate::array_buffer::RustAllocatorVtable<c_void>,
+) -> *mut crate::array_buffer::Allocator {
+    // QuickJS never calls this allocator's allocate/free, so release the
+    // embedder handle right away via its vtable drop to avoid a leak.
+    if !vtable.is_null() {
+        unsafe { ((*vtable).drop)(handle) };
+    }
+    Box::into_raw(Box::new(0u8)) as *mut crate::array_buffer::Allocator
+}

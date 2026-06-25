@@ -105,6 +105,10 @@ struct FnTemplate {
     parent: *const FnTemplate,
     // properties set via Template::Set: (name, value, attr)
     props: Vec<(JSValueRef, JSValueRef, u32)>,
+    /// `ConstructorBehavior::Allow`. V8 only gives constructable functions a
+    /// `.prototype`; `Throw` functions (all deno ops) have none — so we skip the
+    /// (expensive) per-function prototype-object creation for them at boot.
+    constructable: bool,
     /// The materialized `.prototype` object, created on first use and cached so
     /// that `GetFunction` (which installs methods onto it) and `NewInstance`
     /// (which wires it as the instance's `__proto__`) share the SAME object.
@@ -319,6 +323,40 @@ unsafe fn make_function(
     unsafe { make_function_len(ctx, callback, data, 0) }
 }
 
+// --- Startup hot-path caches -------------------------------------------------
+// `make_function_len`/`GetFunction` run once per op (~2400× at boot). Creating a
+// fresh JSString for the constant keys ("length"/"name"/"prototype") and walking
+// the global object for `Function.prototype` on *every* call dominated JSC
+// startup (~24 ms in `ops_bindings`). Cache the immutable bits.
+thread_local! {
+    static STR_LENGTH: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
+    static STR_NAME: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
+    static STR_PROTOTYPE: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
+    static STR_FUNCTION: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
+    // (gctx, Function.prototype) — protected, valid for that global context.
+    static FN_PROTO_CACHE: std::cell::Cell<(JSGlobalContextRef, JSValueRef)> =
+        const { std::cell::Cell::new((ptr::null_mut(), ptr::null_mut())) };
+}
+
+/// A retained, reusable JSStringRef for a constant key (never released).
+#[inline]
+unsafe fn cached_str(
+    cell: &'static std::thread::LocalKey<std::cell::Cell<JSStringRef>>,
+    lit: *const std::os::raw::c_char,
+) -> JSStringRef {
+    cell.with(|c| {
+        let existing = c.get();
+        if !existing.is_null() {
+            return existing;
+        }
+        let s = unsafe { JSStringCreateWithUTF8CString(lit) };
+        // Retain for the process lifetime so it can be reused every call.
+        let s = unsafe { JSStringRetain(s) };
+        c.set(s);
+        s
+    })
+}
+
 /// Like `make_function` but also installs the function's `.length` (arity)
 /// property, which JS bootstrap code (e.g. `setUpAsyncStub`) relies on.
 unsafe fn make_function_len(
@@ -344,12 +382,11 @@ unsafe fn make_function_len(
     // DontEnum (2|4) but NOT DontDelete, so embedder code (e.g. deno's
     // applyWebIdlInterfaceShape) can redefine it without a JSC "unconfigurable
     // property" TypeError.
-    let key = unsafe { JSStringCreateWithUTF8CString(c"length".as_ptr()) };
+    let key = unsafe { cached_str(&STR_LENGTH, c"length".as_ptr()) };
     let lenval = unsafe { JSValueMakeNumber(ctx, length.max(0) as f64) };
     let mut exc: JSValueRef = ptr::null();
     unsafe {
         JSObjectSetProperty(ctx, obj, key, lenval, 2 | 4, &mut exc);
-        JSStringRelease(key);
     }
     // Objects made with a custom JSClass do NOT inherit `Function.prototype`, so
     // they lack `call`/`apply`/`bind`. deno's async-op stubs do
@@ -368,18 +405,27 @@ unsafe fn make_function_len(
 /// the global). Used to give our custom-class function objects `call`/`apply`/
 /// `bind`.
 unsafe fn function_prototype(ctx: JSContextRef) -> JSValueRef {
+    let gctx = unsafe { JSContextGetGlobalContext(ctx) };
+    // Fast path: cached per global context (Function.prototype is immutable).
+    let cached = FN_PROTO_CACHE.with(|c| c.get());
+    if cached.0 == gctx && !cached.1.is_null() {
+        return cached.1;
+    }
     unsafe {
         let global = JSContextGetGlobalObject(ctx);
-        let fkey = JSStringCreateWithUTF8CString(c"Function".as_ptr());
+        let fkey = cached_str(&STR_FUNCTION, c"Function".as_ptr());
         let mut exc: JSValueRef = ptr::null();
         let func_ctor = JSObjectGetProperty(ctx, global, fkey, &mut exc);
-        JSStringRelease(fkey);
         if func_ctor.is_null() || !JSValueIsObject(ctx, func_ctor) {
             return ptr::null();
         }
-        let pkey = JSStringCreateWithUTF8CString(c"prototype".as_ptr());
+        let pkey = cached_str(&STR_PROTOTYPE, c"prototype".as_ptr());
         let fp = JSObjectGetProperty(ctx, func_ctor as JSObjectRef, pkey, &mut exc);
-        JSStringRelease(pkey);
+        if !fp.is_null() {
+            // Protect the cached prototype for the global context's lifetime.
+            JSValueProtect(gctx, fp);
+            FN_PROTO_CACHE.with(|c| c.set((gctx, fp)));
+        }
         fp
     }
 }
@@ -889,11 +935,12 @@ pub extern "C" fn v8__FunctionTemplate__New(
     let _ = (
         isolate,
         signature_or_null,
-        constructor_behavior,
         side_effect_type,
         c_functions,
         c_functions_len,
     );
+    let constructable =
+        matches!(constructor_behavior, crate::ConstructorBehavior::Allow);
     let proto = Box::into_raw(Box::new(ObjTemplate {
         internal_field_count: 0,
         props: Vec::new(),
@@ -917,6 +964,7 @@ pub extern "C" fn v8__FunctionTemplate__New(
         instance,
         parent: ptr::null(),
         props: Vec::new(),
+        constructable,
         cached_proto: ptr::null(),
     }));
     // Wire the instance template back to its FunctionTemplate so NewInstance can
@@ -945,7 +993,7 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
     // Apply class name as the function's `name`.
     if let Some(name) = &t.class_name {
         if let Ok(cname) = std::ffi::CString::new(name.as_str()) {
-            let key = unsafe { JSStringCreateWithUTF8CString(c"name".as_ptr()) };
+            let key = unsafe { cached_str(&STR_NAME, c"name".as_ptr()) };
             let nameval = unsafe {
                 let s = JSStringCreateWithUTF8CString(cname.as_ptr());
                 let v = JSValueMakeString(ctx, s);
@@ -955,7 +1003,6 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
             let mut exc: JSValueRef = ptr::null();
             unsafe {
                 JSObjectSetProperty(ctx, f, key, nameval, 0, &mut exc);
-                JSStringRelease(key);
             }
         }
     }
@@ -963,16 +1010,20 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
     // Apply template properties (static props) directly onto the function.
     apply_props(ctx, f, &t.props);
 
-    // Build a prototype object carrying prototype-template props and install it.
-    // v8 functions ALWAYS have a `.prototype` object (deno's setUpAsyncStub does
-    // `tmplFn.prototype[opName] = fn`), so install one even when the prototype
-    // template has no props.
-    let proto_obj = unsafe { build_prototype_object(ctx, this as *const FnTemplate) };
-    let key = unsafe { JSStringCreateWithUTF8CString(c"prototype".as_ptr()) };
-    let mut exc: JSValueRef = ptr::null();
-    unsafe {
-        JSObjectSetProperty(ctx, f, key, proto_obj as JSValueRef, 0, &mut exc);
-        JSStringRelease(key);
+    // Install a `.prototype` object ONLY for constructable functions. V8 strips
+    // `.prototype` from `ConstructorBehavior::Throw` functions (every deno op),
+    // so matching that both is correct AND avoids ~2400 prototype-object
+    // allocations at boot (the dominant `ops_bindings` cost). Constructable
+    // templates (classes like `Console`) still get the shared prototype object
+    // that `NewInstance` wires onto instances.
+    if t.constructable {
+        let proto_obj =
+            unsafe { build_prototype_object(ctx, this as *const FnTemplate) };
+        let key = unsafe { cached_str(&STR_PROTOTYPE, c"prototype".as_ptr()) };
+        let mut exc: JSValueRef = ptr::null();
+        unsafe {
+            JSObjectSetProperty(ctx, f, key, proto_obj as JSValueRef, 0, &mut exc);
+        }
     }
 
     intern_ctx::<Function>(ctx, f as JSValueRef)
@@ -1344,4 +1395,58 @@ pub extern "C" fn v8__ObjectTemplate__SetNamedPropertyHandler(
         this, getter, setter, query, deleter, enumerator, definer, descriptor,
         data_or_null, flags,
     );
+}
+
+// ===================================================================
+// FunctionCallbackInfo::NewTarget — for a construct call this is the function
+// being constructed (new.target); otherwise undefined.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionCallbackInfo__NewTarget(
+    this: *const FunctionCallbackInfo,
+) -> *const Value {
+    if this.is_null() {
+        return ptr::null();
+    }
+    let info = cbinfo(this);
+    if info.is_construct && !info.new_target.is_null() {
+        return info.new_target as *const Value;
+    }
+    (unsafe { JSValueMakeUndefined(info.ctx) }) as *const Value
+}
+
+// ===================================================================
+// PropertyCallbackInfo — JSC's named/indexed interceptors are not bridged to
+// v8 PropertyCallbackInfo yet, so these provide safe defaults. They are only
+// reached if an interceptor callback fires, which our templates do not install.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__GetIsolate(
+    _this: *const c_void,
+) -> *mut RealIsolate {
+    crate::shim_core::current_iso()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__GetReturnValue(
+    _this: *const c_void,
+) -> usize {
+    // No return slot available; 0 means "unset" in our ReturnValue model.
+    0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__Holder(
+    _this: *const c_void,
+) -> *const Object {
+    ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__ShouldThrowOnError(
+    _this: *const c_void,
+) -> bool {
+    false
 }

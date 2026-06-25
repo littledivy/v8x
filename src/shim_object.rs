@@ -4,8 +4,9 @@
 use crate::jsc_sys::*;
 use crate::support::{int, Maybe, MaybeBool};
 use crate::{
-    Array, Context, KeyCollectionMode, KeyConversionMode, IndexFilter, Name, Object, Private,
-    PropertyAttribute, PropertyDescriptor, PropertyFilter, RealIsolate, String, Value,
+    Array, Context, IntegrityLevel, KeyCollectionMode, KeyConversionMode, IndexFilter, Map, Name,
+    Object, Private, PropertyAttribute, PropertyDescriptor, PropertyFilter, RealIsolate, Set,
+    String, Value,
 };
 use crate::shim_core::{ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval};
 use std::os::raw::{c_char, c_void};
@@ -344,7 +345,8 @@ pub extern "C" fn v8__Object__GetOwnPropertyNames(
     filter: PropertyFilter,
     key_conversion: KeyConversionMode,
 ) -> *const Array {
-    property_names_array(this, context)
+    let _ = (filter, key_conversion);
+    property_names_array(this, context, false)
 }
 
 #[unsafe(no_mangle)]
@@ -356,10 +358,29 @@ pub extern "C" fn v8__Object__GetPropertyNames(
     index_filter: IndexFilter,
     key_conversion: KeyConversionMode,
 ) -> *const Array {
-    property_names_array(this, context)
+    let _ = (mode, key_conversion);
+    // PropertyFilter bits: ONLY_ENUMERABLE=2, SKIP_STRINGS=8, SKIP_SYMBOLS=16.
+    let filter = unsafe { *(&property_filter as *const PropertyFilter as *const u32) };
+    // SKIP_STRINGS asks for *symbols only*. JSObjectCopyPropertyNames returns
+    // only string keys (the JSC C API can't enumerate own symbol keys), so the
+    // correct answer is an empty set. Returning the string keys here makes the
+    // console inspector list every string property twice (once mis-tagged as a
+    // symbol). Return an empty array instead.
+    if filter & 8 != 0 {
+        return empty_array(this, context);
+    }
+    // IndexFilter::SkipIndices == 1. The console inspector lists array elements
+    // separately and then asks for the *non-index* own keys; if we leak the
+    // integer indices here they render twice (e.g. `[1,2,3, "0":1, ...]`).
+    let skip_indices = index_filter as u32 == 1;
+    property_names_array(this, context, skip_indices)
 }
 
-fn property_names_array(this: *const Object, context: *const Context) -> *const Array {
+fn property_names_array(
+    this: *const Object,
+    context: *const Context,
+    skip_indices: bool,
+) -> *const Array {
     let ctx = ctx_of(context) as JSContextRef;
     let o = obj_of(ctx, this);
     if o.is_null() {
@@ -371,6 +392,9 @@ fn property_names_array(this: *const Object, context: *const Context) -> *const 
         let mut vals: Vec<JSValueRef> = Vec::with_capacity(count);
         for i in 0..count {
             let s = JSPropertyNameArrayGetNameAtIndex(names, i);
+            if skip_indices && jsstr_is_array_index(s) {
+                continue;
+            }
             let v = JSValueMakeString(ctx, s);
             vals.push(v);
         }
@@ -382,6 +406,47 @@ fn property_names_array(this: *const Object, context: *const Context) -> *const 
         }
         intern_ctx::<Array>(ctx, arr as JSValueRef)
     }
+}
+
+/// An empty JS array handle (for filters that match nothing here).
+fn empty_array(_this: *const Object, context: *const Context) -> *const Array {
+    let ctx = ctx_of(context) as JSContextRef;
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let mut exc: JSValueRef = ptr::null();
+        let arr = JSObjectMakeArray(ctx, 0, ptr::null(), &mut exc);
+        if !exc.is_null() || arr.is_null() {
+            return ptr::null();
+        }
+        intern_ctx::<Array>(ctx, arr as JSValueRef)
+    }
+}
+
+/// True if a JSStringRef is a canonical array index ("0", "1", … within u32).
+unsafe fn jsstr_is_array_index(s: JSStringRef) -> bool {
+    let len = unsafe { JSStringGetLength(s) };
+    if len == 0 || len > 10 {
+        return false;
+    }
+    let chars = unsafe { JSStringGetCharactersPtr(s) };
+    if chars.is_null() {
+        return false;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(chars, len) };
+    // No leading zero (except the single "0").
+    if slice[0] == b'0' as u16 {
+        return len == 1;
+    }
+    let mut val: u64 = 0;
+    for &c in slice {
+        if !(b'0' as u16..=b'9' as u16).contains(&c) {
+            return false;
+        }
+        val = val * 10 + (c - b'0' as u16) as u64;
+    }
+    val <= u32::MAX as u64
 }
 
 #[unsafe(no_mangle)]
@@ -653,4 +718,425 @@ pub extern "C" fn v8__Object__GetOwnPropertyDescriptor(
         // V8 returns Undefined (not null/empty) when no own descriptor exists.
         intern_ctx::<Value>(ctx, r)
     }
+}
+
+// ===================================================================
+// Object — index / real-named / private / preview / integrity extras.
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__HasIndex(
+    this: *const Object,
+    context: *const Context,
+    index: u32,
+) -> MaybeBool {
+    let ctx = ctx_of(context) as JSContextRef;
+    let o = obj_of(ctx, this);
+    if o.is_null() {
+        return MaybeBool::Nothing;
+    }
+    let mut exc: JSValueRef = ptr::null();
+    let v = unsafe { JSObjectGetPropertyAtIndex(ctx, o, index, &mut exc) };
+    if !exc.is_null() {
+        return MaybeBool::Nothing;
+    }
+    // An index "exists" if reading it yields a non-undefined value.
+    just_bool(!unsafe { JSValueIsUndefined(ctx, v) })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__DeleteIndex(
+    this: *const Object,
+    context: *const Context,
+    index: u32,
+) -> MaybeBool {
+    let ctx = ctx_of(context) as JSContextRef;
+    let o = obj_of(ctx, this);
+    if o.is_null() {
+        return MaybeBool::Nothing;
+    }
+    // No direct delete-by-index in the C API; route through a key.
+    let key = unsafe { JSValueMakeNumber(ctx, index as f64) };
+    let mut exc: JSValueRef = ptr::null();
+    let r = unsafe { JSObjectDeletePropertyForKey(ctx, o, key, &mut exc) };
+    if !exc.is_null() {
+        return MaybeBool::Nothing;
+    }
+    just_bool(r)
+}
+
+// JSC has no notion of "real" (non-interceptor) named lookup distinct from a
+// normal lookup, so these mirror the ordinary Get/Has paths.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetRealNamedProperty(
+    this: *const Object,
+    context: *const Context,
+    key: *const Name,
+) -> *const Value {
+    let ctx = ctx_of(context) as JSContextRef;
+    let o = obj_of(ctx, this);
+    if o.is_null() {
+        return ptr::null();
+    }
+    let mut exc: JSValueRef = ptr::null();
+    let v = unsafe { JSObjectGetPropertyForKey(ctx, o, jsval(key), &mut exc) };
+    if !exc.is_null() {
+        return ptr::null();
+    }
+    intern_ctx::<Value>(ctx, v)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__HasRealNamedProperty(
+    this: *const Object,
+    context: *const Context,
+    key: *const Name,
+) -> MaybeBool {
+    let ctx = ctx_of(context) as JSContextRef;
+    let o = obj_of(ctx, this);
+    if o.is_null() {
+        return MaybeBool::Nothing;
+    }
+    let mut exc: JSValueRef = ptr::null();
+    let r = unsafe { JSObjectHasPropertyForKey(ctx, o, jsval(key), &mut exc) };
+    if !exc.is_null() {
+        return MaybeBool::Nothing;
+    }
+    just_bool(r)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetRealNamedPropertyAttributes(
+    this: *const Object,
+    context: *const Context,
+    key: *const Name,
+    out: *mut Maybe<PropertyAttribute>,
+) {
+    // JSC C API does not expose per-property attribute bits; report NONE if the
+    // property exists, otherwise no value. Mirrors GetPropertyAttributes.
+    if out.is_null() {
+        return;
+    }
+    let ctx = ctx_of(context) as JSContextRef;
+    let o = obj_of(ctx, this);
+    let mut exc: JSValueRef = ptr::null();
+    let has = if o.is_null() {
+        false
+    } else {
+        unsafe { JSObjectHasPropertyForKey(ctx, o, jsval(key), &mut exc) }
+    };
+    let m = if has && exc.is_null() {
+        let mut tmp: Maybe<PropertyAttribute> = unsafe { std::mem::zeroed() };
+        unsafe { *(&mut tmp as *mut Maybe<PropertyAttribute> as *mut bool) = true; }
+        tmp
+    } else {
+        unsafe { std::mem::zeroed() }
+    };
+    unsafe { ptr::write(out, m); }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__HasPrivate(
+    this: *const Object,
+    context: *const Context,
+    key: *const Private,
+) -> MaybeBool {
+    let ctx = ctx_of(context) as JSContextRef;
+    let o = obj_of(ctx, this);
+    if o.is_null() {
+        return MaybeBool::Nothing;
+    }
+    let mut exc: JSValueRef = ptr::null();
+    let r = unsafe { JSObjectHasPropertyForKey(ctx, o, jsval(key), &mut exc) };
+    if !exc.is_null() {
+        return MaybeBool::Nothing;
+    }
+    just_bool(r)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__DeletePrivate(
+    this: *const Object,
+    context: *const Context,
+    key: *const Private,
+) -> MaybeBool {
+    let ctx = ctx_of(context) as JSContextRef;
+    let o = obj_of(ctx, this);
+    if o.is_null() {
+        return MaybeBool::Nothing;
+    }
+    let mut exc: JSValueRef = ptr::null();
+    let r = unsafe { JSObjectDeletePropertyForKey(ctx, o, jsval(key), &mut exc) };
+    if !exc.is_null() {
+        return MaybeBool::Nothing;
+    }
+    just_bool(r)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetCreationContext(this: *const Object) -> *const Context {
+    // We don't track per-object creation contexts; the current context is a
+    // sound approximation (objects belong to the active realm).
+    let iso = current_iso();
+    if iso.is_null() {
+        return ptr::null();
+    }
+    iso_state(iso)
+        .contexts
+        .last()
+        .copied()
+        .unwrap_or(ptr::null_mut()) as *const Context
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__SetIntegrityLevel(
+    this: *const Object,
+    context: *const Context,
+    level: IntegrityLevel,
+) -> MaybeBool {
+    let ctx = ctx_of(context) as JSContextRef;
+    let o = obj_of(ctx, this);
+    if o.is_null() {
+        return MaybeBool::Nothing;
+    }
+    // Route through JS Object.freeze / Object.seal.
+    let fname = match level {
+        IntegrityLevel::Frozen => b"freeze\0".as_ref(),
+        IntegrityLevel::Sealed => b"seal\0".as_ref(),
+    };
+    unsafe {
+        let global = JSContextGetGlobalObject(ctx);
+        let mut exc: JSValueRef = ptr::null();
+        let oname = JSStringCreateWithUTF8CString(b"Object\0".as_ptr() as *const c_char);
+        let object_ctor = JSObjectGetProperty(ctx, global, oname, &mut exc);
+        JSStringRelease(oname);
+        if !exc.is_null() || !JSValueIsObject(ctx, object_ctor) {
+            return MaybeBool::Nothing;
+        }
+        let object_obj = JSValueToObject(ctx, object_ctor, &mut exc);
+        let fs = JSStringCreateWithUTF8CString(fname.as_ptr() as *const c_char);
+        let func = JSObjectGetProperty(ctx, object_obj, fs, &mut exc);
+        JSStringRelease(fs);
+        if !exc.is_null() {
+            return MaybeBool::Nothing;
+        }
+        let func_obj = JSValueToObject(ctx, func, &mut exc);
+        if func_obj.is_null() {
+            return MaybeBool::Nothing;
+        }
+        let args = [o as JSValueRef];
+        JSObjectCallAsFunction(ctx, func_obj, ptr::null_mut(), 1, args.as_ptr(), &mut exc);
+        if !exc.is_null() {
+            return MaybeBool::Nothing;
+        }
+    }
+    MaybeBool::JustTrue
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__PreviewEntries(
+    this: *const Object,
+    is_key_value: *mut bool,
+) -> *const Array {
+    // Used by the inspector to preview Map/Set entries. Best-effort: for Map/Set
+    // call entries()/values() and collect into an array; otherwise return null.
+    let ctx = current_ctx();
+    let o = obj_of(ctx, this);
+    if ctx.is_null() || o.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        // Determine whether this is a Map (key/value) by probing for a `.size`
+        // and an `entries` method. We materialize via Array.from(obj.entries()).
+        let mut exc: JSValueRef = ptr::null();
+        // Try entries() first (Map -> [k,v] pairs, key_value true).
+        let try_iter = |name: &[u8]| -> JSValueRef {
+            let mut e: JSValueRef = ptr::null();
+            let ns = JSStringCreateWithUTF8CString(name.as_ptr() as *const c_char);
+            let m = JSObjectGetProperty(ctx, o, ns, &mut e);
+            JSStringRelease(ns);
+            if !e.is_null() || !JSValueIsObject(ctx, m) {
+                return ptr::null();
+            }
+            let mo = JSValueToObject(ctx, m, &mut e);
+            if mo.is_null() || !JSObjectIsFunction(ctx, mo) {
+                return ptr::null();
+            }
+            JSObjectCallAsFunction(ctx, mo, o, 0, ptr::null(), &mut e)
+        };
+        let (iter, kv) = {
+            let it = try_iter(b"entries\0");
+            if !it.is_null() {
+                (it, true)
+            } else {
+                (try_iter(b"values\0"), false)
+            }
+        };
+        if iter.is_null() {
+            if !is_key_value.is_null() {
+                *is_key_value = false;
+            }
+            return ptr::null();
+        }
+        if !is_key_value.is_null() {
+            *is_key_value = kv;
+        }
+        // Array.from(iter)
+        let global = JSContextGetGlobalObject(ctx);
+        let an = JSStringCreateWithUTF8CString(b"Array\0".as_ptr() as *const c_char);
+        let array_ctor = JSObjectGetProperty(ctx, global, an, &mut exc);
+        JSStringRelease(an);
+        let array_obj = JSValueToObject(ctx, array_ctor, &mut exc);
+        let fr = JSStringCreateWithUTF8CString(b"from\0".as_ptr() as *const c_char);
+        let from = JSObjectGetProperty(ctx, array_obj, fr, &mut exc);
+        JSStringRelease(fr);
+        let from_obj = JSValueToObject(ctx, from, &mut exc);
+        if from_obj.is_null() {
+            return ptr::null();
+        }
+        let args = [iter];
+        let arr = JSObjectCallAsFunction(ctx, from_obj, ptr::null_mut(), 1, args.as_ptr(), &mut exc);
+        if !exc.is_null() || arr.is_null() {
+            return ptr::null();
+        }
+        // For Map entries we want a flat [k0,v0,k1,v1,...] array.
+        if kv {
+            let flat = b"(function(pairs){var r=[];for(var i=0;i<pairs.length;i++){r.push(pairs[i][0]);r.push(pairs[i][1]);}return r;})\0";
+            let fs = JSStringCreateWithUTF8CString(flat.as_ptr() as *const c_char);
+            let fnv = JSEvaluateScript(ctx, fs, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+            JSStringRelease(fs);
+            let fnobj = JSValueToObject(ctx, fnv, &mut exc);
+            if !fnobj.is_null() {
+                let a2 = [arr];
+                let flat_arr = JSObjectCallAsFunction(ctx, fnobj, ptr::null_mut(), 1, a2.as_ptr(), &mut exc);
+                if exc.is_null() && !flat_arr.is_null() {
+                    return intern_ctx::<Array>(ctx, flat_arr);
+                }
+            }
+        }
+        intern_ctx::<Array>(ctx, arr)
+    }
+}
+
+// ===================================================================
+// Map / Set
+// ===================================================================
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Map__Size(map: *const Map) -> usize {
+    map_set_size(jsval(map))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Set__Size(map: *const Set) -> usize {
+    map_set_size(jsval(map))
+}
+
+fn map_set_size(v: JSValueRef) -> usize {
+    let ctx = current_ctx();
+    if ctx.is_null() || v.is_null() {
+        return 0;
+    }
+    unsafe {
+        let mut exc: JSValueRef = ptr::null();
+        let o = JSValueToObject(ctx, v, &mut exc);
+        if o.is_null() {
+            return 0;
+        }
+        let ss = JSStringCreateWithUTF8CString(b"size\0".as_ptr() as *const c_char);
+        let sz = JSObjectGetProperty(ctx, o, ss, &mut exc);
+        JSStringRelease(ss);
+        if !exc.is_null() {
+            return 0;
+        }
+        JSValueToNumber(ctx, sz, &mut exc) as usize
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Map__As__Array(this: *const Map) -> *const Array {
+    // Flatten map entries to [k0,v0,k1,v1,...] (matches V8's Map::AsArray).
+    map_set_as_array(jsval(this), true)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Set__As__Array(this: *const Set) -> *const Array {
+    map_set_as_array(jsval(this), false)
+}
+
+fn map_set_as_array(v: JSValueRef, is_map: bool) -> *const Array {
+    let ctx = current_ctx();
+    if ctx.is_null() || v.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let src = if is_map {
+            b"(function(m){var r=[];m.forEach(function(val,key){r.push(key);r.push(val);});return r;})\0".as_ref()
+        } else {
+            b"(function(s){var r=[];s.forEach(function(val){r.push(val);});return r;})\0".as_ref()
+        };
+        let mut exc: JSValueRef = ptr::null();
+        let fs = JSStringCreateWithUTF8CString(src.as_ptr() as *const c_char);
+        let fnv = JSEvaluateScript(ctx, fs, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+        JSStringRelease(fs);
+        let fnobj = JSValueToObject(ctx, fnv, &mut exc);
+        if fnobj.is_null() {
+            return ptr::null();
+        }
+        let args = [v];
+        let arr = JSObjectCallAsFunction(ctx, fnobj, ptr::null_mut(), 1, args.as_ptr(), &mut exc);
+        if !exc.is_null() || arr.is_null() {
+            return ptr::null();
+        }
+        intern_ctx::<Array>(ctx, arr)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Set__New(isolate: *mut RealIsolate) -> *const Set {
+    let st = iso_state(isolate);
+    let ctx = st.contexts.last().copied().unwrap_or(ptr::null_mut()) as JSContextRef;
+    if ctx.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let mut exc: JSValueRef = ptr::null();
+        let fs = JSStringCreateWithUTF8CString(b"(new Set())\0".as_ptr() as *const c_char);
+        let v = JSEvaluateScript(ctx, fs, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+        JSStringRelease(fs);
+        if !exc.is_null() {
+            return ptr::null();
+        }
+        intern_ctx::<Set>(ctx, v)
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Set__Add(
+    this: *const Set,
+    context: *const Context,
+    key: *const Value,
+) -> *const Set {
+    let ctx = ctx_of(context) as JSContextRef;
+    let o = obj_of(ctx, this as *const Object);
+    if o.is_null() {
+        return ptr::null();
+    }
+    unsafe {
+        let mut exc: JSValueRef = ptr::null();
+        let as_ = JSStringCreateWithUTF8CString(b"add\0".as_ptr() as *const c_char);
+        let add = JSObjectGetProperty(ctx, o, as_, &mut exc);
+        JSStringRelease(as_);
+        let add_obj = JSValueToObject(ctx, add, &mut exc);
+        if add_obj.is_null() {
+            return ptr::null();
+        }
+        let args = [jsval(key)];
+        JSObjectCallAsFunction(ctx, add_obj, o, 1, args.as_ptr(), &mut exc);
+        if !exc.is_null() {
+            return ptr::null();
+        }
+    }
+    // V8 returns the set itself.
+    this
 }
