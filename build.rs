@@ -58,8 +58,71 @@ fn main() {
 
     // --- QuickJS-ng backend: compile + statically link the vendored sources ---
     if env::var_os("CARGO_FEATURE_LINK_QUICKJS").is_some() {
+        // Init the pinned quickjs-ng + WAMR submodules and apply our patches
+        // (idempotent). Skipped when both engines are driven from prebuilt trees.
+        if env::var_os("QUICKJS_NG_LIB_DIR").is_none() || env::var_os("WAMR_LIB_DIR").is_none() {
+            setup_vendor(&manifest_dir);
+        }
         build_quickjs(&manifest_dir);
+        // WebAssembly engine: build the vendored WAMR (interpreter-only) static
+        // lib and link it; the WebAssembly.* JS API is implemented over its
+        // wasm-c-api in src/qjs/fam_wasm.rs.
+        build_wamr(&manifest_dir);
     }
+}
+
+/// Init the pinned quickjs-ng + WAMR submodules and apply our patch files on top
+/// (see tools/setup_vendor.sh). Idempotent; runs before either engine compiles so
+/// a fresh checkout builds without a manual submodule dance.
+fn setup_vendor(manifest_dir: &std::path::Path) {
+    let status = std::process::Command::new("bash")
+        .arg(manifest_dir.join("tools/setup_vendor.sh"))
+        .current_dir(manifest_dir)
+        .status();
+    match status {
+        Ok(s) if s.success() => {}
+        other => panic!("tools/setup_vendor.sh (submodule init + patches) failed: {other:?}"),
+    }
+    println!("cargo:rerun-if-changed=tools/setup_vendor.sh");
+    println!("cargo:rerun-if-changed=quickjs-patches");
+    println!("cargo:rerun-if-changed=wamr-patches");
+}
+
+/// Build the vendored wasm-micro-runtime (WAMR) as an interpreter-only static
+/// library via CMake and link it. Backs the QuickJS backend's `WebAssembly`.
+fn build_wamr(manifest_dir: &std::path::Path) {
+    if let Some(dir) = env::var_os("WAMR_LIB_DIR") {
+        println!("cargo:rustc-link-search=native={}", PathBuf::from(dir).display());
+        println!("cargo:rustc-link-lib=static=vmlib");
+        return;
+    }
+    let src = manifest_dir.join("vendor/wamr/v82jsc");
+    let out = PathBuf::from(env::var("OUT_DIR").unwrap()).join("wamr-build");
+    // Wipe any stale cmake cache so flag changes (notably the HW-bound-check
+    // disable) always take effect.
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).unwrap();
+    let cmake = |args: &[&str]| {
+        let status = std::process::Command::new("cmake")
+            .args(args)
+            .current_dir(&out)
+            .status()
+            .expect("cmake not found — needed to build WAMR");
+        assert!(status.success(), "cmake step failed: {args:?}");
+    };
+    cmake(&[
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+        // WAMR's hardware bound-check installs SIGSEGV/SIGBUS handlers that fight
+        // Rust's stack-overflow guard (instant abort). Force software checks.
+        "-DWAMR_DISABLE_HW_BOUND_CHECK=1",
+        "-DWAMR_DISABLE_STACK_HW_BOUND_CHECK=1",
+        src.to_str().unwrap(),
+    ]);
+    cmake(&["--build", ".", "-j", "4"]);
+    println!("cargo:rustc-link-search=native={}", out.display());
+    println!("cargo:rustc-link-lib=static=vmlib");
+    println!("cargo:rerun-if-changed={}", src.display());
 }
 
 /// Build JavaScriptCore from the vendored WebKit (JSCOnly port) and link it.

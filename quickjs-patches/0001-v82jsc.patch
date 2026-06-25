@@ -1,0 +1,737 @@
+diff --git a/quickjs.c b/quickjs.c
+index 11caae0..a5d29c7 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -988,6 +988,58 @@ struct JSModuleDef {
+     JSValue private_value; /* private value for C modules */
+ };
+ 
++/* v82jsc: report whether a module's body has already run (EVALUATED or the
++   async-evaluating terminal state). Used by the v8x Module::Evaluate shim to
++   decide whether reusing an already-loaded def is safe (no re-run of top-level
++   side effects) vs. a compiled-but-not-yet-evaluated def that still needs to
++   run in its importer's graph. */
++int v82jsc_module_is_evaluated(JSModuleDef *m) {
++    return m && (m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
++                 m->status == JS_MODULE_STATUS_EVALUATED);
++}
++
++/* v82jsc: report whether a module's evaluation has STARTED (it is currently
++   evaluating as part of some graph, or already finished). deno evaluates every
++   module as its own root; when it calls Module::Evaluate on a module that is
++   mid-evaluation inside another graph (e.g. a chunk reached via a dynamic
++   import's JS_Eval), re-running it with a fresh JS_Eval creates a DUPLICATE
++   module def and desyncs the cyclic live bindings -> "[uninitialized]". The shim
++   uses this to reuse the in-flight def instead. EVALUATING is the sync in-graph
++   state that v82jsc_module_is_evaluated deliberately excludes. */
++int v82jsc_module_eval_started(JSModuleDef *m) {
++    return m && (m->status == JS_MODULE_STATUS_EVALUATING ||
++                 m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
++                 m->status == JS_MODULE_STATUS_EVALUATED);
++}
++
++static JSModuleDef *js_find_loaded_module(JSContext *ctx, JSAtom name);
++/* v82jsc: 1 if a module with this exact (already-normalized) name is in the
++   context's loaded-module list. Lets the shim loader dedup defensively. */
++int v82jsc_has_loaded_module(JSContext *ctx, const char *name) {
++    JSAtom atom = JS_NewAtom(ctx, name);
++    if (atom == JS_ATOM_NULL)
++        return 0;
++    JSModuleDef *m = js_find_loaded_module(ctx, atom);
++    JS_FreeAtom(ctx, atom);
++    return m != NULL;
++}
++
++/* v82jsc: return the JSModuleDef already loaded under this exact name, or NULL.
++   The shim module loader uses this to dedup: returning the existing def instead
++   of JS_ReadObject'ing a fresh one from bytecode (which would create a SECOND
++   def for the same name and re-run its body — fatal for modules with
++   non-idempotent top-level side effects, e.g. node:stream's
++   ObjectDefineProperty(pipeline, customPromisify) with implicit
++   configurable:false). */
++void *v82jsc_get_loaded_module(JSContext *ctx, const char *name) {
++    JSAtom atom = JS_NewAtom(ctx, name);
++    if (atom == JS_ATOM_NULL)
++        return NULL;
++    JSModuleDef *m = js_find_loaded_module(ctx, atom);
++    JS_FreeAtom(ctx, atom);
++    return m;
++}
++
+ typedef struct JSJobEntry {
+     struct list_head link;
+     JSContext *ctx;
+@@ -1863,7 +1915,7 @@ typedef struct JSClassShortDef {
+ static JSClassShortDef const js_std_class_def[] = {
+     { JS_ATOM_Object, NULL, NULL },                             /* JS_CLASS_OBJECT */
+     { JS_ATOM_Array, js_array_finalizer, js_array_mark },       /* JS_CLASS_ARRAY */
+-    { JS_ATOM_Error, NULL, NULL }, /* JS_CLASS_ERROR */
++    { JS_ATOM_Error, js_object_data_finalizer, js_object_data_mark }, /* JS_CLASS_ERROR */
+     { JS_ATOM_Number, js_object_data_finalizer, js_object_data_mark }, /* JS_CLASS_NUMBER */
+     { JS_ATOM_String, js_object_data_finalizer, js_object_data_mark }, /* JS_CLASS_STRING */
+     { JS_ATOM_Boolean, js_object_data_finalizer, js_object_data_mark }, /* JS_CLASS_BOOLEAN */
+@@ -5829,6 +5881,7 @@ static JSValue JS_NewObjectFromShape(JSContext *ctx, JSShape *sh, JSClassID clas
+         p->u.array.u.ptr = NULL;
+         p->u.array.count = 0;
+         break;
++    case JS_CLASS_ERROR:
+     case JS_CLASS_NUMBER:
+     case JS_CLASS_STRING:
+     case JS_CLASS_BOOLEAN:
+@@ -7286,6 +7339,7 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
+                 }
+             }
+             break;
++        case JS_CLASS_ERROR:             /* u.object_data */
+         case JS_CLASS_NUMBER:            /* u.object_data */
+         case JS_CLASS_STRING:            /* u.object_data */
+         case JS_CLASS_BOOLEAN:           /* u.object_data */
+@@ -7749,7 +7803,23 @@ static bool can_add_backtrace(JSValueConst obj)
+     if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
+         return false;
+     p = JS_VALUE_GET_OBJ(obj);
+-    if (p->class_id != JS_CLASS_ERROR && p->class_id != JS_CLASS_DOM_EXCEPTION)
++    if (p->class_id != JS_CLASS_DOM_EXCEPTION)
++        return false;
++    if (find_own_property1(p, JS_ATOM_stack))
++        return false;
++    return true;
++}
++
++/* Note: it is important that no exception is returned by this function */
++static bool can_store_error_stack(JSValueConst obj)
++{
++    JSObject *p;
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
++        return false;
++    p = JS_VALUE_GET_OBJ(obj);
++    if (p->class_id != JS_CLASS_ERROR)
++        return false;
++    if (!JS_IsUndefined(p->u.object_data))
+         return false;
+     if (find_own_property1(p, JS_ATOM_stack))
+         return false;
+@@ -7952,7 +8022,18 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+ 
+     if (JS_IsUndefined(ctx->error_back_trace))
+         ctx->error_back_trace = js_dup(stack);
+-    if (has_filter_func || can_add_backtrace(error_obj)) {
++    if (has_filter_func) {
++        /* Error.captureStackTrace(target, ...): install an own data property
++           on the (possibly non-Error) target, shadowing the accessor */
++        JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack,
++                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
++    } else if (can_store_error_stack(error_obj)) {
++        /* genuine Error instance: store as the [[ErrorData]] stack value */
++        p = JS_VALUE_GET_OBJ(error_obj);
++        JS_FreeValue(ctx, p->u.object_data);
++        p->u.object_data = stack;
++    } else if (can_add_backtrace(error_obj)) {
++        /* DOMException and the like keep an own "stack" data property */
+         JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack,
+                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+     } else {
+@@ -8184,6 +8265,10 @@ static JSValue JS_ThrowReferenceErrorNotDefined(JSContext *ctx, JSAtom name)
+ static JSValue JS_ThrowReferenceErrorUninitialized(JSContext *ctx, JSAtom name)
+ {
+     char buf[ATOM_GET_STR_BUF_SIZE];
++    if (getenv("QJS_DBG_UNINIT"))
++        fprintf(stderr, "[uninit-throw] name=%s\n",
++                name == JS_ATOM_NULL ? "<null>" :
++                JS_AtomGetStr(ctx, buf, sizeof(buf), name));
+     return JS_ThrowReferenceError(ctx, "%s is not initialized",
+                                   name == JS_ATOM_NULL ? "lexical variable" :
+                                   JS_AtomGetStr(ctx, buf, sizeof(buf), name));
+@@ -8838,8 +8923,10 @@ static JSValue JS_ThrowTypeErrorPrivateNotFound(JSContext *ctx, JSAtom atom)
+                                  atom);
+ }
+ 
+-/* Private fields can be added even on non extensible objects or
+-   Proxies */
++/* Per the nonextensible-applies-to-private proposal, private fields cannot
++   be added to non-extensible objects. Note that a Proxy's JSObject stays
++   extensible (its trap reflects the target), so private fields can still be
++   stamped onto Proxies. */
+ static int JS_DefinePrivateField(JSContext *ctx, JSValueConst obj,
+                                  JSValue name, JSValue val)
+ {
+@@ -8859,6 +8946,10 @@ static int JS_DefinePrivateField(JSContext *ctx, JSValueConst obj,
+     }
+     prop = js_symbol_to_atom(ctx, name);
+     p = JS_VALUE_GET_OBJ(obj);
++    if (unlikely(!p->extensible)) {
++        JS_ThrowTypeError(ctx, "object is not extensible");
++        goto fail;
++    }
+     prs = find_own_property(&pr, p, prop);
+     if (prs) {
+         JS_ThrowTypeErrorAtom(ctx, "private class field '%s' already exists",
+@@ -8962,6 +9053,11 @@ static int JS_AddBrand(JSContext *ctx, JSValueConst obj, JSValueConst home_obj)
+ 
+     if (JS_IsObject(obj)) {
+         p1 = JS_VALUE_GET_OBJ(obj);
++        if (unlikely(!p1->extensible)) {
++            JS_FreeAtom(ctx, brand_atom);
++            JS_ThrowTypeError(ctx, "object is not extensible");
++            return -1;
++        }
+         prs = find_own_property(&pr, p1, brand_atom);
+         if (unlikely(prs)) {
+             JS_FreeAtom(ctx, brand_atom);
+@@ -9334,20 +9430,12 @@ retry:
+                     if (desc) {
+                         desc->flags = JS_PROP_WRITABLE | JS_PROP_ENUMERABLE |
+                             JS_PROP_CONFIGURABLE;
+-                        if (is_typed_array(p->class_id) && typed_array_is_immutable(p)) {
+-                            desc->flags &= ~JS_PROP_WRITABLE;
+-                            desc->flags &= ~JS_PROP_CONFIGURABLE;
+-                        }
+                         desc->getter = JS_UNDEFINED;
+                         desc->setter = JS_UNDEFINED;
+                         desc->value = JS_GetPropertyUint32(ctx, JS_MKPTR(JS_TAG_OBJECT, p), idx);
+                     } else if (flags_only) {
+                         *pflags = JS_PROP_WRITABLE | JS_PROP_ENUMERABLE |
+                             JS_PROP_CONFIGURABLE;
+-                        if (is_typed_array(p->class_id) && typed_array_is_immutable(p)) {
+-                            *pflags &= ~JS_PROP_WRITABLE;
+-                            *pflags &= ~JS_PROP_CONFIGURABLE;
+-                        }
+                     }
+                     return true;
+                 }
+@@ -15324,6 +15412,11 @@ static no_inline __exception int js_binary_logic_slow(JSContext *ctx,
+         JSBigInt *p1, *p2, *r;
+         JSBigIntBuf buf1, buf2;
+     slow_big_int:
++        /* buf2 is zero-initialized here (after the label, so it also runs on
++           the goto slow_big_int paths) to silence a -Wmaybe-uninitialized
++           false positive: GCC cannot prove buf2 is initialized through the
++           inlined js_bigint_get_si_sat() -> js_bigint_sign() read below. */
++        memset(&buf2, 0, sizeof(buf2));
+         if (JS_VALUE_GET_TAG(op1) == JS_TAG_SHORT_BIG_INT)
+             p1 = js_bigint_set_short(&buf1, op1);
+         else
+@@ -17536,14 +17629,7 @@ static void print_func_name(JSFunctionBytecode *b);
+ 
+ static bool needs_backtrace(JSValue exc)
+ {
+-    JSObject *p;
+-
+-    if (JS_VALUE_GET_TAG(exc) != JS_TAG_OBJECT)
+-        return false;
+-    p = JS_VALUE_GET_OBJ(exc);
+-    if (p->class_id != JS_CLASS_ERROR)
+-        return false;
+-    return !find_own_property1(p, JS_ATOM_stack);
++    return can_store_error_stack(exc) || can_add_backtrace(exc);
+ }
+ 
+ /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
+@@ -18187,6 +18273,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             BREAK;
+ 
+         CASE(OP_throw):
++            if (getenv("QJS_DBG_UNINIT")
++                && JS_VALUE_GET_TAG(sp[-1]) == JS_TAG_UNINITIALIZED) {
++                char fbuf[ATOM_GET_STR_BUF_SIZE];
++                int col = 0;
++                int line = find_line_num(ctx, b,
++                                         (uint32_t)(pc - b->byte_code_buf - 1),
++                                         &col);
++                const char *fn = b->filename != JS_ATOM_NULL
++                    ? JS_AtomGetStr(ctx, fbuf, sizeof(fbuf), b->filename) : "?";
++                fprintf(stderr, "[uninit-op-throw] file=%s line=%d col=%d\n",
++                        fn, line, col);
++            }
+             JS_Throw(ctx, *--sp);
+             goto exception;
+ 
+@@ -30224,6 +30322,45 @@ static JSResolveResultEnum js_resolve_export(JSContext *ctx,
+     return ret;
+ }
+ 
++/* v82jsc patch: return the JSVarRef backing a FOUND *local* export.
++   `import X from "m"; export { X }` makes X a LOCAL export whose var_ref lives in
++   this module's own import slot. While a peer in an import cycle is still
++   unlinked that slot is NULL, and upstream QuickJS-ng then either dereferences
++   the NULL (crash, in js_inner_module_linking) or treats it as a spurious
++   circular reference (in js_build_module_ns). Per spec the indirect binding
++   exists for the whole SCC's instantiation, so when the slot is NULL we follow
++   the import alias to its source module and resolve the binding there (the
++   source's local var_ref is already allocated by js_create_module_function).
++   Returns NULL only if genuinely unresolvable. */
++static JSVarRef *js_get_local_export_var_ref(JSContext *ctx, JSModuleDef *res_m,
++                                             JSExportEntry *res_me)
++{
++    JSVarRef *var_ref = res_me->u.local.var_ref;
++    if (!var_ref) {
++        JSObject *p1 = JS_VALUE_GET_OBJ(res_m->func_obj);
++        var_ref = p1->u.func.var_refs[res_me->u.local.var_idx];
++    }
++    if (!var_ref) {
++        int k;
++        for (k = 0; k < res_m->import_entries_count; k++) {
++            JSImportEntry *imp = &res_m->import_entries[k];
++            if (imp->var_idx == res_me->u.local.var_idx) {
++                JSModuleDef *src_m =
++                    res_m->req_module_entries[imp->req_module_idx].module;
++                JSModuleDef *r2_m;
++                JSExportEntry *r2_me;
++                JSResolveResultEnum r2 =
++                    js_resolve_export(ctx, &r2_m, &r2_me, src_m, imp->import_name);
++                if (r2 == JS_RESOLVE_RES_FOUND &&
++                    r2_me->local_name != JS_ATOM__star_)
++                    var_ref = js_get_local_export_var_ref(ctx, r2_m, r2_me);
++                break;
++            }
++        }
++    }
++    return var_ref;
++}
++
+ static void js_resolve_export_throw_error(JSContext *ctx,
+                                           JSResolveResultEnum res,
+                                           JSModuleDef *m, JSAtom export_name)
+@@ -30424,13 +30561,9 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
+                 en->u.module = res_m->req_module_entries[res_me->u.req_module_idx].module;
+             } else {
+                 en->export_type = EXPORTED_NAME_NORMAL;
+-                if (res_me->u.local.var_ref) {
+-                    en->u.var_ref = res_me->u.local.var_ref;
+-                } else {
+-                    JSObject *p1 = JS_VALUE_GET_OBJ(res_m->func_obj);
+-                    p1 = JS_VALUE_GET_OBJ(res_m->func_obj);
+-                    en->u.var_ref = p1->u.func.var_refs[res_me->u.local.var_idx];
+-                }
++                /* v82jsc patch: follow import alias when the slot is NULL
++                   (cyclic re-export of an imported binding). */
++                en->u.var_ref = js_get_local_export_var_ref(ctx, res_m, res_me);
+             }
+         }
+     }
+@@ -30798,10 +30931,17 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
+                     module_trace(ctx, "namespace from\n");
+ 
+                 } else {
+-                    var_ref = res_me->u.local.var_ref;
++                    /* v82jsc patch: follow import alias when the slot is NULL
++                       (cyclic re-export of an imported binding); see
++                       js_get_local_export_var_ref. */
++                    var_ref = js_get_local_export_var_ref(ctx, res_m, res_me);
+                     if (!var_ref) {
+-                        p1 = JS_VALUE_GET_OBJ(res_m->func_obj);
+-                        var_ref = p1->u.func.var_refs[res_me->u.local.var_idx];
++                        char eb1[ATOM_GET_STR_BUF_SIZE], eb2[ATOM_GET_STR_BUF_SIZE];
++                        JS_ThrowSyntaxError(ctx,
++                            "circular import: binding '%s' not yet initialized in module '%s'",
++                            JS_AtomGetStr(ctx, eb1, sizeof(eb1), mi->import_name),
++                            JS_AtomGetStr(ctx, eb2, sizeof(eb2), res_m->module_name));
++                        goto fail;
+                     }
+                     var_ref->header.ref_count++;
+                     var_refs[mi->var_idx] = var_ref;
+@@ -31057,6 +31197,18 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+     return promise;
+ }
+ 
++/* v82jsc: embedder hook for dynamic import(). When set, js_dynamic_import calls
++   it instead of the built-in sync loader job; the hook settles resolving_funcs
++   (resolve=[0], reject=[1]) — e.g. by chaining deno's async import promise. */
++typedef void (*JSV82jscDynImportHook)(JSContext *ctx, JSValueConst basename,
++                                      JSValueConst specifier,
++                                      JSValueConst attributes,
++                                      JSValueConst *resolving_funcs);
++static JSV82jscDynImportHook v82jsc_dyn_import_hook = NULL;
++void JS_SetDynamicImportHook(JSV82jscDynImportHook fn) {
++    v82jsc_dyn_import_hook = fn;
++}
++
+ static JSValue js_dynamic_import_job(JSContext *ctx,
+                                      int argc, JSValueConst *argv)
+ {
+@@ -31177,9 +31329,18 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
+     args[3] = specifier_str;
+     args[4] = attributes;
+ 
+-    /* cannot run JS_LoadModuleInternal synchronously because it would
+-       cause an unexpected recursion in js_evaluate_module() */
+-    JS_EnqueueJob(ctx, js_dynamic_import_job, 5, vc(args));
++    /* v82jsc: when an embedder dynamic-import hook is installed (deno's async
++       HostImportModuleDynamicallyCallback bridge), route import() through it so
++       the host can fetch+compile new specifiers asynchronously and settle the
++       resolving_funcs. Falls back to QuickJS's built-in sync loader job. */
++    if (v82jsc_dyn_import_hook) {
++        v82jsc_dyn_import_hook(ctx, basename_val, specifier_str, attributes,
++                               resolving_funcs);
++    } else {
++        /* cannot run JS_LoadModuleInternal synchronously because it would
++           cause an unexpected recursion in js_evaluate_module() */
++        JS_EnqueueJob(ctx, js_dynamic_import_job, 5, vc(args));
++    }
+ done:
+     JS_FreeValue(ctx, basename_val);
+     JS_FreeValue(ctx, resolving_funcs[0]);
+@@ -42005,10 +42166,50 @@ static JSValue js_error_toString(JSContext *ctx, JSValueConst this_val,
+     return JS_ConcatString(ctx, name, msg);
+ }
+ 
++static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
++{
++    JSObject *p;
++
++    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
++        return JS_ThrowTypeErrorNotAnObject(ctx);
++    p = JS_VALUE_GET_OBJ(this_val);
++    if (p->class_id != JS_CLASS_ERROR)
++        return JS_UNDEFINED;
++    return js_dup(p->u.object_data);
++}
++
++static JSValue js_error_set_stack(JSContext *ctx, JSValueConst this_val,
++                                  JSValueConst value)
++{
++    int ret, flags;
++
++    if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
++        return JS_ThrowTypeErrorNotAnObject(ctx);
++    if (!JS_IsString(value))
++        return JS_ThrowTypeError(ctx, "Error.prototype.stack setter expects a string");
++    if (js_same_value(ctx, this_val, ctx->class_proto[JS_CLASS_ERROR]))
++        return JS_ThrowTypeError(ctx, "Error.prototype.stack setter called on the home object");
++    ret = JS_GetOwnPropertyFlagsInternal(ctx, &flags, JS_VALUE_GET_OBJ(this_val),
++                                         JS_ATOM_stack);
++    if (ret < 0)
++        return JS_EXCEPTION;
++    if (ret == 0) {
++        if (JS_DefinePropertyValue(ctx, this_val, JS_ATOM_stack, js_dup(value),
++                                   JS_PROP_C_W_E | JS_PROP_THROW) < 0)
++            return JS_EXCEPTION;
++    } else {
++        if (JS_SetPropertyInternal2(ctx, this_val, JS_ATOM_stack, js_dup(value),
++                                    this_val, JS_PROP_THROW) < 0)
++            return JS_EXCEPTION;
++    }
++    return JS_UNDEFINED;
++}
++
+ static const JSCFunctionListEntry js_error_proto_funcs[] = {
+     JS_CFUNC_DEF("toString", 0, js_error_toString ),
+     JS_PROP_STRING_DEF("name", "Error", JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE ),
+     JS_PROP_STRING_DEF("message", "", JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE ),
++    JS_CGETSET_DEF("stack", js_error_get_stack, js_error_set_stack ),
+ };
+ 
+ static JSValue js_error_isError(JSContext *ctx, JSValueConst this_val,
+@@ -42610,7 +42811,8 @@ static int js_typed_array_get_length_unsafe(JSContext *ctx, JSValueConst obj)
+ 
+ static JSValue js_typed_array___speciesCreate(JSContext *ctx,
+                                               JSValueConst this_val,
+-                                              int argc, JSValueConst *argv);
++                                              int argc, JSValueConst *argv,
++                                              bool require_mutable);
+ 
+ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv, int special)
+@@ -42664,7 +42866,7 @@ static JSValue js_array_every(JSContext *ctx, JSValueConst this_val,
+     case special_map | special_TA:
+         args[0] = obj;
+         args[1] = js_int32(len);
+-        ret = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args);
++        ret = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args, true);
+         if (JS_IsException(ret))
+             goto exception;
+         break;
+@@ -42741,7 +42943,7 @@ done:
+         JSValue arr;
+         args[0] = obj;
+         args[1] = js_int32(n);
+-        arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args);
++        arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args, true);
+         if (JS_IsException(arr))
+             goto exception;
+         args[0] = ret;
+@@ -58167,13 +58369,14 @@ static JSValue js_array_buffer_transfer(JSContext *ctx, JSValueConst this_val,
+         return JS_EXCEPTION;
+     if (abuf->shared)
+         return JS_ThrowTypeError(ctx, "cannot transfer a SharedArrayBuffer");
+-    if (magic == JS_ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE && abuf->immutable)
+-        return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
++    // Spec (ArrayBufferCopyAndDetach): the newLength argument must be
++    // coerced (its valueOf observed) before the buffer's detachability /
++    // immutability is checked, so side effects of coercion are visible.
+     if (argc < 1 || JS_IsUndefined(argv[0]))
+         new_len = abuf->byte_length;
+     else if (JS_ToIndex(ctx, &new_len, argv[0]))
+         return JS_EXCEPTION;
+-    if (magic != JS_ARRAY_BUFFER_TRANSFER_TO_IMMUTABLE && abuf->immutable)
++    if (abuf->immutable)
+         return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
+     if (abuf->detached)
+         return JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
+@@ -58350,10 +58553,17 @@ static JSValue js_array_buffer_slice(JSContext *ctx,
+         goto fail;
+     }
+     /* must test again because of side effects */
+-    if (abuf->detached || abuf->byte_length < start + new_len) {
++    if (abuf->detached) {
+         JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
+         goto fail;
+     }
++    if (abuf->byte_length < start + new_len) {
++        if (immutable)
++            JS_ThrowRangeError(ctx, "invalid array buffer length");
++        else
++            JS_ThrowTypeErrorDetachedArrayBuffer(ctx);
++        goto fail;
++    }
+     memcpy(new_abuf->data, abuf->data + start, new_len);
+     new_abuf->immutable = immutable;
+     return new_obj;
+@@ -58830,7 +59040,8 @@ static JSValue js_create_typed_array_iterator(JSContext *ctx, JSValueConst this_
+ }
+ 
+ static JSValue js_typed_array_create(JSContext *ctx, JSValueConst ctor,
+-                                     int argc, JSValueConst *argv)
++                                     int argc, JSValueConst *argv,
++                                     bool require_mutable)
+ {
+     JSValue ret;
+     int new_len;
+@@ -58843,6 +59054,10 @@ static JSValue js_typed_array_create(JSContext *ctx, JSValueConst ctor,
+     new_len = js_typed_array_get_length_unsafe(ctx, ret);
+     if (new_len < 0)
+         goto fail;
++    if (require_mutable && typed_array_is_immutable(JS_VALUE_GET_OBJ(ret))) {
++        JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
++        goto fail;
++    }
+     if (argc == 1) {
+         /* ensure that it is large enough */
+         if (JS_ToLengthFree(ctx, &len, js_dup(argv[0])))
+@@ -58859,7 +59074,8 @@ static JSValue js_typed_array_create(JSContext *ctx, JSValueConst ctor,
+ 
+ static JSValue js_typed_array___speciesCreate(JSContext *ctx,
+                                               JSValueConst this_val,
+-                                              int argc, JSValueConst *argv)
++                                              int argc, JSValueConst *argv,
++                                              bool require_mutable)
+ {
+     JSValueConst obj;
+     JSObject *p;
+@@ -58878,7 +59094,7 @@ static JSValue js_typed_array___speciesCreate(JSContext *ctx,
+         ret = js_typed_array_constructor(ctx, JS_UNDEFINED, argc1, argv + 1,
+                                          p->class_id);
+     } else {
+-        ret = js_typed_array_create(ctx, ctor, argc1, argv + 1);
++        ret = js_typed_array_create(ctx, ctor, argc1, argv + 1, require_mutable);
+         JS_FreeValue(ctx, ctor);
+     }
+     return ret;
+@@ -58916,14 +59132,24 @@ static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val,
+     iter = JS_GetProperty(ctx, items, JS_ATOM_Symbol_iterator);
+     if (JS_IsException(iter))
+         goto exception;
+-    if (!JS_IsUndefined(iter)) {
+-        JS_FreeValue(ctx, iter);
++    if (!JS_IsUndefined(iter) && !JS_IsNull(iter)) {
++        if (!JS_IsFunction(ctx, iter)) {
++            JS_FreeValue(ctx, iter);
++            JS_ThrowTypeError(ctx, "value is not iterable");
++            goto exception;
++        }
+         arr = JS_NewArray(ctx);
+-        if (JS_IsException(arr))
++        if (JS_IsException(arr)) {
++            JS_FreeValue(ctx, iter);
+             goto exception;
+-        stack[0] = js_dup(items);
+-        if (js_for_of_start(ctx, &stack[1], false))
++        }
++        stack[0] = JS_GetIterator2(ctx, items, iter);
++        JS_FreeValue(ctx, iter);
++        if (JS_IsException(stack[0]))
+             goto exception;
++        stack[1] = JS_GetProperty(ctx, stack[0], JS_ATOM_next);
++        if (JS_IsException(stack[1]))
++            goto exception_close;
+         for (k = 0;; k++) {
+             v = JS_IteratorNext(ctx, stack[0], stack[1], 0, NULL, &done);
+             if (JS_IsException(v))
+@@ -58941,7 +59167,7 @@ static JSValue js_typed_array_from(JSContext *ctx, JSValueConst this_val,
+     if (js_get_length64(ctx, &len, arr) < 0)
+         goto exception;
+     v = js_int64(len);
+-    r = js_typed_array_create(ctx, this_val, 1, vc(&v));
++    r = js_typed_array_create(ctx, this_val, 1, vc(&v), true);
+     JS_FreeValue(ctx, v);
+     if (JS_IsException(r))
+         goto exception;
+@@ -58983,7 +59209,7 @@ static JSValue js_typed_array_of(JSContext *ctx, JSValueConst this_val,
+     int i;
+ 
+     v = js_int32(argc);
+-    obj = js_typed_array_create(ctx, this_val, 1, vc(&v));
++    obj = js_typed_array_create(ctx, this_val, 1, vc(&v), true);
+     if (JS_IsException(obj))
+         return obj;
+ 
+@@ -59582,8 +59808,10 @@ static JSValue js_typed_array_reverse(JSContext *ctx, JSValueConst this_val,
+     len = js_typed_array_get_length_unsafe(ctx, this_val);
+     if (len < 0)
+         return JS_EXCEPTION;
++    p = JS_VALUE_GET_OBJ(this_val);
++    if (typed_array_is_immutable(p))
++        return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
+     if (len > 0) {
+-        p = JS_VALUE_GET_OBJ(this_val);
+         switch (typed_array_size_log2(p->class_id)) {
+         case 0:
+             {
+@@ -59681,7 +59909,7 @@ static JSValue js_typed_array_slice(JSContext *ctx, JSValueConst this_val,
+ 
+     args[0] = this_val;
+     args[1] = js_int32(count);
+-    arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args);
++    arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 2, args, true);
+     if (JS_IsException(arr))
+         goto exception;
+ 
+@@ -59769,7 +59997,7 @@ static JSValue js_typed_array_subarray(JSContext *ctx, JSValueConst this_val,
+     // result is length-tracking if source TA is and no explicit count is given
+     if (ta->track_rab && JS_IsUndefined(argv[1]))
+         args[3] = JS_UNDEFINED;
+-    arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 4, args);
++    arr = js_typed_array___speciesCreate(ctx, JS_UNDEFINED, 4, args, false);
+     JS_FreeValue(ctx, ta_buffer);
+     return arr;
+  exception:
+@@ -62106,13 +62334,87 @@ static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int
+     return js_int32(*field);
+ }
+ 
++// v82jsc patch: the rest of V8's CallSite API. QuickJS-ng ships only
++// isNative/getFileName/getFunction/getFunctionName/get{Line,Column}Number, but
++// many npm packages (depd, stack-trace, source-map-support, …) call the other
++// methods on the CallSite objects passed to a user `Error.prepareStackTrace`.
++// We don't track this/typeName/eval-origin/method distinctions, so return V8's
++// documented defaults for a plain non-eval, non-constructor toplevel frame.
++static JSValue js_callsite_ret_undefined(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
++{
++    return JS_UNDEFINED;
++}
++
++static JSValue js_callsite_ret_null(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
++{
++    return JS_NULL;
++}
++
++static JSValue js_callsite_ret_false(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
++{
++    return js_bool(false);
++}
++
++static JSValue js_callsite_tostring(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
++{
++    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
++    if (!csd)
++        return JS_EXCEPTION;
++    DynBuf dbuf;
++    const char *fn = NULL, *file = NULL;
++    js_dbuf_init(ctx, &dbuf);
++    if (JS_IsString(csd->func_name))
++        fn = JS_ToCString(ctx, csd->func_name);
++    if (fn && fn[0])
++        dbuf_printf(&dbuf, "%s (", fn);
++    if (csd->native) {
++        dbuf_printf(&dbuf, "native");
++    } else {
++        if (JS_IsString(csd->filename))
++            file = JS_ToCString(ctx, csd->filename);
++        dbuf_printf(&dbuf, "%s", file ? file : "<anonymous>");
++        if (csd->line_num != -1)
++            dbuf_printf(&dbuf, ":%d:%d", csd->line_num, csd->col_num);
++    }
++    if (fn && fn[0])
++        dbuf_putc(&dbuf, ')');
++    if (fn)
++        JS_FreeCString(ctx, fn);
++    if (file)
++        JS_FreeCString(ctx, file);
++    JSValue r;
++    if (dbuf_error(&dbuf))
++        r = JS_NULL;
++    else
++        r = JS_NewStringLen(ctx, (char *)dbuf.buf, dbuf.size);
++    dbuf_free(&dbuf);
++    return r;
++}
++
+ static const JSCFunctionListEntry js_callsite_proto_funcs[] = {
+     JS_CFUNC_DEF("isNative", 0, js_callsite_isnative),
+     JS_CFUNC_MAGIC_DEF("getFileName", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),
++    JS_CFUNC_MAGIC_DEF("getScriptNameOrSourceURL", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),
+     JS_CFUNC_MAGIC_DEF("getFunction", 0, js_callsite_getfield, offsetof(JSCallSiteData, func)),
+     JS_CFUNC_MAGIC_DEF("getFunctionName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),
++    JS_CFUNC_MAGIC_DEF("getMethodName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),
+     JS_CFUNC_MAGIC_DEF("getColumnNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, col_num)),
+     JS_CFUNC_MAGIC_DEF("getLineNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, line_num)),
++    // v82jsc patch: remaining V8 CallSite surface (defaults for plain frames).
++    JS_CFUNC_DEF("getThis", 0, js_callsite_ret_undefined),
++    JS_CFUNC_DEF("getTypeName", 0, js_callsite_ret_null),
++    JS_CFUNC_DEF("getEvalOrigin", 0, js_callsite_ret_undefined),
++    JS_CFUNC_DEF("getPromiseIndex", 0, js_callsite_ret_null),
++    JS_CFUNC_DEF("getScriptHash", 0, js_callsite_ret_undefined),
++    JS_CFUNC_DEF("getPosition", 0, js_callsite_ret_undefined),
++    JS_CFUNC_DEF("getEnclosingColumnNumber", 0, js_callsite_ret_undefined),
++    JS_CFUNC_DEF("getEnclosingLineNumber", 0, js_callsite_ret_undefined),
++    JS_CFUNC_DEF("isEval", 0, js_callsite_ret_false),
++    JS_CFUNC_DEF("isToplevel", 0, js_callsite_ret_false),
++    JS_CFUNC_DEF("isConstructor", 0, js_callsite_ret_false),
++    JS_CFUNC_DEF("isAsync", 0, js_callsite_ret_false),
++    JS_CFUNC_DEF("isPromiseAll", 0, js_callsite_ret_false),
++    JS_CFUNC_DEF("toString", 0, js_callsite_tostring),
+     JS_PROP_STRING_DEF("[Symbol.toStringTag]", "CallSite", JS_PROP_CONFIGURABLE ),
+ };
+ 
+@@ -63223,6 +63525,9 @@ static JSValue js_uint8array_set_from_base64(JSContext *ctx,
+     if (!p)
+         return JS_EXCEPTION;
+ 
++    if (typed_array_is_immutable(p))
++        return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
++
+     if (!JS_IsString(argv[0]))
+         return JS_ThrowTypeError(ctx, "expected string");
+ 
+@@ -63279,6 +63584,9 @@ static JSValue js_uint8array_set_from_hex(JSContext *ctx,
+     if (!p)
+         return JS_EXCEPTION;
+ 
++    if (typed_array_is_immutable(p))
++        return JS_ThrowTypeErrorImmutableArrayBuffer(ctx);
++
+     if (!JS_IsString(argv[0]))
+         return JS_ThrowTypeError(ctx, "expected string");
+ 
+diff --git a/quickjs.h b/quickjs.h
+index 68d6f38..5ebaf59 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -68,7 +68,7 @@ extern "C" {
+ #  define JS_EXTERN /* nothing */
+ # endif
+ #else
+-# ifdef QUICKJS_NG_CC_GNULIKE
++# if defined(BUILDING_QJS_SHARED) && defined(QUICKJS_NG_CC_GNULIKE)
+ #  define JS_EXTERN __attribute__((visibility("default")))
+ # else
+ #  define JS_EXTERN /* nothing */
+@@ -109,7 +109,7 @@ extern "C" {
+ #  define JS_MODULE_EXTERN __declspec(dllimport)
+ # endif
+ #else
+-# ifdef QUICKJS_NG_CC_GNULIKE
++# if defined(QUICKJS_NG_MODULE_BUILD) && defined(QUICKJS_NG_CC_GNULIKE)
+ #  define JS_MODULE_EXTERN __attribute__((visibility("default")))
+ # else
+ #  define JS_MODULE_EXTERN /* nothing */
