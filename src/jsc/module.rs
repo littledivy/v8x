@@ -1217,6 +1217,14 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
     );
     JSStringRelease(js_src);
     if result.is_null() {
+      // Record the compile exception so deno's TryCatch sees has_caught() —
+      // returning null with no pending exception trips its assert -> panic.
+      let exc = if exc.is_null() {
+        make_generic_error(ctx, "CompileFunction failed")
+      } else {
+        exc
+      };
+      crate::jsc::core::record_pending_exception(ctx, exc);
       return ptr::null();
     }
     intern_ctx::<Function>(ctx, result)
