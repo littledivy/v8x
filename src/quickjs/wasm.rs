@@ -1,0 +1,1472 @@
+//! WebAssembly for the QuickJS backend, implemented over the vendored
+//! wasm-micro-runtime (WAMR) wasm-c-api. QuickJS-ng ships no WASM engine; V8
+//! (the API we emulate) does, and real npm code needs it (e.g. undici's llhttp
+//! HTTP parser is a WASM module compiled at load). We expose a `globalThis.
+//! WebAssembly` with `Module`/`Instance`/`Memory`/`compile`/`instantiate`/
+//! `validate`, marshalling values and import/export functions across the
+//! QuickJS <-> WAMR boundary.
+//!
+//! Native handles (module/instance/memory/store) are kept in a thread-local
+//! registry keyed by a small integer id stored as a hidden property on the JS
+//! wrapper object; the underlying wasm objects are intentionally leaked (never
+//! deleted) — process-lifetime, mirroring how engines treat eternal handles.
+
+#![allow(non_camel_case_types)]
+
+use std::cell::RefCell;
+use std::ffi::{CString, c_void};
+use std::os::raw::c_int;
+use std::ptr;
+
+use crate::quickjs::core::current_ctx;
+use crate::quickjs::quickjs_sys::*;
+
+#[repr(C)]
+pub struct wasm_engine_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_store_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_module_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_instance_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_func_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_memory_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_extern_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_trap_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_functype_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_valtype_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_importtype_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_exporttype_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_externtype_t {
+  _p: [u8; 0],
+}
+
+#[repr(C)]
+pub struct wasm_vec_t {
+  pub size: usize,
+  pub data: *mut c_void,
+  pub num_elems: usize,
+  pub size_of_elem: usize,
+  pub lock: *mut c_void,
+}
+impl wasm_vec_t {
+  fn empty() -> Self {
+    wasm_vec_t {
+      size: 0,
+      data: ptr::null_mut(),
+      num_elems: 0,
+      size_of_elem: 0,
+      lock: ptr::null_mut(),
+    }
+  }
+}
+
+pub const WASM_I32: u8 = 0;
+pub const WASM_I64: u8 = 1;
+pub const WASM_F32: u8 = 2;
+pub const WASM_F64: u8 = 3;
+pub const WASM_EXTERNREF: u8 = 128;
+pub const WASM_FUNCREF: u8 = 129;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct wasm_val_t {
+  pub kind: u8,
+  pub _pad: [u8; 7],
+  pub of: u64,
+}
+
+pub const WASM_EXTERN_FUNC: u8 = 0;
+pub const WASM_EXTERN_GLOBAL: u8 = 1;
+pub const WASM_EXTERN_TABLE: u8 = 2;
+pub const WASM_EXTERN_MEMORY: u8 = 3;
+
+pub type wasm_func_callback_with_env_t =
+  unsafe extern "C" fn(
+    env: *mut c_void,
+    args: *const wasm_vec_t,
+    results: *mut wasm_vec_t,
+  ) -> *mut wasm_trap_t;
+
+unsafe extern "C" {
+  pub fn wasm_engine_new() -> *mut wasm_engine_t;
+  pub fn wasm_store_new(e: *mut wasm_engine_t) -> *mut wasm_store_t;
+
+  pub fn wasm_byte_vec_new(out: *mut wasm_vec_t, size: usize, data: *const u8);
+  pub fn wasm_byte_vec_delete(v: *mut wasm_vec_t);
+
+  pub fn wasm_module_new(
+    store: *mut wasm_store_t,
+    binary: *const wasm_vec_t,
+  ) -> *mut wasm_module_t;
+  pub fn wasm_module_validate(
+    store: *mut wasm_store_t,
+    binary: *const wasm_vec_t,
+  ) -> bool;
+  pub fn wasm_module_imports(m: *const wasm_module_t, out: *mut wasm_vec_t);
+  pub fn wasm_module_exports(m: *const wasm_module_t, out: *mut wasm_vec_t);
+
+  pub fn wasm_importtype_module(
+    it: *const wasm_importtype_t,
+  ) -> *const wasm_vec_t;
+  pub fn wasm_importtype_name(
+    it: *const wasm_importtype_t,
+  ) -> *const wasm_vec_t;
+  pub fn wasm_importtype_type(
+    it: *const wasm_importtype_t,
+  ) -> *const wasm_externtype_t;
+  pub fn wasm_externtype_kind(t: *const wasm_externtype_t) -> u8;
+  pub fn wasm_externtype_as_functype_const(
+    t: *const wasm_externtype_t,
+  ) -> *const wasm_functype_t;
+  pub fn wasm_exporttype_name(
+    et: *const wasm_exporttype_t,
+  ) -> *const wasm_vec_t;
+
+  pub fn wasm_functype_params(ft: *const wasm_functype_t) -> *const wasm_vec_t;
+  pub fn wasm_functype_results(ft: *const wasm_functype_t)
+  -> *const wasm_vec_t;
+  pub fn wasm_valtype_kind(vt: *const wasm_valtype_t) -> u8;
+
+  pub fn wasm_func_new_with_env(
+    store: *mut wasm_store_t,
+    ty: *const wasm_functype_t,
+    cb: wasm_func_callback_with_env_t,
+    env: *mut c_void,
+    finalizer: Option<unsafe extern "C" fn(*mut c_void)>,
+  ) -> *mut wasm_func_t;
+  pub fn wasm_func_call(
+    f: *const wasm_func_t,
+    args: *const wasm_vec_t,
+    results: *mut wasm_vec_t,
+  ) -> *mut wasm_trap_t;
+  pub fn wasm_func_type(f: *const wasm_func_t) -> *mut wasm_functype_t;
+  pub fn wasm_func_as_extern(f: *mut wasm_func_t) -> *mut wasm_extern_t;
+
+  pub fn wasm_instance_new(
+    store: *mut wasm_store_t,
+    m: *const wasm_module_t,
+    imports: *const wasm_vec_t,
+    trap: *mut *mut wasm_trap_t,
+  ) -> *mut wasm_instance_t;
+  pub fn wasm_instance_exports(i: *const wasm_instance_t, out: *mut wasm_vec_t);
+
+  pub fn wasm_extern_kind(e: *const wasm_extern_t) -> u8;
+  pub fn wasm_extern_as_func(e: *mut wasm_extern_t) -> *mut wasm_func_t;
+  pub fn wasm_extern_as_memory(e: *mut wasm_extern_t) -> *mut wasm_memory_t;
+
+  pub fn wasm_memory_data(m: *mut wasm_memory_t) -> *mut u8;
+  pub fn wasm_memory_data_size(m: *const wasm_memory_t) -> usize;
+  pub fn wasm_memory_size(m: *const wasm_memory_t) -> u32;
+  pub fn wasm_memory_grow(m: *mut wasm_memory_t, delta: u32) -> bool;
+
+  pub fn wasm_trap_delete(t: *mut wasm_trap_t);
+  pub fn wasm_trap_new(
+    store: *mut wasm_store_t,
+    message: *const wasm_vec_t,
+  ) -> *mut wasm_trap_t;
+
+  pub fn wasm_extern_as_global(e: *mut wasm_extern_t) -> *mut wasm_global_t;
+  pub fn wasm_global_get(g: *const wasm_global_t, out: *mut wasm_val_t);
+  pub fn wasm_global_set(g: *mut wasm_global_t, v: *const wasm_val_t);
+  pub fn wasm_global_type(g: *const wasm_global_t) -> *mut wasm_globaltype_t;
+  pub fn wasm_globaltype_content(
+    gt: *const wasm_globaltype_t,
+  ) -> *const wasm_valtype_t;
+  pub fn wasm_globaltype_mutability(gt: *const wasm_globaltype_t) -> u8;
+
+  pub fn wasm_extern_as_table(e: *mut wasm_extern_t) -> *mut wasm_table_t;
+  pub fn wasm_table_size(t: *const wasm_table_t) -> u32;
+  pub fn wasm_table_grow(
+    t: *mut wasm_table_t,
+    delta: u32,
+    init: *mut wasm_ref_t,
+  ) -> bool;
+  pub fn wasm_table_get(t: *const wasm_table_t, index: u32) -> *mut wasm_ref_t;
+  pub fn wasm_table_set(
+    t: *mut wasm_table_t,
+    index: u32,
+    r: *mut wasm_ref_t,
+  ) -> bool;
+
+  pub fn wasm_foreign_new(store: *mut wasm_store_t) -> *mut wasm_foreign_t;
+  pub fn wasm_foreign_as_ref(f: *mut wasm_foreign_t) -> *mut wasm_ref_t;
+  pub fn wasm_ref_get_host_info(r: *const wasm_ref_t) -> *mut c_void;
+  pub fn wasm_foreign_set_host_info_with_finalizer(
+    f: *mut wasm_foreign_t,
+    info: *mut c_void,
+    finalizer: Option<unsafe extern "C" fn(*mut c_void)>,
+  );
+
+  pub fn wasm_ref_set_host_info_with_finalizer(
+    r: *mut wasm_ref_t,
+    info: *mut c_void,
+    finalizer: Option<unsafe extern "C" fn(*mut c_void)>,
+  );
+}
+
+#[repr(C)]
+pub struct wasm_global_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_globaltype_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_table_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_ref_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
+pub struct wasm_foreign_t {
+  _p: [u8; 0],
+}
+
+unsafe extern "C" fn externref_box_free(p: *mut c_void) {
+  if !p.is_null() {
+    unsafe { drop(Box::from_raw(p as *mut JSValue)) };
+  }
+}
+
+unsafe fn box_externref(ctx: *mut JSContext, v: JSValue) -> *mut c_void {
+  let dup = unsafe { JS_DupValue(ctx, v) };
+  Box::into_raw(Box::new(dup)) as *mut c_void
+}
+
+unsafe fn unbox_externref(p: *mut c_void) -> JSValue {
+  if p.is_null() {
+    jsv_undefined()
+  } else {
+    unsafe { *(p as *const JSValue) }
+  }
+}
+
+unsafe fn js_to_externref(ctx: *mut JSContext, v: JSValue) -> u64 {
+  let store = with_state(|st| st.store);
+
+  let foreign = unsafe { wasm_foreign_new(store) };
+  if foreign.is_null() {
+    return 0;
+  }
+  let r = unsafe { wasm_foreign_as_ref(foreign) };
+  if r.is_null() {
+    return 0;
+  }
+  let boxed = unsafe { box_externref(ctx, v) };
+  unsafe {
+    wasm_ref_set_host_info_with_finalizer(r, boxed, Some(externref_box_free))
+  };
+  r as u64
+}
+
+unsafe fn externref_to_js(ctx: *mut JSContext, of: u64) -> JSValue {
+  if of == 0 {
+    if std::env::var("V82_WASM_TRACE").is_ok() {
+      eprintln!("[wasm] externref_to_js of=0 -> undefined");
+    }
+    return jsv_undefined();
+  }
+  let r = of as *mut wasm_ref_t;
+  let hi = unsafe { wasm_ref_get_host_info(r) };
+  if std::env::var("V82_WASM_TRACE").is_ok() {
+    eprintln!("[wasm] externref_to_js of={:?} hi_null={}", r, hi.is_null());
+  }
+  if hi.is_null() {
+    return jsv_undefined();
+  }
+  unsafe { JS_DupValue(ctx, unbox_externref(hi)) }
+}
+
+struct WasmState {
+  store: *mut wasm_store_t,
+  modules: Vec<*mut wasm_module_t>,
+  instances: Vec<*mut wasm_instance_t>,
+}
+
+thread_local! {
+    static WASM: RefCell<Option<WasmState>> = const { RefCell::new(None) };
+
+    static PENDING_IMPORT_EXC: RefCell<Option<JSValue>> = const { RefCell::new(None) };
+
+    static WASM_CALL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn with_state<R>(f: impl FnOnce(&mut WasmState) -> R) -> R {
+  WASM.with(|w| {
+    let mut b = w.borrow_mut();
+    if b.is_none() {
+      let engine = unsafe { wasm_engine_new() };
+      let store = unsafe { wasm_store_new(engine) };
+      *b = Some(WasmState {
+        store,
+        modules: Vec::new(),
+        instances: Vec::new(),
+      });
+    }
+    f(b.as_mut().unwrap())
+  })
+}
+
+unsafe fn throw(ctx: *mut JSContext, msg: &str) -> JSValue {
+  if let Ok(c) = CString::new(msg) {
+    unsafe { JS_ThrowTypeError(ctx, c.as_ptr()) }
+  } else {
+    jsv_exception()
+  }
+}
+
+unsafe fn read_wasm_bytes(ctx: *mut JSContext, v: JSValue) -> Option<Vec<u8>> {
+  let mut off = 0usize;
+  let mut len = 0usize;
+  let mut bpe = 0usize;
+  let ab =
+    unsafe { JS_GetTypedArrayBuffer(ctx, v, &mut off, &mut len, &mut bpe) };
+  if ab.tag != JS_TAG_EXCEPTION {
+    let mut abs = 0usize;
+    let p = unsafe { JS_GetArrayBuffer(ctx, &mut abs, ab) };
+    unsafe { JS_FreeValue(ctx, ab) };
+    if !p.is_null() {
+      let slice = unsafe { std::slice::from_raw_parts(p.add(off), len) };
+      return Some(slice.to_vec());
+    }
+  } else {
+    unsafe { JS_FreeValue(ctx, JS_GetException(ctx)) };
+  }
+
+  let mut abs = 0usize;
+  let p = unsafe { JS_GetArrayBuffer(ctx, &mut abs, v) };
+  if !p.is_null() {
+    let slice = unsafe { std::slice::from_raw_parts(p, abs) };
+    return Some(slice.to_vec());
+  }
+  None
+}
+
+unsafe fn wasm_val_to_js(ctx: *mut JSContext, v: &wasm_val_t) -> JSValue {
+  match v.kind {
+    WASM_I32 => unsafe { JS_NewInt32(ctx, v.of as u32 as i32) },
+    WASM_I64 => unsafe { JS_NewBigInt64(ctx, v.of as i64) },
+    WASM_F32 => {
+      let f = f32::from_bits(v.of as u32);
+      unsafe { JS_NewFloat64(ctx, f as f64) }
+    }
+    WASM_F64 => {
+      let f = f64::from_bits(v.of);
+      unsafe { JS_NewFloat64(ctx, f) }
+    }
+    WASM_EXTERNREF | WASM_FUNCREF => unsafe { externref_to_js(ctx, v.of) },
+    _ => jsv_undefined(),
+  }
+}
+
+unsafe fn js_to_wasm_val(
+  ctx: *mut JSContext,
+  kind: u8,
+  v: JSValue,
+) -> wasm_val_t {
+  let mut out = wasm_val_t {
+    kind,
+    _pad: [0; 7],
+    of: 0,
+  };
+  match kind {
+    WASM_I32 => {
+      let mut i = 0i32;
+      unsafe { JS_ToInt32(ctx, &mut i, v) };
+      out.of = i as u32 as u64;
+    }
+    WASM_I64 => {
+      let mut i = 0i64;
+      unsafe { JS_ToInt64(ctx, &mut i, v) };
+      out.of = i as u64;
+    }
+    WASM_F32 => {
+      let mut f = 0f64;
+      unsafe { JS_ToFloat64(ctx, &mut f, v) };
+      out.of = (f as f32).to_bits() as u64;
+    }
+    WASM_F64 => {
+      let mut f = 0f64;
+      unsafe { JS_ToFloat64(ctx, &mut f, v) };
+      out.of = f.to_bits();
+    }
+    WASM_EXTERNREF | WASM_FUNCREF => {
+      out.of = unsafe { js_to_externref(ctx, v) };
+    }
+    _ => {}
+  }
+  out
+}
+
+fn valtype_kinds(vec: *const wasm_vec_t) -> Vec<u8> {
+  if vec.is_null() {
+    return Vec::new();
+  }
+  let v = unsafe { &*vec };
+  let mut out = Vec::with_capacity(v.size);
+  let data = v.data as *const *const wasm_valtype_t;
+  for i in 0..v.size {
+    let vt = unsafe { *data.add(i) };
+    out.push(unsafe { wasm_valtype_kind(vt) });
+  }
+  out
+}
+
+fn vec_name_to_string(vec: *const wasm_vec_t) -> std::string::String {
+  if vec.is_null() {
+    return std::string::String::new();
+  }
+  let v = unsafe { &*vec };
+  if v.data.is_null() || v.size == 0 {
+    return std::string::String::new();
+  }
+
+  let mut len = v.size;
+  let raw = v.data as *const u8;
+  while len > 0 && unsafe { *raw.add(len - 1) } == 0 {
+    len -= 1;
+  }
+  let slice = unsafe { std::slice::from_raw_parts(raw, len) };
+  std::string::String::from_utf8_lossy(slice).into_owned()
+}
+
+struct ImportEnv {
+  ctx: *mut JSContext,
+  func: JSValue,
+  result_kinds: Vec<u8>,
+  name: std::string::String,
+}
+
+unsafe extern "C" fn import_trampoline(
+  env: *mut c_void,
+  args: *const wasm_vec_t,
+  results: *mut wasm_vec_t,
+) -> *mut wasm_trap_t {
+  let env = unsafe { &*(env as *const ImportEnv) };
+  let ctx = env.ctx;
+  let argv = unsafe { &*args };
+  let mut js_args: Vec<JSValue> = Vec::with_capacity(argv.size);
+  let adata = argv.data as *const wasm_val_t;
+  for i in 0..argv.size {
+    let wv = unsafe { &*adata.add(i) };
+    js_args.push(unsafe { wasm_val_to_js(ctx, wv) });
+  }
+  if std::env::var("V82_WASM_TRACE").is_ok() {
+    let d = WASM_CALL_DEPTH.with(|d| d.get());
+    eprintln!(
+      "[wasm] import_trampoline argc={} name={:?} depth={d}",
+      js_args.len(),
+      env.name
+    );
+  }
+  let ret = unsafe {
+    JS_Call(
+      ctx,
+      env.func,
+      jsv_undefined(),
+      js_args.len() as c_int,
+      js_args.as_ptr() as *mut JSValue,
+    )
+  };
+  for a in &js_args {
+    unsafe { JS_FreeValue(ctx, *a) };
+  }
+  if std::env::var("V82_WASM_RET").is_ok()
+    && (env.name.contains("isFile")
+      || env.name.contains("statSync")
+      || env.name.contains("byteLength")
+      || env.name.contains("readFileSync")
+      || env.name.contains("copy_bytes")
+      || env.name.contains("memory"))
+  {
+    let mut l = 0usize;
+    let cs = unsafe { JS_ToCStringLen(ctx, &mut l, ret) };
+    let s = if cs.is_null() {
+      "<nostr>".to_string()
+    } else {
+      let b = unsafe { std::slice::from_raw_parts(cs as *const u8, l) };
+      let out = std::string::String::from_utf8_lossy(b).into_owned();
+      unsafe { JS_FreeCString(ctx, cs) };
+      out
+    };
+    let preview: String = s.chars().take(60).collect();
+    eprintln!("[ret] {} tag={} -> {preview:?}", env.name, ret.tag);
+  }
+
+  if ret.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    if std::env::var("V82_WASM_TRACE").is_ok() {
+      let mut l = 0usize;
+      let cs = unsafe { JS_ToCStringLen(ctx, &mut l, exc) };
+      if !cs.is_null() {
+        let b = unsafe { std::slice::from_raw_parts(cs as *const u8, l) };
+        eprintln!(
+          "[wasm] IMPORT THREW: {}",
+          std::string::String::from_utf8_lossy(b)
+        );
+        unsafe { JS_FreeCString(ctx, cs) };
+      }
+    }
+    PENDING_IMPORT_EXC.with(|p| {
+      let mut b = p.borrow_mut();
+      if let Some(old) = b.take() {
+        unsafe { JS_FreeValue(ctx, old) };
+      }
+      *b = Some(exc);
+    });
+    let store = with_state(|st| st.store);
+    let msg = b"WebAssembly: JS import threw\0";
+    let mv = wasm_vec_t {
+      size: msg.len(),
+      data: msg.as_ptr() as *mut c_void,
+      num_elems: msg.len(),
+      size_of_elem: 1,
+      lock: ptr::null_mut(),
+    };
+    return unsafe { wasm_trap_new(store, &mv) };
+  }
+
+  let res = unsafe { &mut *results };
+  if res.size >= 1 && !env.result_kinds.is_empty() {
+    let rdata = res.data as *mut wasm_val_t;
+    if res.size == 1 {
+      unsafe { *rdata = js_to_wasm_val(ctx, env.result_kinds[0], ret) };
+    } else {
+      for i in 0..res.size.min(env.result_kinds.len()) {
+        let el = unsafe { JS_GetPropertyUint32(ctx, ret, i as u32) };
+        unsafe { *rdata.add(i) = js_to_wasm_val(ctx, env.result_kinds[i], el) };
+        unsafe { JS_FreeValue(ctx, el) };
+      }
+    }
+  }
+  unsafe { JS_FreeValue(ctx, ret) };
+  ptr::null_mut()
+}
+
+struct ExportFuncEnv {
+  func: *mut wasm_func_t,
+  param_kinds: Vec<u8>,
+  result_kinds: Vec<u8>,
+  name: std::string::String,
+}
+
+unsafe extern "C" fn call_export(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  _magic: c_int,
+  data: *mut JSValue,
+) -> JSValue {
+  let mut envp = 0i64;
+  unsafe { JS_ToBigInt64(ctx, &mut envp, *data) };
+  if envp == 0 {
+    return unsafe { throw(ctx, "WebAssembly: invalid export binding") };
+  }
+  let env = unsafe { &*(envp as *const ExportFuncEnv) };
+
+  let depth = WASM_CALL_DEPTH.with(|d| {
+    let n = d.get() + 1;
+    d.set(n);
+    n
+  });
+  if depth > 1 && std::env::var("V82_WASM_TRACE").is_ok() {
+    eprintln!(
+      "[wasm] *** RE-ENTRANT call_export depth={depth} into {:?}",
+      env.name
+    );
+  }
+  struct DepthGuard;
+  impl Drop for DepthGuard {
+    fn drop(&mut self) {
+      WASM_CALL_DEPTH.with(|d| d.set(d.get() - 1));
+    }
+  }
+  let _dg = DepthGuard;
+
+  if std::env::var("V82_WASM_TRACE").is_ok() {
+    eprintln!(
+      "[wasm] call_export argc={} param_kinds={:?} result_kinds={:?}",
+      argc, env.param_kinds, env.result_kinds
+    );
+  }
+
+  let mut args: Vec<wasm_val_t> = Vec::with_capacity(env.param_kinds.len());
+  for (i, &k) in env.param_kinds.iter().enumerate() {
+    let v = if (i as c_int) < argc {
+      unsafe { *argv.add(i) }
+    } else {
+      jsv_undefined()
+    };
+    args.push(unsafe { js_to_wasm_val(ctx, k, v) });
+  }
+  if std::env::var("V82_WASM_TRACE").is_ok() {
+    eprintln!("[wasm] call_export entering wasm_func_call");
+  }
+  let args_vec = wasm_vec_t {
+    size: args.len(),
+    data: args.as_mut_ptr() as *mut c_void,
+    num_elems: args.len(),
+    size_of_elem: size_of::<wasm_val_t>(),
+    lock: ptr::null_mut(),
+  };
+  let mut results: Vec<wasm_val_t> = vec![
+    wasm_val_t {
+      kind: 0,
+      _pad: [0; 7],
+      of: 0
+    };
+    env.result_kinds.len()
+  ];
+  let mut res_vec = wasm_vec_t {
+    size: results.len(),
+    data: results.as_mut_ptr() as *mut c_void,
+    num_elems: results.len(),
+    size_of_elem: size_of::<wasm_val_t>(),
+    lock: ptr::null_mut(),
+  };
+  let trap = unsafe { wasm_func_call(env.func, &args_vec, &mut res_vec) };
+  if std::env::var("V82_WASM_TRACE").is_ok() {
+    eprintln!("[wasm] call_export returned, trap={}", !trap.is_null());
+  }
+
+  if let Some(exc) = PENDING_IMPORT_EXC.with(|p| p.borrow_mut().take()) {
+    unsafe { JS_FreeValue(ctx, exc) };
+  }
+  if !trap.is_null() {
+    unsafe { wasm_trap_delete(trap) };
+    if std::env::var("V82_WASM_TRACE").is_ok() {
+      let d = WASM_CALL_DEPTH.with(|d| d.get());
+      eprintln!("[wasm] TRAP in export {:?} depth={d}", env.name);
+    }
+    return unsafe { throw(ctx, "WebAssembly: trap during function call") };
+  }
+  if results.is_empty() {
+    jsv_undefined()
+  } else if results.len() == 1 {
+    unsafe { wasm_val_to_js(ctx, &results[0]) }
+  } else {
+    if std::env::var("V82_WASM_TRACE").is_ok() {
+      let dump: Vec<(u8, u64)> =
+        results.iter().map(|r| (r.kind, r.of)).collect();
+      eprintln!("[wasm] multi-result {dump:?}");
+    }
+    let arr = unsafe { JS_NewArray(ctx) };
+    for (i, r) in results.iter().enumerate() {
+      let jv = unsafe { wasm_val_to_js(ctx, r) };
+      unsafe { JS_SetPropertyUint32(ctx, arr, i as u32, jv) };
+    }
+    arr
+  }
+}
+
+unsafe fn make_export_func(
+  ctx: *mut JSContext,
+  f: *mut wasm_func_t,
+  name: &str,
+) -> JSValue {
+  let ft = unsafe { wasm_func_type(f) };
+  let param_kinds = valtype_kinds(unsafe { wasm_functype_params(ft) });
+  let result_kinds = valtype_kinds(unsafe { wasm_functype_results(ft) });
+  let env = Box::into_raw(Box::new(ExportFuncEnv {
+    func: f,
+    param_kinds,
+    result_kinds,
+    name: name.to_string(),
+  }));
+  let data = unsafe { JS_NewBigInt64(ctx, env as i64) };
+  let mut data_arr = [data];
+  unsafe {
+    JS_NewCFunctionData(ctx, call_export, 0, 0, 1, data_arr.as_mut_ptr())
+  }
+}
+
+struct TableEnv {
+  table: *mut wasm_table_t,
+}
+
+unsafe fn table_env_of(
+  ctx: *mut JSContext,
+  data: *mut JSValue,
+) -> *const TableEnv {
+  let mut envp = 0i64;
+  unsafe { JS_ToBigInt64(ctx, &mut envp, *data) };
+  envp as *const TableEnv
+}
+
+unsafe extern "C" fn table_grow(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  _magic: c_int,
+  data: *mut JSValue,
+) -> JSValue {
+  let env = unsafe { &*table_env_of(ctx, data) };
+  let old = unsafe { wasm_table_size(env.table) };
+  let mut delta = 0i32;
+  if argc >= 1 {
+    unsafe { JS_ToInt32(ctx, &mut delta, *argv) };
+  }
+  unsafe { wasm_table_grow(env.table, delta.max(0) as u32, ptr::null_mut()) };
+  unsafe { JS_NewInt32(ctx, old as i32) }
+}
+
+unsafe extern "C" fn table_set(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  _magic: c_int,
+  data: *mut JSValue,
+) -> JSValue {
+  let env = unsafe { &*table_env_of(ctx, data) };
+  if argc < 1 {
+    return jsv_undefined();
+  }
+  let mut idx = 0i32;
+  unsafe { JS_ToInt32(ctx, &mut idx, *argv) };
+  let val = if argc >= 2 {
+    unsafe { *argv.add(1) }
+  } else {
+    jsv_undefined()
+  };
+  if std::env::var("V82_WASM_TRACE").is_ok() {
+    let mut l = 0usize;
+    let cs = unsafe { JS_ToCStringLen(ctx, &mut l, val) };
+    let s = if cs.is_null() {
+      "<null>".to_string()
+    } else {
+      let b = unsafe { std::slice::from_raw_parts(cs as *const u8, l) };
+      let out = std::string::String::from_utf8_lossy(b).into_owned();
+      unsafe { JS_FreeCString(ctx, cs) };
+      out
+    };
+    eprintln!("[wasm] table_set idx={idx} tag={} val={s:?}", val.tag);
+  }
+  let store = with_state(|st| st.store);
+  let foreign = unsafe { wasm_foreign_new(store) };
+  if !foreign.is_null() {
+    let r = unsafe { wasm_foreign_as_ref(foreign) };
+    if !r.is_null() {
+      let boxed = unsafe { box_externref(ctx, val) };
+      unsafe {
+        wasm_ref_set_host_info_with_finalizer(
+          r,
+          boxed,
+          Some(externref_box_free),
+        )
+      };
+      unsafe { wasm_table_set(env.table, idx.max(0) as u32, r) };
+    }
+  }
+  jsv_undefined()
+}
+
+unsafe extern "C" fn table_get(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  _magic: c_int,
+  data: *mut JSValue,
+) -> JSValue {
+  let env = unsafe { &*table_env_of(ctx, data) };
+  if argc < 1 {
+    return jsv_undefined();
+  }
+  let mut idx = 0i32;
+  unsafe { JS_ToInt32(ctx, &mut idx, *argv) };
+  let r = unsafe { wasm_table_get(env.table, idx.max(0) as u32) };
+  if std::env::var("V82_WASM_TRACE").is_ok() {
+    let hi = if r.is_null() {
+      ptr::null_mut()
+    } else {
+      unsafe { wasm_ref_get_host_info(r) }
+    };
+    eprintln!(
+      "[wasm] table_get idx={idx} r_null={} hi_null={}",
+      r.is_null(),
+      hi.is_null()
+    );
+  }
+  if r.is_null() {
+    return jsv_undefined();
+  }
+  let hi = unsafe { wasm_ref_get_host_info(r) };
+  unsafe { JS_DupValue(ctx, unbox_externref(hi)) }
+}
+
+unsafe fn make_table_obj(
+  ctx: *mut JSContext,
+  table: *mut wasm_table_t,
+) -> JSValue {
+  let obj = unsafe { JS_NewObject(ctx) };
+  let env = Box::into_raw(Box::new(TableEnv { table }));
+  let mk = |f: unsafe extern "C" fn(
+    *mut JSContext,
+    JSValue,
+    c_int,
+    *mut JSValue,
+    c_int,
+    *mut JSValue,
+  ) -> JSValue| {
+    let data = unsafe { JS_NewBigInt64(ctx, env as i64) };
+    let mut da = [data];
+    unsafe { JS_NewCFunctionData(ctx, f, 0, 0, 1, da.as_mut_ptr()) }
+  };
+  unsafe {
+    let g = mk(table_grow);
+    JS_SetPropertyStr(ctx, obj, c"grow".as_ptr(), g);
+    let s = mk(table_set);
+    JS_SetPropertyStr(ctx, obj, c"set".as_ptr(), s);
+    let ge = mk(table_get);
+    JS_SetPropertyStr(ctx, obj, c"get".as_ptr(), ge);
+    let len = wasm_table_size(table);
+    JS_SetPropertyStr(
+      ctx,
+      obj,
+      c"length".as_ptr(),
+      JS_NewInt32(ctx, len as i32),
+    );
+  }
+  obj
+}
+
+unsafe fn compile_module(
+  ctx: *mut JSContext,
+  bytes: &[u8],
+) -> Result<usize, JSValue> {
+  with_state(|st| {
+    let mut bin = wasm_vec_t::empty();
+    unsafe { wasm_byte_vec_new(&mut bin, bytes.len(), bytes.as_ptr()) };
+    let m = unsafe { wasm_module_new(st.store, &bin) };
+    unsafe { wasm_byte_vec_delete(&mut bin) };
+    if m.is_null() {
+      return Err(unsafe { throw(ctx, "WebAssembly.Module: compile failed") });
+    }
+    st.modules.push(m);
+    Ok(st.modules.len() - 1)
+  })
+}
+
+pub(crate) unsafe fn compile_module_object(
+  ctx: *mut JSContext,
+  bytes: &[u8],
+) -> JSValue {
+  match unsafe { compile_module(ctx, bytes) } {
+    Ok(id) => unsafe { make_module_obj(ctx, id) },
+    Err(e) => e,
+  }
+}
+
+unsafe fn module_ptr(id: usize) -> *mut wasm_module_t {
+  with_state(|st| st.modules.get(id).copied().unwrap_or(ptr::null_mut()))
+}
+
+unsafe fn make_module_obj(ctx: *mut JSContext, id: usize) -> JSValue {
+  let obj = unsafe { JS_NewObject(ctx) };
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      obj,
+      c"__wasm_module_id".as_ptr(),
+      JS_NewInt32(ctx, id as i32),
+    )
+  };
+  obj
+}
+
+unsafe fn obj_module_id(ctx: *mut JSContext, obj: JSValue) -> Option<usize> {
+  let v = unsafe { JS_GetPropertyStr(ctx, obj, c"__wasm_module_id".as_ptr()) };
+
+  if v.tag != JS_TAG_INT && v.tag != JS_TAG_FLOAT64 {
+    unsafe { JS_FreeValue(ctx, v) };
+    return None;
+  }
+  let mut i = -1i32;
+  unsafe { JS_ToInt32(ctx, &mut i, v) };
+  unsafe { JS_FreeValue(ctx, v) };
+  if i < 0 { None } else { Some(i as usize) }
+}
+
+unsafe fn instantiate(
+  ctx: *mut JSContext,
+  mid: usize,
+  import_object: JSValue,
+) -> Result<JSValue, JSValue> {
+  let m = unsafe { module_ptr(mid) };
+  if m.is_null() {
+    return Err(unsafe { throw(ctx, "WebAssembly.Instance: invalid module") });
+  }
+  let store = with_state(|st| st.store);
+
+  let mut imp_types = wasm_vec_t::empty();
+  unsafe { wasm_module_imports(m, &mut imp_types) };
+  let n = imp_types.size;
+  let mut externs: Vec<*mut wasm_extern_t> = Vec::with_capacity(n);
+  let it_data = imp_types.data as *const *const wasm_importtype_t;
+  for i in 0..n {
+    let it = unsafe { *it_data.add(i) };
+    let modname = vec_name_to_string(unsafe { wasm_importtype_module(it) });
+    let name = vec_name_to_string(unsafe { wasm_importtype_name(it) });
+    let ext_ty = unsafe { wasm_importtype_type(it) };
+    let kind = unsafe { wasm_externtype_kind(ext_ty) };
+
+    let modobj = unsafe { get_prop(ctx, import_object, &modname) };
+    let val = unsafe { get_prop(ctx, modobj, &name) };
+    unsafe { JS_FreeValue(ctx, modobj) };
+
+    if kind == WASM_EXTERN_FUNC && unsafe { JS_IsFunction(ctx, val) } != 0 {
+      let ft = unsafe { wasm_externtype_as_functype_const(ext_ty) };
+      let result_kinds = valtype_kinds(unsafe { wasm_functype_results(ft) });
+      let env = Box::into_raw(Box::new(ImportEnv {
+        ctx,
+        func: unsafe { JS_DupValue(ctx, val) },
+        result_kinds,
+        name: name.clone(),
+      }));
+      let f = unsafe {
+        wasm_func_new_with_env(
+          store,
+          ft,
+          import_trampoline,
+          env as *mut c_void,
+          None,
+        )
+      };
+      externs.push(unsafe { wasm_func_as_extern(f) });
+    } else {
+      externs.push(ptr::null_mut());
+    }
+    unsafe { JS_FreeValue(ctx, val) };
+  }
+
+  let imports_vec = wasm_vec_t {
+    size: externs.len(),
+    data: externs.as_mut_ptr() as *mut c_void,
+    num_elems: externs.len(),
+    size_of_elem: size_of::<*mut wasm_extern_t>(),
+    lock: ptr::null_mut(),
+  };
+  let mut trap: *mut wasm_trap_t = ptr::null_mut();
+  let inst = unsafe { wasm_instance_new(store, m, &imports_vec, &mut trap) };
+  if inst.is_null() {
+    if !trap.is_null() {
+      unsafe { wasm_trap_delete(trap) };
+    }
+    return Err(unsafe {
+      throw(ctx, "WebAssembly.Instance: instantiation failed")
+    });
+  }
+  with_state(|st| st.instances.push(inst));
+
+  let mut exp_types = wasm_vec_t::empty();
+  unsafe { wasm_module_exports(m, &mut exp_types) };
+  let mut exports_externs = wasm_vec_t::empty();
+  unsafe { wasm_instance_exports(inst, &mut exports_externs) };
+
+  let exports = unsafe { JS_NewObject(ctx) };
+  let et_data = exp_types.data as *const *const wasm_exporttype_t;
+  let ex_data = exports_externs.data as *const *mut wasm_extern_t;
+  let count = exp_types.size.min(exports_externs.size);
+  if std::env::var_os("QJS_DBG_WASM").is_some() {
+    eprintln!(
+      "[wasm instantiate] exp_types.size={} exports_externs.size={} count={count}",
+      exp_types.size, exports_externs.size
+    );
+  }
+  for i in 0..count {
+    let name =
+      vec_name_to_string(unsafe { wasm_exporttype_name(*et_data.add(i)) });
+    let ext = unsafe { *ex_data.add(i) };
+    let ekind = unsafe { wasm_extern_kind(ext) };
+    if std::env::var_os("QJS_DBG_WASM").is_some() {
+      eprintln!("[wasm export {i}] name={name:?} ekind={ekind}");
+    }
+    let jv = if ekind == WASM_EXTERN_FUNC {
+      let f = unsafe { wasm_extern_as_func(ext) };
+      unsafe { make_export_func(ctx, f, &name) }
+    } else if ekind == WASM_EXTERN_MEMORY {
+      let mem = unsafe { wasm_extern_as_memory(ext) };
+      unsafe { make_memory_obj(ctx, mem) }
+    } else if ekind == WASM_EXTERN_TABLE {
+      let tbl = unsafe { wasm_extern_as_table(ext) };
+      unsafe { make_table_obj(ctx, tbl) }
+    } else if ekind == WASM_EXTERN_GLOBAL {
+      let g = unsafe { wasm_extern_as_global(ext) };
+      unsafe { make_global_obj(ctx, g) }
+    } else {
+      jsv_undefined()
+    };
+    if let Ok(cn) = CString::new(name) {
+      unsafe { JS_SetPropertyStr(ctx, exports, cn.as_ptr(), jv) };
+    } else {
+      unsafe { JS_FreeValue(ctx, jv) };
+    }
+  }
+
+  let inst_obj = unsafe { JS_NewObject(ctx) };
+  unsafe { JS_SetPropertyStr(ctx, inst_obj, c"exports".as_ptr(), exports) };
+  Ok(inst_obj)
+}
+
+unsafe fn get_prop(ctx: *mut JSContext, obj: JSValue, name: &str) -> JSValue {
+  match CString::new(name) {
+    Ok(c) => unsafe { JS_GetPropertyStr(ctx, obj, c.as_ptr()) },
+    Err(_) => jsv_undefined(),
+  }
+}
+
+unsafe extern "C" {
+
+  fn v82jsc_set_mem_grow_cb(cb: Option<unsafe extern "C" fn()>);
+}
+
+struct MemoryEnv {
+  mem: *mut wasm_memory_t,
+  ctx: *mut JSContext,
+  cached: std::cell::Cell<JSValue>,
+}
+
+thread_local! {
+
+    static MEMORY_ENVS: RefCell<Vec<*const MemoryEnv>> = const { RefCell::new(Vec::new()) };
+    static MEM_GROW_CB_SET: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+unsafe extern "C" fn on_mem_grow() {
+  MEMORY_ENVS.with(|v| {
+    for &ep in v.borrow().iter() {
+      let env = unsafe { &*ep };
+      let cached = env.cached.get();
+      if cached.tag != JS_TAG_UNDEFINED {
+        unsafe {
+          JS_DetachArrayBuffer(env.ctx, cached);
+          JS_FreeValue(env.ctx, cached);
+        }
+        env.cached.set(jsv_undefined());
+      }
+    }
+  });
+}
+
+unsafe extern "C" fn memory_buffer_get(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+  _magic: c_int,
+  data: *mut JSValue,
+) -> JSValue {
+  let mut envp = 0i64;
+  unsafe { JS_ToBigInt64(ctx, &mut envp, *data) };
+  if envp == 0 {
+    return jsv_undefined();
+  }
+  let env = unsafe { &*(envp as *const MemoryEnv) };
+  let cached = env.cached.get();
+  if cached.tag != JS_TAG_UNDEFINED {
+    return unsafe { JS_DupValue(ctx, cached) };
+  }
+  let dptr = unsafe { wasm_memory_data(env.mem) };
+  let size = unsafe { wasm_memory_data_size(env.mem) };
+  if dptr.is_null() || size == 0 {
+    return jsv_undefined();
+  }
+
+  let buf =
+    unsafe { JS_NewArrayBuffer(ctx, dptr, size, None, ptr::null_mut(), false) };
+
+  env.cached.set(unsafe { JS_DupValue(ctx, buf) });
+  buf
+}
+
+unsafe extern "C" fn memory_grow(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  _magic: c_int,
+  data: *mut JSValue,
+) -> JSValue {
+  let mut envp = 0i64;
+  unsafe { JS_ToBigInt64(ctx, &mut envp, *data) };
+  if envp == 0 {
+    return jsv_undefined();
+  }
+  let env = unsafe { &*(envp as *const MemoryEnv) };
+  let mut delta = 0i32;
+  if argc >= 1 {
+    unsafe { JS_ToInt32(ctx, &mut delta, *argv) };
+  }
+  let prev_pages = unsafe { wasm_memory_size(env.mem) };
+  let prev_bytes = unsafe { wasm_memory_data_size(env.mem) };
+  let ok = unsafe { wasm_memory_grow(env.mem, delta.max(0) as u32) };
+  if std::env::var("V82_WASM_TRACE").is_ok() {
+    eprintln!(
+      "[wasm] memory_grow delta={delta} prev_pages={prev_pages} prev_bytes={prev_bytes} ok={ok}"
+    );
+  }
+  if !ok {
+    return unsafe {
+      throw(ctx, "WebAssembly.Memory.grow: failed to grow memory")
+    };
+  }
+  unsafe { JS_NewInt32(ctx, prev_pages as i32) }
+}
+
+struct GlobalEnv {
+  global: *mut wasm_global_t,
+}
+
+unsafe extern "C" fn global_value_get(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+  _magic: c_int,
+  data: *mut JSValue,
+) -> JSValue {
+  let mut envp = 0i64;
+  unsafe { JS_ToBigInt64(ctx, &mut envp, *data) };
+  if envp == 0 {
+    return jsv_undefined();
+  }
+  let env = unsafe { &*(envp as *const GlobalEnv) };
+  let mut v = wasm_val_t {
+    kind: 0,
+    _pad: [0; 7],
+    of: 0,
+  };
+  unsafe { wasm_global_get(env.global, &mut v) };
+  unsafe { wasm_val_to_js(ctx, &v) }
+}
+
+unsafe extern "C" fn global_value_set(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  _magic: c_int,
+  data: *mut JSValue,
+) -> JSValue {
+  let mut envp = 0i64;
+  unsafe { JS_ToBigInt64(ctx, &mut envp, *data) };
+  if envp == 0 {
+    return jsv_undefined();
+  }
+  let env = unsafe { &*(envp as *const GlobalEnv) };
+  let gt = unsafe { wasm_global_type(env.global) };
+  let kind = unsafe { wasm_valtype_kind(wasm_globaltype_content(gt)) };
+  let newval = if argc >= 1 {
+    unsafe { *argv }
+  } else {
+    jsv_undefined()
+  };
+  let v = unsafe { js_to_wasm_val(ctx, kind, newval) };
+  unsafe { wasm_global_set(env.global, &v) };
+  jsv_undefined()
+}
+
+unsafe fn make_global_obj(
+  ctx: *mut JSContext,
+  global: *mut wasm_global_t,
+) -> JSValue {
+  let obj = unsafe { JS_NewObject(ctx) };
+  let genv = Box::into_raw(Box::new(GlobalEnv { global }));
+  let mut gd = [unsafe { JS_NewBigInt64(ctx, genv as i64) }];
+  let getter = unsafe {
+    JS_NewCFunctionData(ctx, global_value_get, 0, 0, 1, gd.as_mut_ptr())
+  };
+  let mut sd = [unsafe { JS_NewBigInt64(ctx, genv as i64) }];
+  let setter = unsafe {
+    JS_NewCFunctionData(ctx, global_value_set, 1, 0, 1, sd.as_mut_ptr())
+  };
+  let atom = unsafe { JS_NewAtom(ctx, c"value".as_ptr()) };
+  unsafe {
+    JS_DefinePropertyGetSet(
+      ctx,
+      obj,
+      atom,
+      getter,
+      setter,
+      JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE,
+    );
+    JS_FreeAtom(ctx, atom);
+  }
+  obj
+}
+
+unsafe fn make_memory_obj(
+  ctx: *mut JSContext,
+  mem: *mut wasm_memory_t,
+) -> JSValue {
+  MEM_GROW_CB_SET.with(|s| {
+    if !s.get() {
+      unsafe { v82jsc_set_mem_grow_cb(Some(on_mem_grow)) };
+      s.set(true);
+    }
+  });
+  let obj = unsafe { JS_NewObject(ctx) };
+
+  let env = Box::into_raw(Box::new(MemoryEnv {
+    mem,
+    ctx,
+    cached: std::cell::Cell::new(jsv_undefined()),
+  }));
+  MEMORY_ENVS.with(|v| v.borrow_mut().push(env as *const MemoryEnv));
+  let mut data_arr = [unsafe { JS_NewBigInt64(ctx, env as i64) }];
+  let getter = unsafe {
+    JS_NewCFunctionData(ctx, memory_buffer_get, 0, 0, 1, data_arr.as_mut_ptr())
+  };
+  let atom = unsafe { JS_NewAtom(ctx, c"buffer".as_ptr()) };
+  unsafe {
+    JS_DefinePropertyGetSet(
+      ctx,
+      obj,
+      atom,
+      getter,
+      jsv_undefined(),
+      JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE,
+    );
+    JS_FreeAtom(ctx, atom);
+  }
+  let mut gdata = [unsafe { JS_NewBigInt64(ctx, env as i64) }];
+  let grow_fn = unsafe {
+    JS_NewCFunctionData(ctx, memory_grow, 1, 0, 1, gdata.as_mut_ptr())
+  };
+  unsafe { JS_SetPropertyStr(ctx, obj, c"grow".as_ptr(), grow_fn) };
+  obj
+}
+
+unsafe extern "C" fn wa_validate(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  if argc < 1 {
+    return unsafe { JS_NewBool(ctx, 0) };
+  }
+  let Some(bytes) = (unsafe { read_wasm_bytes(ctx, *argv) }) else {
+    return unsafe { JS_NewBool(ctx, 0) };
+  };
+  let ok = with_state(|st| {
+    let mut bin = wasm_vec_t::empty();
+    unsafe { wasm_byte_vec_new(&mut bin, bytes.len(), bytes.as_ptr()) };
+    let r = unsafe { wasm_module_validate(st.store, &bin) };
+    unsafe { wasm_byte_vec_delete(&mut bin) };
+    r
+  });
+  unsafe { JS_NewBool(ctx, ok as c_int) }
+}
+
+unsafe extern "C" fn wa_module_ctor(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  if argc < 1 {
+    return unsafe { throw(ctx, "WebAssembly.Module: missing bytes") };
+  }
+  let Some(bytes) = (unsafe { read_wasm_bytes(ctx, *argv) }) else {
+    return unsafe { throw(ctx, "WebAssembly.Module: invalid bytes") };
+  };
+  match unsafe { compile_module(ctx, &bytes) } {
+    Ok(id) => unsafe { make_module_obj(ctx, id) },
+    Err(e) => e,
+  }
+}
+
+unsafe extern "C" fn wa_instance_ctor(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  if argc < 1 {
+    return unsafe { throw(ctx, "WebAssembly.Instance: missing module") };
+  }
+  let module = unsafe { *argv };
+  let Some(mid) = (unsafe { obj_module_id(ctx, module) }) else {
+    return unsafe {
+      throw(ctx, "WebAssembly.Instance: argument is not a Module")
+    };
+  };
+  let imports = if argc >= 2 {
+    unsafe { *argv.add(1) }
+  } else {
+    jsv_undefined()
+  };
+  match unsafe { instantiate(ctx, mid, imports) } {
+    Ok(inst) => inst,
+    Err(e) => e,
+  }
+}
+
+unsafe extern "C" fn wa_compile(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  let result = unsafe { wa_module_ctor(ctx, jsv_undefined(), argc, argv) };
+  unsafe { settle_promise(ctx, result) }
+}
+
+unsafe extern "C" fn wa_instantiate(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  if argc < 1 {
+    let e = unsafe { throw(ctx, "WebAssembly.instantiate: missing argument") };
+    return unsafe { settle_promise(ctx, e) };
+  }
+  let first = unsafe { *argv };
+  let imports = if argc >= 2 {
+    unsafe { *argv.add(1) }
+  } else {
+    jsv_undefined()
+  };
+
+  if let Some(mid) = unsafe { obj_module_id(ctx, first) } {
+    let r = unsafe { instantiate(ctx, mid, imports) };
+    return match r {
+      Ok(inst) => unsafe { settle_promise(ctx, inst) },
+      Err(e) => unsafe { settle_promise(ctx, e) },
+    };
+  }
+  let Some(bytes) = (unsafe { read_wasm_bytes(ctx, first) }) else {
+    let e = unsafe { throw(ctx, "WebAssembly.instantiate: invalid source") };
+    return unsafe { settle_promise(ctx, e) };
+  };
+  let mid = match unsafe { compile_module(ctx, &bytes) } {
+    Ok(id) => id,
+    Err(e) => return unsafe { settle_promise(ctx, e) },
+  };
+  match unsafe { instantiate(ctx, mid, imports) } {
+    Ok(inst) => {
+      let res = unsafe { JS_NewObject(ctx) };
+      unsafe {
+        JS_SetPropertyStr(
+          ctx,
+          res,
+          c"module".as_ptr(),
+          make_module_obj(ctx, mid),
+        )
+      };
+      unsafe { JS_SetPropertyStr(ctx, res, c"instance".as_ptr(), inst) };
+      unsafe { settle_promise(ctx, res) }
+    }
+    Err(e) => unsafe { settle_promise(ctx, e) },
+  }
+}
+
+unsafe fn settle_promise(ctx: *mut JSContext, value: JSValue) -> JSValue {
+  let is_exc = value.tag == JS_TAG_EXCEPTION;
+  let v = if is_exc {
+    let e = unsafe { JS_GetException(ctx) };
+    e
+  } else {
+    value
+  };
+  let helper = SETTLE.with(|c| {
+    if let Some(h) = c.get() {
+      return h;
+    }
+    let src = c"(v,e)=>e?Promise.reject(v):Promise.resolve(v)";
+    let f = unsafe {
+      JS_Eval(
+        ctx,
+        src.as_ptr(),
+        src.to_bytes().len(),
+        c"<wasm-settle>".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      )
+    };
+    if f.tag != JS_TAG_EXCEPTION {
+      c.set(Some(f));
+    }
+    f
+  });
+  let mut args = [v, unsafe { JS_NewBool(ctx, is_exc as c_int) }];
+  let p =
+    unsafe { JS_Call(ctx, helper, jsv_undefined(), 2, args.as_mut_ptr()) };
+  unsafe { JS_FreeValue(ctx, v) };
+  p
+}
+
+thread_local! {
+    static SETTLE: std::cell::Cell<Option<JSValue>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn install_webassembly(ctx: *mut JSContext) {
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let wa = JS_NewObject(ctx);
+
+    let set_fn =
+      |obj: JSValue, name: &std::ffi::CStr, f: JSCFunction, argc: c_int| {
+        let func = JS_NewCFunction(ctx, f, name.as_ptr(), argc);
+        JS_SetPropertyStr(ctx, obj, name.as_ptr(), func);
+      };
+
+    let set_ctor = |obj: JSValue,
+                    name: &std::ffi::CStr,
+                    f: JSCFunction,
+                    argc: c_int| {
+      let func =
+        JS_NewCFunction2(ctx, f, name.as_ptr(), argc, JS_CFUNC_CONSTRUCTOR, 0);
+      JS_SetPropertyStr(ctx, obj, name.as_ptr(), func);
+    };
+    set_fn(wa, c"validate", wa_validate, 1);
+    set_ctor(wa, c"Module", wa_module_ctor, 1);
+    set_ctor(wa, c"Instance", wa_instance_ctor, 2);
+    set_fn(wa, c"compile", wa_compile, 1);
+    set_fn(wa, c"instantiate", wa_instantiate, 2);
+
+    JS_SetPropertyStr(ctx, global, c"WebAssembly".as_ptr(), wa);
+    JS_FreeValue(ctx, global);
+  }
+}
