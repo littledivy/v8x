@@ -265,6 +265,7 @@ pub type JSHostPromiseRejectionTracker = unsafe extern "C" fn(
 // ----- Runtime/context lifecycle ---------------------------------------
 
 unsafe extern "C" {
+  pub fn JS_GetVersion() -> *const std::os::raw::c_char;
   pub fn JS_NewRuntime() -> *mut JSRuntime;
   pub fn JS_FreeRuntime(rt: *mut JSRuntime);
   pub fn JS_SetRuntimeOpaque(rt: *mut JSRuntime, opaque: *mut c_void);
