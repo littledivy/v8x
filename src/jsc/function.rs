@@ -558,8 +558,12 @@ pub extern "C" fn v8__Function__SetName(
 pub extern "C" fn v8__Function__CreateCodeCache(
   script: *const Function,
 ) -> *mut crate::CachedData<'static> {
+  // JSC has no bytecode-cache export; return a placeholder (non-null) cache so
+  // deno's CJS path (`function.create_code_cache().ok_or_else(...)`) doesn't
+  // hard-error. The consume path rejects it and recompiles. Mirrors the
+  // UnboundModuleScript placeholder.
   let _ = script;
-  ptr::null_mut()
+  crate::jsc::module::make_placeholder_code_cache()
 }
 
 #[unsafe(no_mangle)]
