@@ -1450,7 +1450,13 @@ pub extern "C" fn v8__Module__Evaluate(
     }
     let dep_async = v8__Module__IsGraphAsync(*dep);
     if let Some(dm) = module_state(*dep) {
-      if matches!(dm.status, ModuleStatus::Evaluated) && !dep_async {
+      // Skip a dep already done, OR currently mid-evaluation up the call stack
+      // (circular import: A imports B imports A). Re-entering an `Evaluating`
+      // module recurses forever; its live bindings are already wired by
+      // InstantiateModule, so the cycle resolves without a re-eval.
+      if matches!(dm.status, ModuleStatus::Evaluating)
+        || (matches!(dm.status, ModuleStatus::Evaluated) && !dep_async)
+      {
         continue;
       }
     }
