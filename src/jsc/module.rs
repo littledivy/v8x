@@ -93,6 +93,67 @@ thread_local! {
     // sees the partial namespace instead of deno's cycle error.
     static EVAL_BODY_RUNNING: std::cell::RefCell<Vec<*const Module>> =
         const { std::cell::RefCell::new(Vec::new()) };
+
+    // deno's HostImportModuleDynamicallyCallback. JSC's C-API global object has
+    // no module loader, so `import()` throws "No module loader provided"; our
+    // WebKit patch wires moduleLoaderImportModule -> v82jsc_dynamic_import,
+    // which calls this to load+evaluate the module and returns deno's promise.
+    static DYN_IMPORT_CB: std::cell::Cell<
+        Option<crate::isolate::RawHostImportModuleDynamicallyCallback>,
+    > = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn set_dynamic_import_callback(
+  cb: crate::isolate::RawHostImportModuleDynamicallyCallback,
+) {
+  DYN_IMPORT_CB.with(|c| c.set(Some(cb)));
+}
+
+/// Called from the WebKit patch (JSAPIGlobalObject::moduleLoaderImportModule)
+/// when JS runs `import(specifier)`. Routes to deno's dynamic-import callback
+/// and returns the promise (resolves to the module namespace). Returns null on
+/// no callback; the patch then rejects the import promise.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn v82jsc_dynamic_import(
+  ctx: JSContextRef,
+  specifier: JSStringRef,
+  referrer: JSStringRef,
+) -> JSValueRef {
+  let Some(cb) = DYN_IMPORT_CB.with(|c| c.get()) else {
+    return ptr::null();
+  };
+  if ctx.is_null() || specifier.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    crate::jsc::core::restore_current(current_iso());
+    let spec_val = JSValueMakeString(ctx, specifier);
+    let ref_val = if referrer.is_null() {
+      JSValueMakeUndefined(ctx)
+    } else {
+      JSValueMakeString(ctx, referrer)
+    };
+    let empty_attrs =
+      JSObjectMakeArray(ctx, 0, ptr::null(), ptr::null_mut()) as JSValueRef;
+
+    let context = ctx as *const Context;
+    let host_opts = intern_ctx::<Data>(ctx, JSValueMakeUndefined(ctx));
+    let ref_h = intern_ctx::<crate::Value>(ctx, ref_val);
+    let spec_h = intern_ctx::<V8String>(ctx, spec_val);
+    let attr_h = intern_ctx::<FixedArray>(ctx, empty_attrs);
+
+    let (Some(c_l), Some(h_l), Some(r_l), Some(s_l), Some(a_l)) = (
+      crate::Local::from_raw(context),
+      crate::Local::from_raw(host_opts),
+      crate::Local::from_raw(ref_h),
+      crate::Local::from_raw(spec_h),
+      crate::Local::from_raw(attr_h),
+    ) else {
+      return ptr::null();
+    };
+    let promise = cb(c_l, h_l, r_l, s_l, a_l);
+    promise as JSValueRef
+  }
 }
 
 fn mod_class() -> JSClassRef {

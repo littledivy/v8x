@@ -1,0 +1,101 @@
+diff --git a/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp b/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
+index bea979b879..ab1d36dcf1 100644
+--- a/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
++++ b/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
+@@ -26,10 +26,26 @@
+ #include "config.h"
+ #include "JSAPIGlobalObject.h"
+ 
++#include "APICast.h"
++#include "Error.h"
+ #include "GlobalObjectMethodTable.h"
++#include "JSCJSValueInlines.h"
++#include "JSCast.h"
+ #include "JSCellInlines.h"
++#include "JSPromise.h"
++#include "JSStringRef.h"
+ #include "StructureCreateInlines.h"
+ 
++// v82jsc: routes import() to deno's HostImportModuleDynamicallyCallback (the
++// real impl is #[no_mangle] in the Rust shim and overrides this at link). This
++// WEAK DEFINITION (returns null) lets JSC's own tools (jsc CLI, etc.) that link
++// libJavaScriptCore.a WITHOUT the Rust shim still resolve the symbol; the null
++// is handled by the caller. deno's strong Rust definition wins in the binary.
++extern "C" __attribute__((weak)) JSValueRef v82jsc_dynamic_import(JSContextRef, JSStringRef, JSStringRef)
++{
++    return nullptr;
++}
++
+ namespace JSC {
+ 
+ const ClassInfo JSAPIGlobalObject::s_info = { "GlobalObject"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSAPIGlobalObject) };
+@@ -43,7 +59,7 @@ const GlobalObjectMethodTable* JSAPIGlobalObject::globalObjectMethodTable()
+         &shouldInterruptScript,
+         &javaScriptRuntimeFlags,
+         &shouldInterruptScriptBeforeTimeout,
+-        nullptr, // moduleLoaderImportModule
++        &moduleLoaderImportModule, // v82jsc: wired to deno's dynamic import
+         nullptr, // moduleLoaderResolve
+         nullptr, // moduleLoaderFetch
+         nullptr, // moduleLoaderCreateImportMetaProperties
+@@ -69,6 +85,46 @@ void JSAPIGlobalObject::reportUncaughtExceptionAtEventLoop(JSGlobalObject* globa
+     Base::reportUncaughtExceptionAtEventLoop(globalObject, exception);
+ }
+ 
++// v82jsc: JS `import(specifier)` lands here. The plain C-API global object has
++// no module loader, so route to deno's HostImportModuleDynamicallyCallback
++// (via the Rust shim) and return its promise — deno resolves/fetches/evaluates
++// the module and settles the promise with the namespace.
++JSPromise* JSAPIGlobalObject::moduleLoaderImportModule(JSGlobalObject* globalObject, JSModuleLoader*, JSString* specifierValue, RefPtr<ScriptFetchParameters>, const SourceOrigin& sourceOrigin, bool)
++{
++    VM& vm = globalObject->vm();
++    auto scope = DECLARE_THROW_SCOPE(vm);
++    auto reject = [&] (const String& message) -> JSPromise* {
++        auto* promise = JSPromise::create(vm, globalObject->promiseStructure());
++        promise->reject(vm, createError(globalObject, message));
++        return promise;
++    };
++
++    if (!v82jsc_dynamic_import)
++        return reject("dynamic import: no host module loader"_s);
++
++    String specifier = specifierValue->value(globalObject);
++    RETURN_IF_EXCEPTION(scope, reject("invalid import specifier"_s));
++    String referrer = sourceOrigin.string();
++
++    JSGlobalContextRef ctx = toGlobalRef(globalObject);
++    JSStringRef specRef = JSStringCreateWithUTF8CString(specifier.utf8().data());
++    JSStringRef refRef = referrer.isNull() ? nullptr : JSStringCreateWithUTF8CString(referrer.utf8().data());
++
++    JSValueRef promiseRef = v82jsc_dynamic_import(ctx, specRef, refRef);
++
++    JSStringRelease(specRef);
++    if (refRef)
++        JSStringRelease(refRef);
++
++    if (!promiseRef)
++        return reject("dynamic import: no host module loader"_s);
++
++    JSValue promiseValue = toJS(globalObject, promiseRef);
++    if (promiseValue.isObject())
++        return static_cast<JSPromise*>(asObject(promiseValue));
++    return reject("dynamic import: host did not return a promise"_s);
++}
++
+ #endif
+ 
+ JSAPIGlobalObject::JSAPIGlobalObject(VM& vm, Structure* structure)
+diff --git a/Source/cmake/WebKitCompilerFlags.cmake b/Source/cmake/WebKitCompilerFlags.cmake
+index 325fbcca5a..856aefe077 100644
+--- a/Source/cmake/WebKitCompilerFlags.cmake
++++ b/Source/cmake/WebKitCompilerFlags.cmake
+@@ -333,7 +333,8 @@ if (COMPILER_IS_GCC_OR_CLANG)
+                                          -Werror=undefined-internal)
+ 
+     # FIXME: https://bugs.webkit.org/show_bug.cgi?id=299689
+-    WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS(-Wno-character-conversion)
++    # v82jsc: -Wno-character-conversion rejected by newer Apple clang
++    # WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS(-Wno-character-conversion)
+ endif ()
+ 
+ if (COMPILER_IS_GCC_OR_CLANG AND NOT MSVC)

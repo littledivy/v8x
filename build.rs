@@ -170,26 +170,25 @@ fn build_vendored_jsc(manifest_dir: &std::path::Path) {
 
   println!("cargo:rustc-link-search=native={}", lib_dir.display());
   // JSC has dense internal cross-references; the default static-archive
-  // member-pulling misses some, so force-load the whole JSC + WTF archives.
+  // member-pulling misses some, so whole-archive the JSC + WTF + JIT + bmalloc
+  // libs (force_load equivalent). Use the `+whole-archive` link-lib MODIFIER,
+  // not `rustc-link-arg=-Wl,-force_load` — the latter does NOT propagate from a
+  // library crate's build script to the final binary's link, so the symbols
+  // would be dropped (every JSValue* undefined). link-lib does propagate.
   println!(
-    "cargo:rustc-link-arg=-Wl,-force_load,{}",
-    lib_dir.join("libJavaScriptCore.a").display()
+    "cargo:rustc-link-lib=static:+whole-archive=JavaScriptCore"
   );
-  println!(
-    "cargo:rustc-link-arg=-Wl,-force_load,{}",
-    lib_dir.join("libWTF.a").display()
-  );
+  println!("cargo:rustc-link-lib=static:+whole-archive=WTF");
   // WebKit splits JSC into JavaScriptCore + JavaScriptCoreJIT targets; the JIT
   // objects aren't archived by the build, so tools/setup_webkit.sh bundles
-  // them into libJavaScriptCoreJIT.a. Force-load it too.
+  // them into libJavaScriptCoreJIT.a. Whole-archive it too.
   let jit_a = lib_dir.join("libJavaScriptCoreJIT.a");
   if jit_a.exists() {
-    println!("cargo:rustc-link-arg=-Wl,-force_load,{}", jit_a.display());
+    println!(
+      "cargo:rustc-link-lib=static:+whole-archive=JavaScriptCoreJIT"
+    );
   }
-  println!(
-    "cargo:rustc-link-arg=-Wl,-force_load,{}",
-    lib_dir.join("libbmalloc.a").display()
-  );
+  println!("cargo:rustc-link-lib=static:+whole-archive=bmalloc");
   println!("cargo:rustc-link-lib=c++");
   println!("cargo:rerun-if-changed={}", jsc_a.display());
 
