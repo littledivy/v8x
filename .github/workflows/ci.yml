@@ -7,32 +7,109 @@ on:
     branches: [main]
 
 jobs:
-  build:
-    name: build ${{ matrix.engine }}
-    runs-on: macos-latest
+  # ---------------------------------------------------------------------------
+  # Fast checks: `cargo build --lib` per backend. Catches compile breakage
+  # without building a full deno. quickjs is cross-platform (ubuntu); the JSC
+  # backends need macOS (system_jsc links the OS framework, jsc builds the
+  # vendored WebKit from source ~11min).
+  # ---------------------------------------------------------------------------
+  check:
+    name: check-${{ matrix.backend }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        # Fast lib builds. `system_jsc` links the OS framework (no WebKit build);
-        # `quickjs` compiles the vendored sources. The vendored-WebKit `jsc`
-        # build + the full backend deno matrix run locally / self-hosted
-        # (tests/modules/matrix.sh) — a from-scratch WebKit build is too heavy
-        # for per-push CI.
-        engine: [system_jsc, quickjs]
+        include:
+          - backend: quickjs
+            os: ubuntu-latest
+            features: quickjs
+          - backend: sys-jsc
+            os: macos-latest
+            features: system_jsc
+          - backend: jsc
+            os: macos-15
+            features: engine_jsc,vendor_jsc
+            ninja: true
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.engine }}
+          key: check-${{ matrix.backend }}
+      - name: Install ninja (WebKit build)
+        if: matrix.ninja
+        run: brew install ninja
+      - name: Build --lib (${{ matrix.features }})
+        run: cargo build --no-default-features --features ${{ matrix.features }} --lib
 
-      - name: Build (${{ matrix.engine }})
-        run: cargo build --no-default-features --features ${{ matrix.engine }} --lib
+  # ---------------------------------------------------------------------------
+  # Real deno on each v82jsc backend, run against the ES-module conformance
+  # suite (byte-for-byte vs the stock-v8 oracle). All on macOS so the JSC
+  # backends link/JIT correctly; quickjs rides along on the same runner.
+  # ---------------------------------------------------------------------------
+  deno:
+    name: deno-${{ matrix.backend }}
+    runs-on: macos-15
+    timeout-minutes: 120
+    # macOS 15+: WebKit's bmalloc uses os_unfair_lock_lock_with_flags (15.0+),
+    # fatal under -Werror=unguarded-availability on an older deployment target.
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: jsc
+            features: '"engine_jsc", "vendor_jsc"'
+            ninja: true
+          - backend: sys-jsc
+            features: '"system_jsc"'
+          - backend: quickjs
+            features: '"quickjs"'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: deno-${{ matrix.backend }}
+      - name: Install ninja (WebKit build)
+        if: matrix.ninja
+        run: brew install ninja
+
+      - name: Clone deno + apply the v82jsc integration patch
+        run: |
+          set -euo pipefail
+          DENO_REF="$(cat tools/deno/DENO_REF)"
+          mkdir -p ../deno && git -C ../deno init -q
+          git -C ../deno remote add origin https://github.com/denoland/deno
+          git -C ../deno fetch --depth 1 origin "$DENO_REF"
+          git -C ../deno checkout -q FETCH_HEAD
+          # The patch's [patch.crates-io] v8 path is a local dev path — point it
+          # at this checkout.
+          sed "s#/Users/divy/gh/v82jsc#${GITHUB_WORKSPACE}#g" \
+            tools/deno/deno-jsc-integration.patch > /tmp/deno.patch
+          git -C ../deno apply --3way /tmp/deno.patch || git -C ../deno apply /tmp/deno.patch
+          # Select this job's backend by swapping the v82jsc feature list the
+          # patch hardcodes (vendored JSC) for this matrix entry's features.
+          perl -0pi -e 's/"engine_jsc", "vendor_jsc"/${{ matrix.features }}/g' ../deno/Cargo.toml
+
+      - name: Build deno (${{ matrix.backend }})
+        working-directory: ../deno
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="-C link-arg=-fuse-ld=/usr/bin/ld -C link-arg=-L$(xcrun --show-sdk-path)/usr/lib"
+          cargo build --release --bin deno --features hmr
+          codesign --force --sign - --entitlements cli/entitlements.plist target/release/deno
+
+      - name: Run ES-module conformance suite
+        run: tests/modules/run.sh "../deno/target/release/deno" "${{ matrix.backend }}"
 
   module-tests:
     name: module suite (stock-v8 oracle)
@@ -44,53 +121,6 @@ jobs:
           deno-version: v2.x
       - name: Run ES-module conformance suite
         run: tests/modules/run.sh "$(command -v deno)" stock-v8
-
-  # Build a real deno on the vendored-JSC backend (WebKit builds from source in
-  # ~11min via build.rs) and run the full module suite against it — same
-  # byte-for-byte expectations as the stock-v8 oracle.
-  deno-jsc:
-    name: deno (vendored JSC) module suite
-    # macOS 15+: WebKit's bmalloc uses os_unfair_lock_lock_with_flags (15.0+),
-    # fatal under -Werror=unguarded-availability on an older deployment target.
-    runs-on: macos-15
-    timeout-minutes: 120
-    env:
-      MACOSX_DEPLOYMENT_TARGET: "15.0"
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: deno-jsc
-      - name: Install ninja (WebKit build)
-        run: brew install ninja
-
-      - name: Clone deno + apply the JSC integration patch
-        run: |
-          set -euo pipefail
-          DENO_REF="$(cat tools/deno/DENO_REF)"
-          mkdir -p ../deno && git -C ../deno init -q
-          git -C ../deno remote add origin https://github.com/denoland/deno
-          git -C ../deno fetch --depth 1 origin "$DENO_REF"
-          git -C ../deno checkout -q FETCH_HEAD
-          # The patch's [patch.crates-io] v8 path is a local dev path — point it
-          # at this checkout.
-          sed "s#/Users/divy/gh/v82jsc#${GITHUB_WORKSPACE}#g" \
-            tools/deno/deno-jsc-integration.patch > /tmp/deno-jsc.patch
-          git -C ../deno apply --3way /tmp/deno-jsc.patch || git -C ../deno apply /tmp/deno-jsc.patch
-
-      - name: Build deno (vendored JSC; builds WebKit from source)
-        working-directory: ../deno
-        run: |
-          set -euo pipefail
-          export RUSTFLAGS="-C link-arg=-fuse-ld=/usr/bin/ld -C link-arg=-L$(xcrun --show-sdk-path)/usr/lib"
-          cargo build --release --bin deno --features hmr
-          codesign --force --sign - --entitlements cli/entitlements.plist target/release/deno
-
-      - name: Run ES-module conformance suite on deno-JSC
-        run: tests/modules/run.sh "../deno/target/release/deno" jsc-vendored
 
   fmt:
     name: rustfmt

@@ -1,0 +1,75 @@
+name: Release
+
+# Tag-triggered: build a real deno on each v82jsc backend and attach the
+# binaries to the GitHub release for that tag.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  deno:
+    name: deno-${{ matrix.backend }}
+    runs-on: macos-15
+    timeout-minutes: 120
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: jsc
+            features: '"engine_jsc", "vendor_jsc"'
+            ninja: true
+          - backend: sys-jsc
+            features: '"system_jsc"'
+          - backend: quickjs
+            features: '"quickjs"'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.backend }}
+      - name: Install ninja (WebKit build)
+        if: matrix.ninja
+        run: brew install ninja
+
+      - name: Clone deno + apply the v82jsc integration patch
+        run: |
+          set -euo pipefail
+          DENO_REF="$(cat tools/deno/DENO_REF)"
+          mkdir -p ../deno && git -C ../deno init -q
+          git -C ../deno remote add origin https://github.com/denoland/deno
+          git -C ../deno fetch --depth 1 origin "$DENO_REF"
+          git -C ../deno checkout -q FETCH_HEAD
+          sed "s#/Users/divy/gh/v82jsc#${GITHUB_WORKSPACE}#g" \
+            tools/deno/deno-jsc-integration.patch > /tmp/deno.patch
+          git -C ../deno apply --3way /tmp/deno.patch || git -C ../deno apply /tmp/deno.patch
+          perl -0pi -e 's/"engine_jsc", "vendor_jsc"/${{ matrix.features }}/g' ../deno/Cargo.toml
+
+      - name: Build deno (${{ matrix.backend }})
+        working-directory: ../deno
+        run: |
+          set -euo pipefail
+          export RUSTFLAGS="-C link-arg=-fuse-ld=/usr/bin/ld -C link-arg=-L$(xcrun --show-sdk-path)/usr/lib"
+          cargo build --release --bin deno --features hmr
+          codesign --force --sign - --entitlements cli/entitlements.plist target/release/deno
+
+      - name: Package the binary
+        run: |
+          set -euo pipefail
+          asset="deno-${{ matrix.backend }}-aarch64-apple-darwin"
+          mkdir -p dist
+          cp ../deno/target/release/deno "dist/$asset"
+          gzip -9 -c "dist/$asset" > "dist/$asset.gz"
+
+      - name: Upload to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/deno-${{ matrix.backend }}-aarch64-apple-darwin.gz
