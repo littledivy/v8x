@@ -50,8 +50,12 @@ jobs:
   # byte-for-byte expectations as the stock-v8 oracle.
   deno-jsc:
     name: deno (vendored JSC) module suite
-    runs-on: macos-latest
+    # macOS 15+: WebKit's bmalloc uses os_unfair_lock_lock_with_flags (15.0+),
+    # fatal under -Werror=unguarded-availability on an older deployment target.
+    runs-on: macos-15
     timeout-minutes: 120
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "15.0"
     steps:
       - uses: actions/checkout@v4
         with:
