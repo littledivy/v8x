@@ -168,11 +168,11 @@ pub extern "C" fn v8__ArrayBuffer__New__with_byte_length(
     return ptr::null();
   }
 
-  let data = if byte_length == 0 {
-    ptr::null_mut()
-  } else {
-    unsafe { calloc(byte_length, 1) }
-  };
+  // Always back the buffer with a non-null allocation: a NoCopy ArrayBuffer
+  // whose data pointer is null is treated as DETACHED by JSC, so any view over
+  // a zero-length buffer would throw "ArrayBuffer has been detached". Allocate
+  // at least one byte while still reporting byte_length to JSC.
+  let data = unsafe { calloc(byte_length.max(1), 1) };
   unsafe extern "C" fn dealloc(bytes: *mut c_void, _ctx: *mut c_void) {
     if !bytes.is_null() {
       unsafe { free(bytes) };
@@ -725,6 +725,14 @@ fn make_typed_array(
   let ctx = current_ctx();
   if ctx.is_null() || buf.is_null() {
     return ptr::null();
+  }
+  // A zero-length view needs no shared storage, and JSC's
+  // ...WithArrayBufferAndOffset path rejects offset==length==0 over an empty
+  // buffer as out-of-bounds. Build a standalone empty typed array instead —
+  // semantically identical (no elements to alias) and always succeeds.
+  if length == 0 {
+    let obj = unsafe { JSObjectMakeTypedArray(ctx, ty, 0, ptr::null_mut()) };
+    return obj as JSValueRef;
   }
   let obj = unsafe {
     JSObjectMakeTypedArrayWithArrayBufferAndOffset(
