@@ -11,7 +11,22 @@ use crate::Platform;
 use std::os::raw::{c_char, c_int};
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__V8__InitializePlatform(_platform: *mut Platform) {}
+pub extern "C" fn v8__V8__InitializePlatform(_platform: *mut Platform) {
+  // Opt JSC into TC39 Explicit Resource Management (`using` / `await using` +
+  // Symbol.dispose/asyncDispose). It's gated off by default
+  // (OptionsList.h: useExplicitResourceManagement) but stable JS that deno's
+  // transpiler emits verbatim, so v8 parses it and JSC must too. JSC reads
+  // `JSC_<option>` env vars at Options::initialize() (a `Normal`-availability
+  // option, honored in release), and that runs lazily on first VM creation —
+  // after this, before any isolate exists. Works for vendored and system JSC
+  // alike (no C++ Options API needed). Don't clobber an explicit override.
+  if std::env::var_os("JSC_useExplicitResourceManagement").is_none() {
+    // SAFETY: called once at platform init, before any threads spawn a VM.
+    unsafe {
+      std::env::set_var("JSC_useExplicitResourceManagement", "1");
+    }
+  }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__Initialize() {}
