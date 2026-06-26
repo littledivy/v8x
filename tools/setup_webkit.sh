@@ -8,6 +8,13 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 WK=vendor/webkit
 
+# `--patches-only`: init the submodule + apply patches, then stop (no build).
+# Used by build.rs to patch the source even when a PREBUILT lib archive is in
+# place (the glue compiles against the patched headers). The full run also does
+# the patch step, so it stays idempotent.
+PATCHES_ONLY=0
+[ "${1:-}" = "--patches-only" ] && PATCHES_ONLY=1
+
 # Fetch WebKit at the pinned submodule commit.
 if [ ! -d "$WK/Source/JavaScriptCore" ]; then
   git submodule update --init --depth 1 "$WK"
@@ -21,6 +28,11 @@ for p in patches/webkit-[0-9]*.patch; do
     git -C "$WK" apply "../../$p" || echo "warn: $p may already be applied"
   fi
 done
+
+if [ "$PATCHES_ONLY" = "1" ]; then
+  echo "WebKit patches applied (source only; no build)."
+  exit 0
+fi
 
 # Static build. USE_THIN_ARCHIVES=OFF emits real self-contained archives.
 "$WK/Tools/Scripts/build-jsc" --jsc-only --release \

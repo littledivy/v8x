@@ -150,9 +150,25 @@ fn build_vendored_jsc(manifest_dir: &std::path::Path) {
 
   // Bundled = STATIC: the JSCOnly port with -DENABLE_STATIC_JSC=ON emits
   // libJavaScriptCore.a + libWTF.a + libbmalloc.a; we link them into the
-  // binary so it's self-contained (no dylib, no rpath). Build if missing.
+  // binary so it's self-contained (no dylib, no rpath).
   let jsc_a = lib_dir.join("libJavaScriptCore.a");
-  if !jsc_a.exists() && env::var_os("JSC_VENDOR_BUILD_DIR").is_none() {
+  let prebuilt = jsc_a.exists() || env::var_os("JSC_VENDOR_BUILD_DIR").is_some();
+  if prebuilt {
+    // A PREBUILT lib archive is in place (CI downloads the WebKit static-lib
+    // release — see .github/workflows/webkit-release.yml). Still apply the
+    // source patches so the glue (native_modules.cpp) compiles against the
+    // patched headers; skip the multi-hour build.
+    let _ = &webkit;
+    let status = std::process::Command::new("bash")
+      .arg(manifest_dir.join("tools/setup_webkit.sh"))
+      .arg("--patches-only")
+      .current_dir(manifest_dir)
+      .status();
+    match status {
+      Ok(s) if s.success() => {}
+      other => panic!("tools/setup_webkit.sh --patches-only failed: {other:?}"),
+    }
+  } else {
     // tools/setup_webkit.sh inits the pinned submodule, applies the patches,
     // and runs the static JSCOnly build — everything needed for a fresh tree.
     let _ = &webkit;
