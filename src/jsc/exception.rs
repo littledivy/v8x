@@ -197,21 +197,140 @@ pub extern "C" fn v8__Location__GetColumnNumber(this: *const Location) -> int {
   unsafe { *((this as *const i32).add(1)) as int }
 }
 
+// JSC has no public structured stack-trace API, but `JSContextCreateBacktrace`
+// (a stable C SPI, present in both the vendored and the system framework)
+// returns a formatted backtrace of the current JS stack. We capture + parse it
+// into our own frame structs and back v8's opaque StackTrace/StackFrame with
+// them. Each frame line is `#<idx> <funcName>() at <sourceURL>:<line>` — JSC
+// emits line but not column, so columns report as 0 (refine via C++ glue if a
+// consumer needs exact columns). deno only ever reaches these frames through
+// the C-ABI accessors below, so a private backing layout is sound.
+unsafe extern "C" {
+  fn JSContextCreateBacktrace(
+    ctx: JSContextRef,
+    max_stack_size: u32,
+  ) -> JSStringRef;
+}
+
+pub(crate) struct JscStackFrame {
+  line: i32,
+  col: i32,
+  url: Option<std::string::String>,
+  func: Option<std::string::String>,
+  is_user: bool,
+}
+
+pub(crate) struct JscStackTrace {
+  frames: Vec<JscStackFrame>,
+}
+
+thread_local! {
+  // Holds the previous capture so it can be freed on the next one, bounding the
+  // leak to a single live trace (deno consumes each trace synchronously before
+  // capturing the next on this thread).
+  static LAST_STACK: std::cell::Cell<*mut JscStackTrace> =
+    const { std::cell::Cell::new(ptr::null_mut()) };
+}
+
+fn jsstring_to_rust(s: JSStringRef) -> std::string::String {
+  if s.is_null() {
+    return std::string::String::new();
+  }
+  unsafe {
+    let max = JSStringGetMaximumUTF8CStringSize(s);
+    let mut buf = vec![0u8; max];
+    let n = JSStringGetUTF8CString(s, buf.as_mut_ptr() as *mut c_char, max);
+    if n > 0 {
+      buf.truncate(n - 1);
+      std::string::String::from_utf8_lossy(&buf).into_owned()
+    } else {
+      std::string::String::new()
+    }
+  }
+}
+
+fn parse_backtrace(raw: &str) -> Vec<JscStackFrame> {
+  let mut frames = Vec::new();
+  for line in raw.lines() {
+    // Strip the `#<idx> ` prefix.
+    let rest = match line.split_once(' ') {
+      Some((idx, rest)) if idx.starts_with('#') => rest,
+      _ => line,
+    };
+    // Split `<funcName>() at <sourceURL>[:<line>]`.
+    let (func, tail) = match rest.split_once("() at ") {
+      Some((f, t)) => (f.trim(), t),
+      None => ("", rest),
+    };
+    // The trailing `:<line>` (if present). sourceURLs contain colons
+    // (`file://`, `https://host:port/`), so only treat a trailing all-digit
+    // segment as the line number.
+    let (url, line_no) = match tail.rsplit_once(':') {
+      Some((u, n))
+        if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) =>
+      {
+        (u, n.parse::<i32>().unwrap_or(0))
+      }
+      _ => (tail, 0),
+    };
+    let url = url.trim();
+    let has_url = !url.is_empty();
+    frames.push(JscStackFrame {
+      line: line_no,
+      col: 0,
+      url: has_url.then(|| url.to_string()),
+      func: (!func.is_empty()).then(|| func.to_string()),
+      // A frame with a source URL is user/script JS; an empty URL is a native
+      // (host) frame, which v8 reports as not user-JavaScript.
+      is_user: has_url,
+    });
+  }
+  frames
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackTrace__CurrentStackTrace(
   isolate: *mut RealIsolate,
   frame_limit: int,
 ) -> *const StackTrace {
-  let _ = (isolate, frame_limit);
-  ptr::null()
+  let _ = isolate;
+  // Free the previous capture (pure-Rust drop; no protected JS values held).
+  LAST_STACK.with(|cell| {
+    let prev = cell.replace(ptr::null_mut());
+    if !prev.is_null() {
+      unsafe { drop(Box::from_raw(prev)) };
+    }
+  });
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  let limit = if frame_limit <= 0 {
+    16
+  } else {
+    frame_limit as u32
+  };
+  let raw = unsafe { JSContextCreateBacktrace(ctx, limit) };
+  if raw.is_null() {
+    return ptr::null();
+  }
+  let s = jsstring_to_rust(raw);
+  unsafe { JSStringRelease(raw) };
+  let frames = parse_backtrace(&s);
+  let boxed = Box::into_raw(Box::new(JscStackTrace { frames }));
+  LAST_STACK.with(|cell| cell.set(boxed));
+  boxed as *const StackTrace
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackTrace__GetFrameCount(
   this: *const StackTrace,
 ) -> int {
-  let _ = this;
-  0
+  if this.is_null() {
+    return 0;
+  }
+  let st = unsafe { &*(this as *const JscStackTrace) };
+  st.frames.len() as int
 }
 
 #[unsafe(no_mangle)]
@@ -220,30 +339,60 @@ pub extern "C" fn v8__StackTrace__GetFrame(
   isolate: *mut RealIsolate,
   index: u32,
 ) -> *const StackFrame {
-  let _ = (this, isolate, index);
-  ptr::null()
+  let _ = isolate;
+  if this.is_null() {
+    return ptr::null();
+  }
+  let st = unsafe { &*(this as *const JscStackTrace) };
+  match st.frames.get(index as usize) {
+    Some(frame) => frame as *const JscStackFrame as *const StackFrame,
+    None => ptr::null(),
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackFrame__GetLineNumber(
   this: *const StackFrame,
 ) -> int {
-  let _ = this;
-  0
+  if this.is_null() {
+    return 0;
+  }
+  unsafe { (*(this as *const JscStackFrame)).line as int }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackFrame__GetColumn(this: *const StackFrame) -> int {
-  let _ = this;
-  0
+  if this.is_null() {
+    return 0;
+  }
+  unsafe { (*(this as *const JscStackFrame)).col as int }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackFrame__GetScriptName(
   this: *const StackFrame,
 ) -> *const String {
-  let _ = this;
-  ptr::null()
+  if this.is_null() {
+    return ptr::null();
+  }
+  let frame = unsafe { &*(this as *const JscStackFrame) };
+  let Some(url) = frame.url.as_deref() else {
+    return ptr::null();
+  };
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    let cstr = match std::ffi::CString::new(url) {
+      Ok(c) => c,
+      Err(_) => return ptr::null(),
+    };
+    let js = JSStringCreateWithUTF8CString(cstr.as_ptr());
+    let v = JSValueMakeString(ctx, js);
+    JSStringRelease(js);
+    intern_ctx::<String>(ctx, v)
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -256,8 +405,10 @@ pub extern "C" fn v8__StackFrame__IsEval(this: *const StackFrame) -> bool {
 pub extern "C" fn v8__StackFrame__IsUserJavaScript(
   this: *const StackFrame,
 ) -> bool {
-  let _ = this;
-  true
+  if this.is_null() {
+    return false;
+  }
+  unsafe { (*(this as *const JscStackFrame)).is_user }
 }
 
 unsafe fn track_promise(ctx: JSContextRef, promise: JSObjectRef) {
@@ -695,8 +846,27 @@ pub extern "C" fn v8__Message__GetSourceLine(
 pub extern "C" fn v8__StackFrame__GetFunctionName(
   this: *const StackFrame,
 ) -> *const String {
-  let _ = this;
-  ptr::null()
+  if this.is_null() {
+    return ptr::null();
+  }
+  let frame = unsafe { &*(this as *const JscStackFrame) };
+  let Some(func) = frame.func.as_deref() else {
+    return ptr::null();
+  };
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    let cstr = match std::ffi::CString::new(func) {
+      Ok(c) => c,
+      Err(_) => return ptr::null(),
+    };
+    let js = JSStringCreateWithUTF8CString(cstr.as_ptr());
+    let v = JSValueMakeString(ctx, js);
+    JSStringRelease(js);
+    intern_ctx::<String>(ctx, v)
+  }
 }
 
 #[unsafe(no_mangle)]
