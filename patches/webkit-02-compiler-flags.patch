@@ -1,15 +1,18 @@
 diff --git a/Source/cmake/WebKitCompilerFlags.cmake b/Source/cmake/WebKitCompilerFlags.cmake
-index 325fbcca5a..8c8e218da9 100644
+index 325fbcca5a..31736f0c8e 100644
 --- a/Source/cmake/WebKitCompilerFlags.cmake
 +++ b/Source/cmake/WebKitCompilerFlags.cmake
-@@ -333,7 +333,9 @@ if (COMPILER_IS_GCC_OR_CLANG)
+@@ -333,7 +333,12 @@ if (COMPILER_IS_GCC_OR_CLANG)
                                           -Werror=undefined-internal)
  
      # FIXME: https://bugs.webkit.org/show_bug.cgi?id=299689
 -    WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS(-Wno-character-conversion)
-+    # v82jsc: Apple clang lacks this newer flag; under -Werror the unknown flag
-+    # is fatal for C sources (which bypass clang-wrapper). Drop it.
-+    # WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS(-Wno-character-conversion)
++    # v82jsc: -Wno-unknown-warning-option keeps this non-fatal on Apple clangs
++    # that don't recognize -Wno-character-conversion, while still suppressing the
++    # warning on clangs that DO emit it (CI's clang errors on it in
++    # URLHelpers.cpp under -Werror). Works for the C sources that bypass the
++    # clang-wrapper too.
++    WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS(-Wno-unknown-warning-option -Wno-character-conversion)
  endif ()
  
  if (COMPILER_IS_GCC_OR_CLANG AND NOT MSVC)

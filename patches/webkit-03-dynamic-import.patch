@@ -126,17 +126,3 @@ index bea979b879..417b77a857 100644
  #endif
  
  JSAPIGlobalObject::JSAPIGlobalObject(VM& vm, Structure* structure)
-diff --git a/Source/cmake/WebKitCompilerFlags.cmake b/Source/cmake/WebKitCompilerFlags.cmake
-index 325fbcca5a..856aefe077 100644
---- a/Source/cmake/WebKitCompilerFlags.cmake
-+++ b/Source/cmake/WebKitCompilerFlags.cmake
-@@ -333,7 +333,8 @@ if (COMPILER_IS_GCC_OR_CLANG)
-                                          -Werror=undefined-internal)
- 
-     # FIXME: https://bugs.webkit.org/show_bug.cgi?id=299689
--    WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS(-Wno-character-conversion)
-+    # v82jsc: -Wno-character-conversion rejected by newer Apple clang
-+    # WEBKIT_PREPEND_GLOBAL_COMPILER_FLAGS(-Wno-character-conversion)
- endif ()
- 
- if (COMPILER_IS_GCC_OR_CLANG AND NOT MSVC)
