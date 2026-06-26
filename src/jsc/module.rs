@@ -583,6 +583,11 @@ unsafe fn eval_value_as_script(
     )
   };
   unsafe { JSStringRelease(src_str) };
+  // Surface the eval error so deno's TryCatch (execute_script) sees has_caught()
+  // instead of asserting on a null return with no pending exception.
+  if result.is_null() && !exc.is_null() {
+    unsafe { crate::jsc::core::record_pending_exception(ctx, exc) };
+  }
   result
 }
 
