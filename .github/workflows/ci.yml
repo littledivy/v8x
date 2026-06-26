@@ -6,6 +6,11 @@ on:
   pull_request:
     branches: [main]
 
+# Newer push to the same ref cancels the older in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   # ---------------------------------------------------------------------------
   # Fast checks: `cargo build --lib` per backend. Catches compile breakage
