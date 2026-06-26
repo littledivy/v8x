@@ -144,6 +144,31 @@ unsafe extern "C" {
 /// is proven on the framework battery; otherwise the rewrite_es_module fallback
 /// stays the default.
 #[inline]
+/// Snapshot R&D: append `(specifier, source)` to a dump dir in load order — one
+/// `NNN.<sanitized-spec>.js` file per module plus a `MANIFEST` of the order.
+/// Used to build/validate the runtime bundler offline. Not on any hot path.
+fn dump_module(dir: &std::path::Path, specifier: &str, source: &str) {
+  use std::io::Write;
+  let _ = std::fs::create_dir_all(dir);
+  let manifest = dir.join("MANIFEST");
+  let idx = std::fs::read_to_string(&manifest)
+    .map(|s| s.lines().count())
+    .unwrap_or(0);
+  let safe: std::string::String = specifier
+    .chars()
+    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+    .collect();
+  let fname = format!("{idx:03}.{safe}.js");
+  let _ = std::fs::write(dir.join(&fname), source);
+  if let Ok(mut f) = std::fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&manifest)
+  {
+    let _ = writeln!(f, "{fname}\t{specifier}");
+  }
+}
+
 fn native_modules_enabled() -> bool {
   // Native JSModuleRecords are the module implementation on vendored JSC (the
   // glue needs WebKit's C++ internals). System JSC has no module C++ API, so it
@@ -881,6 +906,12 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   };
 
   let specifier = unsafe { resource_name_of(ctx, source) };
+
+  // Snapshot R&D: dump every compiled module (in load order) to a dir so the
+  // runtime-bundler can be built/validated against real boot data. Gated.
+  if let Some(dir) = std::env::var_os("V82JSC_DUMP_MODULES") {
+    dump_module(std::path::Path::new(&dir), &specifier, &text);
+  }
 
   // VENDORED: every module is a real JSC record (source via JSModuleRecord,
   // deno's V8-synthetic modules via SyntheticModuleRecord). No string rewriter.
