@@ -1,8 +1,8 @@
 diff --git a/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp b/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
-index bea979b879..ab1d36dcf1 100644
+index bea979b879..417b77a857 100644
 --- a/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
 +++ b/Source/JavaScriptCore/API/JSAPIGlobalObject.cpp
-@@ -26,10 +26,26 @@
+@@ -26,10 +26,38 @@
  #include "config.h"
  #include "JSAPIGlobalObject.h"
  
@@ -14,6 +14,8 @@ index bea979b879..ab1d36dcf1 100644
  #include "JSCellInlines.h"
 +#include "JSPromise.h"
 +#include "JSStringRef.h"
++#include "ObjectConstructor.h"
++#include "ScriptFetchParameters.h"
  #include "StructureCreateInlines.h"
  
 +// v82jsc: routes import() to deno's HostImportModuleDynamicallyCallback (the
@@ -21,7 +23,17 @@ index bea979b879..ab1d36dcf1 100644
 +// WEAK DEFINITION (returns null) lets JSC's own tools (jsc CLI, etc.) that link
 +// libJavaScriptCore.a WITHOUT the Rust shim still resolve the symbol; the null
 +// is handled by the caller. deno's strong Rust definition wins in the binary.
-+extern "C" __attribute__((weak)) JSValueRef v82jsc_dynamic_import(JSContextRef, JSStringRef, JSStringRef)
++extern "C" __attribute__((weak)) JSValueRef v82jsc_dynamic_import(JSContextRef, JSStringRef, JSStringRef, int)
++{
++    return nullptr;
++}
++
++// v82jsc: routes a native module's `import.meta` to deno's
++// HostInitializeImportMetaObject callback (real impl #[no_mangle] in the Rust
++// shim). Weak null fallback so the jsc CLI links without the shim. `record` is
++// the raw AbstractModuleRecord* (key for the Rust record->Module map); `key` is
++// the module key string (the URL).
++extern "C" __attribute__((weak)) JSValueRef v82jsc_create_import_meta(JSContextRef, void*, JSStringRef)
 +{
 +    return nullptr;
 +}
@@ -29,7 +41,7 @@ index bea979b879..ab1d36dcf1 100644
  namespace JSC {
  
  const ClassInfo JSAPIGlobalObject::s_info = { "GlobalObject"_s, &Base::s_info, nullptr, nullptr, CREATE_METHOD_TABLE(JSAPIGlobalObject) };
-@@ -43,7 +59,7 @@ const GlobalObjectMethodTable* JSAPIGlobalObject::globalObjectMethodTable()
+@@ -43,10 +71,10 @@ const GlobalObjectMethodTable* JSAPIGlobalObject::globalObjectMethodTable()
          &shouldInterruptScript,
          &javaScriptRuntimeFlags,
          &shouldInterruptScriptBeforeTimeout,
@@ -37,8 +49,12 @@ index bea979b879..ab1d36dcf1 100644
 +        &moduleLoaderImportModule, // v82jsc: wired to deno's dynamic import
          nullptr, // moduleLoaderResolve
          nullptr, // moduleLoaderFetch
-         nullptr, // moduleLoaderCreateImportMetaProperties
-@@ -69,6 +85,46 @@ void JSAPIGlobalObject::reportUncaughtExceptionAtEventLoop(JSGlobalObject* globa
+-        nullptr, // moduleLoaderCreateImportMetaProperties
++        &moduleLoaderCreateImportMetaProperties, // v82jsc: wired to deno's import.meta
+         nullptr, // moduleLoaderEvaluate
+         &promiseRejectionTracker,
+         &reportUncaughtExceptionAtEventLoop,
+@@ -69,6 +97,71 @@ void JSAPIGlobalObject::reportUncaughtExceptionAtEventLoop(JSGlobalObject* globa
      Base::reportUncaughtExceptionAtEventLoop(globalObject, exception);
  }
  
@@ -46,7 +62,7 @@ index bea979b879..ab1d36dcf1 100644
 +// no module loader, so route to deno's HostImportModuleDynamicallyCallback
 +// (via the Rust shim) and return its promise — deno resolves/fetches/evaluates
 +// the module and settles the promise with the namespace.
-+JSPromise* JSAPIGlobalObject::moduleLoaderImportModule(JSGlobalObject* globalObject, JSModuleLoader*, JSString* specifierValue, RefPtr<ScriptFetchParameters>, const SourceOrigin& sourceOrigin, bool)
++JSPromise* JSAPIGlobalObject::moduleLoaderImportModule(JSGlobalObject* globalObject, JSModuleLoader*, JSString* specifierValue, RefPtr<ScriptFetchParameters> attributes, const SourceOrigin& sourceOrigin, bool)
 +{
 +    VM& vm = globalObject->vm();
 +    auto scope = DECLARE_THROW_SCOPE(vm);
@@ -66,8 +82,9 @@ index bea979b879..ab1d36dcf1 100644
 +    JSGlobalContextRef ctx = toGlobalRef(globalObject);
 +    JSStringRef specRef = JSStringCreateWithUTF8CString(specifier.utf8().data());
 +    JSStringRef refRef = referrer.isNull() ? nullptr : JSStringCreateWithUTF8CString(referrer.utf8().data());
++    int attrType = attributes ? static_cast<int>(attributes->type()) : 0;
 +
-+    JSValueRef promiseRef = v82jsc_dynamic_import(ctx, specRef, refRef);
++    JSValueRef promiseRef = v82jsc_dynamic_import(ctx, specRef, refRef, attrType);
 +
 +    JSStringRelease(specRef);
 +    if (refRef)
@@ -80,6 +97,30 @@ index bea979b879..ab1d36dcf1 100644
 +    if (promiseValue.isObject())
 +        return static_cast<JSPromise*>(asObject(promiseValue));
 +    return reject("dynamic import: host did not return a promise"_s);
++}
++
++// v82jsc: a native module's `import.meta`. Route to deno's import-meta callback
++// (via the Rust shim) which sets url/main/resolve; fall back to an empty object.
++JSObject* JSAPIGlobalObject::moduleLoaderCreateImportMetaProperties(JSGlobalObject* globalObject, JSModuleLoader*, JSValue key, JSModuleRecord* moduleRecord, RefPtr<ScriptFetcher>)
++{
++    JSObject* empty = constructEmptyObject(globalObject->vm(), globalObject->nullPrototypeObjectStructure());
++    if (!v82jsc_create_import_meta)
++        return empty;
++
++    String keyStr = key.isString() ? asString(key)->value(globalObject) : String();
++    JSGlobalContextRef ctx = toGlobalRef(globalObject);
++    JSStringRef keyRef = keyStr.isNull() ? nullptr : JSStringCreateWithUTF8CString(keyStr.utf8().data());
++
++    JSValueRef metaRef = v82jsc_create_import_meta(ctx, static_cast<void*>(moduleRecord), keyRef);
++    if (keyRef)
++        JSStringRelease(keyRef);
++
++    if (!metaRef)
++        return empty;
++    JSValue metaValue = toJS(globalObject, metaRef);
++    if (metaValue.isObject())
++        return asObject(metaValue);
++    return empty;
 +}
 +
  #endif

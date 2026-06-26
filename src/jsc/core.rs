@@ -433,6 +433,7 @@ pub extern "C" fn v8__Context__New(
   unsafe { install_stacktrace_shim(ctx) };
 
   unsafe { crate::jsc::isolate::install_unhandled_rejection_bridge(ctx) };
+  unsafe { crate::jsc::module::install_dynamic_import_global(ctx) };
   ctx as *const Context
 }
 

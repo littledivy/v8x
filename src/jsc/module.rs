@@ -73,6 +73,160 @@ struct SyntheticModule {
   dependencies: Vec<*const Module>,
 
   is_async: bool,
+
+  // Native JSC path (V82JSC_NATIVE_MODULES, vendored only): an opaque
+  // Strong<JSModuleRecord>* from native_modules.cpp. When set, compile/link/
+  // evaluate/namespace delegate to the real JSModuleRecord instead of the
+  // rewrite_es_module string rewriter. null for synthetic + rewriter modules.
+  native: *mut std::ffi::c_void,
+}
+
+// --- Native ES-module glue (src/jsc/native_modules.cpp). Vendored JSC only;
+// the symbols live in libv82jsc_native_modules.a, linked by build.rs. ---
+#[cfg(feature = "vendor_jsc")]
+unsafe extern "C" {
+  fn v82jsc_module_parse(
+    ctx: JSContextRef,
+    url: *const std::os::raw::c_char,
+    src: *const std::os::raw::c_char,
+    exc_out: *mut JSValueRef,
+  ) -> *mut std::ffi::c_void;
+  fn v82jsc_module_request_count(handle: *mut std::ffi::c_void) -> i32;
+  fn v82jsc_module_request_at(
+    handle: *mut std::ffi::c_void,
+    i: i32,
+    buf: *mut std::os::raw::c_char,
+    cap: i32,
+  ) -> i32;
+  fn v82jsc_module_add_dependency(
+    ctx: JSContextRef,
+    parent: *mut std::ffi::c_void,
+    spec: *const std::os::raw::c_char,
+    dep: *mut std::ffi::c_void,
+  ) -> bool;
+  fn v82jsc_module_link(
+    ctx: JSContextRef,
+    handle: *mut std::ffi::c_void,
+  ) -> bool;
+  fn v82jsc_module_evaluate(
+    ctx: JSContextRef,
+    handle: *mut std::ffi::c_void,
+  ) -> JSValueRef;
+  fn v82jsc_module_namespace(
+    ctx: JSContextRef,
+    handle: *mut std::ffi::c_void,
+  ) -> JSValueRef;
+  fn v82jsc_module_release(handle: *mut std::ffi::c_void);
+  fn v82jsc_module_status(handle: *mut std::ffi::c_void) -> i32;
+  fn v82jsc_module_record_ptr(
+    handle: *mut std::ffi::c_void,
+  ) -> *mut std::ffi::c_void;
+  fn v82jsc_module_request_attr_type(
+    handle: *mut std::ffi::c_void,
+    i: i32,
+  ) -> i32;
+  fn v82jsc_synthetic_create(
+    ctx: JSContextRef,
+    url: *const std::os::raw::c_char,
+    names: *const *const std::os::raw::c_char,
+    count: i32,
+  ) -> *mut std::ffi::c_void;
+  fn v82jsc_synthetic_set_export(
+    ctx: JSContextRef,
+    handle: *mut std::ffi::c_void,
+    name: *const std::os::raw::c_char,
+    value: JSValueRef,
+  ) -> bool;
+}
+
+/// Whether the native JSModuleRecord path is active. Vendored JSC only (the glue
+/// needs WebKit's C++ internals) AND opt-in via `V82JSC_NATIVE_MODULES` until it
+/// is proven on the framework battery; otherwise the rewrite_es_module fallback
+/// stays the default.
+#[inline]
+fn native_modules_enabled() -> bool {
+  // Native JSModuleRecords are the module implementation on vendored JSC (the
+  // glue needs WebKit's C++ internals). System JSC has no module C++ API, so it
+  // falls back to the rewrite_es_module path. No runtime flag.
+  cfg!(feature = "vendor_jsc")
+}
+
+/// Whether a module with key `specifier` should use the native JSModuleRecord
+/// path. Deno's runtime internals (`ext:`, `node:`, `checkin:`) and synthetic
+/// modules (JSON, virtual op modules) can't be linked as JSModuleRecords, so
+/// only real source-text ESM URLs (file/http/https/npm/jsr/data) qualify.
+#[cfg(feature = "vendor_jsc")]
+fn native_eligible(_specifier: &str) -> bool {
+  // On the vendored build EVERY module is handled by real JSC records — source
+  // text via JSModuleRecord, deno's V8-synthetic modules (ops/JSON/node facades)
+  // via JSC SyntheticModuleRecords (see CreateSyntheticModule). The
+  // rewrite_es_module string rewriter is NEVER used here; it survives only for
+  // the system-JavaScriptCore build, which has no C++ module API. So: always
+  // native.
+  true
+}
+
+/// Parse `src` (module key `url`) into a native JSModuleRecord, returning the
+/// opaque handle and its requested specifiers. None on parse error (the
+/// exception is recorded as pending on `ctx`).
+#[cfg(feature = "vendor_jsc")]
+unsafe fn native_parse(
+  ctx: JSContextRef,
+  url: &str,
+  src: &str,
+) -> Option<(*mut std::ffi::c_void, Vec<std::string::String>)> {
+  let url_c = std::ffi::CString::new(url).ok()?;
+  let src_c = std::ffi::CString::new(src).ok()?;
+  let mut exc: JSValueRef = ptr::null();
+  let handle = unsafe {
+    v82jsc_module_parse(ctx, url_c.as_ptr(), src_c.as_ptr(), &mut exc)
+  };
+  if handle.is_null() {
+    let e = if exc.is_null() {
+      unsafe { make_generic_error(ctx, "module parse failed") }
+    } else {
+      exc
+    };
+    unsafe { crate::jsc::core::record_pending_exception(ctx, e) };
+    return None;
+  }
+  let count = unsafe { v82jsc_module_request_count(handle) };
+  let mut specs = Vec::with_capacity(count.max(0) as usize);
+  for i in 0..count {
+    let mut buf = vec![0u8; 1024];
+    let n = unsafe {
+      v82jsc_module_request_at(
+        handle,
+        i,
+        buf.as_mut_ptr() as *mut std::os::raw::c_char,
+        buf.len() as i32,
+      )
+    };
+    if n < 0 {
+      continue;
+    }
+    let n = n as usize;
+    if n >= buf.len() {
+      // Specifier longer than the buffer; re-fetch with the exact size.
+      buf = vec![0u8; n + 1];
+      let n2 = unsafe {
+        v82jsc_module_request_at(
+          handle,
+          i,
+          buf.as_mut_ptr() as *mut std::os::raw::c_char,
+          buf.len() as i32,
+        )
+      };
+      if n2 < 0 {
+        continue;
+      }
+    }
+    buf.truncate(n);
+    if let Ok(s) = std::string::String::from_utf8(buf) {
+      specs.push(s);
+    }
+  }
+  Some((handle, specs))
 }
 
 unsafe extern "C" fn mod_finalize(object: JSObjectRef) {
@@ -81,6 +235,16 @@ unsafe extern "C" fn mod_finalize(object: JSObjectRef) {
     let m = unsafe { Box::from_raw(p) };
     if !m.namespace.is_null() && !m.ctx.is_null() {
       unsafe { JSValueUnprotect(m.ctx, m.namespace as JSValueRef) };
+    }
+    #[cfg(feature = "vendor_jsc")]
+    if !m.native.is_null() {
+      let rec = unsafe { v82jsc_module_record_ptr(m.native) };
+      if !rec.is_null() {
+        NATIVE_RECORD_MAP.with(|map| {
+          map.borrow_mut().remove(&(rec as usize));
+        });
+      }
+      unsafe { v82jsc_module_release(m.native) };
     }
   }
 }
@@ -101,6 +265,50 @@ thread_local! {
     static DYN_IMPORT_CB: std::cell::Cell<
         Option<crate::isolate::RawHostImportModuleDynamicallyCallback>,
     > = const { std::cell::Cell::new(None) };
+
+    // Maps a native JSC record pointer -> deno Module wrapper, so the import.meta
+    // hook (moduleLoaderCreateImportMetaProperties) can find the module and route
+    // to deno's import_meta_cb (url/main/resolve).
+    static NATIVE_RECORD_MAP: std::cell::RefCell<
+        std::collections::HashMap<usize, *const Module>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// `import.meta` for a native module. JSC's moduleLoaderCreateImportMetaProperties
+/// hook calls this with the raw record pointer + module key. Routes to deno's
+/// HostInitializeImportMetaObject callback (sets url/main/resolve); falls back to
+/// `{ url: key }` if the module wrapper isn't found.
+#[cfg(feature = "vendor_jsc")]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn v82jsc_create_import_meta(
+  ctx: JSContextRef,
+  record_ptr: *mut std::ffi::c_void,
+  key: JSStringRef,
+) -> JSValueRef {
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    crate::jsc::core::restore_current(current_iso());
+    let module = NATIVE_RECORD_MAP
+      .with(|m| m.borrow().get(&(record_ptr as usize)).copied());
+    let context = ctx as *const Context;
+    if let Some(module) = module {
+      let meta = build_import_meta(context, module);
+      if !meta.is_null() {
+        return meta;
+      }
+    }
+    // Fallback: a plain object carrying just the URL (the module key).
+    let meta = JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut());
+    if !key.is_null() {
+      let url_key = JSStringCreateWithUTF8CString(c"url".as_ptr());
+      let url_val = JSValueMakeString(ctx, key);
+      JSObjectSetProperty(ctx, meta, url_key, url_val, 0, ptr::null_mut());
+      JSStringRelease(url_key);
+    }
+    meta as JSValueRef
+  }
 }
 
 pub(crate) fn set_dynamic_import_callback(
@@ -118,6 +326,7 @@ pub unsafe extern "C" fn v82jsc_dynamic_import(
   ctx: JSContextRef,
   specifier: JSStringRef,
   referrer: JSStringRef,
+  attr_type: i32,
 ) -> JSValueRef {
   let Some(cb) = DYN_IMPORT_CB.with(|c| c.get()) else {
     return ptr::null();
@@ -133,8 +342,26 @@ pub unsafe extern "C" fn v82jsc_dynamic_import(
     } else {
       JSValueMakeString(ctx, referrer)
     };
-    let empty_attrs =
-      JSObjectMakeArray(ctx, 0, ptr::null(), ptr::null_mut()) as JSValueRef;
+    // deno reads dynamic-import attributes as [key, value] pairs and derives the
+    // requested module type — carry the `with { type: ... }` (json/wasm).
+    let type_str = match attr_type {
+      3 => Some("json"),
+      2 => Some("webassembly"),
+      _ => None,
+    };
+    let empty_attrs = if let Some(ts) = type_str {
+      let mk = |s: &str| -> JSValueRef {
+        let c = std::ffi::CString::new(s).unwrap();
+        let js = JSStringCreateWithUTF8CString(c.as_ptr());
+        let v = JSValueMakeString(ctx, js);
+        JSStringRelease(js);
+        v
+      };
+      let pair = [mk("type"), mk(ts)];
+      JSObjectMakeArray(ctx, 2, pair.as_ptr(), ptr::null_mut()) as JSValueRef
+    } else {
+      JSObjectMakeArray(ctx, 0, ptr::null(), ptr::null_mut()) as JSValueRef
+    };
     // deno reads host_defined_options as a PrimitiveArray and calls .length()
     // (read_host_defined_options_kind); passing undefined makes it transmute a
     // non-array and crash. V8 supplies an EMPTY PrimitiveArray when the host set
@@ -160,6 +387,106 @@ pub unsafe extern "C" fn v82jsc_dynamic_import(
     let promise = cb(c_l, h_l, r_l, s_l, a_l);
     promise as JSValueRef
   }
+}
+
+/// JS-callable bridge `globalThis.__v82jsc_dynamicImport(specifier, referrer)`.
+/// The module-source rewriter turns dynamic `import(...)` into a call to this so
+/// dynamic import works WITHOUT a native module-loader hook -- crucial for the
+/// system JavaScriptCore.framework, whose shipped JSAPIGlobalObject has no
+/// `moduleLoaderImportModule` (that hook is our vendored-only C++ patch). Routes
+/// to the same deno callback as `v82jsc_dynamic_import`.
+unsafe extern "C" fn dynamic_import_js_cb(
+  ctx: JSContextRef,
+  _function: JSObjectRef,
+  _this: JSObjectRef,
+  argc: usize,
+  argv: *const JSValueRef,
+  _exception: *mut JSValueRef,
+) -> JSValueRef {
+  unsafe {
+    if argc < 1 || argv.is_null() {
+      return JSValueMakeUndefined(ctx);
+    }
+    let mut exc: JSValueRef = ptr::null();
+    let spec = JSValueToStringCopy(ctx, *argv, &mut exc);
+    if spec.is_null() {
+      return JSValueMakeUndefined(ctx);
+    }
+    let referrer = if argc >= 2 && JSValueIsString(ctx, *argv.add(1)) {
+      JSValueToStringCopy(ctx, *argv.add(1), &mut exc)
+    } else {
+      ptr::null_mut()
+    };
+    let promise = v82jsc_dynamic_import(ctx, spec, referrer, 0);
+    JSStringRelease(spec);
+    if !referrer.is_null() {
+      JSStringRelease(referrer);
+    }
+    if promise.is_null() {
+      JSValueMakeUndefined(ctx)
+    } else {
+      promise
+    }
+  }
+}
+
+/// Install `globalThis.__v82jsc_dynamicImport` on a context. Called for every
+/// context the embedder creates (see core.rs).
+pub(crate) unsafe fn install_dynamic_import_global(gctx: JSGlobalContextRef) {
+  unsafe {
+    let name =
+      JSStringCreateWithUTF8CString(c"__v82jsc_dynamicImport".as_ptr());
+    let f =
+      JSObjectMakeFunctionWithCallback(gctx, name, Some(dynamic_import_js_cb));
+    if f.is_null() {
+      JSStringRelease(name);
+      return;
+    }
+    let global = JSContextGetGlobalObject(gctx);
+    // kJSPropertyAttributeDontEnum = 2
+    JSObjectSetProperty(
+      gctx,
+      global,
+      name,
+      f as JSValueRef,
+      2,
+      ptr::null_mut(),
+    );
+    JSStringRelease(name);
+  }
+}
+
+/// Rewrite dynamic `import(` call sites to `__v82jsc_dynImport(` (a per-module
+/// closure injected by the caller that forwards to the host bridge with the
+/// module's URL as referrer). Matches the `import` keyword immediately followed
+/// by optional whitespace and `(`, only when not preceded by an identifier char
+/// (so `Reimport(` is left alone). `import.meta` / `import x from` have no `(`
+/// next, so they never match.
+pub(crate) fn rewrite_dynamic_import_calls(body: &str) -> std::string::String {
+  let bytes = body.as_bytes();
+  let mut out: Vec<u8> = Vec::with_capacity(body.len());
+  let mut i = 0;
+  let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+  while i < bytes.len() {
+    if bytes[i] == b'i'
+      && body[i..].starts_with("import")
+      && (i == 0 || !is_ident(bytes[i - 1]))
+    {
+      // skip whitespace after `import`
+      let mut j = i + 6;
+      while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+        j += 1;
+      }
+      if j < bytes.len() && bytes[j] == b'(' {
+        out.extend_from_slice(b"__v82jsc_dynImport(");
+        i = j + 1;
+        continue;
+      }
+    }
+    out.push(bytes[i]);
+    i += 1;
+  }
+  std::string::String::from_utf8(out).unwrap_or_else(|_| body.to_string())
 }
 
 fn mod_class() -> JSClassRef {
@@ -555,39 +882,97 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
 
   let specifier = unsafe { resource_name_of(ctx, source) };
 
-  let Some(rewrite) = rewrite_es_module(&text) else {
-    return ptr::null();
-  };
-
-  let namespace =
-    unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
-  unsafe { JSValueProtect(gctx, namespace as JSValueRef) };
-
-  // Register the namespace into the global registry NOW (at compile), not at
-  // Evaluate — a barrel module evaluates last, but its importers read its
-  // namespace earlier. Install live re-export getters so `export { X } from
-  // spec` resolves through to spec's namespace at access time (after spec's
-  // body runs), matching ESM live re-export bindings.
-  unsafe {
-    register_module_namespace(ctx, &specifier, namespace);
-    install_reexport_getters(ctx, namespace, &rewrite.reexports);
+  // VENDORED: every module is a real JSC record (source via JSModuleRecord,
+  // deno's V8-synthetic modules via SyntheticModuleRecord). No string rewriter.
+  #[cfg(feature = "vendor_jsc")]
+  {
+    let _ = native_modules_enabled;
+    return match unsafe { native_parse(ctx, &specifier, &text) } {
+      Some((handle, specs)) => {
+        let is_async = has_top_level_await(&text);
+        let state = Box::new(SyntheticModule {
+          ctx: gctx,
+          status: ModuleStatus::Uninstantiated,
+          export_names: Vec::new(),
+          eval_steps: None,
+          source: None,
+          import_specifiers: specs,
+          namespace: ptr::null_mut(),
+          specifier,
+          dependencies: Vec::new(),
+          is_async,
+          native: handle,
+        });
+        let obj = unsafe {
+          JSObjectMake(ctx, mod_class(), Box::into_raw(state) as *mut _)
+        };
+        let module = intern_ctx::<Module>(ctx, obj as JSValueRef);
+        // Register record -> module so the import.meta hook finds this wrapper.
+        let rec = unsafe { v82jsc_module_record_ptr(handle) };
+        if !rec.is_null() {
+          NATIVE_RECORD_MAP
+            .with(|m| m.borrow_mut().insert(rec as usize, module));
+        }
+        module
+      }
+      None => ptr::null(), // native_parse recorded the exception
+    };
   }
 
-  let state = Box::new(SyntheticModule {
-    ctx: gctx,
-    status: ModuleStatus::Uninstantiated,
-    export_names: rewrite.export_names,
-    eval_steps: None,
-    source: Some(rewrite.body),
-    import_specifiers: rewrite.imports,
-    namespace,
-    specifier,
-    dependencies: Vec::new(),
-    is_async: rewrite.is_async,
-  });
-  let obj =
-    unsafe { JSObjectMake(ctx, mod_class(), Box::into_raw(state) as *mut _) };
-  intern_ctx::<Module>(ctx, obj as JSValueRef)
+  // SYSTEM JavaScriptCore.framework: no C++ module API — fall back to the string
+  // rewriter. Targets BUNDLED apps (deno compile / desktop), where the user
+  // graph is flattened so the rewriter's unbundled-ESM limits never bite.
+  #[cfg(not(feature = "vendor_jsc"))]
+  {
+    let Some(rewrite) = rewrite_es_module(&text) else {
+      // The rewriter couldn't handle this module's syntax. Record a real
+      // SyntaxError so deno reports it instead of unwrapping None and panicking
+      // (libs/core/modules/map.rs `maybe_module.unwrap()`).
+      unsafe {
+        let msg = format!(
+          "v82jsc: unsupported ES module syntax in {}",
+          if specifier.is_empty() {
+            "<module>"
+          } else {
+            &specifier
+          }
+        );
+        let e = make_generic_error(ctx, &msg);
+        crate::jsc::core::record_pending_exception(ctx, e);
+      }
+      return ptr::null();
+    };
+
+    let namespace =
+      unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
+    unsafe { JSValueProtect(gctx, namespace as JSValueRef) };
+
+    // Register the namespace into the global registry NOW (at compile), not at
+    // Evaluate — a barrel module evaluates last, but its importers read its
+    // namespace earlier. Install live re-export getters so `export { X } from
+    // spec` resolves through to spec's namespace at access time.
+    unsafe {
+      register_module_namespace(ctx, &specifier, namespace);
+      install_reexport_getters(ctx, namespace, &rewrite.reexports);
+    }
+
+    let state = Box::new(SyntheticModule {
+      ctx: gctx,
+      status: ModuleStatus::Uninstantiated,
+      export_names: rewrite.export_names,
+      eval_steps: None,
+      source: Some(rewrite.body),
+      import_specifiers: rewrite.imports,
+      namespace,
+      specifier,
+      dependencies: Vec::new(),
+      is_async: rewrite.is_async,
+      native: ptr::null_mut(),
+    });
+    let obj =
+      unsafe { JSObjectMake(ctx, mod_class(), Box::into_raw(state) as *mut _) };
+    intern_ctx::<Module>(ctx, obj as JSValueRef)
+  }
 }
 
 struct RewrittenModule {
@@ -828,6 +1213,11 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
     std::string::String,
     (std::string::String, std::string::String),
   > = std::collections::HashMap::new();
+  // `export * from spec` (None) / `export * as name from spec` (Some(name)).
+  let mut star_reexports: Vec<(
+    std::string::String,
+    Option<std::string::String>,
+  )> = Vec::new();
 
   let cleaned = strip_js_comments(src);
   let logical = join_module_statements(&cleaned);
@@ -838,7 +1228,25 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
     let trimmed = strip_leading_block_comments(line.trim());
 
     if trimmed.starts_with("export *") {
-      return None;
+      // `export * from "spec"` (star re-export) or `export * as ns from "spec"`
+      // (namespace re-export). Collect; emit copy code AFTER local exports so
+      // local/named exports win (ESM precedence).
+      let spec = extract_specifier(trimmed).unwrap_or_default();
+      if spec.is_empty() {
+        return None;
+      }
+      imports.push(spec.clone());
+      let after = trimmed["export *".len()..].trim_start();
+      let as_name = after.strip_prefix("as ").map(|rest| {
+        rest.split(" from ").next().unwrap_or("").trim().to_string()
+      });
+      if let Some(ref n) = as_name {
+        if !n.is_empty() {
+          export_names.push(n.clone());
+        }
+      }
+      star_reexports.push((spec, as_name));
+      continue;
     }
 
     if trimmed.starts_with("import ") || trimmed == "import" {
@@ -1022,6 +1430,29 @@ fn rewrite_es_module(src: &str) -> Option<RewrittenModule> {
 
     out.push_str(raw_line);
     out.push('\n');
+  }
+
+  // Emit `export *` copies last so explicit/named exports take precedence.
+  for (spec, as_name) in &star_reexports {
+    let module_expr =
+      format!("((globalThis.__v8jsc_modules||{{}})[{:?}]||{{}})", spec);
+    match as_name {
+      Some(name) if !name.is_empty() => {
+        // export * as name from spec -> bind the whole namespace object.
+        exports_out.push_str(&format!("__ns[{:?}] = {};\n", name, module_expr));
+      }
+      _ => {
+        // export * from spec -> live-copy every named export except `default`,
+        // not overriding bindings this module already defines.
+        exports_out.push_str(&format!(
+          "{{const __se={m};for(const __k of Object.keys(__se)){{\
+             if(__k!==\"default\"&&!Object.prototype.hasOwnProperty.call(__ns,__k)){{\
+               Object.defineProperty(__ns,__k,{{get:((k)=>()=>__se[k])(__k),\
+                 enumerable:true,configurable:true}});}}}}}}\n",
+          m = module_expr
+        ));
+      }
+    }
   }
 
   let combined = format!("{}{}{}", imports_out, out, exports_out);
@@ -1244,9 +1675,21 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
     let mut body = vec![0u8; max];
     JSStringGetUTF8CString(src_str, body.as_mut_ptr() as *mut _, max);
     JSStringRelease(src_str);
-    let body_str = std::ffi::CStr::from_ptr(body.as_ptr() as *const _)
+    let mut body_str = std::ffi::CStr::from_ptr(body.as_ptr() as *const _)
       .to_string_lossy()
       .into_owned();
+
+    // V8's CompileFunction tolerates a leading `#!` shebang (Node CJS bins
+    // start with `#!/usr/bin/env node`); JSEvaluateScript reports it as
+    // "Invalid character: '#'". Strip a leading shebang line so the wrapped
+    // CJS body compiles instead of falling back to ESM evaluation.
+    if body_str.starts_with("#!") {
+      let rest = match body_str.find('\n') {
+        Some(nl) => body_str[nl + 1..].to_string(),
+        None => std::string::String::new(),
+      };
+      body_str = rest;
+    }
 
     let mut arg_names: Vec<std::string::String> = Vec::new();
     if !arguments.is_null() {
@@ -1272,22 +1715,37 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
       }
     }
 
-    let wrapped =
-      format!("(function({}) {{\n{}\n}})", arg_names.join(","), body_str);
+    // Source URL (deno hands it as the Source resource name): used both as the
+    // JSEvaluateScript sourceURL (so the compiled CJS body carries a
+    // SourceOrigin) and as the referrer for rewritten dynamic `import(...)`
+    // inside CJS (e.g. next's bin doing `import("../cli/next-dev.js")`).
+    let res_name = resource_name_of(ctx, source);
+    let dyn_import = format!(
+      "const __v82jsc_dynImport=(s,o)=>globalThis.__v82jsc_dynamicImport(s,{:?},o);\n",
+      res_name
+    );
+    let body = rewrite_dynamic_import_calls(&body_str);
+    let wrapped = format!(
+      "(function({}) {{\n{dyn_import}{body}\n}})",
+      arg_names.join(",")
+    );
     let cstr = match std::ffi::CString::new(wrapped) {
       Ok(c) => c,
       Err(_) => return ptr::null(),
     };
     let js_src = JSStringCreateWithUTF8CString(cstr.as_ptr());
-    let result = JSEvaluateScript(
-      ctx,
-      js_src,
-      ptr::null_mut(),
-      ptr::null_mut(),
-      1,
-      &mut exc,
-    );
+    let res_cstr = std::ffi::CString::new(res_name).ok();
+    let src_url_js = res_cstr
+      .as_ref()
+      .filter(|c| !c.as_bytes().is_empty())
+      .map(|c| JSStringCreateWithUTF8CString(c.as_ptr()))
+      .unwrap_or(ptr::null_mut());
+    let result =
+      JSEvaluateScript(ctx, js_src, ptr::null_mut(), src_url_js, 1, &mut exc);
     JSStringRelease(js_src);
+    if !src_url_js.is_null() {
+      JSStringRelease(src_url_js);
+    }
     if result.is_null() {
       // Record the compile exception so deno's TryCatch sees has_caught() —
       // returning null with no pending exception trips its assert -> panic.
@@ -1364,6 +1822,24 @@ pub extern "C" fn v8__UnboundModuleScript__GetSourceURL(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__GetStatus(this: *const Module) -> ModuleStatus {
+  // Native ESM modules: report JSC's real record status so deno sees deps that
+  // were evaluated by the graph cascade (CyclicModuleRecord::evaluate) rather
+  // than via a per-module deno Evaluate call. Returns -1 for synthetic records,
+  // which keep the wrapper status below.
+  #[cfg(feature = "vendor_jsc")]
+  if let Some(m) = module_state(this) {
+    if !m.native.is_null() {
+      let s = unsafe { v82jsc_module_status(m.native) };
+      match s {
+        0 => return ModuleStatus::Uninstantiated,
+        1 => return ModuleStatus::Instantiating,
+        2 => return ModuleStatus::Instantiated,
+        3 => return ModuleStatus::Evaluating,
+        4 => return ModuleStatus::Evaluated,
+        _ => {}
+      }
+    }
+  }
   match module_state(this) {
     Some(m) => match m.status {
       ModuleStatus::Uninstantiated => ModuleStatus::Uninstantiated,
@@ -1412,10 +1888,13 @@ pub extern "C" fn v8__Module__GetModuleRequests(
   let specs: Vec<std::string::String> = module_state(this)
     .map(|m| m.import_specifiers.clone())
     .unwrap_or_default();
+  let native = module_state(this)
+    .map(|m| m.native)
+    .unwrap_or(ptr::null_mut());
 
   let mut elems: Vec<JSValueRef> = Vec::with_capacity(specs.len());
   unsafe {
-    for spec in &specs {
+    for (idx, spec) in specs.iter().enumerate() {
       let req = JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut());
       if let Ok(cspec) = std::ffi::CString::new(spec.as_str()) {
         let sval_str = JSStringCreateWithUTF8CString(cspec.as_ptr());
@@ -1424,6 +1903,25 @@ pub extern "C" fn v8__Module__GetModuleRequests(
         let key = JSStringCreateWithUTF8CString(c"specifier".as_ptr());
         JSObjectSetProperty(ctx, req, key, sval, 0, ptr::null_mut());
         JSStringRelease(key);
+      }
+
+      // Carry the native import-attribute type (3=JSON, 2=wasm) so
+      // GetImportAttributes can surface `with { type: ... }` to deno.
+      #[cfg(feature = "vendor_jsc")]
+      if !native.is_null() {
+        let at = v82jsc_module_request_attr_type(native, idx as i32);
+        if at != 0 {
+          let akey = JSStringCreateWithUTF8CString(c"__attr_type".as_ptr());
+          JSObjectSetProperty(
+            ctx,
+            req,
+            akey,
+            JSValueMakeNumber(ctx, at as f64),
+            1 << 1,
+            ptr::null_mut(),
+          );
+          JSStringRelease(akey);
+        }
       }
 
       let mark =
@@ -1463,6 +1961,25 @@ pub extern "C" fn v8__Module__SourceOffsetToLocation(
 pub extern "C" fn v8__Module__GetModuleNamespace(
   this: *const Module,
 ) -> *const Value {
+  // Native path: ask the JSModuleRecord for its real namespace object (valid
+  // after link). Cache it on the wrapper so repeated calls are cheap.
+  #[cfg(feature = "vendor_jsc")]
+  if let Some(m) = module_state(this) {
+    if !m.native.is_null() {
+      let ctx = m.ctx as JSContextRef;
+      if m.namespace.is_null() {
+        let ns = unsafe { v82jsc_module_namespace(ctx, m.native) };
+        if !ns.is_null() {
+          unsafe { JSValueProtect(ctx, ns) };
+          m.namespace = ns as JSObjectRef;
+        }
+      }
+      if !m.namespace.is_null() {
+        return intern_ctx::<Value>(ctx, m.namespace as JSValueRef);
+      }
+      return ptr::null();
+    }
+  }
   match module_state(this) {
     Some(m) if !m.namespace.is_null() => {
       intern_ctx::<Value>(m.ctx as JSContextRef, m.namespace as JSValueRef)
@@ -1508,13 +2025,59 @@ pub extern "C" fn v8__Module__InstantiateModule(
   if !matches!(m.status, ModuleStatus::Uninstantiated) {
     return MaybeBool::JustTrue;
   }
+
+  // Native JSModuleRecord path: DFS-resolve every edge (deno's callback) and
+  // register each dependency in the parent's loaded-modules map, then link the
+  // whole graph through JSC's real linker.
+  #[cfg(feature = "vendor_jsc")]
+  if !m.native.is_null() {
+    let linkable = native_populate(context, cb, _source_callback, this);
+    crate::jsc::core::restore_current(iso);
+    let root_native = module_state(this)
+      .map(|m| m.native)
+      .unwrap_or(ptr::null_mut());
+    // Only hand the graph to JSC's linker when EVERY edge resolved to a native
+    // record; a synthetic/virtual dep would make link() RELEASE_ASSERT.
+    let ok = linkable
+      && !root_native.is_null()
+      && unsafe { v82jsc_module_link(ctx, root_native) };
+    if !ok {
+      // Surface a pending exception so deno's instantiate returns Err instead of
+      // asserting on the Errored status (mod_evaluate expects Instantiated).
+      let msg = if !linkable {
+        "v82jsc: native module graph has a non-ESM (synthetic) dependency"
+      } else {
+        "v82jsc: native module link failed"
+      };
+      unsafe {
+        let e = make_generic_error(ctx, msg);
+        crate::jsc::core::record_pending_exception(ctx, e);
+      }
+    }
+    if let Some(m) = module_state(this) {
+      m.status = if ok {
+        ModuleStatus::Instantiated
+      } else {
+        ModuleStatus::Errored
+      };
+    }
+    // On failure return Nothing (empty Maybe = exception occurred) so deno's
+    // instantiate reads the pending exception and returns Err — JustFalse would
+    // be Some(false), which deno treats as success and then asserts on status.
+    return if ok {
+      MaybeBool::JustTrue
+    } else {
+      MaybeBool::Nothing
+    };
+  }
+
   m.status = ModuleStatus::Instantiating;
   let specs = m.import_specifiers.clone();
 
   let mut deps: Vec<*const Module> = Vec::new();
   for spec in &specs {
     crate::jsc::core::restore_current(iso);
-    let dep = unsafe { resolve_dependency(context, cb, this, spec) };
+    let dep = unsafe { resolve_dependency(context, cb, this, spec, 0) };
     if dep.is_null() {
       continue;
     }
@@ -1540,6 +2103,7 @@ unsafe fn resolve_dependency(
   cb: ResolveModuleCallback,
   referrer: *const Module,
   spec: &str,
+  attr_type: i32,
 ) -> *const Module {
   let ctx = ctx_of(context) as JSContextRef;
   if ctx.is_null() {
@@ -1555,7 +2119,29 @@ unsafe fn resolve_dependency(
   let spec_handle = intern_ctx::<V8String>(ctx, spec_val);
 
   let mut exc: JSValueRef = ptr::null();
-  let attrs_arr = unsafe { JSObjectMakeArray(ctx, 0, ptr::null(), &mut exc) };
+  // deno's resolve callback reads import attributes as StaticImport triples
+  // [key, value, source_offset] and derives the requested module type, which it
+  // matches against the request — so a JSON/wasm edge must carry its `type`.
+  let type_str = match attr_type {
+    3 => Some("json"),
+    2 => Some("webassembly"),
+    _ => None,
+  };
+  let attrs_arr = unsafe {
+    if let Some(ts) = type_str {
+      let mk = |s: &str| -> JSValueRef {
+        let c = std::ffi::CString::new(s).unwrap();
+        let js = JSStringCreateWithUTF8CString(c.as_ptr());
+        let v = JSValueMakeString(ctx, js);
+        JSStringRelease(js);
+        v
+      };
+      let triple = [mk("type"), mk(ts), JSValueMakeNumber(ctx, 0.0)];
+      JSObjectMakeArray(ctx, 3, triple.as_ptr(), &mut exc)
+    } else {
+      JSObjectMakeArray(ctx, 0, ptr::null(), &mut exc)
+    }
+  };
   let attrs_handle = intern_ctx::<FixedArray>(ctx, attrs_arr as JSValueRef);
 
   let ret = unsafe {
@@ -1567,6 +2153,92 @@ unsafe fn resolve_dependency(
   };
 
   unsafe { *(&ret as *const ResolveModuleCallbackRet as *const *const Module) }
+}
+
+/// DFS the native module graph rooted at `this`: resolve each import via deno's
+/// callback, register the dep in `this`'s native loaded-modules map, recurse,
+/// and record the deps + Instantiated status for GetStatus/IsGraphAsync. Does
+/// NOT link (the caller links the root once, which recurses through JSC).
+#[cfg(feature = "vendor_jsc")]
+fn native_populate(
+  context: *const Context,
+  cb: ResolveModuleCallback,
+  source_cb: Option<ResolveSourceCallback>,
+  this: *const Module,
+) -> bool {
+  let ctx = ctx_of(context) as JSContextRef;
+  let iso = current_iso();
+  let Some(m) = module_state(this) else {
+    return false;
+  };
+  if !matches!(m.status, ModuleStatus::Uninstantiated) {
+    return !m.native.is_null(); // already visited (shared dep or cycle)
+  }
+  m.status = ModuleStatus::Instantiating;
+  let specs = m.import_specifiers.clone();
+  let this_native = m.native;
+
+  let mut deps: Vec<*const Module> = Vec::new();
+  let mut linkable = !this_native.is_null();
+  for (idx, spec) in specs.iter().enumerate() {
+    crate::jsc::core::restore_current(iso);
+    let attr_type = if this_native.is_null() {
+      0
+    } else {
+      unsafe { v82jsc_module_request_attr_type(this_native, idx as i32) }
+    };
+    let dep = unsafe { resolve_dependency(context, cb, this, spec, attr_type) };
+    if dep.is_null() {
+      linkable = false;
+      continue;
+    }
+    // Recurse first so the dep's own edges are registered before it links.
+    let dep_linkable = native_populate(context, cb, source_cb, dep);
+    let dep_native = module_state(dep)
+      .map(|d| d.native)
+      .unwrap_or(ptr::null_mut());
+    if !this_native.is_null() && !dep_native.is_null() {
+      if let Ok(cspec) = std::ffi::CString::new(spec.as_str()) {
+        crate::jsc::core::restore_current(iso);
+        unsafe {
+          v82jsc_module_add_dependency(
+            ctx,
+            this_native,
+            cspec.as_ptr(),
+            dep_native,
+          );
+        }
+      }
+    } else {
+      // A synthetic/virtual dep (JSON, node: builtin) has no native record —
+      // this graph can't be linked through JSC.
+      linkable = false;
+    }
+    // A synthetic dep's export values are set by deno's eval_steps, which JSC's
+    // no-op SyntheticModuleRecord::evaluate won't drive during the root's graph
+    // cascade. Run them now so the values are in the native env before any
+    // importer reads them. (eval_steps for JSON/ops are imperative + order-free.)
+    let dep_is_synthetic = module_state(dep)
+      .map(|d| d.eval_steps.is_some() && !d.native.is_null())
+      .unwrap_or(false);
+    if dep_is_synthetic {
+      let needs_eval = module_state(dep)
+        .map(|d| !matches!(d.status, ModuleStatus::Evaluated))
+        .unwrap_or(false);
+      if needs_eval {
+        crate::jsc::core::restore_current(iso);
+        let _ = v8__Module__Evaluate(dep, context);
+        crate::jsc::core::restore_current(iso);
+      }
+    }
+    linkable = linkable && dep_linkable;
+    deps.push(dep);
+  }
+  if let Some(m) = module_state(this) {
+    m.dependencies = deps;
+    m.status = ModuleStatus::Instantiated;
+  }
+  linkable
 }
 
 #[unsafe(no_mangle)]
@@ -1582,6 +2254,37 @@ pub extern "C" fn v8__Module__Evaluate(
   if matches!(m.status, ModuleStatus::Evaluated) {
     return make_resolved_promise(ctx);
   }
+
+  // Native JSModuleRecord path: JSC's evaluate() drives the whole linked graph
+  // (deps first, cycles handled internally) and returns a promise per the
+  // top-level-await spec. No manual dep walk. Synthetic modules (eval_steps set)
+  // take the eval_steps path below — that's what fills their export values
+  // (which we mirror into the native SyntheticModuleRecord env).
+  #[cfg(feature = "vendor_jsc")]
+  if !m.native.is_null() && m.eval_steps.is_none() {
+    let native = m.native;
+    m.status = ModuleStatus::Evaluating;
+    EVAL_BODY_RUNNING.with(|s| s.borrow_mut().push(this));
+    let result = unsafe { v82jsc_module_evaluate(ctx, native) };
+    EVAL_BODY_RUNNING.with(|s| {
+      let mut v = s.borrow_mut();
+      if let Some(pos) = v.iter().rposition(|&p| p == this) {
+        v.remove(pos);
+      }
+    });
+    if let Some(m) = module_state(this) {
+      m.status = ModuleStatus::Evaluated;
+    }
+    if result.is_null() {
+      return make_resolved_promise(ctx);
+    }
+    if unsafe { JSValueIsObject(ctx, result) } {
+      crate::jsc::exception::track_promise_pub(ctx, result as JSObjectRef);
+      return intern_ctx::<Value>(ctx, result);
+    }
+    return make_resolved_promise(ctx);
+  }
+
   m.status = ModuleStatus::Evaluating;
 
   let iso = current_iso();
@@ -1654,6 +2357,7 @@ pub extern "C" fn v8__Module__Evaluate(
   if let Some(src) = m.source.clone() {
     let is_async = m.is_async || !dep_promises.is_empty();
     let namespace = m.namespace;
+    let source_url = m.specifier.clone();
     let meta = unsafe { build_import_meta(context, this) };
     // Mark the body as running: while it executes, GetStatus reports this
     // module as Evaluated (not Evaluating) so a re-entrant require()/import in a
@@ -1662,7 +2366,15 @@ pub extern "C" fn v8__Module__Evaluate(
     // stays Evaluating internally, so the async/promise return path is intact.
     EVAL_BODY_RUNNING.with(|s| s.borrow_mut().push(this));
     let eval_result = unsafe {
-      eval_module_source(ctx, &src, namespace, meta, is_async, &dep_promises)
+      eval_module_source(
+        ctx,
+        &src,
+        namespace,
+        meta,
+        is_async,
+        &dep_promises,
+        &source_url,
+      )
     };
     EVAL_BODY_RUNNING.with(|s| {
       let mut v = s.borrow_mut();
@@ -1723,6 +2435,7 @@ unsafe fn eval_module_source(
   meta: JSValueRef,
   is_async: bool,
   dep_promises: &[JSValueRef],
+  source_url: &str,
 ) -> Result<JSValueRef, JSValueRef> {
   let fail =
     |ctx: JSContextRef, exc: JSValueRef| -> Result<JSValueRef, JSValueRef> {
@@ -1741,14 +2454,20 @@ unsafe fn eval_module_source(
     "function"
   };
 
-  let prologue = if is_async && !dep_promises.is_empty() {
+  let await_deps = if is_async && !dep_promises.is_empty() {
     "await Promise.all(__deps);\n"
   } else {
     ""
   };
+  // Per-module closure that rewrite_dynamic_import_calls()'d `import(...)` sites
+  // call; forwards to the host bridge with this module's URL as the referrer.
+  let dyn_import = format!(
+    "const __v82jsc_dynImport=(s,o)=>globalThis.__v82jsc_dynamicImport(s,{:?},o);\n",
+    source_url
+  );
+  let body = rewrite_dynamic_import_calls(rewritten);
   let wrapped = format!(
-    "({kw}(__ns, __v8jsc_meta, __deps){{\n{prologue}{}\n}})",
-    rewritten
+    "({kw}(__ns, __v8jsc_meta, __deps){{\n{dyn_import}{await_deps}{body}\n}})"
   );
   let cstr = match std::ffi::CString::new(wrapped) {
     Ok(c) => c,
@@ -1756,10 +2475,22 @@ unsafe fn eval_module_source(
   };
   let mut exc: JSValueRef = ptr::null();
   let js = unsafe { JSStringCreateWithUTF8CString(cstr.as_ptr()) };
+  // Pass the module's URL as JSEvaluateScript's sourceURL so JSC records a
+  // SourceOrigin. The dynamic-import hook (moduleLoaderImportModule) reads
+  // sourceOrigin.string() as the referrer; without it, deno can't resolve
+  // relative `import()` specifiers (e.g. next's `import("../cli/next-dev.js")`).
+  let src_url_cstr = std::ffi::CString::new(source_url).ok();
+  let src_url_js = src_url_cstr
+    .as_ref()
+    .map(|c| unsafe { JSStringCreateWithUTF8CString(c.as_ptr()) })
+    .unwrap_or(ptr::null_mut());
   let f = unsafe {
-    JSEvaluateScript(ctx, js, ptr::null_mut(), ptr::null_mut(), 1, &mut exc)
+    JSEvaluateScript(ctx, js, ptr::null_mut(), src_url_js, 1, &mut exc)
   };
   unsafe { JSStringRelease(js) };
+  if !src_url_js.is_null() {
+    unsafe { JSStringRelease(src_url_js) };
+  }
   if f.is_null() {
     return fail(ctx, exc);
   }
@@ -2072,6 +2803,40 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   let steps: SyntheticModuleEvaluationSteps<'static> =
     unsafe { std::mem::transmute(evaluation_steps) };
 
+  // Back the synthetic module with a real JSC SyntheticModuleRecord so native
+  // ESM importers can link to it. Export values start undefined and are filled
+  // by SetSyntheticModuleExport (called from eval_steps) into the record's
+  // module environment (live bindings).
+  let native = {
+    #[cfg(feature = "vendor_jsc")]
+    {
+      if native_modules_enabled() && native_eligible(&specifier) {
+        let cnames: Vec<std::ffi::CString> = names
+          .iter()
+          .filter_map(|n| std::ffi::CString::new(n.as_str()).ok())
+          .collect();
+        let ptrs: Vec<*const std::os::raw::c_char> =
+          cnames.iter().map(|c| c.as_ptr()).collect();
+        let url = std::ffi::CString::new(specifier.as_str()).ok();
+        match url {
+          Some(u) => unsafe {
+            v82jsc_synthetic_create(
+              ctx,
+              u.as_ptr(),
+              ptrs.as_ptr(),
+              ptrs.len() as i32,
+            )
+          },
+          None => ptr::null_mut(),
+        }
+      } else {
+        ptr::null_mut()
+      }
+    }
+    #[cfg(not(feature = "vendor_jsc"))]
+    ptr::null_mut()
+  };
+
   let state = Box::new(SyntheticModule {
     ctx: gctx,
     status: ModuleStatus::Uninstantiated,
@@ -2083,6 +2848,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
     specifier,
     dependencies: Vec::new(),
     is_async: false,
+    native,
   });
   let obj =
     unsafe { JSObjectMake(ctx, mod_class(), Box::into_raw(state) as *mut _) };
@@ -2113,6 +2879,18 @@ pub extern "C" fn v8__Module__SetSyntheticModuleExport(
   unsafe {
     JSObjectSetProperty(ctx, m.namespace, key, val, 0, &mut exc);
     JSStringRelease(key);
+  }
+
+  // Mirror the export into the native SyntheticModuleRecord's module
+  // environment so native ESM importers see the value (live binding).
+  #[cfg(feature = "vendor_jsc")]
+  if !m.native.is_null() {
+    let name_str = unsafe { jsstring_to_rust(ctx, name_v) };
+    if let Ok(cname) = std::ffi::CString::new(name_str) {
+      unsafe {
+        v82jsc_synthetic_set_export(ctx, m.native, cname.as_ptr(), val)
+      };
+    }
   }
   MaybeBool::JustTrue
 }
@@ -2174,18 +2952,52 @@ pub extern "C" fn v8__ModuleRequest__GetSourceOffset(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ModuleRequest__GetImportAttributes(
-  _this: *const ModuleRequest,
+  this: *const ModuleRequest,
 ) -> *const FixedArray {
   let ctx = current_ctx();
   if ctx.is_null() {
     return ptr::null();
   }
-  let mut exc: JSValueRef = ptr::null();
-  let arr = unsafe { JSObjectMakeArray(ctx, 0, ptr::null(), &mut exc) };
-  if arr.is_null() {
-    return ptr::null();
+  // V8 returns static-import attributes as [key, value, source_offset] triples.
+  // We carry only the `type` attribute (json/webassembly), read from the request
+  // object's __attr_type marker set by GetModuleRequests.
+  let mut elems: Vec<JSValueRef> = Vec::new();
+  unsafe {
+    let mut exc: JSValueRef = ptr::null();
+    if !this.is_null() {
+      let obj = jsval(this) as JSObjectRef;
+      let akey = JSStringCreateWithUTF8CString(c"__attr_type".as_ptr());
+      let at_val = JSObjectGetProperty(ctx, obj, akey, &mut exc);
+      JSStringRelease(akey);
+      let at = if at_val.is_null() {
+        0.0
+      } else {
+        JSValueToNumber(ctx, at_val, &mut exc)
+      };
+      let type_str = match at as i32 {
+        3 => Some("json"),
+        2 => Some("webassembly"),
+        _ => None,
+      };
+      if let Some(ts) = type_str {
+        let mk = |s: &str| -> JSValueRef {
+          let c = std::ffi::CString::new(s).unwrap();
+          let js = JSStringCreateWithUTF8CString(c.as_ptr());
+          let v = JSValueMakeString(ctx, js);
+          JSStringRelease(js);
+          v
+        };
+        elems.push(mk("type"));
+        elems.push(mk(ts));
+        elems.push(JSValueMakeNumber(ctx, 0.0)); // source offset
+      }
+    }
+    let arr = JSObjectMakeArray(ctx, elems.len(), elems.as_ptr(), &mut exc);
+    if arr.is_null() {
+      return ptr::null();
+    }
+    intern_ctx::<FixedArray>(ctx, arr as JSValueRef)
   }
-  intern_ctx::<FixedArray>(ctx, arr as JSValueRef)
 }
 
 #[unsafe(no_mangle)]

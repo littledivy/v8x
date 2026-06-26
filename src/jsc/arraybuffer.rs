@@ -615,19 +615,44 @@ pub extern "C" fn v8__ArrayBufferView__GetContents(
     };
   }
   let obj = jsval(this) as JSObjectRef;
-  let (ptr_bytes, off, len) = unsafe {
+  // Compute the data pointer as ArrayBuffer base + byteOffset rather than
+  // trusting JSObjectGetTypedArrayBytesPtr: for a typed array that is a VIEW
+  // over an existing (e.g. pooled) ArrayBuffer, JSC returns the buffer base
+  // (byteOffset NOT applied), so ops read from offset 0. Node's Buffer pools
+  // many small buffers into one ArrayBuffer at increasing byteOffsets, so this
+  // made every non-first pooled Buffer decode read stale bytes (e.g.
+  // `Buffer.from("foo")` => "Hel"). Base + byteOffset is correct regardless.
+  let (off, len) = unsafe {
     (
-      JSObjectGetTypedArrayBytesPtr(ctx, obj, ptr::null_mut()),
       JSObjectGetTypedArrayByteOffset(ctx, obj, ptr::null_mut()),
       JSObjectGetTypedArrayByteLength(ctx, obj, ptr::null_mut()),
     )
   };
-
-  let data = if ptr_bytes.is_null() {
-    ptr::null_mut()
-  } else {
-    ptr_bytes as *mut u8
+  // Prefer ArrayBuffer base + byteOffset (correct for pooled VIEWS, where
+  // JSObjectGetTypedArrayBytesPtr drops the offset). Fall back to the typed
+  // array data pointer when the view has no materializable ArrayBuffer (e.g.
+  // DataView / detached); that pointer already accounts for any offset.
+  let base = unsafe {
+    let buffer = JSObjectGetTypedArrayBuffer(ctx, obj, ptr::null_mut());
+    if buffer.is_null() {
+      ptr::null_mut()
+    } else {
+      JSObjectGetArrayBufferBytesPtr(ctx, buffer, ptr::null_mut())
+    }
   };
+  let data = if !base.is_null() {
+    unsafe { (base as *mut u8).add(off) }
+  } else {
+    unsafe {
+      JSObjectGetTypedArrayBytesPtr(ctx, obj, ptr::null_mut()) as *mut u8
+    }
+  };
+  if data.is_null() {
+    return MemorySpan {
+      data: ptr::null_mut(),
+      size: 0,
+    };
+  }
   MemorySpan { data, size: len }
 }
 

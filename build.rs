@@ -168,14 +168,19 @@ fn build_vendored_jsc(manifest_dir: &std::path::Path) {
     }
   }
 
+  // Compile the native ES-module glue (src/jsc/native_modules.cpp) against the
+  // vendored WebKit private headers and link it. Replaces the rewrite_es_module
+  // string rewriter with real JSModuleRecords.
+  build_native_modules_glue(manifest_dir, &webkit, &build_dir);
+
   println!("cargo:rustc-link-search=native={}", lib_dir.display());
-  // JavaScriptCore + JavaScriptCoreJIT are split cmake targets that DUPLICATE
-  // some objects (notably LLInt::initialize). Whole-archiving BOTH force-loads
-  // both copies -> the linker keeps mismatched LLInt/IPInt offset tables ->
-  // JSC::initialize() traps in IPInt::initialize() at startup (SIGKILL). Link
-  // them as NORMAL static libs (like the `jsc` CLI does) so the linker pulls a
-  // single, consistent copy. bmalloc/WTF have no such dup; whole-archiving them
-  // is unnecessary too. Repeat JavaScriptCore/JIT to satisfy mutual refs.
+  // JavaScriptCore + JavaScriptCoreJIT are split cmake targets; link both as
+  // normal static libs (like the `jsc` CLI does) and repeat to satisfy their
+  // cyclic references. NOTE: the offlineasm LLInt/IPInt assembly objects in
+  // these archives have MH_SUBSECTIONS_VIA_SYMBOLS cleared by tools/
+  // setup_webkit.sh so the deno binary's `-Wl,-dead_strip` cannot strip the
+  // computed-jump-only WASM opcode handlers (else WASM runs garbage). See the
+  // comment there.
   println!("cargo:rustc-link-lib=static=JavaScriptCore");
   let jit_a = lib_dir.join("libJavaScriptCoreJIT.a");
   if jit_a.exists() {
@@ -205,6 +210,105 @@ fn build_vendored_jsc(manifest_dir: &std::path::Path) {
       }
     }
   }
+}
+
+/// Compile `src/jsc/native_modules.cpp` (the native JSModuleRecord glue) against
+/// the vendored WebKit's private + derived headers, archive it, and link it. The
+/// glue exposes `v82jsc_module_*` C functions the JSC module shims call.
+///
+/// We mirror the include set JSC's own unified sources use (extracted from
+/// `compile_commands.json`): the JavaScriptCore.hmap header map resolves the
+/// unprefixed parser internals (`ModuleAnalyzer.h`, `Nodes.h`, ...) that aren't
+/// in PrivateHeaders. config.h is included first by the .cpp itself, so no PCH
+/// is needed. Apple clang (via `xcrun`) — NOT a PATH `clang++` which may be a
+/// mismatched LLVM that mishandles the SDK headers.
+fn build_native_modules_glue(
+  manifest_dir: &std::path::Path,
+  webkit: &std::path::Path,
+  build_dir: &std::path::Path,
+) {
+  let src = manifest_dir.join("src/jsc/native_modules.cpp");
+  let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+  let obj = out_dir.join("native_modules.o");
+  let archive = out_dir.join("libv82jsc_native_modules.a");
+
+  let sdk = String::from_utf8(
+    std::process::Command::new("xcrun")
+      .args(["--show-sdk-path"])
+      .output()
+      .expect("xcrun --show-sdk-path failed")
+      .stdout,
+  )
+  .expect("sdk path not utf8");
+  let sdk = sdk.trim();
+
+  let b = build_dir.to_str().unwrap();
+  let inc = |p: &str| format!("-I{b}/{p}");
+  let status = std::process::Command::new("xcrun")
+    .args(["clang++", "-c"])
+    .arg(&src)
+    .arg("-o")
+    .arg(&obj)
+    .args([
+      "-DBUILDING_JSCONLY__",
+      "-DBUILDING_JavaScriptCore",
+      "-DBUILDING_WEBKIT=1",
+      "-DBUILDING_WITH_CMAKE=1",
+      "-DHAVE_CONFIG_H=1",
+      "-DPAS_BMALLOC=1",
+      "-DSTATICALLY_LINKED_WITH_WTF",
+      "-DSTATICALLY_LINKED_WITH_bmalloc",
+      "-DU_DISABLE_RENAMING=1",
+      "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE",
+      "-DNDEBUG",
+    ])
+    .arg(inc("JavaScriptCore/Headers"))
+    .arg(inc("JavaScriptCore/PrivateHeaders"))
+    .arg(format!("-I{b}"))
+    .arg(inc("HeaderMaps/JavaScriptCore.hmap"))
+    .arg(inc("JavaScriptCore/PrivateHeaders/JavaScriptCore"))
+    .arg(format!("-I{}/Source/JavaScriptCore", webkit.display()))
+    .arg(inc("JavaScriptCore/DerivedSources"))
+    .arg(inc("JavaScriptCore/DerivedSources/inspector"))
+    .arg(inc("JavaScriptCore/DerivedSources/runtime"))
+    .arg(inc("JavaScriptCore/DerivedSources/yarr"))
+    .arg(inc("WTF/Headers"))
+    .arg(inc("bmalloc/Headers"))
+    .arg(inc("bmalloc/PrivateHeaders"))
+    .args(["-isystem", &format!("{b}/ICU/Headers")])
+    .args([
+      "-std=c++2b",
+      "-O3",
+      "-fno-exceptions",
+      "-fno-rtti",
+      "-fvisibility=hidden",
+      "-fvisibility-inlines-hidden",
+      "-fPIC",
+      "-ffp-contract=off",
+      "-fno-slp-vectorize",
+      "-arch",
+      "arm64",
+      "-Wno-everything",
+    ])
+    .args(["-isysroot", sdk])
+    .status()
+    .expect("xcrun clang++ not found — needed to build native_modules.cpp");
+  assert!(status.success(), "native_modules.cpp compile failed");
+
+  // Archive the single object so the linker pulls it on demand (the Rust shims
+  // reference the v82jsc_module_* symbols).
+  let _ = std::fs::remove_file(&archive);
+  let ar = std::process::Command::new("ar")
+    .arg("crs")
+    .arg(&archive)
+    .arg(&obj)
+    .status()
+    .expect("ar failed");
+  assert!(ar.success(), "ar archiving native_modules.o failed");
+
+  println!("cargo:rustc-link-search=native={}", out_dir.display());
+  println!("cargo:rustc-link-lib=static=v82jsc_native_modules");
+  println!("cargo:rerun-if-changed={}", src.display());
 }
 
 /// Run bindgen over the SDK's JavaScriptCore C API umbrella header to produce

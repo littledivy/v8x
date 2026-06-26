@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: build ${{ matrix.engine }}
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Fast lib builds. `system_jsc` links the OS framework (no WebKit build);
+        # `quickjs` compiles the vendored sources. The vendored-WebKit `jsc`
+        # build + the full backend deno matrix run locally / self-hosted
+        # (tests/modules/matrix.sh) — a from-scratch WebKit build is too heavy
+        # for per-push CI.
+        engine: [system_jsc, quickjs]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.engine }}
+
+      - name: Build (${{ matrix.engine }})
+        run: cargo build --no-default-features --features ${{ matrix.engine }} --lib
+
+  module-tests:
+    name: module suite (stock-v8 oracle)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+      - name: Run ES-module conformance suite
+        run: tests/modules/run.sh "$(command -v deno)" stock-v8
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      # Only our code — vendored rusty_v8 lives in vendor/ and is checked
+      # separately by upstream.
+      - run: rustfmt --edition 2024 --check src/lib.rs src/jsc/*.rs src/quickjs/*.rs
