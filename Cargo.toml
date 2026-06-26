@@ -14,12 +14,20 @@ path = "src/lib.rs"
 
 [features]
 # Exactly ONE engine backend must be active (they each define the v8__* C ABI;
-# two would collide at link time). `engine_jsc` is the default.
-default = ["engine_jsc"]
+# two would collide at link time). The default is the VENDORED JSC: it backs
+# every module with real JSC records (zero gaps, no string rewriter) — the
+# shippable engine, like deno ships v8 statically.
+default = ["engine_jsc", "vendor_jsc"]
 engine_jsc = []
 engine_quickjs = []
 # Short aliases (README-facing).
-jsc = ["engine_jsc"]
+jsc = ["engine_jsc", "vendor_jsc"]
+# System JavaScriptCore.framework (tiny binary, no vendored WebKit). Apple's
+# shipped module API is too limited for full native ESM (fetch-only loader, no
+# custom resolve, no synthetic modules) — so this build uses the string-rewriter
+# module shim and targets BUNDLED apps (deno compile / desktop), where the user
+# graph is flattened and the rewriter's unbundled-ESM gaps never bite.
+system_jsc = ["engine_jsc"]
 quickjs = ["engine_quickjs", "link_quickjs"]
 # Compile + statically link the vendored QuickJS-ng sources (engine_quickjs).
 link_quickjs = []

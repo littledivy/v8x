@@ -1,0 +1,24 @@
+diff --git a/Source/JavaScriptCore/runtime/SyntheticModuleRecord.h b/Source/JavaScriptCore/runtime/SyntheticModuleRecord.h
+index e846717dac..52b7ffcb42 100644
+--- a/Source/JavaScriptCore/runtime/SyntheticModuleRecord.h
++++ b/Source/JavaScriptCore/runtime/SyntheticModuleRecord.h
+@@ -57,6 +57,11 @@ public:
+ 
+     static SyntheticModuleRecord* parseJSONModule(JSGlobalObject*, const Identifier& moduleKey, SourceCode&&);
+ 
++    // v82jsc: exposed so the deno synthetic-module bridge (native_modules.cpp)
++    // can build a record with declared export names (placeholder undefined
++    // values), then fill values lazily via moduleEnvironment()+symbolTablePut.
++    static SyntheticModuleRecord* tryCreateWithExportNamesAndValues(JSGlobalObject*, const Identifier& moduleKey, const Vector<Identifier, 4>& exportNames, const MarkedArgumentBuffer& exportValues);
++
+     Synchronousness link(JSGlobalObject*, RefPtr<ScriptFetcher> = nullptr);
+     JS_EXPORT_PRIVATE JSValue NODELETE evaluate(JSGlobalObject*);
+ 
+@@ -64,7 +69,6 @@ private:
+     SyntheticModuleRecord(VM&, Structure*, const Identifier& moduleKey);
+ 
+     static SyntheticModuleRecord* tryCreateDefaultExportSyntheticModule(JSGlobalObject*, const Identifier& moduleKey, JSValue);
+-    static SyntheticModuleRecord* tryCreateWithExportNamesAndValues(JSGlobalObject*, const Identifier& moduleKey, const Vector<Identifier, 4>& exportNames, const MarkedArgumentBuffer& exportValues);
+ 
+     void finishCreation(JSGlobalObject*, VM&);
+ };

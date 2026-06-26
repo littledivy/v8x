@@ -53,13 +53,19 @@ unsafe extern "C" fn unhandled_rejection_trampoline(
   }
   let cb = PROMISE_REJECT_CB.with(|c| c.get());
   if let Some(cb) = cb {
-    let promise = if argc >= 2 {
-      unsafe { *argv.add(1) }
+    // JSC's JSGlobalContextSetUnhandledRejectionCallback invokes the callback
+    // as (promise, reason): argv[0] is the rejected promise, argv[1] is the
+    // rejection reason. deno's PromiseRejectMessage::GetValue must return the
+    // REASON; getting these backwards makes deno format the pending promise
+    // itself ("Uncaught (in promise) Promise { <pending> }") instead of the
+    // real error.
+    let promise = if argc >= 1 {
+      unsafe { *argv }
     } else {
       ptr::null()
     };
-    let reason = if argc >= 1 {
-      unsafe { *argv }
+    let reason = if argc >= 2 {
+      unsafe { *argv.add(1) }
     } else {
       ptr::null()
     };
@@ -385,17 +391,58 @@ pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(
     return;
   }
   let ctx = current_ctx();
-  if !ctx.is_null() {
-    unsafe {
-      // JSC drains its microtask (promise-job) queue when a JS API entry
-      // unwinds back to the embedder, so a trivial JSEvaluateScript forces a
-      // drain — more correct than the previous inert no-op callback.
-      let mut exc: JSValueRef = ptr::null();
-      let s = JSStringCreateWithUTF8CString(c"0".as_ptr());
-      JSEvaluateScript(ctx, s, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
-      JSStringRelease(s);
-    }
+  if ctx.is_null() {
+    return;
   }
+  unsafe {
+    // V8 runs enqueued microtasks (EnqueueMicrotask callbacks, e.g. deno's
+    // op_queue_microtask) and promise reaction jobs in one FIFO at the
+    // checkpoint -- NOT synchronously at enqueue time. Drain both here. A
+    // callback may enqueue more microtasks / promise jobs, so loop until both
+    // queues are quiet (bounded). JSC drains its own promise-job queue when a
+    // JS API entry unwinds, hence the `JSEvaluateScript("0")` pump.
+    let s = JSStringCreateWithUTF8CString(c"0".as_ptr());
+    for _ in 0..64 {
+      // Run all currently-queued embedder microtasks (FIFO). New ones queued
+      // during a callback are picked up on the next inner iteration.
+      loop {
+        let item = MICROTASK_QUEUE.with(|q| {
+          let mut b = q.borrow_mut();
+          if b.is_empty() {
+            None
+          } else {
+            Some(b.remove(0))
+          }
+        });
+        let Some((gctx, f)) = item else { break };
+        let mut exc: JSValueRef = ptr::null();
+        JSObjectCallAsFunction(
+          gctx,
+          f,
+          ptr::null_mut(),
+          0,
+          ptr::null(),
+          &mut exc,
+        );
+        JSValueUnprotect(gctx, f as JSValueRef);
+      }
+      // Pump one layer of JSC promise-reaction jobs.
+      let mut exc: JSValueRef = ptr::null();
+      JSEvaluateScript(ctx, s, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+    }
+    JSStringRelease(s);
+  }
+}
+
+thread_local! {
+    // Embedder microtasks queued via v8__Isolate__EnqueueMicrotask. Each entry
+    // is a (global context, protected function) pair, run + unprotected at the
+    // next PerformMicrotaskCheckpoint. Running them at enqueue time would invoke
+    // ops re-entrantly (deno panics: "op_queue_microtask ... re-entrantly
+    // invoked op_node_fs_close").
+    static MICROTASK_QUEUE: std::cell::RefCell<
+        Vec<(JSGlobalContextRef, JSObjectRef)>,
+    > = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 thread_local! {
@@ -446,8 +493,13 @@ pub extern "C" fn v8__Isolate__EnqueueMicrotask(
   unsafe {
     let f = jsval(function) as JSObjectRef;
     if JSValueIsObject(ctx, jsval(function)) && JSObjectIsFunction(ctx, f) {
-      let mut exc: JSValueRef = ptr::null();
-      JSObjectCallAsFunction(ctx, f, ptr::null_mut(), 0, ptr::null(), &mut exc);
+      // QUEUE the microtask; do NOT run it now. Running synchronously at
+      // enqueue makes the callback (and any ops it calls) execute inside the
+      // caller's op -> deno's op-reentrancy guard panics. Drained at the next
+      // PerformMicrotaskCheckpoint.
+      let gctx = JSContextGetGlobalContext(ctx);
+      JSValueProtect(gctx, f as JSValueRef);
+      MICROTASK_QUEUE.with(|q| q.borrow_mut().push((gctx, f)));
     }
   }
 }
