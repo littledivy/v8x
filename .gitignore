@@ -8,3 +8,4 @@ vendor/quickjs-ng/.git
 # scratch notes (local)
 DEMO.md
 SNAPSHOT_NOTES.md
+__cmake_systeminformation/
