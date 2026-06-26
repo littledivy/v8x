@@ -11,7 +11,7 @@ jobs:
   # Fast checks: `cargo build --lib` per backend. Catches compile breakage
   # without building a full deno. quickjs is cross-platform (ubuntu); the JSC
   # backends need macOS (system_jsc links the OS framework, jsc builds the
-  # vendored WebKit from source ~11min).
+  # vendored WebKit from source — cached, see below).
   # ---------------------------------------------------------------------------
   check:
     name: check-${{ matrix.backend }}
@@ -44,6 +44,20 @@ jobs:
       - name: Install ninja (WebKit build)
         if: matrix.ninja
         run: brew install ninja
+      # Cache the vendored WebKit static-lib build (~13min from scratch). Keyed
+      # on the pinned submodule commit + the patches/setup script, so it's
+      # reused until WebKit or our patches change. build.rs skips the heavy
+      # build when libJavaScriptCore.a is already present (patches-only).
+      - name: WebKit cache key
+        if: matrix.ninja
+        id: wk
+        run: echo "sha=$(git rev-parse HEAD:vendor/webkit)" >> "$GITHUB_OUTPUT"
+      - name: Cache vendored WebKit build
+        if: matrix.ninja
+        uses: actions/cache@v4
+        with:
+          path: vendor/webkit/WebKitBuild
+          key: webkit-${{ runner.os }}-${{ steps.wk.outputs.sha }}-${{ hashFiles('patches/**', 'tools/setup_webkit.sh') }}
       - name: Build --lib (${{ matrix.features }})
         run: cargo build --no-default-features --features ${{ matrix.features }} --lib
 
@@ -76,12 +90,21 @@ jobs:
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: deno-${{ matrix.backend }}
       - name: Install ninja (WebKit build)
         if: matrix.ninja
         run: brew install ninja
+
+      # Reuse the vendored WebKit build across runs (jsc backend only).
+      - name: WebKit cache key
+        if: matrix.ninja
+        id: wk
+        run: echo "sha=$(git rev-parse HEAD:vendor/webkit)" >> "$GITHUB_OUTPUT"
+      - name: Cache vendored WebKit build
+        if: matrix.ninja
+        uses: actions/cache@v4
+        with:
+          path: vendor/webkit/WebKitBuild
+          key: webkit-${{ runner.os }}-${{ steps.wk.outputs.sha }}-${{ hashFiles('patches/**', 'tools/setup_webkit.sh') }}
 
       - name: Clone deno + apply the v82jsc integration patch
         run: |
@@ -99,6 +122,14 @@ jobs:
           # Select this job's backend by swapping the v82jsc feature list the
           # patch hardcodes (vendored JSC) for this matrix entry's features.
           perl -0pi -e 's/"engine_jsc", "vendor_jsc"/${{ matrix.features }}/g' ../deno/Cargo.toml
+
+      # Cache deno's build (cargo deps + the v82jsc patch crate). Keyed per
+      # backend so each engine's feature set gets its own cache. rust-cache
+      # prunes to dependency artifacts — much smaller than the raw target dir.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "../deno"
+          key: deno-${{ matrix.backend }}
 
       - name: Build deno (${{ matrix.backend }})
         working-directory: ../deno
