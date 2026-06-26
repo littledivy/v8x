@@ -18,6 +18,16 @@ pub extern "C" fn v8__V8__Initialize() {}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__Dispose() -> bool {
+  if std::env::var_os("V82JSC_COMPILE_STATS").is_some() {
+    use std::sync::atomic::Ordering;
+    let bytes = crate::jsc::module::COMPILE_BYTES.load(Ordering::Relaxed);
+    let nanos = crate::jsc::module::COMPILE_NANOS.load(Ordering::Relaxed);
+    eprintln!(
+      "[compile-stats] {} KB compiled in {:.1} ms",
+      bytes / 1024,
+      nanos as f64 / 1.0e6
+    );
+  }
   true
 }
 

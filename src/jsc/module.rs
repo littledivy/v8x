@@ -137,13 +137,55 @@ unsafe extern "C" {
     name: *const std::os::raw::c_char,
     value: JSValueRef,
   ) -> bool;
+  // bytecode.cpp — JSC bytecode cache (fast startup).
+  fn v82jsc_bytecode_encode(
+    ctx: JSContextRef,
+    url: *const std::os::raw::c_char,
+    src: *const std::os::raw::c_char,
+    is_module: i32,
+    out_len: *mut usize,
+  ) -> *mut u8;
+  fn v82jsc_bytecode_free(p: *mut u8);
+  fn v82jsc_program_eval_cached(
+    ctx: JSContextRef,
+    url: *const std::os::raw::c_char,
+    src: *const std::os::raw::c_char,
+    bytecode: *const u8,
+    bytecode_len: usize,
+    exc_out: *mut JSValueRef,
+  ) -> JSValueRef;
 }
 
-/// Whether the native JSModuleRecord path is active. Vendored JSC only (the glue
-/// needs WebKit's C++ internals) AND opt-in via `V82JSC_NATIVE_MODULES` until it
-/// is proven on the framework battery; otherwise the rewrite_es_module fallback
-/// stays the default.
+// Script source JSValueRef -> its consumed code-cache bytes, so v8__Script__Run
+// can evaluate from bytecode (skip parse+codegen). Populated by CompileModule's
+// script/ScriptCompiler consume path.
+#[cfg(feature = "vendor_jsc")]
+thread_local! {
+  static SCRIPT_BYTECODE: std::cell::RefCell<
+    std::collections::HashMap<usize, std::vec::Vec<u8>>,
+  > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+// Startup R&D: total JS bytes + wall-time spent compiling at boot. Sizes the
+// bytecode-cache payoff (V82JSC_COMPILE_STATS). Printed by v8__V8__Dispose.
+pub(crate) static COMPILE_BYTES: std::sync::atomic::AtomicUsize =
+  std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static COMPILE_NANOS: std::sync::atomic::AtomicU64 =
+  std::sync::atomic::AtomicU64::new(0);
+
 #[inline]
+pub(crate) fn compile_stat<T>(src_len: usize, f: impl FnOnce() -> T) -> T {
+  if std::env::var_os("V82JSC_COMPILE_STATS").is_none() {
+    return f();
+  }
+  let t = std::time::Instant::now();
+  let r = f();
+  use std::sync::atomic::Ordering;
+  COMPILE_NANOS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+  COMPILE_BYTES.fetch_add(src_len, Ordering::Relaxed);
+  r
+}
+
 /// Snapshot R&D: append `(specifier, source)` to a dump dir in load order — one
 /// `NNN.<sanitized-spec>.js` file per module plus a `MANIFEST` of the order.
 /// Used to build/validate the runtime bundler offline. Not on any hot path.
@@ -169,6 +211,8 @@ fn dump_module(dir: &std::path::Path, specifier: &str, source: &str) {
   }
 }
 
+/// Whether the native JSModuleRecord path is active (vendored JSC only).
+#[inline]
 fn native_modules_enabled() -> bool {
   // Native JSModuleRecords are the module implementation on vendored JSC (the
   // glue needs WebKit's C++ internals). System JSC has no module C++ API, so it
@@ -203,9 +247,9 @@ unsafe fn native_parse(
   let url_c = std::ffi::CString::new(url).ok()?;
   let src_c = std::ffi::CString::new(src).ok()?;
   let mut exc: JSValueRef = ptr::null();
-  let handle = unsafe {
+  let handle = compile_stat(src.len(), || unsafe {
     v82jsc_module_parse(ctx, url_c.as_ptr(), src_c.as_ptr(), &mut exc)
-  };
+  });
   if handle.is_null() {
     let e = if exc.is_null() {
       unsafe { make_generic_error(ctx, "module parse failed") }
@@ -674,7 +718,49 @@ pub extern "C" fn v8__Script__Run(
   context: *const Context,
 ) -> *const Value {
   let ctx = ctx_of(context) as JSContextRef;
-  let result = unsafe { eval_value_as_script(ctx, jsval(script)) };
+  let src_val = jsval(script);
+
+  // Bytecode-cached path: if Compile stashed code cache for this source, eval
+  // from bytecode (skip parse+codegen). JSC silently falls back to parsing on a
+  // stale/invalid buffer, so this stays correct.
+  #[cfg(feature = "vendor_jsc")]
+  {
+    let bytes =
+      SCRIPT_BYTECODE.with(|m| m.borrow().get(&(src_val as usize)).cloned());
+    if let Some(bytes) = bytes {
+      let result = unsafe {
+        let src = jsstring_to_rust(ctx, src_val);
+        let src_c = std::ffi::CString::new(src).ok();
+        let url_c = std::ffi::CString::new("script").ok();
+        match (src_c, url_c) {
+          (Some(s), Some(u)) => {
+            let mut exc: JSValueRef = ptr::null();
+            let r = compile_stat(bytes.len(), || {
+              v82jsc_program_eval_cached(
+                ctx,
+                u.as_ptr(),
+                s.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len(),
+                &mut exc,
+              )
+            });
+            if r.is_null() && !exc.is_null() {
+              crate::jsc::core::record_pending_exception(ctx, exc);
+            }
+            r
+          }
+          _ => ptr::null(),
+        }
+      };
+      if result.is_null() {
+        return ptr::null();
+      }
+      return intern_ctx::<Value>(ctx, result);
+    }
+  }
+
+  let result = unsafe { eval_value_as_script(ctx, src_val) };
   if result.is_null() {
     return ptr::null();
   }
@@ -708,7 +794,7 @@ pub extern "C" fn v8__ScriptCompiler__Source__CONSTRUCT(
   buf: *mut MaybeUninit<Source>,
   source_string: *const V8String,
   origin: *const ScriptOrigin,
-  _cached_data: *mut CachedData,
+  cached_data: *mut CachedData,
 ) {
   if buf.is_null() {
     return;
@@ -720,6 +806,8 @@ pub extern "C" fn v8__ScriptCompiler__Source__CONSTRUCT(
     if !origin.is_null() {
       *slots.add(1) = *(origin as *const usize);
     }
+    // Slot 2: the code cache deno supplies (ConsumeCodeCache); read by Compile.
+    *slots.add(2) = cached_data as usize;
   }
 }
 
@@ -871,7 +959,47 @@ pub extern "C" fn v8__ScriptCompiler__Compile(
       return ptr::null();
     }
   }
+  // ConsumeCodeCache: deno passed precompiled bytecode. Stash it so Run can
+  // evaluate from bytecode (skip parse+codegen) and leave the CachedData
+  // un-rejected so deno keeps reusing it.
+  #[cfg(feature = "vendor_jsc")]
+  unsafe {
+    if let Some(bytes) = cached_data_bytes(source) {
+      if !bytes.is_empty() {
+        SCRIPT_BYTECODE
+          .with(|m| m.borrow_mut().insert(src_val as usize, bytes.to_vec()));
+      }
+    }
+  }
   intern_ctx::<Script>(ctx, src_val)
+}
+
+/// Read the code-cache bytes deno supplied via Source slot 2 (a RawCachedData),
+/// and mark it not-rejected so deno reuses it.
+#[cfg(feature = "vendor_jsc")]
+unsafe fn cached_data_bytes<'a>(source: *mut Source) -> Option<&'a [u8]> {
+  #[repr(C)]
+  struct RawCachedData {
+    data: *const u8,
+    length: i32,
+    rejected: bool,
+    buffer_policy: i32,
+  }
+  if source.is_null() {
+    return None;
+  }
+  let cd = unsafe { *((source as *const usize).add(2)) } as *mut RawCachedData;
+  if cd.is_null() {
+    return None;
+  }
+  unsafe {
+    let raw = &mut *cd;
+    raw.rejected = false;
+    if raw.data.is_null() || raw.length <= 0 {
+      return None;
+    }
+    Some(std::slice::from_raw_parts(raw.data, raw.length as usize))
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1776,8 +1904,9 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
       .filter(|c| !c.as_bytes().is_empty())
       .map(|c| JSStringCreateWithUTF8CString(c.as_ptr()))
       .unwrap_or(ptr::null_mut());
-    let result =
-      JSEvaluateScript(ctx, js_src, ptr::null_mut(), src_url_js, 1, &mut exc);
+    let result = compile_stat(cstr.as_bytes().len(), || {
+      JSEvaluateScript(ctx, js_src, ptr::null_mut(), src_url_js, 1, &mut exc)
+    });
     JSStringRelease(js_src);
     if !src_url_js.is_null() {
       JSStringRelease(src_url_js);
@@ -1799,9 +1928,63 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__UnboundScript__CreateCodeCache(
-  _script: *const UnboundScript,
+  script: *const UnboundScript,
 ) -> *mut CachedData<'static> {
-  ptr::null_mut()
+  // Encode the script's source to JSC bytecode so deno can persist it and
+  // ConsumeCodeCache it on the next run (fast startup).
+  #[cfg(feature = "vendor_jsc")]
+  {
+    let ctx = current_ctx();
+    let src_val = jsval(script);
+    if !ctx.is_null() && !src_val.is_null() {
+      let src = unsafe { jsstring_to_rust(ctx, src_val) };
+      if let (Ok(src_c), Ok(url_c)) = (
+        std::ffi::CString::new(src),
+        std::ffi::CString::new("script"),
+      ) {
+        let mut len: usize = 0;
+        let p = unsafe {
+          v82jsc_bytecode_encode(
+            ctx,
+            url_c.as_ptr(),
+            src_c.as_ptr(),
+            0,
+            &mut len,
+          )
+        };
+        if !p.is_null() && len > 0 {
+          let bytes = unsafe { std::slice::from_raw_parts(p, len) }
+            .to_vec()
+            .into_boxed_slice();
+          unsafe { v82jsc_bytecode_free(p) };
+          return cached_data_from_bytes(bytes);
+        }
+      }
+    }
+  }
+  // Non-null fallback so deno's create_code_cache().ok_or_else doesn't error.
+  make_placeholder_code_cache()
+}
+
+/// Wrap owned `bytes` in a v8 CachedData (buffer_policy=1: freed on DELETE).
+#[cfg(feature = "vendor_jsc")]
+fn cached_data_from_bytes(bytes: Box<[u8]>) -> *mut CachedData<'static> {
+  #[repr(C)]
+  struct RawCachedData {
+    data: *const u8,
+    length: i32,
+    rejected: bool,
+    buffer_policy: i32,
+  }
+  let length = bytes.len() as i32;
+  let data = Box::into_raw(bytes) as *const u8;
+  let boxed = Box::new(RawCachedData {
+    data,
+    length,
+    rejected: false,
+    buffer_policy: 1,
+  });
+  Box::into_raw(boxed) as *mut CachedData<'static>
 }
 
 #[unsafe(no_mangle)]

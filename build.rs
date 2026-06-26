@@ -243,10 +243,11 @@ fn build_native_modules_glue(
   webkit: &std::path::Path,
   build_dir: &std::path::Path,
 ) {
-  let src = manifest_dir.join("src/jsc/native_modules.cpp");
+  // Two glue translation units, archived together: native_modules.cpp (the
+  // JSModuleRecord module system) + bytecode.cpp (JSC bytecode cache).
   let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-  let obj = out_dir.join("native_modules.o");
   let archive = out_dir.join("libv82jsc_native_modules.a");
+  let units = ["native_modules.cpp", "bytecode.cpp"];
 
   let sdk = String::from_utf8(
     std::process::Command::new("xcrun")
@@ -260,7 +261,12 @@ fn build_native_modules_glue(
 
   let b = build_dir.to_str().unwrap();
   let inc = |p: &str| format!("-I{b}/{p}");
-  let status = std::process::Command::new("xcrun")
+  let mut objs: Vec<PathBuf> = Vec::new();
+  for unit in units {
+    let src = manifest_dir.join("src/jsc").join(unit);
+    let obj = out_dir.join(unit).with_extension("o");
+    objs.push(obj.clone());
+    let status = std::process::Command::new("xcrun")
     .args(["clang++", "-c"])
     .arg(&src)
     .arg("-o")
@@ -308,23 +314,23 @@ fn build_native_modules_glue(
     ])
     .args(["-isysroot", sdk])
     .status()
-    .expect("xcrun clang++ not found — needed to build native_modules.cpp");
-  assert!(status.success(), "native_modules.cpp compile failed");
+    .expect("xcrun clang++ not found — needed to build the JSC glue");
+    assert!(status.success(), "{unit} compile failed");
+    println!("cargo:rerun-if-changed={}", src.display());
+  }
 
-  // Archive the single object so the linker pulls it on demand (the Rust shims
-  // reference the v82jsc_module_* symbols).
+  // Archive the objects so the linker pulls them on demand (the Rust shims
+  // reference the v82jsc_* symbols).
   let _ = std::fs::remove_file(&archive);
-  let ar = std::process::Command::new("ar")
-    .arg("crs")
-    .arg(&archive)
-    .arg(&obj)
-    .status()
-    .expect("ar failed");
-  assert!(ar.success(), "ar archiving native_modules.o failed");
+  let mut ar = std::process::Command::new("ar");
+  ar.arg("crs").arg(&archive);
+  for o in &objs {
+    ar.arg(o);
+  }
+  assert!(ar.status().expect("ar failed").success(), "ar archiving failed");
 
   println!("cargo:rustc-link-search=native={}", out_dir.display());
   println!("cargo:rustc-link-lib=static=v82jsc_native_modules");
-  println!("cargo:rerun-if-changed={}", src.display());
 }
 
 /// Run bindgen over the SDK's JavaScriptCore C API umbrella header to produce
