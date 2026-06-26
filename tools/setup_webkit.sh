@@ -98,7 +98,15 @@ for arc, members in targets.items():
                     f.write(struct.pack("<I", flags))
                     changed = True
         if changed:
-            objs = [os.path.join(work, os.path.basename(m)) for m in order]
+            # `ar t` lists the archive symbol table (`__.SYMDEF`) on some
+            # toolchains; libtool rejects it ("not an object file"). Keep only
+            # extracted members that actually exist on disk.
+            objs = [
+                os.path.join(work, os.path.basename(m))
+                for m in order
+                if os.path.basename(m) != "__.SYMDEF"
+                and os.path.exists(os.path.join(work, os.path.basename(m)))
+            ]
             os.remove(path)
             subprocess.run(
                 ["xcrun", "libtool", "-static", "-o", path] + objs, check=True
