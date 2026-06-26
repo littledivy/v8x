@@ -12,18 +12,26 @@ use std::os::raw::{c_char, c_int};
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__InitializePlatform(_platform: *mut Platform) {
-  // Opt JSC into TC39 Explicit Resource Management (`using` / `await using` +
-  // Symbol.dispose/asyncDispose). It's gated off by default
-  // (OptionsList.h: useExplicitResourceManagement) but stable JS that deno's
-  // transpiler emits verbatim, so v8 parses it and JSC must too. JSC reads
-  // `JSC_<option>` env vars at Options::initialize() (a `Normal`-availability
-  // option, honored in release), and that runs lazily on first VM creation —
-  // after this, before any isolate exists. Works for vendored and system JSC
-  // alike (no C++ Options API needed). Don't clobber an explicit override.
-  if std::env::var_os("JSC_useExplicitResourceManagement").is_none() {
-    // SAFETY: called once at platform init, before any threads spawn a VM.
-    unsafe {
-      std::env::set_var("JSC_useExplicitResourceManagement", "1");
+  // Enable JS features that v8 ships on-by-default but JSC gates behind
+  // off-by-default options, so deno's globals/syntax match v8. JSC reads
+  // `JSC_<option>` env vars at Options::initialize() (these are all
+  // `Normal`-availability, honored in release), which runs lazily on first VM
+  // creation — after this, before any isolate exists. Works for vendored and
+  // system JSC alike (no C++ Options API). Don't clobber explicit overrides.
+  //
+  // - useExplicitResourceManagement: TC39 `using`/`await using` +
+  //   Symbol.dispose/asyncDispose (deno's transpiler emits these verbatim).
+  // - useSharedArrayBuffer: the `SharedArrayBuffer` global (deno exposes it;
+  //   Workers/Atomics rely on it).
+  for (key, val) in [
+    ("JSC_useExplicitResourceManagement", "1"),
+    ("JSC_useSharedArrayBuffer", "1"),
+  ] {
+    if std::env::var_os(key).is_none() {
+      // SAFETY: called once at platform init, before any threads spawn a VM.
+      unsafe {
+        std::env::set_var(key, val);
+      }
     }
   }
 }
