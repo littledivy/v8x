@@ -450,8 +450,18 @@ unsafe fn install_stacktrace_shim(ctx: JSGlobalContextRef) {
   }
   const SRC: &[u8] = b"(function(){\
     'use strict';\
-    var E = Error;\
-    var nativeCapture = E.captureStackTrace;\
+    var OrigError = Error;\
+    var nativeCapture = OrigError.captureStackTrace;\
+    function header(e){\
+      var n, m;\
+      try { n = e.name; } catch(_){ n = undefined; }\
+      try { m = e.message; } catch(_){ m = undefined; }\
+      n = n === undefined ? 'Error' : String(n);\
+      m = m === undefined ? '' : String(m);\
+      if (n === '') return m;\
+      if (m === '') return n;\
+      return n + ': ' + m;\
+    }\
     function parseFrames(s){\
       if (typeof s !== 'string' || !s) return [];\
       var out = [];\
@@ -492,23 +502,46 @@ unsafe fn install_stacktrace_shim(ctx: JSGlobalContextRef) {
         toString:function(){ return f.raw; }\
       };\
     }\
-    E.captureStackTrace = function(target, ctorOpt){\
-      var holder = {};\
-      try { if (nativeCapture) nativeCapture.call(E, holder, ctorOpt); } catch(e){}\
-      var raw = holder.stack;\
+    function formatStack(target, raw){\
+      var prep = globalThis.Error.prepareStackTrace;\
+      if (typeof prep === 'function'){\
+        try { return prep(target, parseFrames(raw).map(makeCallSite)); } catch(e){}\
+      }\
+      var h = header(target);\
+      return raw ? (h + '\\n' + raw) : (h + '\\n');\
+    }\
+    function installLazy(target, raw){\
       if (typeof raw !== 'string') raw = '';\
       Object.defineProperty(target, 'stack', {\
-        configurable: true,\
-        get: function(){\
-          var prep = E.prepareStackTrace;\
-          if (typeof prep === 'function'){\
-            try { return prep(target, parseFrames(raw).map(makeCallSite)); } catch(e){ return raw; }\
-          }\
-          return raw;\
-        },\
-        set: function(v){ Object.defineProperty(target, 'stack', {value:v, writable:true, configurable:true}); }\
+        configurable: true, enumerable: false,\
+        get: function(){ return formatStack(this, raw); },\
+        set: function(v){ Object.defineProperty(this, 'stack', {value:v, writable:true, configurable:true}); }\
       });\
-    };\
+    }\
+    function captureStackTrace(target, ctorOpt){\
+      var holder = {};\
+      try { if (nativeCapture) nativeCapture.call(OrigError, holder, ctorOpt); } catch(e){}\
+      var raw = holder.stack;\
+      installLazy(target, typeof raw === 'string' ? raw : '');\
+    }\
+    var names = ['Error','EvalError','RangeError','ReferenceError','SyntaxError','TypeError','URIError','AggregateError'];\
+    for (var i=0;i<names.length;i++){\
+      (function(nm){\
+        var Orig = globalThis[nm];\
+        if (typeof Orig !== 'function') return;\
+        function trap(e){\
+          var raw; try { raw = e.stack; } catch(_){ raw = ''; }\
+          installLazy(e, typeof raw === 'string' ? raw : '');\
+          return e;\
+        }\
+        var P = new Proxy(Orig, {\
+          construct: function(t, args, nt){ return trap(Reflect.construct(t, args, nt)); },\
+          apply: function(t, thisArg, args){ return trap(Reflect.construct(t, args)); }\
+        });\
+        globalThis[nm] = P;\
+      })(names[i]);\
+    }\
+    globalThis.Error.captureStackTrace = captureStackTrace;\
   })()\0";
   unsafe {
     let js = JSStringCreateWithUTF8CString(
