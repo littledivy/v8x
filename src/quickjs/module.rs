@@ -162,6 +162,12 @@ thread_local! {
     static SYNTHETIC_EXPORTS: RefCell<HashMap<usize, Vec<(std::string::String, JSValue)>>> =
         RefCell::new(HashMap::new());
 
+    // Persistent (dup'd) copy of a synthetic module's exports, keyed by def ptr,
+    // kept so `GetModuleNamespace` can build the namespace object — the values in
+    // SYNTHETIC_EXPORTS are consumed by JS_SetModuleExport during init.
+    static SYNTHETIC_NS_EXPORTS: RefCell<HashMap<usize, Vec<(std::string::String, JSValue)>>> =
+        RefCell::new(HashMap::new());
+
     static SYNTHETIC_DEFS: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
 
     static SYNTHETIC_EVAL_STEPS: RefCell<HashMap<usize, (SyntheticModuleEvaluationSteps<'static>, JSValue)>> =
@@ -177,6 +183,31 @@ thread_local! {
 
     static IMPORT_META_ENABLED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+
+    // URL of the main module — the first user (file://http(s)) module deno
+    // compiles. Used to set `import.meta.main` (deno's host callback, which we
+    // bypass, would normally do this).
+    static MAIN_MODULE_URL: std::cell::RefCell<Option<std::string::String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn note_main_module(name: &str) {
+  if !(name.starts_with("file://")
+    || name.starts_with("http://")
+    || name.starts_with("https://"))
+  {
+    return;
+  }
+  MAIN_MODULE_URL.with(|c| {
+    let mut b = c.borrow_mut();
+    if b.is_none() {
+      *b = Some(name.to_string());
+    }
+  });
+}
+
+fn is_main_module(name: &str) -> bool {
+  MAIN_MODULE_URL.with(|c| c.borrow().as_deref() == Some(name))
 }
 
 pub(crate) fn set_import_meta_callback(
@@ -209,11 +240,42 @@ pub(crate) fn set_dynamic_import_callback(
   unsafe { JS_SetDynamicImportHook(dynamic_import_hook) };
 }
 
+// Flatten QuickJS's null-proto `with` attributes object (e.g. {type:"json"})
+// into deno's host-callback FixedArray shape [key1, val1, key2, val2, ...].
+unsafe fn build_dyn_attrs(ctx: *mut JSContext, attributes: JSValue) -> JSValue {
+  if !jsv_is_object(&attributes) {
+    return unsafe { JS_NewArray(ctx) };
+  }
+  let src =
+    c"(o)=>{const a=[];for(const k of Object.keys(o)){a.push(k,String(o[k]));}return a;}";
+  let f = unsafe {
+    JS_Eval(
+      ctx,
+      src.as_ptr(),
+      src.to_bytes().len(),
+      c"<dynimport-attrs>".as_ptr(),
+      JS_EVAL_TYPE_GLOBAL,
+    )
+  };
+  if f.tag == JS_TAG_EXCEPTION {
+    unsafe { JS_FreeValue(ctx, JS_GetException(ctx)) };
+    return unsafe { JS_NewArray(ctx) };
+  }
+  let mut arg = [attributes];
+  let r = unsafe { JS_Call(ctx, f, jsv_undefined(), 1, arg.as_mut_ptr()) };
+  unsafe { JS_FreeValue(ctx, f) };
+  if r.tag == JS_TAG_EXCEPTION {
+    unsafe { JS_FreeValue(ctx, JS_GetException(ctx)) };
+    return unsafe { JS_NewArray(ctx) };
+  }
+  r
+}
+
 unsafe extern "C" fn dynamic_import_hook(
   ctx: *mut JSContext,
   basename: JSValue,
   specifier: JSValue,
-  _attributes: JSValue,
+  attributes: JSValue,
   resolving_funcs: *const JSValue,
 ) {
   let resolve = unsafe { *resolving_funcs };
@@ -242,7 +304,8 @@ unsafe extern "C" fn dynamic_import_hook(
   let host_opts = intern::<Data>(jsv_undefined());
   let referrer = intern_dup::<Value>(ctx, basename);
   let spec_handle = intern_dup::<V8String>(ctx, specifier);
-  let attrs_handle = intern::<FixedArray>(unsafe { JS_NewArray(ctx) });
+  let attrs_handle =
+    intern::<FixedArray>(unsafe { build_dyn_attrs(ctx, attributes) });
   let (Some(ctx_l), Some(ho_l), Some(ref_l), Some(spec_l), Some(attr_l)) = (
     unsafe { crate::Local::from_raw(context) },
     unsafe { crate::Local::from_raw(host_opts) },
@@ -321,8 +384,42 @@ unsafe fn populate_import_meta(
   if let Ok(curl) = CString::new(name) {
     let url_val = unsafe { JS_NewString(ctx, curl.as_ptr()) };
     unsafe { JS_SetPropertyStr(ctx, meta, c"url".as_ptr(), url_val) };
+
+    // import.meta.resolve(spec): deno's host callback installs this; we bypass
+    // the callback and populate import.meta natively, so add it here. Resolves
+    // relative to this module's URL — matches deno for relative/absolute
+    // specifiers (import-map / npm: resolution would need deno's resolver).
+    let factory_src = c"(u)=>(s)=>new URL(s,u).href";
+    let factory = unsafe {
+      JS_Eval(
+        ctx,
+        factory_src.as_ptr(),
+        factory_src.to_bytes().len(),
+        c"<import-meta-resolve>".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      )
+    };
+    if factory.tag != JS_TAG_EXCEPTION {
+      let mut arg = [unsafe { JS_NewString(ctx, curl.as_ptr()) }];
+      let resolve_fn =
+        unsafe { JS_Call(ctx, factory, jsv_undefined(), 1, arg.as_mut_ptr()) };
+      unsafe { JS_FreeValue(ctx, arg[0]) };
+      if resolve_fn.tag != JS_TAG_EXCEPTION {
+        unsafe {
+          JS_SetPropertyStr(ctx, meta, c"resolve".as_ptr(), resolve_fn)
+        };
+      } else {
+        unsafe { JS_FreeValue(ctx, JS_GetException(ctx)) };
+      }
+    } else {
+      unsafe { JS_FreeValue(ctx, JS_GetException(ctx)) };
+    }
+    unsafe { JS_FreeValue(ctx, factory) };
   }
-  unsafe { JS_SetPropertyStr(ctx, meta, c"main".as_ptr(), JS_NewBool(ctx, 0)) };
+  let is_main = if is_main_module(name) { 1 } else { 0 };
+  unsafe {
+    JS_SetPropertyStr(ctx, meta, c"main".as_ptr(), JS_NewBool(ctx, is_main))
+  };
 
   if name.ends_with(".wasm") {
     let global = unsafe { JS_GetGlobalObject(ctx) };
@@ -1479,6 +1576,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   let is_async = has_top_level_await(&text);
 
   register_module_source(&fname, &text);
+  note_main_module(&fname);
   if std::env::var_os("QJS_DEBUG_MOD").is_some() {
     eprintln!("[QJS CompileModule] {fname} imports={import_specifiers:?}");
   }
@@ -1808,6 +1906,37 @@ pub extern "C" fn v8__Module__GetModuleNamespace(
   let ctx = current_ctx();
   if ctx.is_null() {
     return ptr::null();
+  }
+  // Synthetic modules (e.g. dynamically-imported JSON) are `JS_NewCModule`s with
+  // no `func_obj`; QuickJS's `JS_GetModuleNamespace` -> `js_build_module_ns`
+  // dereferences `func_obj` and segfaults. Build the namespace object directly
+  // from the recorded synthetic exports instead.
+  if with_module_state(this, |m| m.synthetic).unwrap_or(false) {
+    let ns = unsafe { JS_NewObject(ctx) };
+    if let Some(def) =
+      SYNTHETIC_DEFS.with(|t| t.borrow().get(&handle_key(this)).copied())
+    {
+      // Prefer the post-init copy (static path). For a dynamically-imported
+      // synthetic module (e.g. JSON) the CModule init never ran, so run deno's
+      // evaluation_steps to populate SYNTHETIC_EXPORTS and read that. We must NOT
+      // call JS_SetModuleExport on the dynamic module — it was never
+      // QuickJS-instantiated, so its export slots don't exist (segfault).
+      let mut exports =
+        SYNTHETIC_NS_EXPORTS.with(|t| t.borrow().get(&def).cloned());
+      if exports.is_none() {
+        unsafe { run_synthetic_eval_steps(ctx, def as *mut JSModuleDef) };
+        exports = SYNTHETIC_EXPORTS.with(|t| t.borrow().get(&def).cloned());
+      }
+      if let Some(exports) = exports {
+        for (name, val) in exports {
+          if let Ok(c) = CString::new(name) {
+            let dup = unsafe { JS_DupValue(ctx, val) };
+            unsafe { JS_SetPropertyStr(ctx, ns, c.as_ptr(), dup) };
+          }
+        }
+      }
+    }
+    return intern::<Value>(ns);
   }
   let mut def =
     with_module_state(this, |m| m.module_def).unwrap_or(ptr::null_mut());
@@ -2451,10 +2580,10 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   this
 }
 
-unsafe extern "C" fn synthetic_module_init_callback(
-  ctx: *mut JSContext,
-  m: *mut JSModuleDef,
-) -> std::os::raw::c_int {
+// Run deno's `SyntheticModuleEvaluationSteps` for module `m`, which call
+// `SetSyntheticModuleExport` to populate SYNTHETIC_EXPORTS. Does NOT touch the
+// QuickJS module export slots (caller decides).
+unsafe fn run_synthetic_eval_steps(ctx: *mut JSContext, m: *mut JSModuleDef) {
   let steps =
     SYNTHETIC_EVAL_STEPS.with(|t| t.borrow().get(&(m as usize)).copied());
   if let Some((eval_steps, handle_jsval)) = steps {
@@ -2473,6 +2602,13 @@ unsafe extern "C" fn synthetic_module_init_callback(
       }
     }
   }
+}
+
+unsafe extern "C" fn synthetic_module_init_callback(
+  ctx: *mut JSContext,
+  m: *mut JSModuleDef,
+) -> std::os::raw::c_int {
+  unsafe { run_synthetic_eval_steps(ctx, m) };
 
   let exports = SYNTHETIC_EXPORTS
     .with(|t| t.borrow_mut().remove(&(m as usize)).unwrap_or_default());
@@ -2483,14 +2619,19 @@ unsafe extern "C" fn synthetic_module_init_callback(
       exports.len()
     );
   }
+  let mut ns_copy: Vec<(std::string::String, JSValue)> = Vec::new();
   for (name, value) in exports {
-    let Ok(name_c) = CString::new(name) else {
+    let Ok(name_c) = CString::new(name.clone()) else {
       unsafe { JS_FreeValue(ctx, value) };
       continue;
     };
-
+    // Keep a dup for the namespace (JS_SetModuleExport consumes `value`).
+    ns_copy.push((name, unsafe { JS_DupValue(ctx, value) }));
     unsafe { JS_SetModuleExport(ctx, m, name_c.as_ptr(), value) };
   }
+  SYNTHETIC_NS_EXPORTS.with(|t| {
+    t.borrow_mut().insert(m as usize, ns_copy);
+  });
   0
 }
 

@@ -502,13 +502,24 @@ unsafe fn install_stacktrace_shim(ctx: JSGlobalContextRef) {
         toString:function(){ return f.raw; }\
       };\
     }\
+    function toV8Frames(raw){\
+      var fs = parseFrames(raw);\
+      var out = [];\
+      for (var i=0;i<fs.length;i++){\
+        var f = fs[i];\
+        var loc = f.line ? (f.file + ':' + f.line + ':' + f.col) : f.file;\
+        out.push('    at ' + (f.fn ? (f.fn + ' (' + loc + ')') : loc));\
+      }\
+      return out.join('\\n');\
+    }\
     function formatStack(target, raw){\
       var prep = globalThis.Error.prepareStackTrace;\
       if (typeof prep === 'function'){\
         try { return prep(target, parseFrames(raw).map(makeCallSite)); } catch(e){}\
       }\
       var h = header(target);\
-      return raw ? (h + '\\n' + raw) : (h + '\\n');\
+      var frames = raw ? toV8Frames(raw) : '';\
+      return frames ? (h + '\\n' + frames) : (h + '\\n');\
     }\
     function installLazy(target, raw){\
       if (typeof raw !== 'string') raw = '';\
@@ -534,11 +545,10 @@ unsafe fn install_stacktrace_shim(ctx: JSGlobalContextRef) {
           installLazy(e, typeof raw === 'string' ? raw : '');\
           return e;\
         }\
-        var P = new Proxy(Orig, {\
-          construct: function(t, args, nt){ return trap(Reflect.construct(t, args, nt)); },\
-          apply: function(t, thisArg, args){ return trap(Reflect.construct(t, args)); }\
-        });\
-        globalThis[nm] = P;\
+        var h = Object.create(null);\
+        h.construct = function(t, args, nt){ return trap(Reflect.construct(t, args, nt)); };\
+        h.apply = function(t, thisArg, args){ return trap(Reflect.construct(t, args)); };\
+        globalThis[nm] = new Proxy(Orig, h);\
       })(names[i]);\
     }\
     globalThis.Error.captureStackTrace = captureStackTrace;\

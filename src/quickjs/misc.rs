@@ -362,13 +362,33 @@ pub extern "C" fn v8__JSON__Parse(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Proxy__GetHandler(_this: *const c_void) -> *const Value {
-  ptr::null()
+pub extern "C" fn v8__Proxy__GetHandler(this: *const c_void) -> *const Value {
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let v = unsafe { JS_GetProxyHandler(ctx, jsval_of(this as *const Value)) };
+  if v.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return ptr::null();
+  }
+  intern::<Value>(v)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Proxy__GetTarget(_this: *const c_void) -> *const Value {
-  ptr::null()
+pub extern "C" fn v8__Proxy__GetTarget(this: *const c_void) -> *const Value {
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let v = unsafe { JS_GetProxyTarget(ctx, jsval_of(this as *const Value)) };
+  if v.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return ptr::null();
+  }
+  intern::<Value>(v)
 }
 
 #[repr(C)]
@@ -608,8 +628,10 @@ pub extern "C" fn v8__JSON__Stringify(
       jsv_undefined(),
     );
     if s.tag == JS_TAG_EXCEPTION {
-      let exc = JS_GetException(ctx);
-      JS_FreeValue(ctx, exc);
+      // Leave the exception PENDING (v8's JSON::Stringify returns Empty and
+      // keeps it set) so the caller's TryCatch can read it — e.g. console's
+      // `%j` distinguishes circular-reference TypeErrors from real ones.
+      // Clearing it here made TryCatch::Exception() return undefined.
       return ptr::null();
     }
     intern::<V8String>(s)

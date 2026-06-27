@@ -152,7 +152,8 @@ fn build_vendored_jsc(manifest_dir: &std::path::Path) {
   // libJavaScriptCore.a + libWTF.a + libbmalloc.a; we link them into the
   // binary so it's self-contained (no dylib, no rpath).
   let jsc_a = lib_dir.join("libJavaScriptCore.a");
-  let prebuilt = jsc_a.exists() || env::var_os("JSC_VENDOR_BUILD_DIR").is_some();
+  let prebuilt =
+    jsc_a.exists() || env::var_os("JSC_VENDOR_BUILD_DIR").is_some();
   if prebuilt {
     // A PREBUILT lib archive is in place (CI downloads the WebKit static-lib
     // release — see .github/workflows/webkit-release.yml). Still apply the
@@ -243,11 +244,12 @@ fn build_native_modules_glue(
   webkit: &std::path::Path,
   build_dir: &std::path::Path,
 ) {
-  // Two glue translation units, archived together: native_modules.cpp (the
-  // JSModuleRecord module system) + bytecode.cpp (JSC bytecode cache).
+  // Glue translation units, archived together: native_modules.cpp (the
+  // JSModuleRecord module system), bytecode.cpp (JSC bytecode cache), and
+  // introspect.cpp (Proxy handler / Promise state / iterator preview).
   let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
   let archive = out_dir.join("libv82jsc_native_modules.a");
-  let units = ["native_modules.cpp", "bytecode.cpp"];
+  let units = ["native_modules.cpp", "bytecode.cpp", "introspect.cpp"];
 
   let sdk = String::from_utf8(
     std::process::Command::new("xcrun")
@@ -267,54 +269,54 @@ fn build_native_modules_glue(
     let obj = out_dir.join(unit).with_extension("o");
     objs.push(obj.clone());
     let status = std::process::Command::new("xcrun")
-    .args(["clang++", "-c"])
-    .arg(&src)
-    .arg("-o")
-    .arg(&obj)
-    .args([
-      "-DBUILDING_JSCONLY__",
-      "-DBUILDING_JavaScriptCore",
-      "-DBUILDING_WEBKIT=1",
-      "-DBUILDING_WITH_CMAKE=1",
-      "-DHAVE_CONFIG_H=1",
-      "-DPAS_BMALLOC=1",
-      "-DSTATICALLY_LINKED_WITH_WTF",
-      "-DSTATICALLY_LINKED_WITH_bmalloc",
-      "-DU_DISABLE_RENAMING=1",
-      "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE",
-      "-DNDEBUG",
-    ])
-    .arg(inc("JavaScriptCore/Headers"))
-    .arg(inc("JavaScriptCore/PrivateHeaders"))
-    .arg(format!("-I{b}"))
-    .arg(inc("HeaderMaps/JavaScriptCore.hmap"))
-    .arg(inc("JavaScriptCore/PrivateHeaders/JavaScriptCore"))
-    .arg(format!("-I{}/Source/JavaScriptCore", webkit.display()))
-    .arg(inc("JavaScriptCore/DerivedSources"))
-    .arg(inc("JavaScriptCore/DerivedSources/inspector"))
-    .arg(inc("JavaScriptCore/DerivedSources/runtime"))
-    .arg(inc("JavaScriptCore/DerivedSources/yarr"))
-    .arg(inc("WTF/Headers"))
-    .arg(inc("bmalloc/Headers"))
-    .arg(inc("bmalloc/PrivateHeaders"))
-    .args(["-isystem", &format!("{b}/ICU/Headers")])
-    .args([
-      "-std=c++2b",
-      "-O3",
-      "-fno-exceptions",
-      "-fno-rtti",
-      "-fvisibility=hidden",
-      "-fvisibility-inlines-hidden",
-      "-fPIC",
-      "-ffp-contract=off",
-      "-fno-slp-vectorize",
-      "-arch",
-      "arm64",
-      "-Wno-everything",
-    ])
-    .args(["-isysroot", sdk])
-    .status()
-    .expect("xcrun clang++ not found — needed to build the JSC glue");
+      .args(["clang++", "-c"])
+      .arg(&src)
+      .arg("-o")
+      .arg(&obj)
+      .args([
+        "-DBUILDING_JSCONLY__",
+        "-DBUILDING_JavaScriptCore",
+        "-DBUILDING_WEBKIT=1",
+        "-DBUILDING_WITH_CMAKE=1",
+        "-DHAVE_CONFIG_H=1",
+        "-DPAS_BMALLOC=1",
+        "-DSTATICALLY_LINKED_WITH_WTF",
+        "-DSTATICALLY_LINKED_WITH_bmalloc",
+        "-DU_DISABLE_RENAMING=1",
+        "-D_LIBCPP_HARDENING_MODE=_LIBCPP_HARDENING_MODE_EXTENSIVE",
+        "-DNDEBUG",
+      ])
+      .arg(inc("JavaScriptCore/Headers"))
+      .arg(inc("JavaScriptCore/PrivateHeaders"))
+      .arg(format!("-I{b}"))
+      .arg(inc("HeaderMaps/JavaScriptCore.hmap"))
+      .arg(inc("JavaScriptCore/PrivateHeaders/JavaScriptCore"))
+      .arg(format!("-I{}/Source/JavaScriptCore", webkit.display()))
+      .arg(inc("JavaScriptCore/DerivedSources"))
+      .arg(inc("JavaScriptCore/DerivedSources/inspector"))
+      .arg(inc("JavaScriptCore/DerivedSources/runtime"))
+      .arg(inc("JavaScriptCore/DerivedSources/yarr"))
+      .arg(inc("WTF/Headers"))
+      .arg(inc("bmalloc/Headers"))
+      .arg(inc("bmalloc/PrivateHeaders"))
+      .args(["-isystem", &format!("{b}/ICU/Headers")])
+      .args([
+        "-std=c++2b",
+        "-O3",
+        "-fno-exceptions",
+        "-fno-rtti",
+        "-fvisibility=hidden",
+        "-fvisibility-inlines-hidden",
+        "-fPIC",
+        "-ffp-contract=off",
+        "-fno-slp-vectorize",
+        "-arch",
+        "arm64",
+        "-Wno-everything",
+      ])
+      .args(["-isysroot", sdk])
+      .status()
+      .expect("xcrun clang++ not found — needed to build the JSC glue");
     assert!(status.success(), "{unit} compile failed");
     println!("cargo:rerun-if-changed={}", src.display());
   }
@@ -327,7 +329,10 @@ fn build_native_modules_glue(
   for o in &objs {
     ar.arg(o);
   }
-  assert!(ar.status().expect("ar failed").success(), "ar archiving failed");
+  assert!(
+    ar.status().expect("ar failed").success(),
+    "ar archiving failed"
+  );
 
   println!("cargo:rustc-link-search=native={}", out_dir.display());
   println!("cargo:rustc-link-lib=static=v82jsc_native_modules");

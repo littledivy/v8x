@@ -184,12 +184,80 @@ pub(crate) fn intern_dup<T>(ctx: *mut JSContext, v: JSValue) -> *const T {
   intern::<T>(dup)
 }
 
+// Process-global refcount table for SharedArrayBuffer memory shared across worker
+// threads. Keyed by data pointer so foreign pointers (e.g. SABs deno hands us via
+// a backing store rather than `sab_alloc`) are handled gracefully: dup/free on an
+// unknown pointer is a no-op, so we never free memory we did not allocate.
+fn sab_refcounts()
+-> &'static std::sync::Mutex<std::collections::HashMap<usize, usize>> {
+  static T: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, usize>>,
+  > = std::sync::OnceLock::new();
+  T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+unsafe extern "C" {
+  fn malloc(size: usize) -> *mut c_void;
+  fn free(ptr: *mut c_void);
+}
+
+unsafe extern "C" fn sab_alloc_fn(
+  _opaque: *mut c_void,
+  size: usize,
+) -> *mut c_void {
+  let p = unsafe { malloc(size.max(1)) };
+  if !p.is_null() {
+    sab_refcounts().lock().unwrap().insert(p as usize, 1);
+  }
+  p
+}
+
+unsafe extern "C" fn sab_dup_fn(_opaque: *mut c_void, ptr: *mut c_void) {
+  if let Some(c) = sab_refcounts().lock().unwrap().get_mut(&(ptr as usize)) {
+    *c += 1;
+  }
+}
+
+unsafe extern "C" fn sab_free_fn(_opaque: *mut c_void, ptr: *mut c_void) {
+  let mut map = sab_refcounts().lock().unwrap();
+  if let Some(c) = map.get_mut(&(ptr as usize)) {
+    *c -= 1;
+    if *c == 0 {
+      map.remove(&(ptr as usize));
+      drop(map);
+      unsafe { free(ptr) };
+    }
+  }
+}
+
+struct SabFuncsHolder(JSSharedArrayBufferFunctions);
+// SAFETY: the only non-Sync field is `sab_opaque`, a null pointer we never read.
+unsafe impl Sync for SabFuncsHolder {}
+
+fn sab_funcs_table() -> *const JSSharedArrayBufferFunctions {
+  static FUNCS: SabFuncsHolder = SabFuncsHolder(JSSharedArrayBufferFunctions {
+    sab_alloc: Some(sab_alloc_fn),
+    sab_free: Some(sab_free_fn),
+    sab_dup: Some(sab_dup_fn),
+    sab_opaque: ptr::null_mut(),
+  });
+  &FUNCS.0
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
   unsafe { JS_SetMaxStackSize(rt, 8 * 1024 * 1024) };
+  // deno's V8 lets `Atomics.wait` block the main isolate (deno isn't a browser);
+  // QuickJS gates it behind can_block (default false → "cannot block in this
+  // thread"). Enable to match.
+  unsafe { JS_SetCanBlock(rt, true) };
+  // Cross-thread SharedArrayBuffer: register a process-global refcounted shared
+  // allocator. Without it the bytecode deserializer rejects BC_TAG_SHARED_ARRAY_BUFFER
+  // (`!sab_funcs.sab_dup` gate) so SABs cannot survive a `postMessage` to a worker.
+  unsafe { JS_SetSharedArrayBufferFunctions(rt, sab_funcs_table()) };
 
   unsafe {
     JS_SetModuleLoaderFunc(

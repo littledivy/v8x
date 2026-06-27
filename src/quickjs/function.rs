@@ -62,6 +62,15 @@ unsafe extern "C" {
     val: JSValue,
     flags: c_int,
   ) -> c_int;
+
+  fn JS_ValueToAtom(ctx: *mut JSContext, val: JSValue) -> JSAtom;
+  fn JS_DefinePropertyValue(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: JSAtom,
+    val: JSValue,
+    flags: c_int,
+  ) -> c_int;
 }
 
 type JSClassFinalizer = unsafe extern "C" fn(rt: *mut JSRuntime, val: JSValue);
@@ -1038,18 +1047,19 @@ fn apply_props(
       continue;
     }
 
-    let mut len: usize = 0;
-    let keystr = unsafe { JS_ToCStringLen(ctx, &mut len, key) };
-    if keystr.is_null() {
+    // Atom-based define so Symbol keys (e.g. a cppgc method exposed under
+    // `Symbol.for("Deno_bitmapData")`) round-trip — `JS_ToCStringLen` would
+    // collapse a symbol to its string description and lose it.
+    let atom = unsafe { JS_ValueToAtom(ctx, key) };
+    if atom == 0 {
       continue;
     }
 
     let value = materialize_template_value(ctx, value);
-
     let v = unsafe { JS_DupValue(ctx, value) };
     unsafe {
-      JS_SetPropertyStr(ctx, obj, keystr, v);
-      JS_FreeCString(ctx, keystr);
+      JS_DefinePropertyValue(ctx, obj, atom, v, JS_PROP_C_W_E);
+      JS_FreeAtom(ctx, atom);
     }
   }
 }

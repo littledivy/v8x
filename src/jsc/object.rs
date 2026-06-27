@@ -950,6 +950,26 @@ pub extern "C" fn v8__Object__PreviewEntries(
   if ctx.is_null() || o.is_null() {
     return ptr::null();
   }
+  // A Map/Set ITERATOR has no `.entries()`/`.values()` of its own; previewing
+  // it means peeking the remaining backing entries without consuming. Do that
+  // natively (introspect.cpp). Collections fall through to the iterator-method
+  // path below.
+  {
+    let mut kv = false;
+    let arr = unsafe {
+      crate::jsc::introspect::v82jsc_iterator_preview(
+        ctx,
+        o as JSValueRef,
+        &mut kv,
+      )
+    };
+    if !arr.is_null() {
+      if !is_key_value.is_null() {
+        unsafe { *is_key_value = kv };
+      }
+      return intern::<Array>(arr);
+    }
+  }
   unsafe {
     let mut exc: JSValueRef = ptr::null();
 

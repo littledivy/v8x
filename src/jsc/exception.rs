@@ -469,22 +469,16 @@ pub extern "C" fn v8__Promise__State(this: *const Promise) -> PromiseState {
   if ctx.is_null() || this.is_null() {
     return PromiseState::Pending;
   }
-  unsafe {
-    let obj = jsval(this) as JSObjectRef;
-    let key = JSStringCreateWithUTF8CString(
-      b"__v8jsc_state\0".as_ptr() as *const c_char
-    );
-    let mut exc: JSValueRef = ptr::null();
-    let v = JSObjectGetProperty(ctx, obj, key, &mut exc);
-    JSStringRelease(key);
-    if v.is_null() || JSValueIsUndefined(ctx, v) {
-      return PromiseState::Pending;
-    }
-    match JSValueToNumber(ctx, v, &mut exc) as i32 {
-      1 => PromiseState::Fulfilled,
-      2 => PromiseState::Rejected,
-      _ => PromiseState::Pending,
-    }
+  // Native read of JSPromise::status() (introspect.cpp) — synchronous and
+  // accurate for ANY promise, unlike the old property-emulated tracking which
+  // only saw promises deno created via Resolver and updated asynchronously.
+  let mut result: JSValueRef = ptr::null();
+  match unsafe {
+    crate::jsc::introspect::v82jsc_promise_status(ctx, jsval(this), &mut result)
+  } {
+    1 => PromiseState::Fulfilled,
+    2 => PromiseState::Rejected,
+    _ => PromiseState::Pending,
   }
 }
 
@@ -499,18 +493,18 @@ pub extern "C" fn v8__Promise__Result(this: *const Promise) -> *const Value {
   if ctx.is_null() || this.is_null() {
     return ptr::null();
   }
+  // Native read of JSPromise::result() (introspect.cpp).
+  let mut result: JSValueRef = ptr::null();
   unsafe {
-    let obj = jsval(this) as JSObjectRef;
-    let key = JSStringCreateWithUTF8CString(
-      b"__v8jsc_result\0".as_ptr() as *const c_char
+    crate::jsc::introspect::v82jsc_promise_status(
+      ctx,
+      jsval(this),
+      &mut result,
     );
-    let mut exc: JSValueRef = ptr::null();
-    let v = JSObjectGetProperty(ctx, obj, key, &mut exc);
-    JSStringRelease(key);
-    let v = if v.is_null() {
+    let v = if result.is_null() {
       JSValueMakeUndefined(ctx)
     } else {
-      v
+      result
     };
     intern_ctx::<Value>(ctx, v)
   }

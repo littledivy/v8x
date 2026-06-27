@@ -147,14 +147,115 @@ pub extern "C" fn v8__Context__SetAlignedPointerInEmbedderData(
   });
 }
 
+type JSPromiseHookType = i32;
+
+unsafe extern "C" {
+  fn JS_SetPromiseHook(
+    rt: *mut JSRuntime,
+    hook: Option<
+      unsafe extern "C" fn(
+        ctx: *mut JSContext,
+        ty: JSPromiseHookType,
+        promise: JSValue,
+        parent: JSValue,
+        opaque: *mut c_void,
+      ),
+    >,
+    opaque: *mut c_void,
+  );
+}
+
+thread_local! {
+  // [init, before, after, resolve] JS hook fns (+1 ref each; undefined = unset)
+  // and a re-entrancy guard.
+  static PROMISE_HOOKS: std::cell::Cell<[JSValue; 4]> =
+    std::cell::Cell::new([jsv_undefined(); 4]);
+  static PROMISE_HOOK_BUSY: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+unsafe extern "C" fn promise_hook_trampoline(
+  ctx: *mut JSContext,
+  ty: JSPromiseHookType,
+  promise: JSValue,
+  parent: JSValue,
+  _opaque: *mut c_void,
+) {
+  let idx = ty as usize;
+  if idx >= 4 || ctx.is_null() {
+    return;
+  }
+  // Guard against a hook that itself creates/awaits promises recursing forever.
+  if PROMISE_HOOK_BUSY.with(|b| b.get()) {
+    return;
+  }
+  let f = PROMISE_HOOKS.with(|h| h.get()[idx]);
+  if jsv_is_undefined(&f) {
+    return;
+  }
+  PROMISE_HOOK_BUSY.with(|b| b.set(true));
+  // init (idx 0) also receives the parent promise.
+  let mut args = [promise, parent];
+  let argc = if idx == 0 { 2 } else { 1 };
+  let ret =
+    unsafe { JS_Call(ctx, f, jsv_undefined(), argc, args.as_mut_ptr()) };
+  if ret.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+  } else {
+    unsafe { JS_FreeValue(ctx, ret) };
+  }
+  PROMISE_HOOK_BUSY.with(|b| b.set(false));
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__SetPromiseHooks(
   _this: *const Context,
-  _init_hook: *const Function,
-  _before_hook: *const Function,
-  _after_hook: *const Function,
-  _resolve_hook: *const Function,
+  init_hook: *const Function,
+  before_hook: *const Function,
+  after_hook: *const Function,
+  resolve_hook: *const Function,
 ) {
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return;
+  }
+  let promote = |p: *const Function| -> JSValue {
+    if p.is_null() {
+      jsv_undefined()
+    } else {
+      let v = jsval_of(p);
+      if jsv_is_undefined(&v) {
+        jsv_undefined()
+      } else {
+        unsafe { JS_DupValue(ctx, v) }
+      }
+    }
+  };
+  let new = [
+    promote(init_hook),
+    promote(before_hook),
+    promote(after_hook),
+    promote(resolve_hook),
+  ];
+  let old = PROMISE_HOOKS.with(|h| h.replace(new));
+  for v in old {
+    if !jsv_is_undefined(&v) {
+      unsafe { JS_FreeValue(ctx, v) };
+    }
+  }
+  let any = new.iter().any(|v| !jsv_is_undefined(v));
+  let rt = unsafe { JS_GetRuntime(ctx) };
+  unsafe {
+    JS_SetPromiseHook(
+      rt,
+      if any {
+        Some(promise_hook_trampoline)
+      } else {
+        None
+      },
+      ptr::null_mut(),
+    )
+  };
 }
 
 thread_local! {

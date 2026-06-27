@@ -155,6 +155,9 @@ unsafe extern "C" {
   pub fn wasm_exporttype_name(
     et: *const wasm_exporttype_t,
   ) -> *const wasm_vec_t;
+  pub fn wasm_exporttype_type(
+    et: *const wasm_exporttype_t,
+  ) -> *const wasm_externtype_t;
 
   pub fn wasm_functype_params(ft: *const wasm_functype_t) -> *const wasm_vec_t;
   pub fn wasm_functype_results(ft: *const wasm_functype_t)
@@ -1441,6 +1444,122 @@ thread_local! {
     static SETTLE: std::cell::Cell<Option<JSValue>> = const { std::cell::Cell::new(None) };
 }
 
+unsafe fn extern_kind_str(kind: u8) -> &'static std::ffi::CStr {
+  match kind {
+    WASM_EXTERN_FUNC => c"function",
+    WASM_EXTERN_GLOBAL => c"global",
+    WASM_EXTERN_TABLE => c"table",
+    WASM_EXTERN_MEMORY => c"memory",
+    _ => c"",
+  }
+}
+
+unsafe fn js_str(ctx: *mut JSContext, s: &str) -> JSValue {
+  unsafe {
+    JS_NewStringLen(ctx, s.as_ptr() as *const std::os::raw::c_char, s.len())
+  }
+}
+
+// WebAssembly.Module.exports(module) -> [{ name, kind }]
+unsafe extern "C" fn wa_module_exports(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  if argc < 1 {
+    return unsafe { throw(ctx, "WebAssembly.Module.exports: missing module") };
+  }
+  let Some(id) = (unsafe { obj_module_id(ctx, *argv) }) else {
+    return unsafe { throw(ctx, "WebAssembly.Module.exports: invalid module") };
+  };
+  let m = unsafe { module_ptr(id) };
+  if m.is_null() {
+    return unsafe { throw(ctx, "WebAssembly.Module.exports: invalid module") };
+  }
+  let mut ets = wasm_vec_t::empty();
+  unsafe { wasm_module_exports(m, &mut ets) };
+  let arr = unsafe { JS_NewArray(ctx) };
+  let data = ets.data as *const *const wasm_exporttype_t;
+  for i in 0..ets.size {
+    let et = unsafe { *data.add(i) };
+    let name = vec_name_to_string(unsafe { wasm_exporttype_name(et) });
+    let kind = unsafe { wasm_externtype_kind(wasm_exporttype_type(et)) };
+    let desc = unsafe { JS_NewObject(ctx) };
+    unsafe {
+      JS_SetPropertyStr(ctx, desc, c"name".as_ptr(), js_str(ctx, &name));
+      JS_SetPropertyStr(
+        ctx,
+        desc,
+        c"kind".as_ptr(),
+        JS_NewStringLen(
+          ctx,
+          extern_kind_str(kind).as_ptr(),
+          extern_kind_str(kind).to_bytes().len(),
+        ),
+      );
+      JS_SetPropertyUint32(ctx, arr, i as u32, desc);
+    }
+  }
+  arr
+}
+
+// WebAssembly.Module.imports(module) -> [{ module, name, kind }]
+unsafe extern "C" fn wa_module_imports(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  if argc < 1 {
+    return unsafe { throw(ctx, "WebAssembly.Module.imports: missing module") };
+  }
+  let Some(id) = (unsafe { obj_module_id(ctx, *argv) }) else {
+    return unsafe { throw(ctx, "WebAssembly.Module.imports: invalid module") };
+  };
+  let m = unsafe { module_ptr(id) };
+  if m.is_null() {
+    return unsafe { throw(ctx, "WebAssembly.Module.imports: invalid module") };
+  }
+  let mut its = wasm_vec_t::empty();
+  unsafe { wasm_module_imports(m, &mut its) };
+  let arr = unsafe { JS_NewArray(ctx) };
+  let data = its.data as *const *const wasm_importtype_t;
+  for i in 0..its.size {
+    let it = unsafe { *data.add(i) };
+    let modname = vec_name_to_string(unsafe { wasm_importtype_module(it) });
+    let name = vec_name_to_string(unsafe { wasm_importtype_name(it) });
+    let kind = unsafe { wasm_externtype_kind(wasm_importtype_type(it)) };
+    let desc = unsafe { JS_NewObject(ctx) };
+    unsafe {
+      JS_SetPropertyStr(ctx, desc, c"module".as_ptr(), js_str(ctx, &modname));
+      JS_SetPropertyStr(ctx, desc, c"name".as_ptr(), js_str(ctx, &name));
+      JS_SetPropertyStr(
+        ctx,
+        desc,
+        c"kind".as_ptr(),
+        JS_NewStringLen(
+          ctx,
+          extern_kind_str(kind).as_ptr(),
+          extern_kind_str(kind).to_bytes().len(),
+        ),
+      );
+      JS_SetPropertyUint32(ctx, arr, i as u32, desc);
+    }
+  }
+  arr
+}
+
+// WebAssembly.Module.customSections(module, name) -> [] (sections not retained)
+unsafe extern "C" fn wa_module_custom_sections(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
+  unsafe { JS_NewArray(ctx) }
+}
+
 pub(crate) fn install_webassembly(ctx: *mut JSContext) {
   unsafe {
     let global = JS_GetGlobalObject(ctx);
@@ -1466,7 +1585,34 @@ pub(crate) fn install_webassembly(ctx: *mut JSContext) {
     set_fn(wa, c"compile", wa_compile, 1);
     set_fn(wa, c"instantiate", wa_instantiate, 2);
 
+    // Static introspection methods on the Module constructor.
+    let module_ctor = JS_GetPropertyStr(ctx, wa, c"Module".as_ptr());
+    set_fn(module_ctor, c"exports", wa_module_exports, 1);
+    set_fn(module_ctor, c"imports", wa_module_imports, 1);
+    set_fn(module_ctor, c"customSections", wa_module_custom_sections, 2);
+    JS_FreeValue(ctx, module_ctor);
+
     JS_SetPropertyStr(ctx, global, c"WebAssembly".as_ptr(), wa);
     JS_FreeValue(ctx, global);
+
+    // compile/instantiateStreaming: V8 installs these via a streaming callback
+    // deno provides; we expose the standard buffering polyfill (await the
+    // Response/source, read its bytes, delegate to the non-streaming form).
+    let poly = c"(()=>{const W=globalThis.WebAssembly;\
+const check=async s=>{s=await s;\
+if(typeof Response!=='undefined'&&!(s instanceof Response))throw new TypeError('Invalid WebAssembly response object');\
+const ct=((s.headers&&s.headers.get('content-type'))||'').split(';')[0].trim().toLowerCase();\
+if(ct!=='application/wasm')throw new TypeError(\"Invalid WebAssembly content type, expected 'application/wasm'.\");\
+return await s.arrayBuffer();};\
+W.compileStreaming=async s=>W.compile(await check(s));\
+W.instantiateStreaming=async (s,i)=>W.instantiate(await check(s),i);})()";
+    let r = JS_Eval(
+      ctx,
+      poly.as_ptr(),
+      poly.to_bytes().len(),
+      c"<wasm-streaming>".as_ptr(),
+      JS_EVAL_TYPE_GLOBAL,
+    );
+    JS_FreeValue(ctx, r);
   }
 }

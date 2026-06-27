@@ -821,10 +821,12 @@ pub extern "C" fn simdutf__base64_to_binary(
 
   let mut sextets: Vec<u8> = Vec::with_capacity(s.len());
   let mut padding_seen = false;
+  let mut nonws = 0usize; // non-whitespace chars, including '=' padding
   for (idx, &c) in s.iter().enumerate() {
     if c.is_ascii_whitespace() {
       continue;
     }
+    nonws += 1;
     if c == b'=' {
       padding_seen = true;
       continue;
@@ -836,6 +838,18 @@ pub extern "C" fn simdutf__base64_to_binary(
       Some(v) => sextets.push(v),
       None => return err(INVALID_BASE64_CHARACTER, idx),
     }
+  }
+
+  // WHATWG forgiving-base64 padding validation (simdutf strips '=' up front, so
+  // enforce it here else `atob` accepts what v8 rejects): the whitespace-
+  // stripped length (counting '=') ≡1 mod 4 is invalid; and '=' padding is only
+  // allowed when that length ≡0 mod 4, at most two of them.
+  let pad_count = nonws - sextets.len();
+  if nonws % 4 == 1 {
+    return err(BASE64_INPUT_REMAINDER, nonws);
+  }
+  if pad_count > 0 && (nonws % 4 != 0 || pad_count > 2) {
+    return err(INVALID_BASE64_CHARACTER, nonws.saturating_sub(1));
   }
 
   let rem = sextets.len() % 4;

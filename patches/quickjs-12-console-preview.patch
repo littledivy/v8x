@@ -1,0 +1,143 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -53048,7 +53048,126 @@
+         }
+     }
+ }
++
++/* v82jsc: peek the remaining entries of a Map/Set iterator WITHOUT consuming it
++   (v8's Object::PreviewEntries / `Deno.core.previewEntries`, used by console to
++   render `[Set Iterator] { 1, 2, 3 }`). Walks the record list from the
++   iterator's current position without touching cur_record or ref counts.
++   Returns a fresh array (entries flattened as key,value for KEY_AND_VALUE), or
++   JS_NULL if `iter` is not a Map/Set iterator. Sets *pis_key_value. */
++/* v82jsc: report a function's kind from its internal class (bit0 = async,
++   bit1 = generator; async-generator sets both) — matching v8's
++   IsAsyncFunction/IsGeneratorFunction, which read [[FunctionKind]] rather than
++   the prototype's Symbol.toStringTag (so it still works when the prototype is
++   removed). Returns 0 for non-functions / plain functions. */
++int js_v82jsc_function_kind(JSValueConst v)
++{
++    JSObject *p;
++    if (JS_VALUE_GET_TAG(v) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(v);
++    switch (p->class_id) {
++    case JS_CLASS_ASYNC_FUNCTION:
++        return 1;
++    case JS_CLASS_GENERATOR_FUNCTION:
++        return 2;
++    case JS_CLASS_ASYNC_GENERATOR_FUNCTION:
++        return 3;
++    default:
++        return 0;
++    }
++}
++
++JSValue js_v82jsc_iterator_preview(JSContext *ctx, JSValueConst iter,
++                                   int *pis_key_value)
++{
++    JSObject *p;
++    JSMapIteratorData *it;
++    JSMapState *s;
++    JSMapRecord *mr;
++    struct list_head *el;
++    JSValue arr;
++    uint32_t idx;
++    int magic;
+ 
++    if (pis_key_value)
++        *pis_key_value = 0;
++    if (JS_VALUE_GET_TAG(iter) != JS_TAG_OBJECT)
++        return JS_NULL;
++    p = JS_VALUE_GET_OBJ(iter);
++
++    /* WeakMap/WeakSet collections aren't iterable from script, but console's
++       showHidden previews their live entries; walk the records directly. */
++    if (p->class_id == JS_CLASS_WEAKMAP || p->class_id == JS_CLASS_WEAKSET) {
++        int coll_magic = p->class_id - JS_CLASS_MAP; /* 2 weakmap, 3 weakset */
++        s = p->u.map_state;
++        arr = JS_NewArray(ctx);
++        if (JS_IsException(arr))
++            return arr;
++        if (pis_key_value)
++            *pis_key_value = ((coll_magic & 1) == 0); /* weakmap = key,value */
++        if (!s)
++            return arr;
++        idx = 0;
++        list_for_each(el, &s->records) {
++            JSValue v;
++            mr = list_entry(el, JSMapRecord, link);
++            if (mr->empty)
++                continue;
++            if (coll_magic & 1) { /* weakset: value only */
++                JS_DefinePropertyValueUint32(ctx, arr, idx++, js_dup(mr->key),
++                                             JS_PROP_C_W_E);
++            } else { /* weakmap: key, value flattened */
++                JS_DefinePropertyValueUint32(ctx, arr, idx++, js_dup(mr->key),
++                                             JS_PROP_C_W_E);
++                v = mr->value;
++                JS_DefinePropertyValueUint32(ctx, arr, idx++, js_dup(v),
++                                             JS_PROP_C_W_E);
++            }
++        }
++        return arr;
++    }
++
++    if (p->class_id != JS_CLASS_MAP_ITERATOR &&
++        p->class_id != JS_CLASS_SET_ITERATOR)
++        return JS_NULL;
++    magic = p->class_id - JS_CLASS_MAP_ITERATOR; /* 0 = map, 1 = set */
++    it = p->u.map_iterator_data;
++    arr = JS_NewArray(ctx);
++    if (JS_IsException(arr))
++        return arr;
++    if (pis_key_value)
++        *pis_key_value = (it && it->kind == JS_ITERATOR_KIND_KEY_AND_VALUE);
++    if (!it || JS_IsUndefined(it->obj))
++        return arr; /* exhausted iterator: empty preview */
++    s = JS_GetOpaque(it->obj, JS_CLASS_MAP + magic);
++    if (!s)
++        return arr;
++    idx = 0;
++    el = it->cur_record ? it->cur_record->link.next : s->records.next;
++    for (; el != &s->records; el = el->next) {
++        JSValue v;
++        mr = list_entry(el, JSMapRecord, link);
++        if (mr->empty)
++            continue;
++        /* Sets store the element as the key; the value field mirrors it. */
++        v = magic ? mr->key : mr->value;
++        if (it->kind == JS_ITERATOR_KIND_KEY) {
++            JS_DefinePropertyValueUint32(ctx, arr, idx++, js_dup(mr->key),
++                                         JS_PROP_C_W_E);
++        } else if (it->kind == JS_ITERATOR_KIND_VALUE) {
++            JS_DefinePropertyValueUint32(ctx, arr, idx++, js_dup(v),
++                                         JS_PROP_C_W_E);
++        } else { /* KEY_AND_VALUE */
++            JS_DefinePropertyValueUint32(ctx, arr, idx++, js_dup(mr->key),
++                                         JS_PROP_C_W_E);
++            JS_DefinePropertyValueUint32(ctx, arr, idx++, js_dup(v),
++                                         JS_PROP_C_W_E);
++        }
++    }
++    return arr;
++}
++
+ static JSValue js_map_read(BCReaderState *s, int magic)
+ {
+     JSContext *ctx = s->ctx;
+@@ -55328,6 +55447,12 @@
+                 error = js_aggregate_error_constructor(ctx, values);
+                 if (JS_IsException(error))
+                     goto fail_reject;
++                /* v82jsc: v8 gives the Promise.any rejection AggregateError the
++                   message "All promises were rejected"; quickjs leaves it empty.
++                   Match v8 so console renders `[AggregateError: ...]`. */
++                JS_DefinePropertyValue(ctx, error, JS_ATOM_message,
++                    JS_NewString(ctx, "All promises were rejected"),
++                    JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+                 JS_FreeValue(ctx, values);
+                 values = error;
+             }

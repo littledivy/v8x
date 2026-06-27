@@ -256,21 +256,146 @@ pub extern "C" fn v8__Location__GetColumnNumber(this: *const Location) -> int {
   unsafe { *((this as *const i32).add(1)) as int }
 }
 
+// QuickJS records the current call stack into a fresh Error's `.stack` (V8-ish
+// `    at <fn> (<file>:<line>:<col>)` lines). We capture + parse that into our
+// own frame structs and back v8's opaque StackTrace/StackFrame with them —
+// deno reaches these frames only via the C-ABI accessors below.
+struct QjsStackFrame {
+  line: i32,
+  col: i32,
+  url: Option<std::string::String>,
+  func: Option<std::string::String>,
+  is_user: bool,
+}
+
+struct QjsStackTrace {
+  frames: Vec<QjsStackFrame>,
+}
+
+thread_local! {
+  static LAST_STACK: std::cell::Cell<*mut QjsStackTrace> =
+    const { std::cell::Cell::new(ptr::null_mut()) };
+}
+
+unsafe fn current_backtrace_string(ctx: *mut JSContext) -> std::string::String {
+  // `new Error()` captures the current backtrace; read its `.stack`.
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let ctor = unsafe { JS_GetPropertyStr(ctx, global, c"Error".as_ptr()) };
+  unsafe { JS_FreeValue(ctx, global) };
+  if unsafe { JS_IsConstructor(ctx, ctor) } == 0 {
+    unsafe { JS_FreeValue(ctx, ctor) };
+    return std::string::String::new();
+  }
+  let err = unsafe { JS_CallConstructor(ctx, ctor, 0, ptr::null_mut()) };
+  unsafe { JS_FreeValue(ctx, ctor) };
+  if err.tag == JS_TAG_EXCEPTION {
+    unsafe { clear_pending(ctx) };
+    return std::string::String::new();
+  }
+  let stack = unsafe { JS_GetPropertyStr(ctx, err, c"stack".as_ptr()) };
+  unsafe { JS_FreeValue(ctx, err) };
+  let mut len: usize = 0;
+  let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, stack) };
+  let out = if cstr.is_null() {
+    std::string::String::new()
+  } else {
+    let bytes = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+    let s = std::string::String::from_utf8_lossy(bytes).into_owned();
+    unsafe { JS_FreeCString(ctx, cstr) };
+    s
+  };
+  unsafe { JS_FreeValue(ctx, stack) };
+  out
+}
+
+fn parse_qjs_backtrace(raw: &str) -> Vec<QjsStackFrame> {
+  let mut frames = Vec::new();
+  for line in raw.lines() {
+    let mut ln = line.trim();
+    if ln.is_empty() {
+      continue;
+    }
+    if let Some(rest) = ln.strip_prefix("at ") {
+      ln = rest;
+    }
+    // `<func> (<loc>)` or just `<loc>`.
+    let (func, loc) = match (ln.find('('), ln.strip_suffix(')')) {
+      (Some(p), Some(_)) => (ln[..p].trim(), ln[p + 1..ln.len() - 1].trim()),
+      _ => {
+        // `<func>@<loc>` (some builds) or bare `<loc>`.
+        match ln.rfind('@') {
+          Some(p) => (ln[..p].trim(), ln[p + 1..].trim()),
+          None => ("", ln),
+        }
+      }
+    };
+    let (url, line_no, col_no) = parse_loc(loc);
+    let has_url = !url.is_empty() && url != "<anonymous>";
+    frames.push(QjsStackFrame {
+      line: line_no,
+      col: col_no,
+      url: has_url.then(|| url.to_string()),
+      func: (!func.is_empty()).then(|| func.to_string()),
+      is_user: has_url,
+    });
+  }
+  frames
+}
+
+/// Split `<file>:<line>:<col>` / `<file>:<line>` into (file, line, col),
+/// tolerating colons inside the URL (`file://`, `https://host:port/`).
+fn parse_loc(loc: &str) -> (&str, i32, i32) {
+  let mut file = loc;
+  let mut line = 0;
+  let mut col = 0;
+  if let Some((rest, last)) = loc.rsplit_once(':') {
+    if last.bytes().all(|b| b.is_ascii_digit()) && !last.is_empty() {
+      if let Some((rest2, mid)) = rest.rsplit_once(':') {
+        if mid.bytes().all(|b| b.is_ascii_digit()) && !mid.is_empty() {
+          file = rest2;
+          line = mid.parse().unwrap_or(0);
+          col = last.parse().unwrap_or(0);
+          return (file, line, col);
+        }
+      }
+      file = rest;
+      line = last.parse().unwrap_or(0);
+    }
+  }
+  (file, line, col)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackTrace__CurrentStackTrace(
   isolate: *mut RealIsolate,
   frame_limit: int,
 ) -> *const StackTrace {
   let _ = (isolate, frame_limit);
-  ptr::null()
+  LAST_STACK.with(|cell| {
+    let prev = cell.replace(ptr::null_mut());
+    if !prev.is_null() {
+      unsafe { drop(Box::from_raw(prev)) };
+    }
+  });
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  let raw = unsafe { current_backtrace_string(ctx) };
+  let frames = parse_qjs_backtrace(&raw);
+  let boxed = Box::into_raw(Box::new(QjsStackTrace { frames }));
+  LAST_STACK.with(|cell| cell.set(boxed));
+  boxed as *const StackTrace
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackTrace__GetFrameCount(
   this: *const StackTrace,
 ) -> int {
-  let _ = this;
-  0
+  if this.is_null() {
+    return 0;
+  }
+  unsafe { (*(this as *const QjsStackTrace)).frames.len() as int }
 }
 
 #[unsafe(no_mangle)]
@@ -279,30 +404,56 @@ pub extern "C" fn v8__StackTrace__GetFrame(
   isolate: *mut RealIsolate,
   index: u32,
 ) -> *const StackFrame {
-  let _ = (this, isolate, index);
-  ptr::null()
+  let _ = isolate;
+  if this.is_null() {
+    return ptr::null();
+  }
+  let st = unsafe { &*(this as *const QjsStackTrace) };
+  match st.frames.get(index as usize) {
+    Some(frame) => frame as *const QjsStackFrame as *const StackFrame,
+    None => ptr::null(),
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackFrame__GetLineNumber(
   this: *const StackFrame,
 ) -> int {
-  let _ = this;
-  0
+  if this.is_null() {
+    return 0;
+  }
+  unsafe { (*(this as *const QjsStackFrame)).line as int }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackFrame__GetColumn(this: *const StackFrame) -> int {
-  let _ = this;
-  0
+  if this.is_null() {
+    return 0;
+  }
+  unsafe { (*(this as *const QjsStackFrame)).col as int }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackFrame__GetScriptName(
   this: *const StackFrame,
 ) -> *const String {
-  let _ = this;
-  ptr::null()
+  if this.is_null() {
+    return ptr::null();
+  }
+  let frame = unsafe { &*(this as *const QjsStackFrame) };
+  let Some(url) = frame.url.as_deref() else {
+    return ptr::null();
+  };
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  let cstr = match std::ffi::CString::new(url) {
+    Ok(c) => c,
+    Err(_) => return ptr::null(),
+  };
+  let v = unsafe { JS_NewString(ctx, cstr.as_ptr()) };
+  intern(v)
 }
 
 #[unsafe(no_mangle)]
@@ -315,8 +466,10 @@ pub extern "C" fn v8__StackFrame__IsEval(this: *const StackFrame) -> bool {
 pub extern "C" fn v8__StackFrame__IsUserJavaScript(
   this: *const StackFrame,
 ) -> bool {
-  let _ = this;
-  true
+  if this.is_null() {
+    return false;
+  }
+  unsafe { (*(this as *const QjsStackFrame)).is_user }
 }
 
 #[unsafe(no_mangle)]

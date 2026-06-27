@@ -13,6 +13,18 @@ pub struct JSRuntime {
 }
 
 #[repr(C)]
+pub struct JSSharedArrayBufferFunctions {
+  pub sab_alloc: Option<
+    unsafe extern "C" fn(opaque: *mut c_void, size: usize) -> *mut c_void,
+  >,
+  pub sab_free:
+    Option<unsafe extern "C" fn(opaque: *mut c_void, ptr: *mut c_void)>,
+  pub sab_dup:
+    Option<unsafe extern "C" fn(opaque: *mut c_void, ptr: *mut c_void)>,
+  pub sab_opaque: *mut c_void,
+}
+
+#[repr(C)]
 pub struct JSContext {
   _private: [u8; 0],
 }
@@ -232,6 +244,11 @@ unsafe extern "C" {
   pub fn JS_GetRuntimeOpaque(rt: *mut JSRuntime) -> *mut c_void;
   pub fn JS_SetMemoryLimit(rt: *mut JSRuntime, limit: usize);
   pub fn JS_SetMaxStackSize(rt: *mut JSRuntime, stack_size: usize);
+  pub fn JS_SetCanBlock(rt: *mut JSRuntime, can_block: bool);
+  pub fn JS_SetSharedArrayBufferFunctions(
+    rt: *mut JSRuntime,
+    sf: *const JSSharedArrayBufferFunctions,
+  );
   pub fn JS_SetGCThreshold(rt: *mut JSRuntime, gc_threshold: usize);
   pub fn JS_RunGC(rt: *mut JSRuntime);
   pub fn JS_IsJobPending(rt: *mut JSRuntime) -> bool;
@@ -498,6 +515,18 @@ unsafe extern "C" {
     export_name: *const c_char,
     val: JSValue,
   ) -> c_int;
+
+  pub fn js_v82jsc_function_kind(v: JSValue) -> std::os::raw::c_int;
+
+  pub fn js_v82jsc_iterator_preview(
+    ctx: *mut JSContext,
+    iter: JSValue,
+    pis_key_value: *mut std::os::raw::c_int,
+  ) -> JSValue;
+
+  pub fn JS_IsProxy(val: JSValue) -> bool;
+  pub fn JS_GetProxyTarget(ctx: *mut JSContext, proxy: JSValue) -> JSValue;
+  pub fn JS_GetProxyHandler(ctx: *mut JSContext, proxy: JSValue) -> JSValue;
 
   pub fn JS_Throw(ctx: *mut JSContext, obj: JSValue) -> JSValue;
   pub fn JS_GetException(ctx: *mut JSContext) -> JSValue;

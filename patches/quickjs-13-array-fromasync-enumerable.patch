@@ -1,0 +1,47 @@
+diff --git a/builtin-array-fromasync.h b/builtin-array-fromasync.h
+index 4901aaf17ca6353eed9ed34f7c9c3552a4f9c72e..ba1bbdfeda0c3dc5a5388daed05cc6c0c8e618d9 100644
+GIT binary patch
+delta 718
+zcmdm?-L5mCo5{jrVz0icg+;7_twJ@If<c90qK<+=MY1V~G`0khrp6%BIC<m4C9F)A
+z#+%#O_Odc2PZneq+Z@fanUTrZe6s+bFw^9J{Jf0DlLc9Y8M!7a2#85rfV7zzfJg(d
+zp$1^KnV}BX<Uj$H$#SfmEGgzXT$7swRCpB(Dh$AO8W`wsP2LO@0c!w@JP}Zl1E~SK
+z1tbFEq=L*gO9GLWAe+Uwpw=bpa7}g-1e=-$c19Y=(sDtS$rt!JS&}VuxF)ZFNGF4(
+z4L}-h3aU(gDZ;}B3I%f`kpIMtOh9Hs+zlZu5_PyHTML1WHU&Ev?4KNn2$Gt)5Ro*n
+z7Ysq(JO>d;0S78r*MEqJ0o+rQ4TK>kr-1D>(czk$D6BHsTa=T<5)>}I{7U>_??Nmx
+zNz&n(ypLanRl%Ub#Bj2pi1_4x{GyX3Sb2m%o`8h930Q*(IDCxL%)thy>VV|a!1kJh
+z?Mh37N`S)E48%4|29X9SU}LjI__-AfDxhMfV6izO{K6pBU>}-*Ndq$-uE~ttqB0O~
+z8-R^AGXxt1O9EVz-;2nBG@=DA*JK4zxyhBnJnRrdxh4mS%1ure7Lo_K)d=i9NV0@@
+Q-Uu9X$)-A!7mA7l0I5T*VE_OC
+
+delta 550
+zcmZqI*`Yn5o5|dCVz0icxoNC|twJ@If<c90qK<+=g^?wQOfdwJ=1CyZ#A4&aC9F&q
+zW}DmD_OddXO%`Mo+Z@fanUTpTakBuQFq2-IIY^yBDu_%o0+E(rwwVElZIGw~GTs2p
+zF*DSeTqdBxix5dM*O|OrK!uTOvLmn9<VONhNOA@SI+HmCRVE+j6=w&##UgpKp@29i
+z)Zk>D$=QMsv(hX;R;3y0Or9gCGC5zAl>=;DvW3p%vrr|;U?m30I+OoFMIcTxG1Qr?
+zF9b0LB4UxKGdV#>g$?9Llhnxxe430&le_rjCT9x^PTtAqI{BtB_he3fi^<u-e3Sk8
+z6Bv^wZ{RQ1#S8`uW00#L0b^hW4hFMiuu#fmL00j}dqntnK$buSO+i6B`Hcv_5J(W>
+z789^P48Wnzl?LIY=x|MbFCsSCSyW0Gq|(R)Y$im~KxcA+s2n5LWCLN*$xB3~jX)~Q
+h!0~ASaSm9WQ5r~3vMGp!*kl9_pJY=VuE`%n#R257io5^-
+
+diff --git a/builtin-array-fromasync.js b/builtin-array-fromasync.js
+index 3e425c0..cfe09ee 100644
+--- a/builtin-array-fromasync.js
++++ b/builtin-array-fromasync.js
+@@ -13,7 +13,7 @@
+                 let value = arrayLike[i]
+                 if (sync) value = await value
+                 if (mapFn) value = await mapFn.call(thisArg, value, i)
+-                Object·defineProperty(result, i++, {value, configurable: true, writable: true})
++                Object·defineProperty(result, i++, {value, configurable: true, writable: true, enumerable: true})
+             }
+         } else {
+             const iter = method.call(arrayLike)
+@@ -24,7 +24,7 @@
+                     if (done) break
+                     if (sync) value = await value
+                     if (mapFn) value = await mapFn.call(thisArg, value, i)
+-                    Object·defineProperty(result, i++, {value, configurable: true, writable: true})
++                    Object·defineProperty(result, i++, {value, configurable: true, writable: true, enumerable: true})
+                 }
+             } finally {
+                 if (iter.return) iter.return()

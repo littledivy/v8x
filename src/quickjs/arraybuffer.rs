@@ -10,9 +10,50 @@ use crate::{
   ArrayBuffer, ArrayBufferView, BackingStore, BackingStoreDeleterCallback,
   Context, DataView, RealIsolate, SharedArrayBuffer, Value,
 };
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+// Registry of live "alias" backing stores (created by `backing_store_for_buffer`)
+// keyed by the QuickJS ArrayBuffer data pointer they alias. When that buffer is
+// detached (deno's `#[buffer(detach)]` path: get_backing_store THEN detach),
+// QuickJS frees the data out from under the still-outstanding backing store.
+// On detach we look the pointer up here and "steal" the bytes into a process-heap
+// malloc copy each aliasing store owns, so the SharedRef deno carries survives the
+// detach and is safe to read on another thread (worker postMessage transport).
+fn alias_registry() -> &'static Mutex<HashMap<usize, Vec<usize>>> {
+  static REG: OnceLock<Mutex<HashMap<usize, Vec<usize>>>> = OnceLock::new();
+  REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn registry_add(key: usize, inner: *mut BsInner) {
+  if key == 0 {
+    return;
+  }
+  alias_registry()
+    .lock()
+    .unwrap()
+    .entry(key)
+    .or_default()
+    .push(inner as usize);
+}
+
+fn registry_remove(key: usize, inner: *mut BsInner) {
+  if key == 0 {
+    return;
+  }
+  let mut map = alias_registry().lock().unwrap();
+  if let Some(v) = map.get_mut(&key) {
+    if let Some(pos) = v.iter().position(|&p| p == inner as usize) {
+      v.swap_remove(pos);
+    }
+    if v.is_empty() {
+      map.remove(&key);
+    }
+  }
+}
 
 #[allow(non_camel_case_types)]
 type JSTypedArrayEnum = i32;
@@ -139,6 +180,7 @@ impl BsInner {
     if ptr.is_null() {
       return;
     }
+    registry_remove(unsafe { (*ptr).data } as usize, ptr);
     let b = unsafe { Box::from_raw(ptr) };
     if !b.data.is_null() {
       if b.owns_malloc {
@@ -207,7 +249,54 @@ fn backing_store_for_buffer(
     (*inner).retained_ctx = ctx;
     (*inner).retained_val = JS_DupValue(ctx, buf);
   }
+  registry_add(data as usize, inner);
   make_shared_ref(inner)
+}
+
+unsafe fn read_len_prop(
+  ctx: *mut JSContext,
+  view: JSValue,
+  name: *const std::os::raw::c_char,
+) -> usize {
+  let v = unsafe { JS_GetPropertyStr(ctx, view, name) };
+  let mut out: i64 = 0;
+  unsafe {
+    JS_ToInt64(ctx, &mut out, v);
+    JS_FreeValue(ctx, v);
+  }
+  out.max(0) as usize
+}
+
+/// Resolve a view's underlying ArrayBuffer + byte offset/length. `JS_GetTypedArrayBuffer`
+/// rejects `DataView` (it is not a typed array), so on failure fall back to the view's
+/// own `.buffer`/`.byteOffset`/`.byteLength` — otherwise a DataView reads as 0 bytes
+/// (e.g. `crypto.subtle.digest` over a DataView hashed the empty string). Returns the
+/// buffer (+1 ref) or `JS_EXCEPTION`.
+unsafe fn view_buffer(
+  ctx: *mut JSContext,
+  view: JSValue,
+  poff: *mut usize,
+  plen: *mut usize,
+) -> JSValue {
+  let buf =
+    unsafe { JS_GetTypedArrayBuffer(ctx, view, poff, plen, ptr::null_mut()) };
+  if buf.tag != JS_TAG_EXCEPTION {
+    return buf;
+  }
+  let exc = unsafe { JS_GetException(ctx) };
+  unsafe { JS_FreeValue(ctx, exc) };
+  let bufp = unsafe { JS_GetPropertyStr(ctx, view, c"buffer".as_ptr()) };
+  if bufp.tag != JS_TAG_OBJECT {
+    unsafe { JS_FreeValue(ctx, bufp) };
+    return jsv_exception();
+  }
+  if !poff.is_null() {
+    unsafe { *poff = read_len_prop(ctx, view, c"byteOffset".as_ptr()) };
+  }
+  if !plen.is_null() {
+    unsafe { *plen = read_len_prop(ctx, view, c"byteLength".as_ptr()) };
+  }
+  bufp
 }
 
 unsafe extern "C" fn bs_free_func(
@@ -280,7 +369,31 @@ pub extern "C" fn v8__ArrayBuffer__New__with_backing_store(
   if inner.is_null() {
     return ptr::null();
   }
-  let (data, len) = unsafe { ((*inner).data, (*inner).byte_length) };
+  let (data, len, deleter_data) =
+    unsafe { ((*inner).data, (*inner).byte_length, (*inner).deleter_data) };
+
+  // Two distinct cases reach here, distinguished by whether the backing store
+  // OWNS its bytes (it carries a deleter with non-null deleter_data — e.g. an
+  // op return value via `new_backing_store_from_bytes`, a transient Box deno
+  // hands to JS and never reads back) vs deno-owned bytes exposed for SHARING
+  // (`new_backing_store_from_ptr` with a no-op/null deleter — timer_expiry,
+  // timer_info, tick_info: Rust writes, JS reads, or vice versa).
+  //   - Owned/transient: COPY into a self-contained QuickJS buffer. Deno frees
+  //     its allocation on its own schedule (independent of this engine's GC),
+  //     so aliasing use-after-frees — observed as garbage fetch/Blob bodies.
+  //   - Shared: ALIAS the external pointer; a copy would desync the two sides.
+  // (SharedArrayBuffer keeps aliasing via its own shim for cross-thread use.)
+  if !deleter_data.is_null() {
+    let obj = if data.is_null() || len == 0 {
+      unsafe { JS_NewArrayBufferCopy(ctx, ptr::null(), 0) }
+    } else {
+      unsafe { JS_NewArrayBufferCopy(ctx, data as *const u8, len) }
+    };
+    if obj.tag == JS_TAG_EXCEPTION {
+      return ptr::null();
+    }
+    return intern::<ArrayBuffer>(obj);
+  }
 
   unsafe { (*inner).refcount.fetch_add(1, Ordering::SeqCst) };
   let obj = unsafe {
@@ -360,7 +473,48 @@ pub extern "C" fn v8__ArrayBuffer__Detach(
   if ctx.is_null() || this.is_null() {
     return MaybeBool::Nothing;
   }
-  unsafe { JS_DetachArrayBuffer(ctx, jsval_of(this)) };
+  let buf = jsval_of(this);
+  // Steal the bytes for any outstanding alias backing stores before QuickJS frees
+  // them: get_backing_store()-then-detach() (deno's transferable path) otherwise
+  // leaves the SharedRef deno keeps pointing at freed QuickJS heap — fatal once
+  // that buffer crosses to a worker thread.
+  let mut len: usize = 0;
+  let data = unsafe { JS_GetArrayBuffer(ctx, &mut len, buf) } as *mut c_void;
+  if !data.is_null() {
+    let inners = alias_registry().lock().unwrap().remove(&(data as usize));
+    if let Some(inners) = inners {
+      for inner_usize in inners {
+        let inner = inner_usize as *mut BsInner;
+        if inner.is_null() {
+          continue;
+        }
+        unsafe {
+          let blen = (*inner).byte_length;
+          let copy = if blen > 0 {
+            let m = malloc(blen);
+            if !m.is_null() {
+              ptr::copy_nonoverlapping(data, m, blen);
+            }
+            m
+          } else {
+            ptr::null_mut()
+          };
+          (*inner).data = copy;
+          (*inner).owns_malloc = true;
+          (*inner).deleter = noop_deleter;
+          (*inner).deleter_data = ptr::null_mut();
+          // Drop the dup that pinned the (now-detached) JS buffer; the bytes live
+          // in our malloc copy now, so there is nothing cross-thread to free later.
+          if !(*inner).retained_ctx.is_null() {
+            JS_FreeValue((*inner).retained_ctx, (*inner).retained_val);
+            (*inner).retained_ctx = ptr::null_mut();
+            (*inner).retained_val = jsv_undefined();
+          }
+        }
+      }
+    }
+  }
+  unsafe { JS_DetachArrayBuffer(ctx, buf) };
   MaybeBool::JustTrue
 }
 
@@ -489,13 +643,7 @@ pub extern "C" fn v8__ArrayBufferView__Buffer(
   }
 
   let buf = unsafe {
-    JS_GetTypedArrayBuffer(
-      ctx,
-      jsval_of(this),
-      ptr::null_mut(),
-      ptr::null_mut(),
-      ptr::null_mut(),
-    )
+    view_buffer(ctx, jsval_of(this), ptr::null_mut(), ptr::null_mut())
   };
   if buf.tag == JS_TAG_EXCEPTION {
     let exc = unsafe { JS_GetException(ctx) };
@@ -515,13 +663,7 @@ pub extern "C" fn v8__ArrayBufferView__Buffer__Data(
   }
 
   let buf = unsafe {
-    JS_GetTypedArrayBuffer(
-      ctx,
-      jsval_of(this),
-      ptr::null_mut(),
-      ptr::null_mut(),
-      ptr::null_mut(),
-    )
+    view_buffer(ctx, jsval_of(this), ptr::null_mut(), ptr::null_mut())
   };
   if buf.tag == JS_TAG_EXCEPTION {
     let exc = unsafe { JS_GetException(ctx) };
@@ -544,15 +686,8 @@ pub extern "C" fn v8__ArrayBufferView__ByteLength(
     return 0;
   }
   let mut len: usize = 0;
-  let buf = unsafe {
-    JS_GetTypedArrayBuffer(
-      ctx,
-      jsval_of(this),
-      ptr::null_mut(),
-      &mut len,
-      ptr::null_mut(),
-    )
-  };
+  let buf =
+    unsafe { view_buffer(ctx, jsval_of(this), ptr::null_mut(), &mut len) };
   if buf.tag == JS_TAG_EXCEPTION {
     let exc = unsafe { JS_GetException(ctx) };
     unsafe { JS_FreeValue(ctx, exc) };
@@ -571,15 +706,8 @@ pub extern "C" fn v8__ArrayBufferView__ByteOffset(
     return 0;
   }
   let mut off: usize = 0;
-  let buf = unsafe {
-    JS_GetTypedArrayBuffer(
-      ctx,
-      jsval_of(this),
-      &mut off,
-      ptr::null_mut(),
-      ptr::null_mut(),
-    )
-  };
+  let buf =
+    unsafe { view_buffer(ctx, jsval_of(this), &mut off, ptr::null_mut()) };
   if buf.tag == JS_TAG_EXCEPTION {
     let exc = unsafe { JS_GetException(ctx) };
     unsafe { JS_FreeValue(ctx, exc) };
@@ -598,13 +726,7 @@ pub extern "C" fn v8__ArrayBufferView__HasBuffer(
     return false;
   }
   let buf = unsafe {
-    JS_GetTypedArrayBuffer(
-      ctx,
-      jsval_of(this),
-      ptr::null_mut(),
-      ptr::null_mut(),
-      ptr::null_mut(),
-    )
+    view_buffer(ctx, jsval_of(this), ptr::null_mut(), ptr::null_mut())
   };
   if buf.tag == JS_TAG_EXCEPTION {
     let exc = unsafe { JS_GetException(ctx) };
@@ -631,15 +753,7 @@ pub extern "C" fn v8__ArrayBufferView__GetContents(
   }
   let mut off: usize = 0;
   let mut len: usize = 0;
-  let buf = unsafe {
-    JS_GetTypedArrayBuffer(
-      ctx,
-      jsval_of(this),
-      &mut off,
-      &mut len,
-      ptr::null_mut(),
-    )
-  };
+  let buf = unsafe { view_buffer(ctx, jsval_of(this), &mut off, &mut len) };
   if buf.tag == JS_TAG_EXCEPTION {
     let exc = unsafe { JS_GetException(ctx) };
     unsafe { JS_FreeValue(ctx, exc) };
@@ -866,15 +980,7 @@ pub extern "C" fn v8__ArrayBufferView__CopyContents(
   }
   let mut off: usize = 0;
   let mut len: usize = 0;
-  let buf = unsafe {
-    JS_GetTypedArrayBuffer(
-      ctx,
-      jsval_of(this),
-      &mut off,
-      &mut len,
-      ptr::null_mut(),
-    )
-  };
+  let buf = unsafe { view_buffer(ctx, jsval_of(this), &mut off, &mut len) };
   if buf.tag == JS_TAG_EXCEPTION {
     let exc = unsafe { JS_GetException(ctx) };
     unsafe { JS_FreeValue(ctx, exc) };

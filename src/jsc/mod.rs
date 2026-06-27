@@ -8,6 +8,7 @@ pub(crate) mod exception;
 pub(crate) mod function;
 pub(crate) mod init;
 pub(crate) mod inspector;
+pub(crate) mod introspect;
 pub(crate) mod isolate;
 pub(crate) mod jsc_sys;
 pub(crate) mod misc;

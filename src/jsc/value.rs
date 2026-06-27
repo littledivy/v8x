@@ -360,17 +360,34 @@ pub extern "C" fn v8__Value__IsRegExp(this: *const Value) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsAsyncFunction(this: *const Value) -> bool {
+  // v8 reports async generators as both async and generator functions, so the
+  // console can label them "AsyncGeneratorFunction".
   class_tag_is(this, "AsyncFunction")
+    || class_tag_is(this, "AsyncGeneratorFunction")
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsGeneratorFunction(this: *const Value) -> bool {
   class_tag_is(this, "GeneratorFunction")
+    || class_tag_is(this, "AsyncGeneratorFunction")
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsPromise(this: *const Value) -> bool {
-  instance_of_global(this, b"Promise\0")
+  // v8's IsPromise checks the internal [[PromiseState]] slot, not the prototype
+  // chain — e.g. `Object.create(Promise.prototype)` is NOT a promise. Mirror
+  // that with the native JSPromise downcast (returns < 0 for non-promises).
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe {
+    crate::jsc::introspect::v82jsc_promise_status(
+      ctx,
+      jsval(this),
+      ptr::null_mut(),
+    ) >= 0
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -408,9 +425,24 @@ pub extern "C" fn v8__Value__IsWeakSet(this: *const Value) -> bool {
   class_tag_is(this, "WeakSet")
 }
 
+// JSObjectGetProxyTarget (JSObjectRefPrivate.h, a C SPI exported by vendored +
+// system JSC) returns the wrapped target of a Proxy/JSProxy, or null for a
+// non-proxy — exactly the detection v8::Value::IsProxy needs.
+unsafe extern "C" {
+  pub(crate) fn JSObjectGetProxyTarget(obj: JSObjectRef) -> JSObjectRef;
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsProxy(this: *const Value) -> bool {
-  false
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return false;
+  }
+  let v = jsval(this);
+  if !unsafe { JSValueIsObject(ctx, v) } {
+    return false;
+  }
+  !unsafe { JSObjectGetProxyTarget(v as JSObjectRef) }.is_null()
 }
 
 #[unsafe(no_mangle)]

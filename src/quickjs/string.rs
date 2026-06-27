@@ -328,37 +328,71 @@ pub extern "C" fn v8__String__WriteUtf8_v2(
   }
   let v = jsval_of(this);
   let mut len: usize = 0;
+  // QuickJS hands back WTF-8: a valid surrogate PAIR is combined into 4-byte
+  // UTF-8, but a LONE surrogate is emitted as its 3-byte CESU-8 form
+  // (`ed a0-bf 80-bf` = U+D800..U+DFFF). v8 instead replaces lone surrogates
+  // with U+FFFD (USVString semantics, which deno's encodeInto relies on), and
+  // reports `processed` as UTF-16 code units consumed. Re-walk the WTF-8 and
+  // re-emit, replacing lone surrogates and stopping on the buffer boundary.
   let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, v) };
   if cstr.is_null() {
     set_processed(0);
     return 0;
   }
   let bytes = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+  let out =
+    unsafe { std::slice::from_raw_parts_mut(buffer as *mut u8, capacity) };
 
-  let cap = capacity;
-  let mut copy = bytes.len().min(cap);
-  if copy < bytes.len() {
-    while copy > 0 && (bytes[copy] & 0xC0) == 0x80 {
-      copy -= 1;
-    }
-  }
-  if copy > 0 {
-    unsafe {
-      ptr::copy_nonoverlapping(bytes.as_ptr(), buffer as *mut u8, copy)
+  let mut i = 0usize; // input byte cursor
+  let mut w = 0usize; // output byte cursor
+  let mut units: usize = 0; // UTF-16 code units consumed
+  while i < bytes.len() {
+    let b0 = bytes[i];
+    // Decode one WTF-8 scalar: (output bytes, input byte length, utf16 units).
+    let (enc, ilen, u16): ([u8; 4], usize, usize) = if b0 < 0x80 {
+      ([b0, 0, 0, 0], 1, 1)
+    } else if b0 >= 0xC0 && b0 < 0xE0 && i + 1 < bytes.len() {
+      ([b0, bytes[i + 1], 0, 0], 2, 1)
+    } else if b0 >= 0xE0 && b0 < 0xF0 && i + 2 < bytes.len() {
+      let cp = (((b0 & 0x0F) as u32) << 12)
+        | (((bytes[i + 1] & 0x3F) as u32) << 6)
+        | ((bytes[i + 2] & 0x3F) as u32);
+      if (0xD800..=0xDFFF).contains(&cp) {
+        ([0xEF, 0xBF, 0xBD, 0], 3, 1) // lone surrogate -> U+FFFD
+      } else {
+        ([b0, bytes[i + 1], bytes[i + 2], 0], 3, 1)
+      }
+    } else if b0 >= 0xF0 && i + 3 < bytes.len() {
+      ([b0, bytes[i + 1], bytes[i + 2], bytes[i + 3]], 4, 2)
+    } else {
+      ([0xEF, 0xBF, 0xBD, 0], 1, 1) // malformed -> U+FFFD
     };
+    // Output byte length: replaced scalars (lone surrogate / malformed) emit
+    // the 3-byte U+FFFD; everything else re-emits its original UTF-8 bytes.
+    let replaced = enc[0] == 0xEF && enc[1] == 0xBF && enc[2] == 0xBD;
+    let olen = if b0 < 0x80 {
+      1
+    } else if replaced {
+      3
+    } else {
+      ilen
+    };
+    if w + olen > capacity {
+      break;
+    }
+    out[w..w + olen].copy_from_slice(&enc[..olen]);
+    w += olen;
+    i += ilen;
+    units += u16;
   }
 
-  let chars_written = std::string::String::from_utf8_lossy(&bytes[..copy])
-    .encode_utf16()
-    .count();
-
-  if (flags & K_NULL_TERMINATE) != 0 && copy < cap {
-    unsafe { *(buffer as *mut u8).add(copy) = 0 };
+  if (flags & K_NULL_TERMINATE) != 0 && w < capacity {
+    out[w] = 0;
   }
   unsafe { JS_FreeCString(ctx, cstr) };
 
-  set_processed(chars_written as size_t);
-  copy as int
+  set_processed(units as size_t);
+  w as int
 }
 
 #[unsafe(no_mangle)]

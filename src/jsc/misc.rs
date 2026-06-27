@@ -369,13 +369,36 @@ pub extern "C" fn v8__Date__ValueOf(this: *const crate::Date) -> f64 {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Proxy__GetHandler(_this: *const c_void) -> *const Value {
-  ptr::null()
+pub extern "C" fn v8__Proxy__GetHandler(this: *const c_void) -> *const Value {
+  // Native read of ProxyObject::handler() (introspect.cpp) — JSC's C API has
+  // no handler accessor.
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let v = this as *const Value;
+  let handler =
+    unsafe { crate::jsc::introspect::v82jsc_proxy_handler(ctx, jsval(v)) };
+  if handler.is_null() {
+    return ptr::null();
+  }
+  intern_ctx::<Value>(ctx, handler)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Proxy__GetTarget(_this: *const c_void) -> *const Value {
-  ptr::null()
+pub extern "C" fn v8__Proxy__GetTarget(this: *const c_void) -> *const Value {
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let v = this as *const Value;
+  let target = unsafe {
+    crate::jsc::value::JSObjectGetProxyTarget(jsval(v) as JSObjectRef)
+  };
+  if target.is_null() {
+    return ptr::null();
+  }
+  intern_ctx::<Value>(ctx, target as JSValueRef)
 }
 
 #[repr(C)]

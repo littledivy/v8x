@@ -992,6 +992,23 @@ pub extern "C" fn v8__Object__PreviewEntries(
     }
     return ptr::null();
   }
+  // A Map/Set ITERATOR has no `.entries()`; previewing it must peek the
+  // remaining backing entries WITHOUT consuming it (Array.from would). Native
+  // peek (quickjs.c js_v82jsc_iterator_preview); collections fall through.
+  {
+    let mut kv: std::os::raw::c_int = 0;
+    let arr =
+      unsafe { js_v82jsc_iterator_preview(ctx, jsval_of(this), &mut kv) };
+    if arr.tag != JS_TAG_NULL && arr.tag != JS_TAG_EXCEPTION {
+      if !is_key_value.is_null() {
+        unsafe { *is_key_value = kv != 0 };
+      }
+      return intern::<Array>(arr);
+    }
+    if arr.tag == JS_TAG_EXCEPTION {
+      unsafe { JS_FreeValue(ctx, JS_GetException(ctx)) };
+    }
+  }
   unsafe {
     let is_map = {
       let m = JS_GetPropertyStr(ctx, jsval_of(this), c"set".as_ptr());

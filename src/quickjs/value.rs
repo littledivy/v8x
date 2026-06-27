@@ -364,12 +364,20 @@ pub extern "C" fn v8__Value__IsRegExp(this: *const Value) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsAsyncFunction(this: *const Value) -> bool {
-  class_tag_is(this, "AsyncFunction")
+  // Native [[FunctionKind]] check (bit0 = async; async-generators set it too).
+  // Robust even when the prototype/Symbol.toStringTag is removed, matching v8.
+  if this.is_null() {
+    return false;
+  }
+  unsafe { js_v82jsc_function_kind(jsval_of(this)) & 1 != 0 }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsGeneratorFunction(this: *const Value) -> bool {
-  class_tag_is(this, "GeneratorFunction")
+  if this.is_null() {
+    return false;
+  }
+  unsafe { js_v82jsc_function_kind(jsval_of(this)) & 2 != 0 }
 }
 
 #[unsafe(no_mangle)]
@@ -414,8 +422,10 @@ pub extern "C" fn v8__Value__IsWeakSet(this: *const Value) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsProxy(this: *const Value) -> bool {
-  let _ = this;
-  false
+  if this.is_null() {
+    return false;
+  }
+  unsafe { JS_IsProxy(jsval_of(this)) }
 }
 
 #[unsafe(no_mangle)]
