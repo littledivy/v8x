@@ -1,4 +1,12 @@
 # Baseline: tests that PASS for backend=jsc suite=rusty_v8.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 0 passing. DO NOT hand-sort; the
+# (run.mjs --update). 8 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
+rv8_slots::context_slots
+rv8_slots::dropped_context_slots_on_kept_context
+rv8_slots::slots_auto_boxing
+rv8_slots::slots_general_1
+rv8_slots::slots_general_2
+rv8_slots::slots_layer1
+rv8_slots::slots_layer2
+rv8_test_single_threaded_default_platform::single_threaded_default_platform
