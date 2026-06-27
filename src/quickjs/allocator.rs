@@ -7,7 +7,6 @@
 
 use crate::Allocator;
 use crate::support::{SharedPtrBase, UniquePtr, long};
-use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 // The allocator `std::shared_ptr` is modelled with a real, atomically
