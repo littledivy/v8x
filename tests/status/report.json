@@ -1,6 +1,6 @@
 {
-  "generated": "2026-06-27T12:07:40.676Z",
-  "commit": "local",
+  "generated": "2026-06-27T12:28:41.479Z",
+  "commit": "3038b0cfc5cfc38ce6504f466704d598bf4efe7f",
   "backends": [
     {
       "id": "jsc",
@@ -31,60 +31,60 @@
     "jsc": {
       "rusty_v8": {
         "pass": 0,
-        "total": null,
+        "total": 0,
         "baseline": 0,
-        "fail": null,
-        "tier": "build",
-        "fresh": false
-      },
-      "deno_core": {
-        "pass": 0,
-        "total": null,
-        "baseline": 0,
-        "fail": null,
-        "tier": "build",
-        "fresh": false
-      }
-    },
-    "sys-jsc": {
-      "rusty_v8": {
-        "pass": 0,
-        "total": null,
-        "baseline": 0,
-        "fail": null,
-        "tier": "build",
-        "fresh": false
-      },
-      "deno_core": {
-        "pass": 0,
-        "total": null,
-        "baseline": 0,
-        "fail": null,
-        "tier": "build",
-        "fresh": false
-      }
-    },
-    "quickjs": {
-      "rusty_v8": {
-        "pass": 9,
-        "total": 16,
-        "baseline": 9,
-        "fail": 7,
+        "fail": 0,
         "tier": "build",
         "fresh": true
       },
       "deno_core": {
         "pass": 0,
-        "total": null,
+        "total": 0,
         "baseline": 0,
-        "fail": null,
+        "fail": 0,
         "tier": "build",
-        "fresh": false
+        "fresh": true
+      }
+    },
+    "sys-jsc": {
+      "rusty_v8": {
+        "pass": 0,
+        "total": 0,
+        "baseline": 0,
+        "fail": 0,
+        "tier": "build",
+        "fresh": true
+      },
+      "deno_core": {
+        "pass": 0,
+        "total": 0,
+        "baseline": 0,
+        "fail": 0,
+        "tier": "build",
+        "fresh": true
+      }
+    },
+    "quickjs": {
+      "rusty_v8": {
+        "pass": 0,
+        "total": 0,
+        "baseline": 0,
+        "fail": 0,
+        "tier": "build",
+        "fresh": true
+      },
+      "deno_core": {
+        "pass": 0,
+        "total": 0,
+        "baseline": 0,
+        "fail": 0,
+        "tier": "build",
+        "fresh": true
       }
     }
   },
   "totals": {
-    "pass": 9,
-    "known": 16
+    "pass": 0,
+    "known": 0
   }
 }
