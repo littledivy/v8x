@@ -20,7 +20,4 @@ pub(crate) mod serializer;
 pub(crate) mod shims;
 pub(crate) mod simdutf;
 pub(crate) mod string;
-// Safe link-stubs for v8 C-ABI symbols `test_api.rs` references but JSC doesn't
-// implement yet, so the large test targets link and run. See the module docs.
-pub(crate) mod test_api_stubs;
 pub(crate) mod value;

@@ -835,3 +835,139 @@ pub extern "C" fn v8__StackFrame__GetFunctionName(
   let _ = this;
   ptr::null()
 }
+
+// ---------------------------------------------------------------------------
+// Link-stubs for v8 C-ABI symbols that `test_api.rs` references but this
+// backend doesn't implement yet. Each returns a benign default
+// (null / 0 / false / `Nothing`) so the target LINKS and the many tests that
+// don't touch these paths run; tests that do exercise them fail gracefully
+// without crashing. Promote individual stubs to real implementations over time.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Exception__CaptureStackTrace(
+  _context: *const std::os::raw::c_void,
+  _object: *const std::os::raw::c_void,
+) -> crate::support::MaybeBool {
+  crate::support::MaybeBool::Nothing
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Exception__GetStackTrace(
+  _exception: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Message__ErrorLevel(
+  _this: *const std::os::raw::c_void,
+) -> crate::support::int {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Message__GetEndColumn(
+  _this: *const std::os::raw::c_void,
+) -> crate::support::int {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Message__GetEndPosition(
+  _this: *const std::os::raw::c_void,
+) -> crate::support::int {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Message__GetStartPosition(
+  _this: *const std::os::raw::c_void,
+) -> crate::support::int {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Message__GetWasmFunctionIndex(
+  _this: *const std::os::raw::c_void,
+) -> crate::support::int {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Message__IsOpaque(
+  _this: *const std::os::raw::c_void,
+) -> bool {
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Message__IsSharedCrossOrigin(
+  _this: *const std::os::raw::c_void,
+) -> bool {
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Promise__HasHandler(
+  _this: *const std::os::raw::c_void,
+) -> bool {
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__StackFrame__GetScriptId(
+  _this: *const std::os::raw::c_void,
+) -> crate::support::int {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__StackFrame__GetScriptNameOrSourceURL(
+  _this: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__StackFrame__GetScriptSource(
+  _this: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__StackFrame__GetScriptSourceMappingURL(
+  _this: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__StackFrame__IsConstructor(
+  _this: *const std::os::raw::c_void,
+) -> bool {
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__StackFrame__IsWasm(
+  _this: *const std::os::raw::c_void,
+) -> bool {
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__StackTrace__CurrentScriptNameOrSourceURL(
+  _isolate: *mut std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__StackTrace(
+  _this: *const std::os::raw::c_void,
+  _context: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}

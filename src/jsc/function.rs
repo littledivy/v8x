@@ -1317,3 +1317,124 @@ pub extern "C" fn v8__PropertyCallbackInfo__ShouldThrowOnError(
 ) -> bool {
   false
 }
+
+// ---------------------------------------------------------------------------
+// Link-stubs for v8 C-ABI symbols that `test_api.rs` references but this
+// backend doesn't implement yet. Each returns a benign default
+// (null / 0 / false / `Nothing`) so the target LINKS and the many tests that
+// don't touch these paths run; tests that do exercise them fail gracefully
+// without crashing. Promote individual stubs to real implementations over time.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionCallbackInfo__IsConstructCall(
+  _this: *const std::os::raw::c_void,
+) -> bool {
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionTemplate__SetAccessorProperty(
+  _this: *const std::os::raw::c_void,
+  _key: *const std::os::raw::c_void,
+  _getter: *const std::os::raw::c_void,
+  _setter: *const std::os::raw::c_void,
+  _attr: crate::PropertyAttribute,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Function__GetName(
+  _this: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Function__GetScriptColumnNumber(
+  _this: *const std::os::raw::c_void,
+) -> crate::support::int {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Function__GetScriptLineNumber(
+  _this: *const std::os::raw::c_void,
+) -> crate::support::int {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Function__GetScriptOrigin(
+  _this: *const std::os::raw::c_void,
+  _out: *mut std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Function__ScriptId(
+  _this: *const std::os::raw::c_void,
+) -> crate::support::int {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ObjectTemplate__InternalFieldCount(
+  _this: *const std::os::raw::c_void,
+) -> crate::support::int {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ObjectTemplate__SetImmutableProto(
+  _this: *const std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ObjectTemplate__SetNativeDataProperty(
+  _this: *const std::os::raw::c_void,
+  _key: *const std::os::raw::c_void,
+  _getter: *const std::os::raw::c_void,
+  _setter: *const std::os::raw::c_void,
+  _data_or_null: *const std::os::raw::c_void,
+  _attr: crate::PropertyAttribute,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__Data(
+  _this: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ReturnValue__Value__Get(
+  _this: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ReturnValue__Value__SetEmptyString(
+  _this: *mut std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Signature__New(
+  _isolate: *mut std::os::raw::c_void,
+  _templ: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Template__SetIntrinsicDataProperty(
+  _this: *const std::os::raw::c_void,
+  _key: *const std::os::raw::c_void,
+  _intrinsic: crate::Intrinsic,
+  _attr: crate::PropertyAttribute,
+) {
+}

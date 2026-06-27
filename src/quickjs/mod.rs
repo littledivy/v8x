@@ -25,7 +25,6 @@ mod serializer;
 mod shims;
 mod simdutf;
 mod string;
-mod test_api_stubs;
 mod value;
 mod wasm;
 

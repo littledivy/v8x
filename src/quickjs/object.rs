@@ -1228,3 +1228,104 @@ pub extern "C" fn v8__Object__IsApiWrapper(this: *const Object) -> bool {
   let key = wrap_key(this);
   WRAP_TABLE.with(|t| t.borrow().keys().any(|(w, _)| *w == key))
 }
+
+// ---------------------------------------------------------------------------
+// Link-stubs for v8 C-ABI symbols that `test_api.rs` references but this
+// backend doesn't implement yet. Each returns a benign default
+// (null / 0 / false / `Nothing`) so the target LINKS and the many tests that
+// don't touch these paths run; tests that do exercise them fail gracefully
+// without crashing. Promote individual stubs to real implementations over time.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetAlignedPointerFromInternalField(
+  _this: *const std::os::raw::c_void,
+  _index: crate::support::int,
+  _tag: u16,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetInternalField(
+  _this: *const std::os::raw::c_void,
+  _index: crate::support::int,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__InternalFieldCount(
+  _this: *const std::os::raw::c_void,
+) -> crate::support::int {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__SetAccessor(
+  _this: *const std::os::raw::c_void,
+  _context: *const std::os::raw::c_void,
+  _key: *const std::os::raw::c_void,
+  _getter: *const std::os::raw::c_void,
+  _setter: *const std::os::raw::c_void,
+  _data_or_null: *const std::os::raw::c_void,
+  _attr: crate::PropertyAttribute,
+) -> crate::support::MaybeBool {
+  crate::support::MaybeBool::Nothing
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__SetAlignedPointerInInternalField(
+  _this: *const std::os::raw::c_void,
+  _index: crate::support::int,
+  _value: *const std::os::raw::c_void,
+  _tag: u16,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__SetInternalField(
+  _this: *const std::os::raw::c_void,
+  _index: crate::support::int,
+  _data: *const std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__SetLazyDataProperty(
+  _this: *const std::os::raw::c_void,
+  _context: *const std::os::raw::c_void,
+  _key: *const std::os::raw::c_void,
+  _getter: *const std::os::raw::c_void,
+  _data_or_null: *const std::os::raw::c_void,
+  _attr: crate::PropertyAttribute,
+  _getter_side_effect_type: crate::SideEffectType,
+  _setter_side_effect_type: crate::SideEffectType,
+) -> crate::support::MaybeBool {
+  crate::support::MaybeBool::Nothing
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__RegExp__Exec(
+  _this: *const std::os::raw::c_void,
+  _context: *const std::os::raw::c_void,
+  _subject: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__RegExp__GetSource(
+  _this: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__RegExp__New(
+  _context: *const std::os::raw::c_void,
+  _pattern: *const std::os::raw::c_void,
+  _flags: crate::RegExpCreationFlags,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}

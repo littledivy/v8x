@@ -986,3 +986,29 @@ pub extern "C" fn v8__Float16Array__New(
     intern_ctx::<crate::Float16Array>(ctx, v)
   }
 }
+
+// ---------------------------------------------------------------------------
+// Link-stubs for v8 C-ABI symbols that `test_api.rs` references but this
+// backend doesn't implement yet. Each returns a benign default
+// (null / 0 / false / `Nothing`) so the target LINKS and the many tests that
+// don't touch these paths run; tests that do exercise them fail gracefully
+// without crashing. Promote individual stubs to real implementations over time.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__SharedArrayBuffer__NewBackingStore__with_data(
+  _data: *mut std::os::raw::c_void,
+  _byte_length: usize,
+  _deleter: *const std::os::raw::c_void,
+  _deleter_data: *mut std::os::raw::c_void,
+) -> *mut std::os::raw::c_void {
+  std::ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__SharedArrayBuffer__New__with_byte_length(
+  _isolate: *mut std::os::raw::c_void,
+  _byte_length: usize,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}

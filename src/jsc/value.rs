@@ -847,3 +847,42 @@ pub extern "C" fn v8__Value__Int32Value(
     }
   }
 }
+
+// ---------------------------------------------------------------------------
+// Link-stubs for v8 C-ABI symbols that `test_api.rs` references but this
+// backend doesn't implement yet. Each returns a benign default
+// (null / 0 / false / `Nothing`) so the target LINKS and the many tests that
+// don't touch these paths run; tests that do exercise them fail gracefully
+// without crashing. Promote individual stubs to real implementations over time.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__GetHash(
+  _this: *const std::os::raw::c_void,
+) -> u32 {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__ToDetailString(
+  _this: *const std::os::raw::c_void,
+  _context: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__ToInt32(
+  _this: *const std::os::raw::c_void,
+  _context: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__ToUint32(
+  _this: *const std::os::raw::c_void,
+  _context: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}

@@ -3274,3 +3274,46 @@ pub extern "C" fn v8__UnboundScript__GetSourceMappingURL(
   let v = unsafe { JSValueMakeUndefined(ctx) };
   intern_ctx::<Value>(ctx, v)
 }
+
+// ---------------------------------------------------------------------------
+// Link-stubs for v8 C-ABI symbols that `test_api.rs` references but this
+// backend doesn't implement yet. Each returns a benign default
+// (null / 0 / false / `Nothing`) so the target LINKS and the many tests that
+// don't touch these paths run; tests that do exercise them fail gracefully
+// without crashing. Promote individual stubs to real implementations over time.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Module__IsSourceTextModule(
+  _this: *const std::os::raw::c_void,
+) -> bool {
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Module__ScriptId(
+  _this: *const std::os::raw::c_void,
+) -> crate::support::int {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ScriptOrigin__ResourceName(
+  _origin: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ScriptOrigin__ScriptId(
+  _origin: *const std::os::raw::c_void,
+) -> i32 {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ScriptOrigin__SourceMapUrl(
+  _origin: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}

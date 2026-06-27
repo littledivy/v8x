@@ -1188,3 +1188,169 @@ pub extern "C" fn v8__HeapProfiler__TakeHeapSnapshot(
 pub extern "C" fn v8__ScriptCompiler__CachedDataVersionTag() -> u32 {
   0x5145_4a53
 }
+
+// ---------------------------------------------------------------------------
+// Link-stubs for v8 C-ABI symbols that `test_api.rs` references but this
+// backend doesn't implement yet. Each returns a benign default
+// (null / 0 / false / `Nothing`) so the target LINKS and the many tests that
+// don't touch these paths run; tests that do exercise them fail gracefully
+// without crashing. Promote individual stubs to real implementations over time.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn icu_set_default_locale(_locale: *const std::os::raw::c_void) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__CompiledWasmModule__GetWireBytesRef(
+  _this: *mut std::os::raw::c_void,
+  _length: *mut std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__CompiledWasmModule__SourceUrl(
+  _this: *mut std::os::raw::c_void,
+  _length: *mut std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Eternal__Clear(_this: *mut std::os::raw::c_void) {}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Eternal__IsEmpty(
+  _this: *const std::os::raw::c_void,
+) -> bool {
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Map__Clear(_this: *const std::os::raw::c_void) {}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Map__Delete(
+  _this: *const std::os::raw::c_void,
+  _context: *const std::os::raw::c_void,
+  _key: *const std::os::raw::c_void,
+) -> crate::support::MaybeBool {
+  crate::support::MaybeBool::Nothing
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Map__Get(
+  _this: *const std::os::raw::c_void,
+  _context: *const std::os::raw::c_void,
+  _key: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Map__Has(
+  _this: *const std::os::raw::c_void,
+  _context: *const std::os::raw::c_void,
+  _key: *const std::os::raw::c_void,
+) -> crate::support::MaybeBool {
+  crate::support::MaybeBool::Nothing
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Map__New(
+  _isolate: *mut std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Map__Set(
+  _this: *const std::os::raw::c_void,
+  _context: *const std::os::raw::c_void,
+  _key: *const std::os::raw::c_void,
+  _value: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Proxy__IsRevoked(
+  _this: *const std::os::raw::c_void,
+) -> bool {
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Proxy__New(
+  _context: *const std::os::raw::c_void,
+  _target: *const std::os::raw::c_void,
+  _handler: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Proxy__Revoke(_this: *const std::os::raw::c_void) {}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Set__Clear(_this: *const std::os::raw::c_void) {}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Set__Delete(
+  _this: *const std::os::raw::c_void,
+  _context: *const std::os::raw::c_void,
+  _key: *const std::os::raw::c_void,
+) -> crate::support::MaybeBool {
+  crate::support::MaybeBool::Nothing
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Set__Has(
+  _this: *const std::os::raw::c_void,
+  _context: *const std::os::raw::c_void,
+  _key: *const std::os::raw::c_void,
+) -> crate::support::MaybeBool {
+  crate::support::MaybeBool::Nothing
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__SnapshotCreator__AddData_to_isolate(
+  _this: *mut std::os::raw::c_void,
+  _data: *const std::os::raw::c_void,
+) -> usize {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__WasmModuleCompilation__Abort(
+  _this: *mut std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__WasmModuleCompilation__Finish(
+  _this: *mut std::os::raw::c_void,
+  _isolate: *mut std::os::raw::c_void,
+  _caching_callback: *const std::os::raw::c_void,
+  _resolution_callback: *const std::os::raw::c_void,
+  _resolution_data: *mut std::os::raw::c_void,
+  _drop_resolution_data: *const std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__WasmModuleCompilation__OnBytesReceived(
+  _this: *mut std::os::raw::c_void,
+  _bytes: *const std::os::raw::c_void,
+  _size: usize,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__WasmModuleCompilation__SetUrl(
+  _this: *mut std::os::raw::c_void,
+  _url: *const std::os::raw::c_void,
+  _length: usize,
+) {
+}
