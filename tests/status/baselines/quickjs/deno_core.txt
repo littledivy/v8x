@@ -1,4 +1,96 @@
 # Baseline: tests that PASS for backend=quickjs suite=deno_core.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 0 passing. DO NOT hand-sort; the
+# (run.mjs --update). 92 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
+deno_core::arena::raw_arena::tests::test_add_clear_many
+deno_core::arena::raw_arena::tests::test_add_remove_many
+deno_core::arena::raw_arena::tests::test_add_remove_many_separate
+deno_core::arena::raw_arena::tests::test_droppable
+deno_core::arena::raw_arena::tests::test_drops
+deno_core::arena::raw_arena::tests::test_drops_full
+deno_core::arena::raw_arena::tests::test_no_drop
+deno_core::arena::shared_arena::tests::test_allocate_drop_arc_first
+deno_core::arena::shared_arena::tests::test_allocate_drop_arena_first
+deno_core::arena::shared_arena::tests::test_clone_into_raw
+deno_core::arena::shared_arena::tests::test_raw
+deno_core::arena::shared_atomic_arena::tests::test_allocate_drop_arc_first
+deno_core::arena::shared_atomic_arena::tests::test_allocate_drop_arena_first
+deno_core::arena::shared_atomic_arena::tests::test_clone_into_raw
+deno_core::arena::shared_atomic_arena::tests::test_raw
+deno_core::arena::shared_atomic_arena::tests::test_threaded
+deno_core::arena::unique_arena::tests::test_allocate_drop_arena_first
+deno_core::arena::unique_arena::tests::test_allocate_drop_box_first
+deno_core::arena::unique_arena::tests::test_raw
+deno_core::async_cancel::tests::abort_future
+deno_core::async_cancel::tests::abort_multiple_times
+deno_core::async_cancel::tests::abort_poll
+deno_core::async_cancel::tests::abort_poll_once
+deno_core::async_cancel::tests::cancel_future
+deno_core::async_cancel::tests::cancel_handle_pinning
+deno_core::async_cancel::tests::cancel_try_future
+deno_core::async_cancel::tests::future_cancels_itself_and_completes
+deno_core::async_cancel::tests::future_cancels_itself_and_hangs
+deno_core::async_cancel::tests::future_cancels_itself_before_completion
+deno_core::async_cell::tests::async_ref_cell_borrow
+deno_core::async_cell::tests::async_ref_cell_try_borrow
+deno_core::async_cell::tests::rc_ref_map
+deno_core::convert::tests::derive_from_struct
+deno_core::convert::tests::derive_from_tuple_struct
+deno_core::convert::tests::derive_struct
+deno_core::convert::tests::derive_to_struct
+deno_core::convert::tests::derive_to_tuple_struct
+deno_core::convert::tests::test_bigint
+deno_core::convert::tests::test_bigint64array
+deno_core::convert::tests::test_biguint64array
+deno_core::convert::tests::test_box_roundtrip
+deno_core::convert::tests::test_int32array
+deno_core::convert::tests::test_option_null
+deno_core::convert::tests::test_option_undefined
+deno_core::convert::tests::test_tuple
+deno_core::convert::tests::test_uint16array
+deno_core::convert::tests::test_uint32array
+deno_core::convert::tests::test_uint8array
+deno_core::convert::tests::test_vec
+deno_core::cppgc::tests::inheriting_types_list_contains_derived
+deno_core::error::tests::test_format_file_name
+deno_core::error::tests::test_js_error_v8_roundtrip_preserves_shape
+deno_core::error::tests::test_parse_eval_origin
+deno_core::error::tests::test_relative_specifier_within
+deno_core::error::tests::test_to_v8_error_handles_null_builder_exception
+deno_core::error::tests::test_to_v8_error_handles_stack_overflow_in_builder
+deno_core::extensions::tests::test_include_js
+deno_core::external::tests::test_external
+deno_core::external::tests::test_external_deref_after_take - should panic
+deno_core::external::tests::test_external_incompatible_deref - should panic
+deno_core::external::tests::test_external_incompatible_same_name - should panic
+deno_core::external::tests::test_external_incompatible_take - should panic
+deno_core::external::tests::test_external_markers
+deno_core::fast_string::tests::string_eq
+deno_core::fast_string::tests::test_const
+deno_core::fast_string::tests::test_large_include
+deno_core::fast_string::tests::truncate
+deno_core::gotham_state::tests::borrow_mut
+deno_core::gotham_state::tests::missing - should panic
+deno_core::gotham_state::tests::put_borrow1
+deno_core::gotham_state::tests::put_borrow2
+deno_core::gotham_state::tests::take
+deno_core::gotham_state::tests::try_borrow
+deno_core::gotham_state::tests::try_borrow_mut
+deno_core::gotham_state::tests::try_take
+deno_core::gotham_state::tests::type_alias
+deno_core::io::buffer_strategy::tests::resource_known_hint
+deno_core::io::buffer_strategy::tests::resource_no_hint
+deno_core::io::buffers::tests::bufmutview_grow
+deno_core::io::buffers::tests::bufmutview_read_and_truncate
+deno_core::io::buffers::tests::bufmutview_resize
+deno_core::io::buffers::tests::bufmutview_split
+deno_core::io::buffers::tests::bufview_read_and_truncate
+deno_core::io::buffers::tests::bufview_split
+deno_core::module_specifier::tests::test_deserialize_module_specifier
+deno_core::module_specifier::tests::test_resolve_import
+deno_core::module_specifier::tests::test_resolve_import_error
+deno_core::modules::map::test_render_js_wasm_module
+deno_core::modules::map::test_render_js_wasm_module_global_import
+deno_core::modules::map::test_render_js_wasm_module_global_unwrap
+deno_core::modules::module_map_data::tests::module_name_map_test
+deno_core::modules::tests::builtin_core_module
