@@ -50,6 +50,20 @@ const isMac = os.platform() === "darwin";
 const needsCodesign = isMac && b.os === "macos"; // JSC JIT entitlements
 const ENT = path.join(ROOT, "tools/jit-entitlements.plist");
 
+// Per-test wall-clock timeout. libtest has NO per-test timeout, and we run with
+// --test-threads 1, so a single hanging test (e.g. a deadlocked C-API bridge on
+// the vendored-JSC deno_core module loader) blocks the entire binary forever.
+// Under CI that means the job hits its job-level timeout-minutes and is
+// cancelled — no artifact, the whole cell scores 0 (denoland/divybot#651).
+// Override with LIBTEST_TEST_TIMEOUT_SECS; 0 disables the watchdog entirely.
+// NOTE: must be declared before the top-level `await` switch below — the suite
+// runners reference it during that synchronous-from-here evaluation, so a
+// `const` placed lower in the file would hit the temporal dead zone.
+const PER_TEST_TIMEOUT_MS =
+  (process.env.LIBTEST_TEST_TIMEOUT_SECS != null
+    ? Number(process.env.LIBTEST_TEST_TIMEOUT_SECS)
+    : 120) * 1000;
+
 let result;
 switch (s.kind) {
   case "cargo-self":
@@ -113,17 +127,6 @@ function cargoBuild(extraArgs, cwd, selectBackend = true) {
   }
   return bins;
 }
-
-// Per-test wall-clock timeout. libtest has NO per-test timeout, and we run with
-// --test-threads 1, so a single hanging test (e.g. a deadlocked C-API bridge on
-// the vendored-JSC deno_core module loader) blocks the entire binary forever.
-// Under CI that means the job hits its job-level timeout-minutes and is
-// cancelled — no artifact, the whole cell scores 0 (denoland/divybot#651).
-// Override with LIBTEST_TEST_TIMEOUT_SECS; 0 disables the watchdog entirely.
-const PER_TEST_TIMEOUT_MS =
-  (process.env.LIBTEST_TEST_TIMEOUT_SECS != null
-    ? Number(process.env.LIBTEST_TEST_TIMEOUT_SECS)
-    : 120) * 1000;
 
 // Run a single libtest binary once, streaming its output behind a watchdog.
 // With --test-threads 1 libtest's pretty formatter prints `test <name> ... `
