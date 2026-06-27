@@ -28,6 +28,15 @@ const ts = new Date().toISOString();
 const cfg = loadConfig();
 const runResults = loadRuns();
 
+// Carry-forward the engine version from the previous report when this run has no
+// fresh run-result for a backend (e.g. its build job was slow/absent this time).
+// Keeps the dashboard label stable instead of dropping the version + sha.
+const prevVersions = {};
+try {
+  const prev = JSON.parse(fs.readFileSync(path.join(STATUS_DIR, "report.json"), "utf8"));
+  for (const b of prev.backends || []) if (b.version) prevVersions[b.id] = b.version;
+} catch {}
+
 // On main (single writer) we fold each fresh run's pass set back into the
 // committed baseline. PRs never do this — their ratchet (run.mjs --check)
 // compares against the committed baseline, so regressions are blocked there.
@@ -69,8 +78,10 @@ const report = {
     // run.mjs records the engine version into each run-result (it has the
     // submodules + right OS; this aggregator's checkout does not). Append it to
     // the base label, e.g. "JavaScriptCore" -> "JavaScriptCore 625.1.23 (0f307e9)".
-    const v = cfg.suites.map((s) => runResults[`${b.id}__${s.id}`]?.version).find(Boolean);
-    return { id: b.id, label: v ? `${b.label} ${v}` : b.label };
+    // Fall back to the previous report's version if no fresh run carried one.
+    const v = cfg.suites.map((s) => runResults[`${b.id}__${s.id}`]?.version).find(Boolean)
+      || prevVersions[b.id] || null;
+    return { id: b.id, label: v ? `${b.label} ${v}` : b.label, version: v };
   }),
   suites: cfg.suites.map((s) => ({ id: s.id, label: s.label, tier: s.tier })),
   cells,

@@ -6,10 +6,15 @@ on:
   pull_request:
     branches: [main]
 
-# Newer push to the same ref cancels the older in-flight run.
+# Newer push cancels the older in-flight run — but ONLY for PRs. Main runs are
+# never cancelled: the report job aggregates per-job artifacts and publishes the
+# dashboard, so cancelling a main run mid-flight would let its report job (which
+# runs even on partial results) publish a dashboard missing the cells whose jobs
+# hadn't uploaded yet — exactly the flapping (version vanishing, "38" vs
+# "38/264") seen when several main pushes land close together.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -237,10 +242,13 @@ jobs:
   report:
     name: aggregate report
     needs: [check, deno_core]
-    # always() so a failed/partial matrix leg still seeds whatever run-result
-    # artifacts were uploaded (the per-suite steps don't fail the build on test
-    # failures; only infra/build breakage does).
-    if: always() && github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # !cancelled() (not always()) so a failed/partial matrix leg still seeds
+    # whatever run-result artifacts were uploaded (the per-suite steps don't fail
+    # the build on test failures; only infra/build breakage does) — but a
+    # CANCELLED run does NOT publish, so it can't overwrite the dashboard with a
+    # half-populated aggregate. (Main runs aren't cancelled anyway; this is belt
+    # and suspenders.)
+    if: ${{ !cancelled() && github.ref == 'refs/heads/main' && github.event_name == 'push' }}
     runs-on: ubuntu-latest
     # Deploys Pages directly (the [skip ci] commit below won't trigger pages.yml).
     permissions:
