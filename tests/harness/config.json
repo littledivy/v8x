@@ -1,0 +1,75 @@
+{
+  "$schema": "./config.schema.json",
+  "comment": "Single source of truth for the test matrix. Backends x suites. The runner (run.mjs), the aggregator (aggregate.mjs) and CI all read this.",
+
+  "backends": [
+    {
+      "id": "jsc",
+      "label": "Vendored JSC",
+      "features": "engine_jsc,vendor_jsc",
+      "os": "macos",
+      "comment": "WebKit JSCOnly built from source. The shippable engine."
+    },
+    {
+      "id": "sys-jsc",
+      "label": "System JSC",
+      "features": "system_jsc",
+      "os": "macos",
+      "comment": "Apple's JavaScriptCore.framework. String-rewriter module shim."
+    },
+    {
+      "id": "quickjs",
+      "label": "QuickJS-ng",
+      "features": "quickjs",
+      "os": "any",
+      "comment": "Vendored quickjs-ng, statically linked. Cross-platform."
+    }
+  ],
+
+  "suites": [
+    {
+      "id": "rusty_v8",
+      "label": "rusty_v8 API",
+      "tier": "build",
+      "kind": "cargo-self",
+      "comment": "Vendored rusty_v8 integration tests run unmodified against our v8 shim (see [[test]] entries in Cargo.toml). Cheapest: no deno.",
+      "cargo_tests": [
+        "rv8_test_api",
+        "rv8_test_api_flags",
+        "rv8_test_api_entropy_source",
+        "rv8_slots",
+        "rv8_test_simple_external",
+        "rv8_test_external_deserialize",
+        "rv8_test_custom_platform",
+        "rv8_test_single_threaded_default_platform",
+        "rv8_test_platform_atomics_pump_message_loop",
+        "rv8_test_concurrent_isolate_creation_and_disposal",
+        "rv8_test_cppgc"
+      ]
+    },
+    {
+      "id": "deno_core",
+      "label": "deno_core",
+      "tier": "build",
+      "kind": "cargo-deno",
+      "comment": "cargo test -p deno_core in the patched deno checkout. Links our v8 shim but does NOT build the full deno binary.",
+      "package": "deno_core"
+    },
+    {
+      "id": "deno_node_compat",
+      "label": "Deno node compat",
+      "tier": "deno",
+      "kind": "deno-test",
+      "comment": "Deno's Node.js compatibility suite. Needs the full deno binary.",
+      "test_path": "tests/unit_node"
+    },
+    {
+      "id": "deno_unit",
+      "label": "Deno unit",
+      "tier": "deno",
+      "kind": "deno-test",
+      "comment": "Deno's own unit test suite. Needs the full deno binary.",
+      "test_path": "tests/unit"
+    }
+  ]
+}

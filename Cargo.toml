@@ -51,4 +51,62 @@ temporal_capi = { version = "0.2.3", features = ["zoneinfo64"] }
 cc = "1.0"
 bindgen = "0.70"
 
+# Dev-deps needed to compile the vendored rusty_v8 integration tests
+# (registered as [[test]] targets below). Versions track vendor/rusty_v8.
 [dev-dependencies]
+align-data = "0.1.0"
+bytes = "1"
+
+# -----------------------------------------------------------------------------
+# Test-suite hill-climb: the vendored rusty_v8 integration tests run UNMODIFIED
+# against our v8 shim. Each is a [[test]] target pointing straight at the
+# vendored file (path = vendor/rusty_v8/tests/*.rs). The harness
+# (tests/harness/run.mjs) runs these via `cargo test --test rv8_*` per backend
+# and ratchets the pass set against status/baselines/<backend>/rusty_v8.txt.
+#
+# Excluded on purpose: test_ui (trybuild, needs deno crate fixtures),
+# test_simdutf (feature-gated). They are not part of the tracked suite.
+# -----------------------------------------------------------------------------
+[[test]]
+name = "rv8_test_api"
+path = "vendor/rusty_v8/tests/test_api.rs"
+
+[[test]]
+name = "rv8_test_api_flags"
+path = "vendor/rusty_v8/tests/test_api_flags.rs"
+
+[[test]]
+name = "rv8_test_api_entropy_source"
+path = "vendor/rusty_v8/tests/test_api_entropy_source.rs"
+
+[[test]]
+name = "rv8_slots"
+path = "vendor/rusty_v8/tests/slots.rs"
+
+[[test]]
+name = "rv8_test_simple_external"
+path = "vendor/rusty_v8/tests/test_simple_external.rs"
+
+[[test]]
+name = "rv8_test_external_deserialize"
+path = "vendor/rusty_v8/tests/test_external_deserialize.rs"
+
+[[test]]
+name = "rv8_test_custom_platform"
+path = "vendor/rusty_v8/tests/test_custom_platform.rs"
+
+[[test]]
+name = "rv8_test_single_threaded_default_platform"
+path = "vendor/rusty_v8/tests/test_single_threaded_default_platform.rs"
+
+[[test]]
+name = "rv8_test_platform_atomics_pump_message_loop"
+path = "vendor/rusty_v8/tests/test_platform_atomics_pump_message_loop.rs"
+
+[[test]]
+name = "rv8_test_concurrent_isolate_creation_and_disposal"
+path = "vendor/rusty_v8/tests/test_concurrent_isolate_creation_and_disposal.rs"
+
+[[test]]
+name = "rv8_test_cppgc"
+path = "vendor/rusty_v8/tests/test_cppgc.rs"

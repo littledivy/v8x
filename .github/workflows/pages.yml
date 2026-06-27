@@ -1,0 +1,42 @@
+name: Pages
+
+# Publish the hill-climb dashboard to GitHub Pages on dashboard (docs/) changes
+# or manual dispatch. NOTE: routine data updates are deployed by the ci.yml
+# `report` job itself (its [skip ci] commit can't trigger this workflow).
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Don't cancel an in-flight deploy; queue instead.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble site (dashboard + data)
+        run: |
+          mkdir -p _site
+          cp docs/index.html _site/
+          cp status/report.json _site/report.json
+          # history.jsonl may not exist on the very first deploy.
+          cp status/history.jsonl _site/history.jsonl 2>/dev/null || : > _site/history.jsonl
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -66,6 +66,29 @@ jobs:
       - name: Build --lib (${{ matrix.features }})
         run: cargo build --no-default-features --features ${{ matrix.features }} --lib
 
+      # --- hill-climb: rusty_v8 suite (build tier) ---------------------------
+      # Cheapest suite — vendored rusty_v8 integration tests run unmodified
+      # against our shim ([[test]] rv8_* in Cargo.toml). PRs ratchet strictly
+      # (--check: red on regression or un-baselined new pass); main just records
+      # a run-result artifact the `report` job folds in.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: rusty_v8 suite (${{ matrix.backend }})
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            node tests/harness/run.mjs rusty_v8 ${{ matrix.backend }} --check
+          else
+            node tests/harness/run.mjs rusty_v8 ${{ matrix.backend }}
+          fi
+      - name: Upload run results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runs-${{ matrix.backend }}-rusty_v8
+          path: status/.runs/
+          if-no-files-found: ignore
+
   # ---------------------------------------------------------------------------
   # Real deno on each v82jsc backend, run against the ES-module conformance
   # suite (byte-for-byte vs the stock-v8 oracle). All on macOS so the JSC
@@ -147,6 +170,33 @@ jobs:
       - name: Run ES-module conformance suite
         run: tests/modules/run.sh "../deno/target/release/deno" "${{ matrix.backend }}"
 
+      # --- hill-climb: deno_core + Deno node-compat + Deno unit -------------
+      # deno_core is build-tier-ish (no full binary needed) but it needs the
+      # deno checkout, so it rides here. node-compat + unit need the binary
+      # built above. PRs ratchet strictly; main records run-result artifacts.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run hill-climb suites (${{ matrix.backend }})
+        env:
+          PR: ${{ github.event_name == 'pull_request' && '--check' || '' }}
+        run: |
+          set -uo pipefail
+          DENO=../deno/target/release/deno
+          rc=0
+          for suite in deno_core deno_node_compat deno_unit; do
+            node tests/harness/run.mjs "$suite" "${{ matrix.backend }}" $PR \
+              --deno-dir=../deno --deno-bin="$DENO" || rc=$?
+          done
+          exit $rc
+      - name: Upload run results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: runs-${{ matrix.backend }}-deno
+          path: status/.runs/
+          if-no-files-found: ignore
+
   module-tests:
     name: module suite (stock-v8 oracle)
     runs-on: ubuntu-latest
@@ -170,3 +220,66 @@ jobs:
         with:
           components: rustfmt
       - run: rustfmt --edition 2024 --check src/jsc/*.rs src/quickjs/*.rs
+
+  # ---------------------------------------------------------------------------
+  # Single-writer aggregation. Runs only on push to main (after merge), once,
+  # gathering every matrix job's run-result artifacts. Folds fresh pass sets
+  # into the committed baselines (--write-baselines), regenerates the single
+  # status/report.json and appends a status/history.jsonl snapshot, then commits
+  # + pushes. Because only this job writes those files, parallel PRs never
+  # conflict on them. The Pages workflow redeploys the dashboard on that commit.
+  # ---------------------------------------------------------------------------
+  report:
+    name: aggregate report
+    needs: [check, deno]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # Deploys Pages directly (the [skip ci] commit below won't trigger pages.yml).
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Download all run-result artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: runs-*
+          path: /tmp/runs
+          merge-multiple: true
+      - name: Collect run results
+        run: |
+          mkdir -p status/.runs
+          cp -v /tmp/runs/*.json status/.runs/ 2>/dev/null || echo "no run results"
+      - name: Aggregate (baselines + report + history)
+        run: node tests/harness/aggregate.mjs --write-baselines --commit="${GITHUB_SHA}"
+      - name: Commit + push
+        run: |
+          git config user.name  "v82jsc-bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add status/baselines status/report.json status/history.jsonl
+          if git diff --cached --quiet; then
+            echo "no changes to report"
+          else
+            git commit -m "ci: update test report [skip ci]"
+            git push origin main
+          fi
+      - name: Assemble dashboard
+        run: |
+          mkdir -p _site
+          cp docs/index.html _site/
+          cp status/report.json _site/report.json
+          cp status/history.jsonl _site/history.jsonl 2>/dev/null || : > _site/history.jsonl
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v4

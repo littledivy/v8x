@@ -1,0 +1,4 @@
+# Baseline: tests that PASS for backend=quickjs suite=deno_core.
+# Ratchet — CI goes red if any of these regress. Add new passes here
+# (run.mjs --update). 0 passing. DO NOT hand-sort; the
+# harness keeps this sorted + unique.
