@@ -59,9 +59,23 @@ node tests/harness/run.mjs rusty_v8 quickjs
 cat tests/status/.runs/quickjs__rusty_v8.json | jq '.failing'
 ```
 
-A test target that won't **link** (missing `v8__*` symbol) counts as 0 passing
-for its whole file — implementing that one symbol can unlock hundreds of tests.
-Find the gap from the build error, implement it in `src/<engine>/`, rebuild.
+A test target that won't **link** (missing `v8__*`/C-ABI symbol) counts as 0
+passing for its **whole file** — the biggest files are the biggest payoffs.
+Find the undefined symbols from the build error, define them in `src/<engine>/`
+(no-op/stub is fine to start; the test then fails instead of blocking the link),
+rebuild. macOS `ld64` dead-strips *unreferenced* undefined symbols, but a symbol
+a test actually references blocks the link → 0 for that file.
+
+**Highest-leverage unlock right now:** `test_api.rs` (hundreds of tests) and
+`test_cppgc` don't link because they reference two unimplemented subsystems:
+- **inspector protocol** — ~40 `crdtp__*` fns (CreateResponse, DispatchResponse,
+  Dispatchable, Serializable, vec_u8, …), declared in the vendored rusty_v8
+  binding, undefined in our shim.
+- **cppgc** (Oilpan) — `cppgc__Member__{Get,Assign}`, `cppgc__Visitor__Trace__Member`,
+  `v8__Isolate__RequestGarbageCollectionForTesting`.
+Landing those (even as safe non-crashing stubs) makes `test_api` link and surface
+its hundreds across all 3 engines — likely the single biggest jump on the
+dashboard. Tracked in #2 (assigned to divybot).
 
 ### deno_core (needs a deno checkout)
 
