@@ -159,9 +159,22 @@ pub extern "C" fn v8_inspector__V8InspectorSession__cancelPauseOnNextStatement(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8InspectorSession__canDispatchMethod(
-  _method: StringView,
+  method: StringView,
 ) -> bool {
-  false
+  // A method "Domain.command" is dispatchable iff its domain is one of the
+  // protocol domains V8InspectorSession serves built-in. Mirror V8's set.
+  let s: String = if let Some(b) = method.characters8() {
+    b.iter().map(|&c| c as char).collect()
+  } else if let Some(u) = method.characters16() {
+    String::from_utf16_lossy(u)
+  } else {
+    String::new()
+  };
+  let domain = s.split('.').next().unwrap_or("");
+  matches!(
+    domain,
+    "Runtime" | "Debugger" | "Profiler" | "HeapProfiler" | "Console" | "Schema"
+  )
 }
 
 #[unsafe(no_mangle)]

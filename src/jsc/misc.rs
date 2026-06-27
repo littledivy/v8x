@@ -842,7 +842,12 @@ pub extern "C" fn cppgc__Visitor__Trace__TracedReference(
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn icu_set_default_locale(_locale: *const std::os::raw::c_void) {
+pub extern "C" fn icu_set_default_locale(locale: *const std::os::raw::c_char) {
+  if locale.is_null() {
+    return;
+  }
+  let s = unsafe { std::ffi::CStr::from_ptr(locale) }.to_string_lossy();
+  crate::jsc::cli_extra::set_default_locale_str(&s);
 }
 
 #[unsafe(no_mangle)]

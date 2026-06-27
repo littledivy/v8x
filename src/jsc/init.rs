@@ -87,12 +87,20 @@ pub extern "C" fn v8__V8__SetFlagsFromCommandLine(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__GetVersion() -> *const c_char {
+  // Report the V8 version string our vendored rusty_v8 surface was generated
+  // against (`v8::VERSION_STRING`), so `V8::get_version()` round-trips exactly.
+  // This is a compat shim emulating V8; downstream code (e.g. Deno) compares
+  // against the V8 version, not JavaScriptCore's. (`jsc_version_string` is kept
+  // for diagnostics but no longer drives the reported version.)
   use std::sync::OnceLock;
   static VERSION: OnceLock<std::ffi::CString> = OnceLock::new();
-  VERSION.get_or_init(jsc_version_string).as_ptr()
+  VERSION
+    .get_or_init(|| std::ffi::CString::new(crate::VERSION_STRING).unwrap())
+    .as_ptr()
 }
 
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 fn jsc_version_string() -> std::ffi::CString {
   use std::os::raw::c_void;
   type CFRef = *const c_void;
@@ -155,6 +163,7 @@ fn jsc_version_string() -> std::ffi::CString {
 }
 
 #[cfg(not(target_os = "macos"))]
+#[allow(dead_code)]
 fn jsc_version_string() -> std::ffi::CString {
   std::ffi::CString::new("JavaScriptCore").unwrap()
 }
