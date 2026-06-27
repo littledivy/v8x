@@ -82,7 +82,22 @@ function cargoBuild(extraArgs, cwd, selectBackend = true) {
   const base = selectBackend
     ? ["test", "--no-default-features", "--features", b.features, "--no-run"]
     : ["test", "--no-run"];
-  const r = run("cargo", [...base, ...extraArgs], { cwd });
+  // The vendored rusty_v8 binding references some C-ABI symbols our shim
+  // doesn't define yet (crdtp__* inspector protocol, icu_set_default_locale).
+  // macOS ld64 dead-strips the unreferenced ones; Linux lld errors out and the
+  // whole test binary fails to link, zeroing the suite. Tell lld to leave
+  // unreferenced-undefined symbols as 0 (same net effect as mac) so unrelated
+  // tests still link + run; a test that actually calls one just fails. Only for
+  // cargo-self (our crate); the deno checkout defines these via deno's crdtp.
+  // macOS ld64 already dead-strips the unreferenced-undefined symbols and links
+  // fine. Linux lld errors instead, zeroing the suite — tell it to leave them
+  // as 0 (same net effect). cargo-self only; the deno checkout defines them.
+  const env = {};
+  if (selectBackend && os.platform() === "linux") {
+    const extra = "-C link-arg=-Wl,--unresolved-symbols=ignore-all";
+    env.RUSTFLAGS = process.env.RUSTFLAGS ? `${process.env.RUSTFLAGS} ${extra}` : extra;
+  }
+  const r = run("cargo", [...base, ...extraArgs], { cwd, env });
   if (r.code !== 0) return null;
   const bins = [];
   for (const line of r.out.split("\n")) {
