@@ -4,135 +4,171 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>v8x test suite</title>
-    <script src="https://cdn.jsdelivr.net/npm/d3@7/dist/d3.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/@observablehq/plot@0.6/dist/plot.umd.min.js"></script>
+    <link rel="preconnect" href="https://rsms.me/" />
+    <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
     <style>
       :root {
-        --bg: #0b0e14; --panel: #11151f; --border: #232938;
-        --fg: #e6edf3; --muted: #8b949e; --accent: #6ea8fe;
+        --bg: #0a0c10; --fg: #e8ecf1; --dim: #6b7480; --line: #1a1f29;
+        --card: #0e1117; --green: #3fb950; --green-soft: #2ea04333;
       }
       * { box-sizing: border-box; }
+      html { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
       body {
         margin: 0; background: var(--bg); color: var(--fg);
-        font: 14px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
-        padding: 40px 24px; max-width: 980px; margin: 0 auto;
-        -webkit-font-smoothing: antialiased;
+        font-family: "Inter", -apple-system, system-ui, sans-serif;
+        font-feature-settings: "cv05", "ss01", "tnum";
+        max-width: 920px; margin: 0 auto; padding: 56px 28px 80px;
       }
-      h1 { font-size: 22px; font-weight: 650; margin: 0; letter-spacing: -0.01em; }
-      .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
-      h2 { font-size: 12px; color: var(--muted); margin: 40px 0 14px; font-weight: 600;
-           text-transform: uppercase; letter-spacing: 0.08em; }
-      .stats { display: flex; gap: 14px; margin: 24px 0 8px; flex-wrap: wrap; }
-      .stat { background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
-              padding: 16px 20px; flex: 1; min-width: 130px; }
-      .stat .n { font-size: 28px; font-weight: 680; letter-spacing: -0.02em; }
-      .stat .l { color: var(--muted); font-size: 11px; text-transform: uppercase;
-                 letter-spacing: 0.06em; margin-top: 2px; }
-      .panel { background: var(--panel); border: 1px solid var(--border);
-               border-radius: 12px; padding: 18px 20px; overflow-x: auto; }
-      figure { margin: 0; }
-      a { color: var(--accent); text-decoration: none; }
-      code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
-             color: var(--muted); }
+      header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+      h1 { font-size: 19px; font-weight: 600; margin: 0; letter-spacing: -0.02em; }
+      h1 .mono { color: var(--dim); font-weight: 500; }
+      .meta { color: var(--dim); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+      .mono { font-family: "Inter", ui-monospace, monospace; }
+
+      .hero { display: flex; align-items: flex-end; gap: 10px; margin: 36px 0 4px; }
+      .hero .num { font-size: 56px; font-weight: 680; letter-spacing: -0.04em; line-height: 0.9; }
+      .hero .of { color: var(--dim); font-size: 18px; font-weight: 500; padding-bottom: 6px; }
+      .hero .pct { margin-left: auto; color: var(--green); font-size: 15px; font-weight: 600;
+                   padding-bottom: 8px; font-variant-numeric: tabular-nums; }
+      .caption { color: var(--dim); font-size: 12.5px; letter-spacing: 0.01em; }
+
+      #chart { height: 220px; margin: 18px 0 8px; }
+
+      table { width: 100%; border-collapse: collapse; margin-top: 40px; font-variant-numeric: tabular-nums; }
+      caption { text-align: left; color: var(--dim); font-size: 11px; font-weight: 600;
+                text-transform: uppercase; letter-spacing: 0.1em; padding-bottom: 14px; }
+      th { font-weight: 500; color: var(--dim); font-size: 12px; text-align: right; padding: 0 0 12px; }
+      th:first-child { text-align: left; }
+      td { padding: 13px 0; border-top: 1px solid var(--line); text-align: right; vertical-align: middle; }
+      td:first-child { text-align: left; font-weight: 500; }
+      .cellnum b { font-weight: 600; }
+      .cellnum span { color: var(--dim); font-size: 12px; }
+      .track { height: 3px; background: var(--line); border-radius: 2px; margin-top: 7px; overflow: hidden; }
+      .track > i { display: block; height: 100%; background: var(--green); border-radius: 2px; }
+      .z { color: var(--dim); }
+      footer { margin-top: 48px; color: var(--dim); font-size: 12px; }
+      footer a { color: var(--dim); }
     </style>
   </head>
   <body>
-    <h1>v8x test suite</h1>
-    <div class="sub" id="meta">loading…</div>
+    <header>
+      <h1>v8x <span class="mono">test suite</span></h1>
+      <div class="meta" id="meta">loading…</div>
+    </header>
 
-    <div class="stats" id="stats"></div>
+    <div class="hero">
+      <div class="num" id="pass">—</div>
+      <div class="of" id="known"></div>
+      <div class="pct" id="pct"></div>
+    </div>
+    <div class="caption">tests passing across the matrix</div>
 
-    <h2>Matrix — passing per backend × suite</h2>
-    <div class="panel"><div id="matrix"></div></div>
+    <div id="chart"></div>
 
-    <h2>Progress over time</h2>
-    <div class="panel"><div id="history"></div></div>
+    <table id="matrix"></table>
 
-    <h2>Passing by suite</h2>
-    <div class="panel"><div id="bars"></div></div>
+    <footer id="foot"></footer>
 
     <script type="module">
-      const C = {
-        bg: "transparent", fg: "#e6edf3", muted: "#8b949e", grid: "#232938",
-        scheme: ["#6ea8fe", "#3fb950", "#d29922", "#bc8cff", "#ff7b72"],
-      };
-      const plotBase = {
-        style: { background: "transparent", color: C.fg, fontSize: "12px" },
-        marginLeft: 90, marginBottom: 36,
-      };
+      const GREEN = "#3fb950", DIM = "#6b7480", LINE = "#1a1f29";
 
       const report = await fetch("report.json").then((r) => r.json()).catch(() => null);
-      if (!report) { document.getElementById("meta").textContent = "no report.json yet"; }
-      else render(report, await fetch("history.jsonl").then((r) => r.text()).then(parseJsonl).catch(() => []));
+      const history = await fetch("history.jsonl").then((r) => r.text()).then(parseJsonl).catch(() => []);
+      if (!report) document.getElementById("meta").textContent = "no data yet";
+      else render(report, history);
 
       function parseJsonl(t) {
         return t.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
       }
 
       function render(report, history) {
-        const backends = report.backends, suites = report.suites;
-        const cells = [];
+        const { backends, suites, cells } = report;
+        let pass = 0, known = 0;
         for (const b of backends) for (const s of suites) {
-          const c = report.cells[b.id][s.id];
-          cells.push({ backend: b.label, suite: s.label, pass: c.pass, total: c.total,
-            rate: c.total ? c.pass / c.total : 0, label: c.total != null ? `${c.pass}/${c.total}` : `${c.pass}` });
+          const c = cells[b.id][s.id]; pass += c.pass; known += c.total || 0;
         }
-        const known = cells.reduce((a, c) => a + (c.total || 0), 0);
-
         document.getElementById("meta").innerHTML =
-          `commit <code>${report.commit.slice(0, 12)}</code> · updated ${new Date(report.generated).toLocaleString()}`;
+          `<span class="mono">${report.commit.slice(0, 7)}</span> · ${timeago(report.generated)}`;
+        document.getElementById("pass").textContent = pass.toLocaleString();
+        document.getElementById("known").textContent = known ? `/ ${known.toLocaleString()}` : "";
+        document.getElementById("pct").textContent = known ? `${Math.round((pass / known) * 100)}% pass` : "";
 
-        document.getElementById("stats").innerHTML = `
-          <div class="stat"><div class="n">${report.totals.pass}</div><div class="l">passing</div></div>
-          <div class="stat"><div class="n">${known || "—"}</div><div class="l">known (built)</div></div>
-          <div class="stat"><div class="n">${known ? Math.round((report.totals.pass / known) * 100) + "%" : "—"}</div><div class="l">pass rate</div></div>
-          <div class="stat"><div class="n">${backends.length}×${suites.length}</div><div class="l">backends × suites</div></div>`;
+        drawChart(history);
+        drawMatrix(report);
 
-        // Matrix heatmap with value labels.
-        document.getElementById("matrix").append(Plot.plot({
-          ...plotBase, marginTop: 10, height: 70 + backends.length * 46,
-          x: { domain: suites.map((s) => s.label), label: null, tickSize: 0 },
-          y: { domain: backends.map((b) => b.label), label: null, tickSize: 0 },
-          color: { type: "linear", domain: [0, 1], range: ["#1b2030", "#3fb950"], legend: false },
-          marks: [
-            Plot.cell(cells, { x: "suite", y: "backend", fill: "rate", rx: 8, inset: 4 }),
-            Plot.text(cells, { x: "suite", y: "backend", text: "label", fill: C.fg, fontSize: 14, fontWeight: 600 }),
-          ],
-        }));
-
-        // Progress over time.
-        const hist = history.flatMap((snap) =>
-          Object.entries(snap.pass || {}).map(([k, v]) => ({ date: new Date(snap.ts), series: k, pass: v })));
-        const histNode = hist.length
-          ? Plot.plot({
-              ...plotBase, height: 300,
-              x: { label: null, grid: false },
-              y: { label: "passing", grid: true, nice: true },
-              color: { legend: true, scheme: "set2" },
-              marks: [
-                Plot.ruleY([0], { stroke: C.grid }),
-                Plot.lineY(hist, { x: "date", y: "pass", stroke: "series", curve: "monotone-x", strokeWidth: 2, marker: "circle" }),
-              ],
-            })
-          : note("no history yet — first CI run populates this");
-        document.getElementById("history").append(histNode);
-
-        // Passing by suite, grouped by backend.
-        document.getElementById("bars").append(Plot.plot({
-          ...plotBase, height: 110 + suites.length * 70, marginLeft: 120,
-          x: { label: "passing", grid: true, nice: true },
-          y: { label: null, tickSize: 0 },
-          fy: { label: null },
-          color: { legend: true, domain: backends.map((b) => b.label), range: C.scheme },
-          marks: [
-            Plot.barX(cells, { x: "pass", y: "backend", fy: "suite", fill: "backend", rx: 4, sort: { y: "-x" } }),
-            Plot.text(cells, { x: "pass", y: "backend", fy: "suite", text: (d) => d.pass || "", dx: 12, fill: C.muted }),
-            Plot.ruleX([0], { stroke: C.grid }),
-          ],
-        }));
+        document.getElementById("foot").innerHTML =
+          `${backends.length} engines · ${suites.length} suites · ratchet-gated · ` +
+          `<a href="https://github.com/littledivy/v8x">littledivy/v8x</a>`;
       }
 
-      function note(txt) { const d = document.createElement("div"); d.className = "sub"; d.textContent = txt; return d; }
+      function drawChart(history) {
+        const el = document.getElementById("chart");
+        if (history.length < 2) {
+          el.style.height = "auto";
+          el.innerHTML = `<div class="caption">progress chart appears after a few CI runs</div>`;
+          return;
+        }
+        const data = history.map((s) => [s.ts, s.totalPass]);
+        const chart = echarts.init(el, null, { renderer: "svg" });
+        chart.setOption({
+          grid: { left: 0, right: 0, top: 12, bottom: 20, containLabel: true },
+          tooltip: {
+            trigger: "axis", backgroundColor: "#0e1117", borderColor: LINE,
+            textStyle: { color: "#e8ecf1", fontSize: 12 },
+            formatter: (p) => `${new Date(p[0].value[0]).toLocaleDateString()} · <b>${p[0].value[1]}</b> passing`,
+          },
+          xAxis: {
+            type: "time", boundaryGap: false,
+            axisLine: { lineStyle: { color: LINE } }, axisTick: { show: false },
+            axisLabel: { color: DIM, fontSize: 11, hideOverlap: true },
+            splitLine: { show: false },
+          },
+          yAxis: {
+            type: "value", minInterval: 1,
+            axisLabel: { color: DIM, fontSize: 11 },
+            splitLine: { lineStyle: { color: LINE } }, axisLine: { show: false }, axisTick: { show: false },
+          },
+          series: [{
+            type: "line", data, smooth: 0.4, showSymbol: false,
+            lineStyle: { color: GREEN, width: 2 },
+            areaStyle: {
+              color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                { offset: 0, color: "#2ea04355" }, { offset: 1, color: "#2ea04300" },
+              ]),
+            },
+          }],
+        });
+        addEventListener("resize", () => chart.resize());
+      }
+
+      function drawMatrix(report) {
+        const { backends, suites, cells } = report;
+        const t = document.getElementById("matrix");
+        let h = `<caption>passing per engine × suite</caption><tr><th>engine</th>`;
+        for (const s of suites) h += `<th>${s.label}</th>`;
+        h += `</tr>`;
+        for (const b of backends) {
+          h += `<tr><td>${b.label}</td>`;
+          for (const s of suites) {
+            const c = cells[b.id][s.id];
+            const tot = c.total, w = tot ? (c.pass / tot) * 100 : 0;
+            const zero = !c.pass;
+            h += `<td><div class="cellnum ${zero ? "z" : ""}"><b>${c.pass}</b>${tot != null ? ` <span>/ ${tot}</span>` : ""}</div>
+                  <div class="track"><i style="width:${w}%"></i></div></td>`;
+          }
+          h += `</tr>`;
+        }
+        t.innerHTML = h;
+      }
+
+      function timeago(iso) {
+        const s = (Date.now() - new Date(iso)) / 1000;
+        if (s < 90) return "just now";
+        if (s < 5400) return `${Math.round(s / 60)}m ago`;
+        if (s < 129600) return `${Math.round(s / 3600)}h ago`;
+        return `${Math.round(s / 86400)}d ago`;
+      }
     </script>
   </body>
 </html>
