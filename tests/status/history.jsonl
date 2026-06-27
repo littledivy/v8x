@@ -12,3 +12,4 @@
 {"ts":"2026-06-27T18:36:50.891Z","commit":"af50d9af06b1100496e9ec82098db4177d8ffdcb","totalPass":117,"pass":{"jsc/rusty_v8":38,"jsc/deno_core":0,"sys-jsc/rusty_v8":38,"sys-jsc/deno_core":0,"quickjs/rusty_v8":41,"quickjs/deno_core":0}}
 {"ts":"2026-06-27T18:50:28.647Z","commit":"43a7cc42f2507920e6af19576428d6dad10e42ca","totalPass":116,"pass":{"jsc/rusty_v8":38,"jsc/deno_core":0,"sys-jsc/rusty_v8":38,"sys-jsc/deno_core":0,"quickjs/rusty_v8":40,"quickjs/deno_core":0}}
 {"ts":"2026-06-27T20:52:52.082Z","commit":"4ef520739dca94167b8cccacea38927273aab66a","totalPass":388,"pass":{"jsc/rusty_v8":38,"jsc/deno_core":0,"sys-jsc/rusty_v8":38,"sys-jsc/deno_core":179,"quickjs/rusty_v8":41,"quickjs/deno_core":92}}
+{"ts":"2026-06-27T22:23:34.991Z","commit":"b9c76c4260cff751fc34890f4c3efbf712bbc7f6","totalPass":369,"pass":{"jsc/rusty_v8":41,"jsc/deno_core":0,"sys-jsc/rusty_v8":41,"sys-jsc/deno_core":152,"quickjs/rusty_v8":43,"quickjs/deno_core":92}}
