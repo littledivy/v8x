@@ -102,7 +102,12 @@ function cargoBuild(extraArgs, cwd, selectBackend = true) {
   // Strip any ANSI just in case CARGO_TERM_COLOR is forced upstream.
   const clean = r.out.replace(/\x1b\[[0-9;]*m/g, "");
   for (const line of clean.split("\n")) {
-    const m = line.match(/Executable\s+\S+\s+\(([^)]+)\)/);
+    // cargo prints either `Executable tests/rv8_x.rs (path)` (rusty_v8 integration
+    // tests, one token) or `Executable unittests lib.rs (path)` (a crate's unit
+    // tests, TWO tokens — e.g. deno_core). Match the trailing (path) regardless
+    // of how many tokens precede it, else the unittests binary is never found and
+    // the whole suite silently scores 0/0.
+    const m = line.match(/^\s*Executable\s+.*?\(([^)]+)\)\s*$/);
     if (m) bins.push(path.resolve(cwd, m[1]));
   }
   return bins;
