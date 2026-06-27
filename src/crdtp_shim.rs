@@ -95,7 +95,11 @@ impl<'a> Parser<'a> {
     self.ws();
     let v = self.value()?;
     self.ws();
-    if self.i == self.b.len() { Some(v) } else { None }
+    if self.i == self.b.len() {
+      Some(v)
+    } else {
+      None
+    }
   }
 
   fn value(&mut self) -> Option<Json> {
@@ -668,7 +672,11 @@ pub unsafe extern "C" fn crdtp__Dispatchable__paramsCopy(
 // DispatchResponse
 // ---------------------------------------------------------------------------
 
-fn make_response(kind: RespKind, code: i32, message: &str) -> *mut DispatchResponse {
+fn make_response(
+  kind: RespKind,
+  code: i32,
+  message: &str,
+) -> *mut DispatchResponse {
   box_raw(DispatchResponse {
     kind,
     code,
@@ -907,11 +915,14 @@ pub unsafe extern "C" fn crdtp__CreateErrorResponse(
   response: *mut DispatchResponse,
 ) -> *mut Serializable {
   let bytes = if response.is_null() {
-    error_response_json(call_id, &DispatchResponse {
-      kind: RespKind::Error,
-      code: -32000,
-      message: String::new(),
-    })
+    error_response_json(
+      call_id,
+      &DispatchResponse {
+        kind: RespKind::Error,
+        code: -32000,
+        message: String::new(),
+      },
+    )
   } else {
     let r = unsafe { &*response };
     error_response_json(call_id, r)
@@ -1192,8 +1203,8 @@ pub unsafe extern "C" fn crdtp__DomainDispatcher__sendResponse(
 
   // Success -> {"id","result"}; error -> {"id","error"}. Matches crdtp's
   // DomainDispatcher::sendResponse.
-  let is_success = response.is_null()
-    || unsafe { (*response).kind } == RespKind::Success;
+  let is_success =
+    response.is_null() || unsafe { (*response).kind } == RespKind::Success;
 
   let bytes = if is_success {
     let params = if result.is_null() {

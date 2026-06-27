@@ -30,7 +30,11 @@ fn read_words(ptr: *const SharedPtrBase<Allocator>) -> (usize, usize) {
   unsafe { (*w, *w.add(1)) }
 }
 
-unsafe fn write_words(ptr: *mut SharedPtrBase<Allocator>, obj: usize, ctrl: usize) {
+unsafe fn write_words(
+  ptr: *mut SharedPtrBase<Allocator>,
+  obj: usize,
+  ctrl: usize,
+) {
   let w = ptr as *mut usize;
   unsafe {
     *w = obj;
