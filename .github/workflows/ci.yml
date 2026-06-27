@@ -182,6 +182,10 @@ jobs:
           PR: ${{ github.event_name == 'pull_request' && '--check' || '' }}
         run: |
           set -uo pipefail
+          # Same linker flags the deno-binary build uses; otherwise cargo test
+          # for deno_core picks up the deno repo's default -fuse-ld=lld (absent
+          # on the runner) and fails with "invalid linker name".
+          export RUSTFLAGS="-C link-arg=-fuse-ld=/usr/bin/ld -C link-arg=-L$(xcrun --show-sdk-path)/usr/lib"
           DENO=../deno/target/release/deno
           rc=0
           for suite in deno_core deno_node_compat deno_unit; do
@@ -266,8 +270,8 @@ jobs:
         run: node tests/harness/aggregate.mjs --write-baselines --commit="${GITHUB_SHA}"
       - name: Commit + push
         run: |
-          git config user.name  "v82jsc-bot"
-          git config user.email "bot@users.noreply.github.com"
+          git config user.name  "divybot"
+          git config user.email "279198639+divybot@users.noreply.github.com"
           git add status/baselines status/report.json status/history.jsonl
           if git diff --cached --quiet; then
             echo "no changes to report"
