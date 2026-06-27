@@ -41,7 +41,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
+      # vendor/webkit is 8.9 GB and only the jsc backend builds it. Init just
+      # the submodules this backend needs (everything except webkit) unless
+      # this is the jsc leg (matrix.ninja). Saves ~3min of checkout off the
+      # non-jsc critical path.
+      - name: Init submodules
+        run: |
+          if [ "${{ matrix.ninja }}" = "true" ]; then
+            git submodule update --init --depth 1 --recursive
+          else
+            git submodule update --init --depth 1 vendor/rusty_v8 vendor/quickjs-ng vendor/wamr
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -117,7 +128,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          submodules: false
+      # See check job: skip the 8.9 GB vendor/webkit checkout except on jsc.
+      - name: Init submodules
+        run: |
+          if [ "${{ matrix.ninja }}" = "true" ]; then
+            git submodule update --init --depth 1 --recursive
+          else
+            git submodule update --init --depth 1 vendor/rusty_v8 vendor/quickjs-ng vendor/wamr
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - name: Install ninja (WebKit build)
         if: matrix.ninja
