@@ -651,18 +651,69 @@ pub extern "C" fn v8__Context__Global(this: *const Context) -> *const Object {
   intern::<Object>(g)
 }
 
+thread_local! {
+  // Resource name (script URL) per compiled `Script` handle, so `Run` can pass
+  // it to `JS_Eval` as the filename. QuickJS reports that filename as the
+  // referrer/basename for any `import()` evaluated in the script — without it
+  // a relative/root-relative dynamic-import specifier can't be URL-resolved
+  // (deno's loader sees referrer `<eval>` and rejects). Keyed on the unique
+  // `Script` slot pointer returned by `Compile` (no value-pointer reuse risk);
+  // the entry is consumed in `Run`.
+  static SCRIPT_RESOURCE_NAMES: RefCell<
+    std::collections::HashMap<usize, std::ffi::CString>,
+  > = RefCell::new(std::collections::HashMap::new());
+}
+
+// Pull the resource-name string out of a `ScriptOrigin` (slot 0 holds the
+// `resource_name` handle pointer, per `v8__ScriptOrigin__CONSTRUCT`).
+unsafe fn origin_resource_name(
+  ctx: *mut JSContext,
+  origin: *const c_void,
+) -> Option<std::ffi::CString> {
+  if origin.is_null() || ctx.is_null() {
+    return None;
+  }
+  let name_handle = unsafe { *(origin as *const usize) } as *const Value;
+  if name_handle.is_null() {
+    return None;
+  }
+  let v = jsval_of(name_handle);
+  if jsv_is_undefined(&v) || jsv_is_null(&v) {
+    return None;
+  }
+  let mut len: usize = 0;
+  let s = unsafe { JS_ToCStringLen(ctx, &mut len, v) };
+  if s.is_null() {
+    return None;
+  }
+  let bytes = unsafe { std::slice::from_raw_parts(s as *const u8, len) };
+  let owned = String::from_utf8_lossy(bytes).into_owned();
+  unsafe { JS_FreeCString(ctx, s) };
+  if owned.is_empty() {
+    return None;
+  }
+  std::ffi::CString::new(owned).ok()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Script__Compile(
   context: *const Context,
   source: *const V8String,
-  _origin: *const c_void,
+  origin: *const c_void,
 ) -> *const crate::Script {
   let ctx = ctx_of(context);
   if ctx.is_null() || source.is_null() {
     return ptr::null();
   }
 
-  intern_dup::<crate::Script>(ctx, jsval_of(source))
+  let handle = intern_dup::<crate::Script>(ctx, jsval_of(source));
+  if !handle.is_null()
+    && let Some(name) = unsafe { origin_resource_name(ctx, origin) }
+  {
+    SCRIPT_RESOURCE_NAMES
+      .with(|m| m.borrow_mut().insert(handle as usize, name));
+  }
+  handle
 }
 
 #[unsafe(no_mangle)]
@@ -681,9 +732,17 @@ pub extern "C" fn v8__Script__Run(
   if cstr.is_null() {
     return ptr::null();
   }
-  let fname = c"<eval>";
+  // Use the compile-time resource name (script URL) as the eval filename so
+  // `import()` inside this script resolves relative to it; fall back to
+  // `<eval>` for scripts compiled without a ScriptOrigin.
+  let fname_owned =
+    SCRIPT_RESOURCE_NAMES.with(|m| m.borrow_mut().remove(&(script as usize)));
+  let fname_ptr = match fname_owned.as_ref() {
+    Some(name) => name.as_ptr(),
+    None => c"<eval>".as_ptr(),
+  };
   let result =
-    unsafe { JS_Eval(ctx, cstr, len, fname.as_ptr(), JS_EVAL_TYPE_GLOBAL) };
+    unsafe { JS_Eval(ctx, cstr, len, fname_ptr, JS_EVAL_TYPE_GLOBAL) };
   unsafe { JS_FreeCString(ctx, cstr) };
   if result.tag == JS_TAG_EXCEPTION {
     if std::env::var_os("QJS_DEBUG_EXC").is_some() {
