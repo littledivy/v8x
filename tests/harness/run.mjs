@@ -89,10 +89,9 @@ function cargoBuild(extraArgs, cwd, selectBackend = true) {
   // unreferenced-undefined symbols as 0 (same net effect as mac) so unrelated
   // tests still link + run; a test that actually calls one just fails. Only for
   // cargo-self (our crate); the deno checkout defines these via deno's crdtp.
-  // macOS ld64 already dead-strips the unreferenced-undefined symbols and links
-  // fine. Linux lld errors instead, zeroing the suite — tell it to leave them
-  // as 0 (same net effect). cargo-self only; the deno checkout defines them.
-  const env = {};
+  // Force plain output: CI sets CARGO_TERM_COLOR=always, whose ANSI codes
+  // (e.g. around "Executable") break the path-parsing regex below.
+  const env = { CARGO_TERM_COLOR: "never" };
   if (selectBackend && os.platform() === "linux") {
     const extra = "-C link-arg=-Wl,--unresolved-symbols=ignore-all";
     env.RUSTFLAGS = process.env.RUSTFLAGS ? `${process.env.RUSTFLAGS} ${extra}` : extra;
@@ -100,7 +99,9 @@ function cargoBuild(extraArgs, cwd, selectBackend = true) {
   const r = run("cargo", [...base, ...extraArgs], { cwd, env });
   if (r.code !== 0) return null;
   const bins = [];
-  for (const line of r.out.split("\n")) {
+  // Strip any ANSI just in case CARGO_TERM_COLOR is forced upstream.
+  const clean = r.out.replace(/\x1b\[[0-9;]*m/g, "");
+  for (const line of clean.split("\n")) {
     const m = line.match(/Executable\s+\S+\s+\(([^)]+)\)/);
     if (m) bins.push(path.resolve(cwd, m[1]));
   }
@@ -113,8 +114,8 @@ function runBins(bins, cwd) {
     codesign(bin);
     // Print the path so parseLibtest can attribute tests to a binary.
     out += `Running ${bin}\n`;
-    const r = run(bin, ["--test-threads", "1"], { cwd, echo: false });
-    out += r.out + "\n";
+    const r = run(bin, ["--test-threads", "1", "--color", "never"], { cwd, echo: false });
+    out += r.out.replace(/\x1b\[[0-9;]*m/g, "") + "\n";
   }
   return out;
 }
