@@ -65,7 +65,13 @@ for (const b of cfg.backends) {
 const report = {
   generated: ts,
   commit,
-  backends: cfg.backends.map((b) => ({ id: b.id, label: b.label })),
+  backends: cfg.backends.map((b) => {
+    // run.mjs records the engine version into each run-result (it has the
+    // submodules + right OS; this aggregator's checkout does not). Append it to
+    // the base label, e.g. "JavaScriptCore" -> "JavaScriptCore 625.1.23 (0f307e9)".
+    const v = cfg.suites.map((s) => runResults[`${b.id}__${s.id}`]?.version).find(Boolean);
+    return { id: b.id, label: v ? `${b.label} ${v}` : b.label };
+  }),
   suites: cfg.suites.map((s) => ({ id: s.id, label: s.label, tier: s.tier })),
   cells,
   totals: { pass: totalPass, known: totalKnown },

@@ -5,14 +5,14 @@
   "backends": [
     {
       "id": "jsc",
-      "label": "Vendored JSC",
+      "label": "JavaScriptCore",
       "features": "engine_jsc,vendor_jsc",
       "os": "macos",
       "comment": "WebKit JSCOnly built from source. The shippable engine."
     },
     {
       "id": "sys-jsc",
-      "label": "System JSC",
+      "label": "JavaScriptCore System",
       "features": "system_jsc",
       "os": "macos",
       "comment": "Apple's JavaScriptCore.framework. String-rewriter module shim."

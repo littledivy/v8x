@@ -195,10 +195,45 @@ function reqDenoDir() {
   return opt("deno-dir") || die("--deno-dir=PATH required for this suite");
 }
 
+// Resolve the engine's version string for the dashboard label. Runs inside the
+// build job (submodules present, correct OS), so aggregate.mjs — which checks
+// out WITHOUT submodules — can read it back from the run-result instead.
+//   vendor_jsc  -> WebKit FULL_VERSION + short submodule sha, e.g. "625.1.23 (0f307e9)"
+//   system_jsc  -> framework CFBundleVersion, e.g. "20621.3.11.11.3"
+//   quickjs     -> QJS_VERSION_* from quickjs.h, e.g. "0.15.1"
+function engineVersion() {
+  try {
+    if (b.features.includes("vendor_jsc")) {
+      const xc = fs.readFileSync(path.join(ROOT, "vendor/webkit/Configurations/Version.xcconfig"), "utf8");
+      const g = (k) => (xc.match(new RegExp(`${k}\\s*=\\s*(\\d+)`)) || [])[1];
+      const full = ["MAJOR_VERSION", "MINOR_VERSION", "TINY_VERSION"].map(g).filter(Boolean).join(".");
+      const sha = run("git", ["rev-parse", "--short=7", "HEAD:vendor/webkit"], { echo: false });
+      const s = sha.code === 0 ? sha.out.trim() : "";
+      return (s ? `${full} (${s})` : full) || null;
+    }
+    if (b.features.includes("system_jsc")) {
+      const r = run("defaults", ["read",
+        "/System/Library/Frameworks/JavaScriptCore.framework/Resources/Info.plist",
+        "CFBundleVersion"], { echo: false });
+      return r.code === 0 ? r.out.trim() || null : null;
+    }
+    if (b.features.includes("quickjs")) {
+      const h = fs.readFileSync(path.join(ROOT, "vendor/quickjs-ng/quickjs.h"), "utf8");
+      const g = (k) => (h.match(new RegExp(`#define\\s+QJS_VERSION_${k}\\s+(\\S+)`)) || [])[1];
+      const maj = g("MAJOR");
+      if (maj == null) return null;
+      const suf = (g("SUFFIX") || "").replace(/"/g, "");
+      return `${maj}.${g("MINOR")}.${g("PATCH")}${suf}`;
+    }
+  } catch {}
+  return null;
+}
+
 function finalize(parsed) {
   return {
     backend: backendId,
     suite: suiteId,
+    version: engineVersion(),
     pass: parsed.pass.size,
     fail: parsed.fail.size,
     skip: parsed.skip.size,
