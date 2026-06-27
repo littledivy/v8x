@@ -57,6 +57,12 @@ pub extern "C" fn v8__V8__Dispose() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__DisposePlatform() {}
 
+// JSC seeds its own RNG; the v8 entropy-source hook is a no-op. Defined so
+// `test_api_entropy_source.rs` links.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__V8__SetEntropySource(_callback: *const std::ffi::c_void) {
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__SetFlagsFromString(
   _flags: *const u8,

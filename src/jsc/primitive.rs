@@ -495,6 +495,44 @@ pub extern "C" fn v8__Symbol__For(
   intern_ctx::<Symbol>(ctx, v)
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Symbol__ForApi(
+  isolate: *mut RealIsolate,
+  description: *const V8String,
+) -> *const Symbol {
+  let st = iso_state(isolate);
+  let ctx =
+    st.contexts.last().copied().unwrap_or(ptr::null_mut()) as JSContextRef;
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  let desc = if description.is_null() {
+    std::string::String::new()
+  } else {
+    unsafe { jsvalue_to_desc(ctx, jsval(description)) }
+  };
+  let escaped = desc.replace('\\', "\\\\").replace('"', "\\\"");
+  // `Symbol::ForApi` keeps its OWN registry, distinct from the public
+  // `Symbol.for` table — same description returns the same symbol, but it must
+  // never alias a `Symbol.for(...)` result nor a fresh `Symbol(...)`. Back it
+  // with a hidden Map on the context's global, populated with plain `Symbol()`
+  // values (so `for_api(d) != for(d)` and `for_api(d) != Symbol(d)`).
+  let v = unsafe {
+    eval(
+      ctx,
+      &format!(
+        "(function(d){{\
+           var g=globalThis;\
+           var m=g.__v8_api_symbols__||(g.__v8_api_symbols__=new Map());\
+           if(m.has(d))return m.get(d);\
+           var s=Symbol(d);m.set(d,s);return s;\
+         }})(\"{escaped}\")"
+      ),
+    )
+  };
+  intern_ctx::<Symbol>(ctx, v)
+}
+
 macro_rules! well_known_symbol {
   ($fn_name:ident, $js:literal) => {
     #[unsafe(no_mangle)]

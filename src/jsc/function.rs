@@ -739,6 +739,17 @@ pub extern "C" fn v8__ReturnValue__Value__SetNull(this: *mut RawReturnValue) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn v8__ReturnValue__Value__SetUndefined(
+  this: *mut RawReturnValue,
+) {
+  let slot = unsafe { rv_slot(this) };
+  if !slot.is_null() {
+    let v = unsafe { JSValueMakeUndefined(current_ctx()) };
+    unsafe { *slot = v };
+  }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn v8__Template__Set(
   this: *const crate::Template,
   key: *const Name,
