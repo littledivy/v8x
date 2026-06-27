@@ -112,6 +112,11 @@ mod jsc;
 #[cfg(feature = "engine_quickjs")]
 mod quickjs;
 
+// Pure-Rust implementation of the `crdtp__*` inspector-protocol C-ABI surface
+// (engine-independent), so `test_api.rs` and friends link and run. See the
+// module docs for the simplified "CBOR == JSON bytes" encoding rationale.
+mod crdtp_shim;
+
 #[path = "../vendor/rusty_v8/src/script_or_module.rs"]
 mod script_or_module;
 #[path = "../vendor/rusty_v8/src/shared_array_buffer.rs"]
