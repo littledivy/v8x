@@ -1,6 +1,6 @@
 {
-  "generated": "2026-06-27T08:34:44.137Z",
-  "commit": "seed-quickjs-rv8",
+  "generated": "2026-06-27T10:27:03.547Z",
+  "commit": "098c040228f14fb89b950b7a51971730c841a0bb",
   "backends": [
     {
       "id": "jsc",
@@ -109,11 +109,11 @@
     "quickjs": {
       "rusty_v8": {
         "pass": 9,
-        "total": 16,
+        "total": null,
         "baseline": 9,
-        "fail": 7,
+        "fail": null,
         "tier": "build",
-        "fresh": true
+        "fresh": false
       },
       "deno_core": {
         "pass": 0,
@@ -143,6 +143,6 @@
   },
   "totals": {
     "pass": 9,
-    "known": 16
+    "known": 0
   }
 }
