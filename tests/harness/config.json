@@ -54,24 +54,6 @@
       "kind": "cargo-deno",
       "comment": "cargo test -p deno_core in the patched deno checkout. Links our v8 shim but does NOT build the full deno binary.",
       "package": "deno_core"
-    },
-    {
-      "id": "deno_node_compat",
-      "label": "Deno node compat",
-      "tier": "deno",
-      "kind": "deno-test",
-      "comment": "Deno's Node.js compatibility suite. Needs the full deno binary. --config carries the @std/* import map (tests/util/std).",
-      "test_path": "tests/unit_node",
-      "deno_flags": ["-A", "--no-check", "--config", "tests/config/deno.json"]
-    },
-    {
-      "id": "deno_unit",
-      "label": "Deno unit",
-      "tier": "deno",
-      "kind": "deno-test",
-      "comment": "Deno's own unit test suite. Needs the full deno binary. --config carries the @std/* import map (tests/util/std).",
-      "test_path": "tests/unit",
-      "deno_flags": ["-A", "--no-check", "--config", "tests/config/deno.json"]
     }
   ]
 }

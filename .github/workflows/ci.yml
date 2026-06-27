@@ -86,19 +86,19 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: runs-${{ matrix.backend }}-rusty_v8
-          path: status/.runs/
+          path: tests/status/.runs/
           include-hidden-files: true
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # Real deno on each v82jsc backend, run against the ES-module conformance
-  # suite (byte-for-byte vs the stock-v8 oracle). All on macOS so the JSC
-  # backends link/JIT correctly; quickjs rides along on the same runner.
+  # deno_core test suite per backend: clone+patch deno, `cargo test -p
+  # deno_core` against our v8 shim. No full deno binary (node-compat + unit are
+  # dropped for now to keep CI cheap). macOS so the JSC backends link/JIT.
   # ---------------------------------------------------------------------------
-  deno:
-    name: deno-${{ matrix.backend }}
+  deno_core:
+    name: deno_core-${{ matrix.backend }}
     runs-on: macos-15
-    timeout-minutes: 120
+    timeout-minutes: 90
     # macOS 15+: WebKit's bmalloc uses os_unfair_lock_lock_with_flags (15.0+),
     # fatal under -Werror=unguarded-availability on an older deployment target.
     env:
@@ -152,58 +152,34 @@ jobs:
           # patch hardcodes (vendored JSC) for this matrix entry's features.
           perl -0pi -e 's/"engine_jsc", "vendor_jsc"/${{ matrix.features }}/g' ../deno/Cargo.toml
 
-      # Cache deno's build (cargo deps + the v82jsc patch crate). Keyed per
-      # backend so each engine's feature set gets its own cache. rust-cache
-      # prunes to dependency artifacts — much smaller than the raw target dir.
+      # Cache the deno_core build (cargo deps + the v82jsc patch crate). Keyed
+      # per backend so each engine's feature set gets its own cache.
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "../deno"
-          key: deno-${{ matrix.backend }}
+          key: deno_core-${{ matrix.backend }}
 
-      - name: Build deno (${{ matrix.backend }})
-        working-directory: ../deno
-        run: |
-          set -euo pipefail
-          export RUSTFLAGS="-C link-arg=-fuse-ld=/usr/bin/ld -C link-arg=-L$(xcrun --show-sdk-path)/usr/lib"
-          cargo build --release --bin deno --features hmr
-          codesign --force --sign - --entitlements cli/entitlements.plist target/release/deno
-
-      - name: Run ES-module conformance suite
-        run: tests/modules/run.sh "../deno/target/release/deno" "${{ matrix.backend }}"
-
-      # --- hill-climb: deno_core + Deno node-compat + Deno unit -------------
-      # deno_core is build-tier-ish (no full binary needed) but it needs the
-      # deno checkout, so it rides here. node-compat + unit need the binary
-      # built above. PRs ratchet strictly; main records run-result artifacts.
       - uses: actions/setup-node@v4
-        if: always()
         with:
           node-version: 22
-      # always(): run even if the ES-module conformance step above failed
-      # (pre-existing backend gaps shouldn't block seeding the deno suites).
-      - name: Run hill-climb suites (${{ matrix.backend }})
-        if: always()
+      # deno_core test suite only — `cargo test -p deno_core`, no full deno
+      # binary (node-compat + unit are dropped for now to keep CI cheap).
+      - name: Run deno_core suite (${{ matrix.backend }})
         env:
           PR: ${{ github.event_name == 'pull_request' && '--check' || '' }}
         run: |
           set -uo pipefail
-          # Same linker flags the deno-binary build uses; otherwise cargo test
-          # for deno_core picks up the deno repo's default -fuse-ld=lld (absent
-          # on the runner) and fails with "invalid linker name".
+          # Same linker flags v82jsc/deno use; otherwise cargo test for
+          # deno_core picks up the deno repo's default -fuse-ld=lld (absent on
+          # the runner) and fails with "invalid linker name".
           export RUSTFLAGS="-C link-arg=-fuse-ld=/usr/bin/ld -C link-arg=-L$(xcrun --show-sdk-path)/usr/lib"
-          DENO=../deno/target/release/deno
-          rc=0
-          for suite in deno_core deno_node_compat deno_unit; do
-            node tests/harness/run.mjs "$suite" "${{ matrix.backend }}" $PR \
-              --deno-dir=../deno --deno-bin="$DENO" || rc=$?
-          done
-          exit $rc
+          node tests/harness/run.mjs deno_core "${{ matrix.backend }}" $PR --deno-dir=../deno
       - name: Upload run results
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: runs-${{ matrix.backend }}-deno
-          path: status/.runs/
+          name: runs-${{ matrix.backend }}-deno_core
+          path: tests/status/.runs/
           include-hidden-files: true
           if-no-files-found: ignore
 
@@ -235,13 +211,13 @@ jobs:
   # Single-writer aggregation. Runs only on push to main (after merge), once,
   # gathering every matrix job's run-result artifacts. Folds fresh pass sets
   # into the committed baselines (--write-baselines), regenerates the single
-  # status/report.json and appends a status/history.jsonl snapshot, then commits
+  # tests/status/report.json and appends a tests/status/history.jsonl snapshot, then commits
   # + pushes. Because only this job writes those files, parallel PRs never
   # conflict on them. The Pages workflow redeploys the dashboard on that commit.
   # ---------------------------------------------------------------------------
   report:
     name: aggregate report
-    needs: [check, deno]
+    needs: [check, deno_core]
     # always() so a failed/partial matrix leg still seeds whatever run-result
     # artifacts were uploaded (the per-suite steps don't fail the build on test
     # failures; only infra/build breakage does).
@@ -270,15 +246,15 @@ jobs:
           merge-multiple: true
       - name: Collect run results
         run: |
-          mkdir -p status/.runs
-          cp -v /tmp/runs/*.json status/.runs/ 2>/dev/null || echo "no run results"
+          mkdir -p tests/status/.runs
+          cp -v /tmp/runs/*.json tests/status/.runs/ 2>/dev/null || echo "no run results"
       - name: Aggregate (baselines + report + history)
         run: node tests/harness/aggregate.mjs --write-baselines --commit="${GITHUB_SHA}"
       - name: Commit + push
         run: |
           git config user.name  "divybot"
           git config user.email "279198639+divybot@users.noreply.github.com"
-          git add status/baselines status/report.json status/history.jsonl
+          git add tests/status/baselines tests/status/report.json tests/status/history.jsonl
           if git diff --cached --quiet; then
             echo "no changes to report"
           else
@@ -289,8 +265,8 @@ jobs:
         run: |
           mkdir -p _site
           cp docs/index.html _site/
-          cp status/report.json _site/report.json
-          cp status/history.jsonl _site/history.jsonl 2>/dev/null || : > _site/history.jsonl
+          cp tests/status/report.json _site/report.json
+          cp tests/status/history.jsonl _site/history.jsonl 2>/dev/null || : > _site/history.jsonl
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

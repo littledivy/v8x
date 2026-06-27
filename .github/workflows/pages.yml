@@ -32,9 +32,9 @@ jobs:
         run: |
           mkdir -p _site
           cp docs/index.html _site/
-          cp status/report.json _site/report.json
+          cp tests/status/report.json _site/report.json
           # history.jsonl may not exist on the very first deploy.
-          cp status/history.jsonl _site/history.jsonl 2>/dev/null || : > _site/history.jsonl
+          cp tests/status/history.jsonl _site/history.jsonl 2>/dev/null || : > _site/history.jsonl
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

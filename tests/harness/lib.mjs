@@ -6,7 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const ROOT = path.resolve(fileURLToPath(import.meta.url), "../../..");
-export const STATUS_DIR = path.join(ROOT, "status");
+export const STATUS_DIR = path.join(ROOT, "tests/status");
 export const BASELINE_DIR = path.join(STATUS_DIR, "baselines");
 export const RUNS_DIR = path.join(STATUS_DIR, ".runs");
 

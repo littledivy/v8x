@@ -10,13 +10,13 @@ the agent workflow. This file documents the harness internals.
 |---|---|
 | `config.json` | single source of truth: backends + suites |
 | `run.mjs` | run ONE suite×backend, parse, ratchet (`--check`/`--update`) |
-| `aggregate.mjs` | build `status/report.json` + `status/history.jsonl` (CI only) |
+| `aggregate.mjs` | build `tests/status/report.json` + `tests/status/history.jsonl` (CI only) |
 | `lib.mjs` | shared: parsers (libtest + JUnit), baselines, ratchet diff |
 
-## Data layout (`status/`)
+## Data layout (`tests/status/`)
 
 ```
-status/
+tests/status/
   report.json                       # CI-generated aggregate (dashboard source)
   history.jsonl                     # CI-appended snapshots (time series)
   baselines/<backend>/<suite>.txt   # ratchet: known-passing test names
@@ -39,8 +39,9 @@ Suite kinds (`config.json`):
   unlinkable target scores 0 without zeroing the rest. Parsed from libtest text.
 - `cargo-deno` (deno_core): `cargo test -p deno_core` in the deno checkout; the
   v8 backend comes from deno's `[patch.crates-io] v8` features (not our flags).
-- `deno-test` (node_compat, unit): the built deno binary's `deno test
-  --junit-path`, parsed from JUnit XML.
+- `deno-test` (built deno binary's `deno test --junit-path`, parsed from JUnit):
+  supported by `run.mjs` but **not currently in `config.json`** — the full-deno
+  node-compat + unit suites are dropped for now to keep CI cheap.
 
 ## Ratchet semantics
 

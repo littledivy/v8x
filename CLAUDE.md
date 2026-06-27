@@ -16,14 +16,15 @@ define the ~570 `v8__*` C-ABI symbols the vendored rusty_v8 Rust surface calls.
 ## Your job
 
 Make **more tests pass**, one PR at a time, without regressing any that pass.
-We track four suites per backend (12 cells total):
+We track two suites per backend (6 cells total):
 
-| suite | tier | what runs |
-|---|---|---|
-| `rusty_v8` | build | vendored `vendor/rusty_v8/tests/*.rs`, unmodified, vs our shim |
-| `deno_core` | build | `cargo test -p deno_core` in a patched deno checkout |
-| `deno_node_compat` | deno | Deno's Node compat suite (needs full deno binary) |
-| `deno_unit` | deno | Deno's unit suite (needs full deno binary) |
+| suite | what runs |
+|---|---|
+| `rusty_v8` | vendored `vendor/rusty_v8/tests/*.rs`, unmodified, vs our shim |
+| `deno_core` | `cargo test -p deno_core` in a patched deno checkout |
+
+(The full-deno node-compat + unit suites are dropped for now to keep CI cheap;
+they can be re-added to `config.json` later — `run.mjs` still supports them.)
 
 The matrix + suite definitions are in **`tests/harness/config.json`** (single
 source of truth). Never edit the vendored test files or Deno's tests — they run
@@ -34,35 +35,35 @@ source of truth). Never edit the vendored test files or Deno's tests — they ru
 Each cell has a baseline of known-passing tests:
 
 ```
-status/baselines/<backend>/<suite>.txt   # one passing test name per line
+tests/status/baselines/<backend>/<suite>.txt   # one passing test name per line
 ```
 
 - CI on a PR runs `run.mjs <suite> <backend> --check`. It is **red** if any
   baselined test now fails/vanishes (regression) **or** if new tests pass that
   aren't in the baseline yet.
 - So every PR that makes tests pass **must also update the baseline** (below).
-- `status/report.json` and `status/history.jsonl` are **CI-generated** — never
+- `tests/status/report.json` and `tests/status/history.jsonl` are **CI-generated** — never
   hand-edit them. They aggregate the baselines for the dashboard.
 
 ## Local loop
 
 Prereqs: Node 22+, Rust stable. macOS for the JSC backends.
 
-### Build-tier suites (cheap — start here)
+### rusty_v8 (cheapest — start here)
 
 ```bash
 # rusty_v8 on quickjs (no WebKit build, fastest feedback):
 node tests/harness/run.mjs rusty_v8 quickjs
 
 # see which tests FAIL (and which whole targets fail to link — those score 0):
-cat status/.runs/quickjs__rusty_v8.json | jq '.failing'
+cat tests/status/.runs/quickjs__rusty_v8.json | jq '.failing'
 ```
 
 A test target that won't **link** (missing `v8__*` symbol) counts as 0 passing
 for its whole file — implementing that one symbol can unlock hundreds of tests.
 Find the gap from the build error, implement it in `src/<engine>/`, rebuild.
 
-### deno-tier suites (need a deno checkout)
+### deno_core (needs a deno checkout)
 
 ```bash
 # clone + patch deno exactly like CI (tools/deno/DENO_REF pins the commit):
@@ -73,12 +74,8 @@ sed "s#/Users/divy/gh/v82jsc#$PWD#g" tools/deno/deno-jsc-integration.patch | git
 # select your backend's v8 features in the patch's [patch.crates-io] v8 line:
 perl -0pi -e 's/"engine_jsc", "vendor_jsc"/"quickjs"/g' ../deno/Cargo.toml   # example
 
-# build the deno binary (needed by node_compat + unit):
-( cd ../deno && cargo build --release --bin deno --features hmr )
-
-node tests/harness/run.mjs deno_core        quickjs --deno-dir=../deno
-node tests/harness/run.mjs deno_node_compat quickjs --deno-dir=../deno --deno-bin=../deno/target/release/deno
-node tests/harness/run.mjs deno_unit        quickjs --deno-dir=../deno --deno-bin=../deno/target/release/deno
+# runs `cargo test -p deno_core` against our shim (no full deno binary):
+node tests/harness/run.mjs deno_core quickjs --deno-dir=../deno
 ```
 
 On macOS (`jsc`/`sys-jsc`) the runner auto-codesigns test binaries with
@@ -91,13 +88,13 @@ On macOS (`jsc`/`sys-jsc`) the runner auto-codesigns test binaries with
    ```bash
    node tests/harness/run.mjs <suite> <backend> --update
    ```
-   This rewrites `status/baselines/<backend>/<suite>.txt` (sorted, deduped).
+   This rewrites `tests/status/baselines/<backend>/<suite>.txt` (sorted, deduped).
 3. Confirm the ratchet holds and you didn't regress another cell:
    ```bash
    node tests/harness/run.mjs <suite> <backend> --check
    ```
 4. Commit the **source fix + the baseline file** together. One PR should touch
-   **one cell's baseline** (`status/baselines/<backend>/<suite>.txt`) so parallel
+   **one cell's baseline** (`tests/status/baselines/<backend>/<suite>.txt`) so parallel
    agents never collide. Do **not** touch `report.json`, `history.jsonl`, or any
    file under `vendor/` test dirs.
 5. Open the PR. CI re-runs `--check` for your cell; green = mergeable.
@@ -105,7 +102,7 @@ On macOS (`jsc`/`sys-jsc`) the runner auto-codesigns test binaries with
 ## Don't
 
 - Don't modify vendored rusty_v8 tests or Deno's test files to make them pass.
-- Don't edit `status/report.json` / `status/history.jsonl` (CI owns them).
+- Don't edit `tests/status/report.json` / `tests/status/history.jsonl` (CI owns them).
 - Don't lower a baseline to dodge a regression — fix the regression.
 - Don't enable a backend's feature alongside another (they collide at link).
 
@@ -113,7 +110,7 @@ On macOS (`jsc`/`sys-jsc`) the runner auto-codesigns test binaries with
 
 - Harness internals: `tests/harness/lib.mjs`, `run.mjs`, `aggregate.mjs`.
 - Dashboard: `docs/index.html` (GitHub Pages). Reads `report.json` + history.
-- CI: `.github/workflows/ci.yml` (`check` = build tier, `deno` = deno tier,
-  `report` = single-writer aggregator on main), `pages.yml` (dashboard deploy).
+- CI: `.github/workflows/ci.yml` (`check` = rusty_v8, `deno_core` = deno_core
+  suite, `report` = single-writer aggregator on main), `pages.yml` (dashboard).
 - Deno pin + integration patch: `tools/deno/DENO_REF`,
   `tools/deno/deno-jsc-integration.patch`.

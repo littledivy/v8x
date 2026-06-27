@@ -5,8 +5,8 @@ vendor/quickjs-ng/.git
 # Claude Code local state
 .claude/
 
-# ephemeral test-run results (aggregated into status/report.json by CI)
-status/.runs/
+# ephemeral test-run results (aggregated into tests/status/report.json by CI)
+tests/status/.runs/
 
 # ICU data placeholder the harness creates so vendored rusty_v8 tests compile
 vendor/rusty_v8/third_party/icu/common/icudtl.dat
