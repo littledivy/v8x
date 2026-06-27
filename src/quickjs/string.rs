@@ -627,3 +627,57 @@ pub extern "C" fn v8__String__ValueView__length(
 ) -> c_int {
   unsafe { (*this).len as c_int }
 }
+
+// ---------------------------------------------------------------------------
+// Link-stubs for v8 C-ABI symbols that `test_api.rs` references but this
+// backend doesn't implement yet. Each returns a benign default
+// (null / 0 / false / `Nothing`) so the target LINKS and the many tests that
+// don't touch these paths run; tests that do exercise them fail gracefully
+// without crashing. Promote individual stubs to real implementations over time.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ExternalOneByteStringResource__data(
+  _this: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ExternalOneByteStringResource__length(
+  _this: *const std::os::raw::c_void,
+) -> usize {
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__Concat(
+  _isolate: *mut std::os::raw::c_void,
+  _left: *const std::os::raw::c_void,
+  _right: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__IsExternalOneByte(
+  _this: *const std::os::raw::c_void,
+) -> bool {
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__IsExternalTwoByte(
+  _this: *const std::os::raw::c_void,
+) -> bool {
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__NewExternalTwoByteStatic(
+  _isolate: *mut std::os::raw::c_void,
+  _buffer: *const std::os::raw::c_void,
+  _length: crate::support::int,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}

@@ -977,3 +977,125 @@ pub extern "C" fn v8__Context__SetSecurityToken(
   _value: *const Value,
 ) {
 }
+
+// ---------------------------------------------------------------------------
+// Link-stubs for v8 C-ABI symbols that `test_api.rs` references but this
+// backend doesn't implement yet. Each returns a benign default
+// (null / 0 / false / `Nothing`) so the target LINKS and the many tests that
+// don't touch these paths run; tests that do exercise them fail gracefully
+// without crashing. Promote individual stubs to real implementations over time.
+// ---------------------------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__GetMicrotaskQueue(
+  _this: *const std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__SetMicrotaskQueue(
+  _this: *const std::os::raw::c_void,
+  _microtask_queue: *const std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__CpuProfiler__CollectSample(
+  _isolate: *mut std::os::raw::c_void,
+  _trace_id: *const std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__CpuProfiler__UseDetailedSourcePositionsForProfiling(
+  _isolate: *mut std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__AddMessageListener(
+  _isolate: *mut std::os::raw::c_void,
+  _callback: *const std::os::raw::c_void,
+) -> bool {
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__ClearKeptObjects(
+  _isolate: *mut std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__GetCurrentHostDefinedOptions(
+  _this: *mut std::os::raw::c_void,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__GetDataFromSnapshotOnce(
+  _this: *mut std::os::raw::c_void,
+  _index: usize,
+) -> *const std::os::raw::c_void {
+  std::ptr::null()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__GetMicrotasksPolicy(
+  _isolate: *const std::os::raw::c_void,
+) -> crate::MicrotasksPolicy {
+  crate::MicrotasksPolicy::Explicit
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__MemoryPressureNotification(
+  _this: *mut std::os::raw::c_void,
+  _level: u8,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__RemoveGCEpilogueCallback(
+  _isolate: *mut std::os::raw::c_void,
+  _callback: *const std::os::raw::c_void,
+  _data: *mut std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__RemoveGCPrologueCallback(
+  _isolate: *mut std::os::raw::c_void,
+  _callback: *const std::os::raw::c_void,
+  _data: *mut std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__SetAllowAtomicsWait(
+  _isolate: *mut std::os::raw::c_void,
+  _allow: bool,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__SetOOMErrorHandler(
+  _isolate: *mut std::os::raw::c_void,
+  _callback: *const std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__SetPromiseHook(
+  _isolate: *mut std::os::raw::c_void,
+  _hook: *const std::os::raw::c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__SetUseCounterCallback(
+  _isolate: *mut std::os::raw::c_void,
+  _callback: *const std::os::raw::c_void,
+) {
+}

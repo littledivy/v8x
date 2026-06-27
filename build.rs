@@ -46,6 +46,12 @@ fn main() {
   #[cfg(target_os = "macos")]
   if env::var_os("CARGO_FEATURE_ENGINE_JSC").is_some() {
     println!("cargo:rustc-link-lib=framework=JavaScriptCore");
+    // `jsc_version_string` reads the JavaScriptCore bundle's version via
+    // CoreFoundation (CFBundle*/CFString*/CFRelease). Those symbols are only
+    // pulled in once a test target references `v8__V8__GetVersion` (the small
+    // suites dead-strip them), so link CoreFoundation explicitly or the
+    // `test_api` target fails to link on the system-framework backend.
+    println!("cargo:rustc-link-lib=framework=CoreFoundation");
     // lld with -nodefaultlibs doesn't search the SDK, where macOS now keeps
     // the .tbd stubs for system libs like iconv (the .dylib files were moved
     // into the dyld shared cache). Add the SDK lib dir so `-liconv` resolves.
