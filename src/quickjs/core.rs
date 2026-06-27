@@ -54,6 +54,17 @@ pub(crate) struct IsoState {
   pub handles: Vec<*mut JSValue>,
 
   pub data_slots: [*mut c_void; 4],
+
+  // Whether the bootstrap context (`ctx`) has been handed out by
+  // `v8__Context__New`. QuickJS has one global object per JSContext, but
+  // deno_core uses multiple v8::Contexts (notably during snapshot creation,
+  // where two coexist). Backing them all by the single `ctx` makes their
+  // embedder-data slots collide. So the FIRST Context::New uses the
+  // bootstrapped `ctx` (runtime is single-context, unchanged); each later one
+  // gets its own JSContext (tracked in `extra_contexts`) for independent slots.
+  pub main_ctx_claimed: bool,
+
+  pub extra_contexts: Vec<*mut JSContext>,
 }
 
 thread_local! {
@@ -283,6 +294,8 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     contexts: Vec::new(),
     handles: Vec::new(),
     data_slots: [ptr::null_mut(); 4],
+    main_ctx_claimed: false,
+    extra_contexts: Vec::new(),
   });
   Box::into_raw(state) as *mut RealIsolate
 }
@@ -321,6 +334,9 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
       let v = *slot;
       JS_FreeValue(st.ctx, v);
       drop(Box::from_raw(slot));
+    }
+    for c in st.extra_contexts.drain(..) {
+      JS_FreeContext(c);
     }
     JS_FreeContext(st.ctx);
     if std::env::var_os("QJS_SKIP_FREE_RT").is_none() {
@@ -497,7 +513,21 @@ pub extern "C" fn v8__Context__New(
   if isolate.is_null() {
     return ptr::null();
   }
-  let ctx = iso_state(isolate).ctx;
+  let st = iso_state(isolate);
+  // First Context::New hands out the bootstrapped context; later ones get a
+  // fresh JSContext so their embedder-data slots don't collide (see IsoState).
+  let ctx = if !st.main_ctx_claimed {
+    st.main_ctx_claimed = true;
+    st.ctx
+  } else {
+    let c = unsafe { JS_NewContext(st.rt) };
+    assert!(!c.is_null(), "JS_NewContext failed");
+    if std::env::var_os("QJS_NO_WASM").is_none() {
+      super::wasm::install_webassembly(c);
+    }
+    st.extra_contexts.push(c);
+    c
+  };
   install_default_globals(ctx);
 
   intern_ctx(ctx)

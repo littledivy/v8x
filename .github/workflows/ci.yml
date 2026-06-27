@@ -87,6 +87,7 @@ jobs:
         with:
           name: runs-${{ matrix.backend }}-rusty_v8
           path: status/.runs/
+          include-hidden-files: true
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
@@ -175,9 +176,13 @@ jobs:
       # deno checkout, so it rides here. node-compat + unit need the binary
       # built above. PRs ratchet strictly; main records run-result artifacts.
       - uses: actions/setup-node@v4
+        if: always()
         with:
           node-version: 22
+      # always(): run even if the ES-module conformance step above failed
+      # (pre-existing backend gaps shouldn't block seeding the deno suites).
       - name: Run hill-climb suites (${{ matrix.backend }})
+        if: always()
         env:
           PR: ${{ github.event_name == 'pull_request' && '--check' || '' }}
         run: |
@@ -199,6 +204,7 @@ jobs:
         with:
           name: runs-${{ matrix.backend }}-deno
           path: status/.runs/
+          include-hidden-files: true
           if-no-files-found: ignore
 
   module-tests:

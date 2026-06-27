@@ -60,16 +60,18 @@
       "label": "Deno node compat",
       "tier": "deno",
       "kind": "deno-test",
-      "comment": "Deno's Node.js compatibility suite. Needs the full deno binary.",
-      "test_path": "tests/unit_node"
+      "comment": "Deno's Node.js compatibility suite. Needs the full deno binary. --config carries the @std/* import map (tests/util/std).",
+      "test_path": "tests/unit_node",
+      "deno_flags": ["-A", "--no-check", "--config", "tests/config/deno.json"]
     },
     {
       "id": "deno_unit",
       "label": "Deno unit",
       "tier": "deno",
       "kind": "deno-test",
-      "comment": "Deno's own unit test suite. Needs the full deno binary.",
-      "test_path": "tests/unit"
+      "comment": "Deno's own unit test suite. Needs the full deno binary. --config carries the @std/* import map (tests/util/std).",
+      "test_path": "tests/unit",
+      "deno_flags": ["-A", "--no-check", "--config", "tests/config/deno.json"]
     }
   ]
 }
