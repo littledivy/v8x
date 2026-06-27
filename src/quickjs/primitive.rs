@@ -496,6 +496,55 @@ pub extern "C" fn v8__Symbol__For(
   intern::<Symbol>(v)
 }
 
+thread_local! {
+  // Embedder "API" symbol registry (V8's `Symbol::ForApi`). It is a registry
+  // *distinct* from `Symbol.for` (so `for_api(d) != for_key(d)`) but idempotent
+  // (`for_api(d) == for_api(d)`), with the symbol's description preserved. We
+  // back it with our own per-context cache of fresh, unique symbols.
+  static API_SYMBOLS: std::cell::RefCell<
+    std::collections::HashMap<(usize, std::string::String), JSValue>,
+  > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Symbol__ForApi(
+  isolate: *mut RealIsolate,
+  description: *const V8String,
+) -> *const Symbol {
+  let ctx = iso_ctx(isolate);
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  let desc = if description.is_null() {
+    std::string::String::new()
+  } else {
+    unsafe { to_dec_string(ctx, jsval_of(description)) }
+  };
+
+  API_SYMBOLS.with(|m| {
+    let key = (ctx as usize, desc.clone());
+    if let Some(v) = m.borrow().get(&key) {
+      let dup = unsafe { JS_DupValue(ctx, *v) };
+      return intern::<Symbol>(dup);
+    }
+    let Ok(cdesc) = CString::new(desc) else {
+      return ptr::null();
+    };
+    // Fresh, unique (non-global) symbol — never equal to a `Symbol.for` result.
+    let v = unsafe { JS_NewSymbol(ctx, cdesc.as_ptr(), 0) };
+    if v.tag == JS_TAG_EXCEPTION {
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+      return ptr::null();
+    }
+    // Keep a duplicate alive in the registry so future lookups return the same
+    // symbol identity.
+    let stored = unsafe { JS_DupValue(ctx, v) };
+    m.borrow_mut().insert(key, stored);
+    intern::<Symbol>(v)
+  })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Symbol__New(
   isolate: *mut RealIsolate,

@@ -54,37 +54,102 @@ pub extern "C" fn cppgc__heap__collect_garbage_for_testing(
 ) {
 }
 
+// cppgc `Member<T>` / `WeakMember<T>` slots. NOTE: the bindgen-derived
+// `cppgc__Member_SIZE` is only **4 bytes** (compressed pointer), so we must
+// never write a raw 64-bit pointer into a member slot — that overflows the
+// inline `[u8; 4]` field and corrupts adjacent memory. We don't run a real
+// Oilpan GC, so members are inert: construct/destruct zero the 4-byte slot and
+// `Get` returns null (`Set`/`Assign` are no-ops). This keeps `test_cppgc`
+// *linking* and non-crashing; the GC-collection assertions in those tests need
+// a real cppgc heap and are expected to fail.
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__Member__CONSTRUCT(
-  member: *mut *mut c_void,
-  obj: *mut c_void,
+  member: *mut c_void,
+  _obj: *mut c_void,
 ) {
   if !member.is_null() {
-    unsafe { *member = obj };
+    unsafe { ptr::write_unaligned(member as *mut u32, 0) };
   }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cppgc__Member__DESTRUCT(member: *mut *mut c_void) {
+pub extern "C" fn cppgc__Member__DESTRUCT(member: *mut c_void) {
   if !member.is_null() {
-    unsafe { *member = ptr::null_mut() };
+    unsafe { ptr::write_unaligned(member as *mut u32, 0) };
   }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__Member__Get(_member: *const c_void) -> *mut c_void {
+  ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__Member__Assign(
+  _member: *mut c_void,
+  _obj: *mut c_void,
+) {
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__WeakMember__CONSTRUCT(
-  member: *mut *mut c_void,
-  obj: *mut c_void,
+  member: *mut c_void,
+  _obj: *mut c_void,
 ) {
   if !member.is_null() {
-    unsafe { *member = obj };
+    unsafe { ptr::write_unaligned(member as *mut u32, 0) };
   }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cppgc__WeakMember__DESTRUCT(member: *mut *mut c_void) {
+pub extern "C" fn cppgc__WeakMember__DESTRUCT(member: *mut c_void) {
   if !member.is_null() {
-    unsafe { *member = ptr::null_mut() };
+    unsafe { ptr::write_unaligned(member as *mut u32, 0) };
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__WeakMember__Get(
+  _member: *const c_void,
+) -> *mut c_void {
+  ptr::null_mut()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__WeakMember__Assign(
+  _member: *mut c_void,
+  _obj: *mut c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__Visitor__Trace__Member(
+  _visitor: *mut c_void,
+  _member: *const c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__Visitor__Trace__WeakMember(
+  _visitor: *mut c_void,
+  _member: *const c_void,
+) {
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__RequestGarbageCollectionForTesting(
+  isolate: *mut RealIsolate,
+  _type: usize,
+) {
+  // Best-effort: run the engine GC. Our cppgc shim doesn't reclaim native
+  // wrappers, so the cppgc-specific collection assertions still won't hold,
+  // but this satisfies the many `test_api` tests that just need a GC to run.
+  if isolate.is_null() {
+    return;
+  }
+  let st = iso_state(isolate);
+  if !st.rt.is_null() {
+    unsafe { JS_RunGC(st.rt) };
   }
 }
 

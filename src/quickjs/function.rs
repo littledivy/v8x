@@ -811,6 +811,16 @@ pub extern "C" fn v8__ReturnValue__Value__SetNull(this: *mut RawReturnValue) {
   }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ReturnValue__Value__SetUndefined(
+  this: *mut RawReturnValue,
+) {
+  let slot = unsafe { rv_slot(this) };
+  if !slot.is_null() {
+    unsafe { *slot = jsv_undefined() };
+  }
+}
+
 trait AttrU32 {
   fn as_u32_lenient(&self) -> u32;
 }
