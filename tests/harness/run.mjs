@@ -102,7 +102,16 @@ function cargoBuild(extraArgs, cwd, selectBackend = true) {
   // Strip any ANSI just in case CARGO_TERM_COLOR is forced upstream.
   const clean = r.out.replace(/\x1b\[[0-9;]*m/g, "");
   for (const line of clean.split("\n")) {
-    const m = line.match(/Executable\s+\S+\s+\(([^)]+)\)/);
+    // cargo prints the compiled test executable as either
+    //   "Executable tests/foo.rs (target/debug/deps/foo-<hash>)"   (a [[test]] target)
+    // or
+    //   "Executable unittests lib.rs (target/debug/deps/crate-<hash>)" (a crate's
+    //    inline #[test]s, e.g. `cargo test -p deno_core`).
+    // The label between "Executable" and the parenthesised path can be one or
+    // more whitespace-separated tokens, so anchor on the trailing "(path)" and
+    // match the label lazily — otherwise the two-token "unittests lib.rs" form
+    // is silently skipped and the whole suite scores 0/0.
+    const m = line.match(/Executable\s+.*?\(([^)]+)\)/);
     if (m) bins.push(path.resolve(cwd, m[1]));
   }
   return bins;
