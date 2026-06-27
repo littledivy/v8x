@@ -607,6 +607,7 @@ fn module_state<'a>(this: *const Module) -> Option<&'a mut SyntheticModule> {
 unsafe fn eval_value_as_script(
   ctx: JSContextRef,
   source_val: JSValueRef,
+  source_url: Option<&str>,
 ) -> JSValueRef {
   if ctx.is_null() || source_val.is_null() {
     return ptr::null();
@@ -616,16 +617,24 @@ unsafe fn eval_value_as_script(
   if src_str.is_null() {
     return ptr::null();
   }
+  // Thread the ScriptOrigin resource name into JSEvaluateScript's `sourceURL`.
+  // JSC records it as the script's SourceOrigin; the dynamic-import hook
+  // (moduleLoaderImportModule) reports `sourceOrigin.string()` as the referrer
+  // for any `import()` evaluated in this script. Without it deno's loader sees
+  // referrer `<eval>`/empty and can't URL-resolve a relative/root-relative
+  // dynamic-import specifier (`./b.js`, `/foo.js`). Null `sourceURL` for scripts
+  // compiled without a ScriptOrigin.
+  let src_url_cstr = source_url.and_then(|u| std::ffi::CString::new(u).ok());
+  let src_url_js = src_url_cstr
+    .as_ref()
+    .map(|c| unsafe { JSStringCreateWithUTF8CString(c.as_ptr()) })
+    .unwrap_or(ptr::null_mut());
   let result = unsafe {
-    JSEvaluateScript(
-      ctx,
-      src_str,
-      ptr::null_mut(),
-      ptr::null_mut(),
-      1,
-      &mut exc,
-    )
+    JSEvaluateScript(ctx, src_str, ptr::null_mut(), src_url_js, 1, &mut exc)
   };
+  if !src_url_js.is_null() {
+    unsafe { JSStringRelease(src_url_js) };
+  }
   unsafe { JSStringRelease(src_str) };
   // Surface the eval error so deno's TryCatch (execute_script) sees has_caught()
   // instead of asserting on a null return with no pending exception.
@@ -679,11 +688,47 @@ pub extern "C" fn v8__FixedArray__Get(
   }
 }
 
+thread_local! {
+  // Resource name (script URL) per compiled `Script` handle, so `Run` can pass
+  // it to `JSEvaluateScript` as the `sourceURL`. JSC reports that as the script's
+  // SourceOrigin, which the dynamic-import hook surfaces as the referrer for any
+  // `import()` evaluated in the script — without it deno's loader can't resolve a
+  // relative/root-relative dynamic-import specifier (see `eval_value_as_script`).
+  // Keyed on the source JSValueRef (== the `Script` handle, since `intern_ctx`
+  // returns the value pointer unchanged), mirroring SCRIPT_BYTECODE.
+  static SCRIPT_RESOURCE_NAMES: std::cell::RefCell<
+    std::collections::HashMap<usize, std::string::String>,
+  > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+// Pull the resource-name string out of a `ScriptOrigin` (slot 0 holds the
+// `resource_name` Value pointer, per `v8__ScriptOrigin__CONSTRUCT`). Returns
+// None for a null/undefined/empty name.
+unsafe fn origin_resource_name(
+  ctx: JSContextRef,
+  origin: *const ScriptOrigin,
+) -> Option<std::string::String> {
+  if origin.is_null() || ctx.is_null() {
+    return None;
+  }
+  let name_val = unsafe { *(origin as *const usize) } as JSValueRef;
+  if name_val.is_null() {
+    return None;
+  }
+  unsafe {
+    if JSValueIsUndefined(ctx, name_val) || JSValueIsNull(ctx, name_val) {
+      return None;
+    }
+    let s = jsstring_to_rust(ctx, name_val);
+    if s.is_empty() { None } else { Some(s) }
+  }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Script__Compile(
   context: *const Context,
   source: *const V8String,
-  _origin: *const ScriptOrigin,
+  origin: *const ScriptOrigin,
 ) -> *const Script {
   let ctx = ctx_of(context) as JSContextRef;
   let src_val = jsval(source);
@@ -701,6 +746,10 @@ pub extern "C" fn v8__Script__Compile(
     if !ok {
       return ptr::null();
     }
+  }
+  if let Some(name) = unsafe { origin_resource_name(ctx, origin) } {
+    SCRIPT_RESOURCE_NAMES
+      .with(|m| m.borrow_mut().insert(src_val as usize, name));
   }
   intern_ctx::<Script>(ctx, src_val)
 }
@@ -720,6 +769,11 @@ pub extern "C" fn v8__Script__Run(
   let ctx = ctx_of(context) as JSContextRef;
   let src_val = jsval(script);
 
+  // Resource name (script URL) from the compile-time ScriptOrigin, used as the
+  // eval `sourceURL` so `import()` in this script resolves relative to it.
+  let source_url = SCRIPT_RESOURCE_NAMES
+    .with(|m| m.borrow().get(&(src_val as usize)).cloned());
+
   // Bytecode-cached path: if Compile stashed code cache for this source, eval
   // from bytecode (skip parse+codegen). JSC silently falls back to parsing on a
   // stale/invalid buffer, so this stays correct.
@@ -731,7 +785,9 @@ pub extern "C" fn v8__Script__Run(
       let result = unsafe {
         let src = jsstring_to_rust(ctx, src_val);
         let src_c = std::ffi::CString::new(src).ok();
-        let url_c = std::ffi::CString::new("script").ok();
+        let url_c =
+          std::ffi::CString::new(source_url.as_deref().unwrap_or("script"))
+            .ok();
         match (src_c, url_c) {
           (Some(s), Some(u)) => {
             let mut exc: JSValueRef = ptr::null();
@@ -760,7 +816,8 @@ pub extern "C" fn v8__Script__Run(
     }
   }
 
-  let result = unsafe { eval_value_as_script(ctx, src_val) };
+  let result =
+    unsafe { eval_value_as_script(ctx, src_val, source_url.as_deref()) };
   if result.is_null() {
     return ptr::null();
   }
@@ -958,6 +1015,13 @@ pub extern "C" fn v8__ScriptCompiler__Compile(
     if !ok {
       return ptr::null();
     }
+  }
+  // Carry the Source's resource name (ScriptOrigin) so Run uses it as the eval
+  // `sourceURL` — same dynamic-import referrer fix as v8__Script__Compile.
+  let name = unsafe { resource_name_of(ctx, source) };
+  if !name.is_empty() {
+    SCRIPT_RESOURCE_NAMES
+      .with(|m| m.borrow_mut().insert(src_val as usize, name));
   }
   // ConsumeCodeCache: deno passed precompiled bytecode. Stash it so Run can
   // evaluate from bytecode (skip parse+codegen) and leave the CachedData
