@@ -16,6 +16,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawn } from "node:child_process";
 import {
   ROOT,
   backend,
@@ -52,10 +53,10 @@ const ENT = path.join(ROOT, "tools/jit-entitlements.plist");
 let result;
 switch (s.kind) {
   case "cargo-self":
-    result = runCargoSelf();
+    result = await runCargoSelf();
     break;
   case "cargo-deno":
-    result = runCargoDeno();
+    result = await runCargoDeno();
     break;
   case "deno-test":
     result = runDenoTest();
@@ -113,19 +114,105 @@ function cargoBuild(extraArgs, cwd, selectBackend = true) {
   return bins;
 }
 
-function runBins(bins, cwd) {
+// Per-test wall-clock timeout. libtest has NO per-test timeout, and we run with
+// --test-threads 1, so a single hanging test (e.g. a deadlocked C-API bridge on
+// the vendored-JSC deno_core module loader) blocks the entire binary forever.
+// Under CI that means the job hits its job-level timeout-minutes and is
+// cancelled — no artifact, the whole cell scores 0 (denoland/divybot#651).
+// Override with LIBTEST_TEST_TIMEOUT_SECS; 0 disables the watchdog entirely.
+const PER_TEST_TIMEOUT_MS =
+  (process.env.LIBTEST_TEST_TIMEOUT_SECS != null
+    ? Number(process.env.LIBTEST_TEST_TIMEOUT_SECS)
+    : 120) * 1000;
+
+// Run a single libtest binary once, streaming its output behind a watchdog.
+// With --test-threads 1 libtest's pretty formatter prints `test <name> ... `
+// (flushed) BEFORE running each test and appends `ok`/`FAILED`/`ignored` after.
+// A hung test therefore leaves that start line dangling and emits no further
+// output; if nothing arrives for PER_TEST_TIMEOUT_MS we SIGKILL the process and
+// report the dangling test as the hung one. Returns the captured output, whether
+// we killed it, and the name of the test that was in flight at kill time.
+function streamWithWatchdog(bin, args, cwd) {
+  return new Promise((resolve) => {
+    console.error(`\$ ${bin} ${args.join(" ")}  (cwd: ${cwd})`);
+    const child = spawn(bin, args, { cwd, env: { ...process.env } });
+    let output = "";
+    let killed = false;
+    let timer = null;
+    const arm = () => {
+      if (!(PER_TEST_TIMEOUT_MS > 0)) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        killed = true;
+        child.kill("SIGKILL");
+      }, PER_TEST_TIMEOUT_MS);
+    };
+    const onData = (buf) => {
+      output += buf.toString();
+      arm(); // any output is forward progress — reset the watchdog
+    };
+    child.stdout.on("data", onData);
+    child.stderr.on("data", onData);
+    child.on("error", (e) => {
+      output += `\n[spawn error] ${e.message}\n`;
+    });
+    arm();
+    child.on("close", () => {
+      clearTimeout(timer);
+      output = output.replace(/\x1b\[[0-9;]*m/g, "");
+      // The hung test is the dangling `test <name> ... ` start line (no result).
+      const tail = output.slice(output.lastIndexOf("\n") + 1);
+      const m = tail.match(/^test (.+?) \.\.\. *$/);
+      resolve({ output, killed, inFlight: m ? m[1] : null });
+    });
+  });
+}
+
+// Run a libtest binary to completion, tolerating tests that hang forever. On a
+// watchdog kill we record the in-flight test as a timeout and re-run skipping
+// every known-hung test, until the binary finishes on its own (or we can no
+// longer identify a fresh culprit). Timed-out tests are surfaced as synthetic
+// FAILED lines so they show in the run result and are never silently baselined.
+async function runOneBin(bin, cwd, baseArgs) {
+  const timedOut = [];
+  let combined = "";
+  for (let round = 0; round < 64; round++) {
+    const skipArgs = timedOut.length
+      ? ["--exact", ...timedOut.flatMap((t) => ["--skip", t])]
+      : [];
+    const r = await streamWithWatchdog(bin, [...baseArgs, ...skipArgs], cwd);
+    combined += r.output;
+    if (!r.killed) break; // binary finished on its own
+    if (!r.inFlight || timedOut.includes(r.inFlight)) {
+      console.error(
+        `  [timeout] killed after ${PER_TEST_TIMEOUT_MS / 1000}s but could not ` +
+          `identify a new hung test — stopping retries for ${bin}`,
+      );
+      break;
+    }
+    timedOut.push(r.inFlight);
+    console.error(
+      `  [timeout] '${r.inFlight}' exceeded ${PER_TEST_TIMEOUT_MS / 1000}s — ` +
+        `SIGKILLed; re-running with it skipped (${timedOut.length} hung so far)`,
+    );
+  }
+  // Mark each hung test as FAILED so it's visible (and excluded from baselines).
+  for (const t of timedOut) combined += `test ${t} ... FAILED\n`;
+  return combined;
+}
+
+async function runBins(bins, cwd) {
   let out = "";
   for (const bin of bins) {
     codesign(bin);
     // Print the path so parseLibtest can attribute tests to a binary.
     out += `Running ${bin}\n`;
-    const r = run(bin, ["--test-threads", "1", "--color", "never"], { cwd, echo: false });
-    out += r.out.replace(/\x1b\[[0-9;]*m/g, "") + "\n";
+    out += (await runOneBin(bin, cwd, ["--test-threads", "1", "--color", "never"])) + "\n";
   }
   return out;
 }
 
-function runCargoSelf() {
+async function runCargoSelf() {
   ensureIcuData(); // vendored rusty_v8 tests include_bytes! the ICU blob
   // Build each [[test]] target on its own so a single unbuildable/unlinkable
   // target (missing v8__* symbol) doesn't zero the whole suite. The others
@@ -141,13 +228,13 @@ function runCargoSelf() {
       console.error(`  (target ${t} did not build — counts as 0 passing)`);
       continue;
     }
-    out += runBins(bins, ROOT);
+    out += await runBins(bins, ROOT);
   }
   if (unbuildable.length) console.error(`unbuildable targets: ${unbuildable.join(", ")}`);
   return finalize(parseLibtest(out));
 }
 
-function runCargoDeno() {
+async function runCargoDeno() {
   const denoDir = reqDenoDir();
   const bins = cargoBuild(["-p", s.package], denoDir, false);
   if (!bins) {
@@ -155,7 +242,7 @@ function runCargoDeno() {
     return finalize({ pass: new Set(), fail: new Set(), skip: new Set() });
   }
   // Run from the crate dir so cwd-relative fixtures resolve.
-  const out = runBins(bins, path.join(denoDir, "libs/core"));
+  const out = await runBins(bins, path.join(denoDir, "libs/core"));
   return finalize(parseLibtest(out));
 }
 
