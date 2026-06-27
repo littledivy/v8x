@@ -232,7 +232,10 @@ jobs:
   report:
     name: aggregate report
     needs: [check, deno]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # always() so a failed/partial matrix leg still seeds whatever run-result
+    # artifacts were uploaded (the per-suite steps don't fail the build on test
+    # failures; only infra/build breakage does).
+    if: always() && github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     # Deploys Pages directly (the [skip ci] commit below won't trigger pages.yml).
     permissions:
