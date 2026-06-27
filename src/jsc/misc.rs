@@ -473,6 +473,20 @@ pub extern "C" fn v8__StartupData__IsValid(_this: *const c_void) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StartupData__data__DELETE(_this: *const c_char) {}
 
+// ICU common-data loader (vendored rusty_v8 `icu::set_common_data_77`). V8 needs
+// its bundled icudtl.dat; JSC brings its own ICU/Intl, so loading v8's blob is a
+// no-op. Report success (error_code = 0) so `set_common_data_77` returns Ok and
+// test setup proceeds instead of failing to link / segfaulting.
+#[unsafe(no_mangle)]
+pub extern "C" fn udata_setCommonData_77(
+  _data: *const u8,
+  error_code: *mut i32,
+) {
+  if !error_code.is_null() {
+    unsafe { *error_code = 0 };
+  }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Task__Run(_task: *mut c_void) {}
 
