@@ -25,20 +25,14 @@ pub extern "C" fn v8__V8__DisposePlatform() {}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__GetVersion() -> *const c_char {
+  // Report the V8 version string our vendored rusty_v8 surface was generated
+  // against (`v8::VERSION_STRING`), so `V8::get_version()` round-trips exactly.
+  // This is a compat shim emulating V8; downstream code (e.g. Deno) compares
+  // against the V8 version, not QuickJS's.
   use std::sync::OnceLock;
   static VERSION: OnceLock<std::ffi::CString> = OnceLock::new();
   VERSION
-    .get_or_init(|| {
-      let raw = unsafe { crate::quickjs::quickjs_sys::JS_GetVersion() };
-      let ver = if raw.is_null() {
-        "unknown".to_string()
-      } else {
-        unsafe { std::ffi::CStr::from_ptr(raw) }
-          .to_string_lossy()
-          .into_owned()
-      };
-      std::ffi::CString::new(format!("{ver} (quickjs-ng)")).unwrap()
-    })
+    .get_or_init(|| std::ffi::CString::new(crate::VERSION_STRING).unwrap())
     .as_ptr()
 }
 

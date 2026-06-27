@@ -767,6 +767,75 @@ fn map_set_size(v: *const Object) -> usize {
   }
 }
 
+fn mb(b: bool) -> crate::support::MaybeBool {
+  if b {
+    crate::support::MaybeBool::JustTrue
+  } else {
+    crate::support::MaybeBool::JustFalse
+  }
+}
+
+// Invoke `this.<method>(args...)` and return the raw result JSValue (the caller
+// must `JS_FreeValue` it) or `jsv_exception()` when the method is missing or
+// threw (the pending exception is cleared). Used to back the Map/Set C-ABI on
+// top of QuickJS's native Map/Set prototype methods.
+unsafe fn call_collection_method(
+  ctx: *mut JSContext,
+  this: JSValue,
+  method: *const c_char,
+  args: &mut [JSValue],
+) -> JSValue {
+  unsafe {
+    let f = JS_GetPropertyStr(ctx, this, method);
+    if JS_IsFunction(ctx, f) == 0 {
+      JS_FreeValue(ctx, f);
+      return jsv_exception();
+    }
+    let r = JS_Call(
+      ctx,
+      f,
+      this,
+      args.len() as std::os::raw::c_int,
+      args.as_mut_ptr(),
+    );
+    JS_FreeValue(ctx, f);
+    if r.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    r
+  }
+}
+
+// `new <ctor_name>()` against the isolate's active context (Map / Set).
+fn new_builtin(isolate: *mut RealIsolate, ctor_name: *const c_char) -> JSValue {
+  if isolate.is_null() {
+    return jsv_exception();
+  }
+  let st = iso_state(isolate);
+  let ctx = st.contexts.last().copied().unwrap_or(st.ctx);
+  if ctx.is_null() {
+    return jsv_exception();
+  }
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let ctor = JS_GetPropertyStr(ctx, global, ctor_name);
+    JS_FreeValue(ctx, global);
+    if JS_IsConstructor(ctx, ctor) == 0 {
+      JS_FreeValue(ctx, ctor);
+      return jsv_exception();
+    }
+    let v = JS_CallConstructor(ctx, ctor, 0, ptr::null_mut());
+    JS_FreeValue(ctx, ctor);
+    if v.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      return jsv_exception();
+    }
+    v
+  }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Map__Size(map: *const crate::Map) -> usize {
   map_set_size(map as *const Object)
@@ -1198,7 +1267,12 @@ pub extern "C" fn v8__ScriptCompiler__CachedDataVersionTag() -> u32 {
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn icu_set_default_locale(_locale: *const std::os::raw::c_void) {
+pub extern "C" fn icu_set_default_locale(locale: *const c_char) {
+  if locale.is_null() {
+    return;
+  }
+  let s = unsafe { std::ffi::CStr::from_ptr(locale) }.to_string_lossy();
+  crate::quickjs::cli_extra::set_default_locale_str(&s);
 }
 
 #[unsafe(no_mangle)]
@@ -1228,50 +1302,128 @@ pub extern "C" fn v8__Eternal__IsEmpty(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Map__Clear(_this: *const std::os::raw::c_void) {}
+pub extern "C" fn v8__Map__Clear(this: *const crate::Map) {
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return;
+  }
+  unsafe {
+    let r =
+      call_collection_method(ctx, jsval_of(this), c"clear".as_ptr(), &mut []);
+    JS_FreeValue(ctx, r);
+  }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Map__Delete(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
+  this: *const crate::Map,
+  context: *const Context,
+  key: *const Value,
 ) -> crate::support::MaybeBool {
-  crate::support::MaybeBool::Nothing
+  let ctx = ctx_of(context);
+  if ctx.is_null() || this.is_null() {
+    return crate::support::MaybeBool::Nothing;
+  }
+  unsafe {
+    let mut args = [JS_DupValue(ctx, jsval_of(key))];
+    let r = call_collection_method(
+      ctx,
+      jsval_of(this),
+      c"delete".as_ptr(),
+      &mut args,
+    );
+    JS_FreeValue(ctx, args[0]);
+    if r.tag == JS_TAG_EXCEPTION {
+      return crate::support::MaybeBool::Nothing;
+    }
+    let b = JS_ToBool(ctx, r) != 0;
+    JS_FreeValue(ctx, r);
+    mb(b)
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Map__Get(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  this: *const crate::Map,
+  context: *const Context,
+  key: *const Value,
+) -> *const Value {
+  let ctx = ctx_of(context);
+  if ctx.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    let mut args = [JS_DupValue(ctx, jsval_of(key))];
+    let r =
+      call_collection_method(ctx, jsval_of(this), c"get".as_ptr(), &mut args);
+    JS_FreeValue(ctx, args[0]);
+    if r.tag == JS_TAG_EXCEPTION {
+      return ptr::null();
+    }
+    intern::<Value>(r)
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Map__Has(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
+  this: *const crate::Map,
+  context: *const Context,
+  key: *const Value,
 ) -> crate::support::MaybeBool {
-  crate::support::MaybeBool::Nothing
+  let ctx = ctx_of(context);
+  if ctx.is_null() || this.is_null() {
+    return crate::support::MaybeBool::Nothing;
+  }
+  unsafe {
+    let mut args = [JS_DupValue(ctx, jsval_of(key))];
+    let r =
+      call_collection_method(ctx, jsval_of(this), c"has".as_ptr(), &mut args);
+    JS_FreeValue(ctx, args[0]);
+    if r.tag == JS_TAG_EXCEPTION {
+      return crate::support::MaybeBool::Nothing;
+    }
+    let b = JS_ToBool(ctx, r) != 0;
+    JS_FreeValue(ctx, r);
+    mb(b)
+  }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Map__New(
-  _isolate: *mut std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+pub extern "C" fn v8__Map__New(isolate: *mut RealIsolate) -> *const crate::Map {
+  let v = new_builtin(isolate, c"Map".as_ptr());
+  if v.tag == JS_TAG_EXCEPTION {
+    return ptr::null();
+  }
+  intern::<crate::Map>(v)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Map__Set(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
-  _value: *const std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  this: *const crate::Map,
+  context: *const Context,
+  key: *const Value,
+  value: *const Value,
+) -> *const crate::Map {
+  let ctx = ctx_of(context);
+  if ctx.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    let mut args = [
+      JS_DupValue(ctx, jsval_of(key)),
+      JS_DupValue(ctx, jsval_of(value)),
+    ];
+    let r =
+      call_collection_method(ctx, jsval_of(this), c"set".as_ptr(), &mut args);
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, args[1]);
+    if r.tag == JS_TAG_EXCEPTION {
+      return ptr::null();
+    }
+    // Map.prototype.set returns the map; return our handle to `this`.
+    JS_FreeValue(ctx, r);
+    intern::<crate::Map>(JS_DupValue(ctx, jsval_of(this)))
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1294,24 +1446,68 @@ pub extern "C" fn v8__Proxy__New(
 pub extern "C" fn v8__Proxy__Revoke(_this: *const std::os::raw::c_void) {}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Set__Clear(_this: *const std::os::raw::c_void) {}
+pub extern "C" fn v8__Set__Clear(this: *const crate::Set) {
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return;
+  }
+  unsafe {
+    let r =
+      call_collection_method(ctx, jsval_of(this), c"clear".as_ptr(), &mut []);
+    JS_FreeValue(ctx, r);
+  }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Set__Delete(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
+  this: *const crate::Set,
+  context: *const Context,
+  key: *const Value,
 ) -> crate::support::MaybeBool {
-  crate::support::MaybeBool::Nothing
+  let ctx = ctx_of(context);
+  if ctx.is_null() || this.is_null() {
+    return crate::support::MaybeBool::Nothing;
+  }
+  unsafe {
+    let mut args = [JS_DupValue(ctx, jsval_of(key))];
+    let r = call_collection_method(
+      ctx,
+      jsval_of(this),
+      c"delete".as_ptr(),
+      &mut args,
+    );
+    JS_FreeValue(ctx, args[0]);
+    if r.tag == JS_TAG_EXCEPTION {
+      return crate::support::MaybeBool::Nothing;
+    }
+    let b = JS_ToBool(ctx, r) != 0;
+    JS_FreeValue(ctx, r);
+    mb(b)
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Set__Has(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
+  this: *const crate::Set,
+  context: *const Context,
+  key: *const Value,
 ) -> crate::support::MaybeBool {
-  crate::support::MaybeBool::Nothing
+  let ctx = ctx_of(context);
+  if ctx.is_null() || this.is_null() {
+    return crate::support::MaybeBool::Nothing;
+  }
+  unsafe {
+    let mut args = [JS_DupValue(ctx, jsval_of(key))];
+    let r =
+      call_collection_method(ctx, jsval_of(this), c"has".as_ptr(), &mut args);
+    JS_FreeValue(ctx, args[0]);
+    if r.tag == JS_TAG_EXCEPTION {
+      return crate::support::MaybeBool::Nothing;
+    }
+    let b = JS_ToBool(ctx, r) != 0;
+    JS_FreeValue(ctx, r);
+    mb(b)
+  }
 }
 
 #[unsafe(no_mangle)]
