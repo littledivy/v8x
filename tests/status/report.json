@@ -1,6 +1,6 @@
 {
-  "generated": "2026-06-28T06:03:49.379Z",
-  "commit": "7142adad6cc4069229499ef6dfd1b790c286acb6",
+  "generated": "2026-06-28T06:14:12.340Z",
+  "commit": "a9ddaa04113e807ad6e8cbbc9e06262c784d3e7f",
   "backends": [
     {
       "id": "jsc",
@@ -41,10 +41,10 @@
         "fresh": true
       },
       "deno_core": {
-        "pass": 262,
+        "pass": 266,
         "total": 303,
-        "baseline": 262,
-        "fail": 41,
+        "baseline": 266,
+        "fail": 37,
         "tier": "build",
         "fresh": true
       }
@@ -69,9 +69,9 @@
     },
     "quickjs": {
       "rusty_v8": {
-        "pass": 43,
-        "total": 264,
-        "baseline": 43,
+        "pass": 44,
+        "total": 265,
+        "baseline": 44,
         "fail": 221,
         "tier": "build",
         "fresh": true
@@ -87,7 +87,7 @@
     }
   },
   "totals": {
-    "pass": 577,
-    "known": 1285
+    "pass": 582,
+    "known": 1286
   }
 }
