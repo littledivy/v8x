@@ -401,9 +401,9 @@ pub extern "C" fn v8__External__New(
   isolate: *mut RealIsolate,
   value: *mut c_void,
 ) -> *const External {
-  let st = iso_state(isolate);
-  let ctx =
-    st.contexts.last().copied().unwrap_or(ptr::null_mut()) as JSContextRef;
+  // V8 permits `External::new` on a bare HandleScope (no entered Context);
+  // fall back to the isolate's base context so the object can be created.
+  let ctx = crate::jsc::core::ensure_ctx(isolate);
   if ctx.is_null() {
     return ptr::null();
   }

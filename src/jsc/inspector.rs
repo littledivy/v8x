@@ -177,24 +177,58 @@ pub extern "C" fn v8_inspector__V8InspectorSession__canDispatchMethod(
   )
 }
 
+/// A real `StringBuffer` backing store. V8's `StringBuffer::create` copies the
+/// source `StringView` into an owned buffer that outlives it; the previous stub
+/// dropped the contents, so `string()` reported an empty view (rusty_v8's
+/// `inspector_string_buffer` test). Mirrors the quickjs backend.
+#[repr(C)]
+struct RealStringBuffer {
+  _vtable: *const Opaque,
+  units: Vec<u16>,
+}
+
+impl RealStringBuffer {
+  fn boxed_from_utf16(units: Vec<u16>) -> *mut StringBuffer {
+    Box::into_raw(Box::new(RealStringBuffer {
+      _vtable: std::ptr::null(),
+      units,
+    }))
+    .cast::<StringBuffer>()
+  }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__StringBuffer__DELETE(this: *mut StringBuffer) {
-  unsafe { free_inert(this) };
+  if !this.is_null() {
+    unsafe { drop(Box::from_raw(this.cast::<RealStringBuffer>())) };
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__StringBuffer__string(
-  _this: &StringBuffer,
+  this: &StringBuffer,
 ) -> StringView<'_> {
-  StringView::empty()
+  let rb =
+    unsafe { &*(this as *const StringBuffer as *const RealStringBuffer) };
+  StringView::from(rb.units.as_slice())
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__StringBuffer__create(
-  _source: StringView,
+  source: StringView,
 ) -> UniquePtr<StringBuffer> {
-  let p = alloc_inert::<StringBuffer>();
-  unsafe { UniquePtr::from_raw(p) }
+  let units = string_view_to_utf16(&source);
+  unsafe { UniquePtr::from_raw(RealStringBuffer::boxed_from_utf16(units)) }
+}
+
+fn string_view_to_utf16(sv: &StringView<'_>) -> Vec<u16> {
+  if let Some(s) = sv.characters16() {
+    s.to_vec()
+  } else if let Some(s) = sv.characters8() {
+    s.iter().map(|&b| b as u16).collect()
+  } else {
+    Vec::new()
+  }
 }
 
 #[unsafe(no_mangle)]
