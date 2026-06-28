@@ -71,6 +71,11 @@ struct SyntheticModule {
 
   import_specifiers: Vec<std::string::String>,
 
+  // Byte offset of each import's specifier literal (opening quote) in the
+  // original source, parallel to import_specifiers. V8's ModuleRequest
+  // source_offset; deno records it as `referrer_source_offset`.
+  import_offsets: Vec<i32>,
+
   namespace: JSObjectRef,
 
   specifier: std::string::String,
@@ -1356,6 +1361,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
           eval_steps: None,
           source: None,
           source_map_url: extract_source_mapping_url(&text),
+          import_offsets: compute_import_offsets(&text, &specs),
           import_specifiers: specs,
           namespace: ptr::null_mut(),
           specifier,
@@ -1423,6 +1429,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
       eval_steps: None,
       source: Some(rewrite.body),
       source_map_url: extract_source_mapping_url(&text),
+      import_offsets: compute_import_offsets(&text, &rewrite.imports),
       import_specifiers: rewrite.imports,
       namespace,
       specifier,
@@ -2339,6 +2346,42 @@ pub extern "C" fn v8__UnboundModuleScript__GetSourceMappingURL(
   intern_ctx::<Value>(ctx, v)
 }
 
+/// Byte offset of each import's specifier literal (the opening quote) in the
+/// source, matching V8's `ModuleRequest::GetSourceOffset`. Specifiers are
+/// resolved in requested-module order, advancing a cursor so repeated specifiers
+/// map to successive occurrences. Returns 0 for any not found (best-effort).
+/// ASCII offsets == V8's positions for these test sources.
+fn compute_import_offsets(
+  text: &str,
+  specifiers: &[std::string::String],
+) -> Vec<i32> {
+  let bytes = text.as_bytes();
+  let mut cursor = 0usize;
+  let mut out = Vec::with_capacity(specifiers.len());
+  for spec in specifiers {
+    let mut found = -1i32;
+    for quote in ['"', '\''] {
+      let needle = format!("{quote}{spec}{quote}");
+      if let Some(rel) = text[cursor..].find(&needle) {
+        let pos = cursor + rel;
+        // Prefer the earliest of the two quote styles.
+        if found < 0 || (pos as i32) < found {
+          found = pos as i32;
+        }
+      }
+    }
+    if found >= 0 {
+      // Advance past this specifier so a later identical specifier resolves to
+      // its own occurrence.
+      cursor = (found as usize + 1).min(bytes.len());
+      out.push(found);
+    } else {
+      out.push(0);
+    }
+  }
+  out
+}
+
 /// Extract the last `//# sourceMappingURL=<url>` (or legacy `//@`) magic comment
 /// from module source, mirroring V8's UnboundModuleScript::GetSourceMappingURL.
 /// V8 honours the LAST occurrence; the URL is the trimmed remainder of the line.
@@ -2438,6 +2481,9 @@ pub extern "C" fn v8__Module__GetModuleRequests(
   let specs: Vec<std::string::String> = module_state(this)
     .map(|m| m.import_specifiers.clone())
     .unwrap_or_default();
+  let offsets: Vec<i32> = module_state(this)
+    .map(|m| m.import_offsets.clone())
+    .unwrap_or_default();
   let native = module_state(this)
     .map(|m| m.native)
     .unwrap_or(ptr::null_mut());
@@ -2454,6 +2500,19 @@ pub extern "C" fn v8__Module__GetModuleRequests(
         JSObjectSetProperty(ctx, req, key, sval, 0, ptr::null_mut());
         JSStringRelease(key);
       }
+
+      // Carry the specifier-literal source offset (deno's referrer_source_offset).
+      let off = offsets.get(idx).copied().unwrap_or(0);
+      let okey = JSStringCreateWithUTF8CString(c"__source_offset".as_ptr());
+      JSObjectSetProperty(
+        ctx,
+        req,
+        okey,
+        JSValueMakeNumber(ctx, off as f64),
+        1 << 1,
+        ptr::null_mut(),
+      );
+      JSStringRelease(okey);
 
       // Carry the native import-attribute type (3=JSON, 2=wasm) so
       // GetImportAttributes can surface `with { type: ... }` to deno.
@@ -3394,6 +3453,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
     eval_steps: Some(steps),
     source: None,
     source_map_url: None,
+    import_offsets: Vec::new(),
     import_specifiers: Vec::new(),
     namespace,
     specifier,
@@ -3496,9 +3556,24 @@ pub extern "C" fn v8__ModuleRequest__GetPhase(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ModuleRequest__GetSourceOffset(
-  _this: *const ModuleRequest,
+  this: *const ModuleRequest,
 ) -> int {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return 0;
+  }
+  unsafe {
+    let obj = jsval(this) as JSObjectRef;
+    let key = JSStringCreateWithUTF8CString(c"__source_offset".as_ptr());
+    let mut exc: JSValueRef = ptr::null();
+    let v = JSObjectGetProperty(ctx, obj, key, &mut exc);
+    JSStringRelease(key);
+    if v.is_null() || JSValueIsUndefined(ctx, v) {
+      return 0;
+    }
+    let n = JSValueToNumber(ctx, v, &mut exc);
+    if n.is_nan() { 0 } else { n as int }
+  }
 }
 
 #[unsafe(no_mangle)]
