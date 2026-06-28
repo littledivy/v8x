@@ -52,10 +52,32 @@ pub extern "C" fn v8__V8__SetFlagsFromCommandLine(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__V8__SetFlagsFromString(
-  _flags: *const u8,
-  _length: usize,
-) {
+pub extern "C" fn v8__V8__SetFlagsFromString(flags: *const u8, length: usize) {
+  // Most V8 flags are inert for the QuickJS backend, but `--use_strict` changes
+  // observable JS semantics (it makes top-level scripts run in strict mode), so
+  // honor it. V8 normalizes `-`/`_` in flag names and supports a `--no` prefix
+  // to clear booleans, so accept both spellings.
+  if flags.is_null() || length == 0 {
+    return;
+  }
+  let bytes = unsafe { std::slice::from_raw_parts(flags, length) };
+  let Ok(text) = std::str::from_utf8(bytes) else {
+    return;
+  };
+  for tok in text.split_whitespace() {
+    let name = tok.trim_start_matches('-').replace('-', "_");
+    match name.as_str() {
+      "use_strict" => {
+        crate::quickjs::core::FORCE_STRICT
+          .store(true, std::sync::atomic::Ordering::Relaxed);
+      }
+      "no_use_strict" => {
+        crate::quickjs::core::FORCE_STRICT
+          .store(false, std::sync::atomic::Ordering::Relaxed);
+      }
+      _ => {}
+    }
+  }
 }
 
 #[unsafe(no_mangle)]
