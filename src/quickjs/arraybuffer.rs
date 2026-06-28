@@ -13,7 +13,7 @@ use crate::{
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 // Registry of live "alias" backing stores (created by `backing_store_for_buffer`)
@@ -94,6 +94,13 @@ unsafe extern "C" {
     obj: JSValue,
   ) -> *mut u8;
   fn JS_DetachArrayBuffer(ctx: *mut JSContext, obj: JSValue);
+  fn JS_DefinePropertyValueStr(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: *const std::os::raw::c_char,
+    val: JSValue,
+    flags: i32,
+  ) -> i32;
   fn JS_NewTypedArray(
     ctx: *mut JSContext,
     argc: i32,
@@ -438,11 +445,49 @@ pub extern "C" fn v8__ArrayBuffer__Data(
   unsafe { JS_GetArrayBuffer(ctx, &mut len, jsval_of(this)) as *mut c_void }
 }
 
+// Some ArrayBuffers must report `IsDetachable() == false` — notably the backing
+// store of a `WebAssembly.Memory`, which V8 keeps non-detachable so deno's
+// `to_v8_slice_detachable` rejects ops that would steal its bytes. QuickJS has no
+// per-buffer "detachable" flag, so we tag such buffers with a hidden (non-enum,
+// non-writable, non-configurable) own property and look it up here. The
+// `HAS_NONDETACHABLE` gate keeps the common all-detachable path (every plain
+// `ArrayBuffer` deno hands us) a single atomic load with no property lookup.
+pub(crate) static HAS_NONDETACHABLE: AtomicBool = AtomicBool::new(false);
+
+/// Mark `buf` (a JSValue holding an ArrayBuffer) as non-detachable.
+pub(crate) fn mark_buffer_nondetachable(ctx: *mut JSContext, buf: JSValue) {
+  unsafe {
+    JS_DefinePropertyValueStr(
+      ctx,
+      buf,
+      c"__v8x_nondetach".as_ptr(),
+      jsv_bool(true),
+      0,
+    );
+  }
+  HAS_NONDETACHABLE.store(true, Ordering::Relaxed);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ArrayBuffer__IsDetachable(
   this: *const ArrayBuffer,
 ) -> bool {
-  !this.is_null()
+  if this.is_null() {
+    return false;
+  }
+  if !HAS_NONDETACHABLE.load(Ordering::Relaxed) {
+    return true;
+  }
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return true;
+  }
+  let prop = unsafe {
+    JS_GetPropertyStr(ctx, jsval_of(this), c"__v8x_nondetach".as_ptr())
+  };
+  let nondetach = unsafe { JS_ToBool(ctx, prop) } != 0;
+  unsafe { JS_FreeValue(ctx, prop) };
+  !nondetach
 }
 
 #[unsafe(no_mangle)]
