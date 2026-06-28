@@ -42,8 +42,17 @@ try {
 // compares against the committed baseline, so regressions are blocked there.
 if (args.includes("--write-baselines")) {
   for (const [key, r] of Object.entries(runResults)) {
-    const n = saveBaseline(r.backend, r.suite, new Set(r.passing));
-    console.error(`baseline ${key}: ${n} passing`);
+    // MONOTONIC: union with the committed baseline — the floor only ever rises,
+    // never falls. A flaky / truncated / crashed run (e.g. a non-deterministic
+    // JSC crash that cuts the suite short) can only ADD newly-passing tests; it
+    // can never lower the baseline. This stops such a run from silently
+    // overwriting e.g. 256 -> 95 and masking a coverage regression from CI +
+    // auto-merge. Self-healing: once the crash is fixed, the next clean run
+    // unions the full set back in and the baseline is restored.
+    const prev = loadBaseline(r.backend, r.suite);
+    const merged = new Set([...prev, ...r.passing]);
+    const n = saveBaseline(r.backend, r.suite, merged);
+    console.error(`baseline ${key}: ${n} passing (monotonic, +${n - prev.size})`);
   }
 }
 
