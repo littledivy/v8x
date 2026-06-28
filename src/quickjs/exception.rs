@@ -971,3 +971,307 @@ pub extern "C" fn v8__TryCatch__StackTrace(
 ) -> *const std::os::raw::c_void {
   std::ptr::null()
 }
+
+// ---------------------------------------------------------------------------
+// Error.prepareStackTrace shim — V8-accurate stack frames for deno_core.
+//
+// deno_core registers a native V8 PrepareStackTraceCallback
+// (`v8__Isolate__SetPrepareStackTraceCallback`). On V8 that callback runs in
+// place of `Error.prepareStackTrace`, reading structured CallSite frames and
+// formatting them. QuickJS-ng has no equivalent native hook — it only consults
+// `Error.prepareStackTrace`. The vendored fork exposes the full V8 CallSite API
+// on its native CallSites, but with placeholder values (isToplevel /
+// isConstructor always false, getColumnNumber = the construct CALL column,
+// synthetic Promise/Error-construct native frames left in). Left as-is, deno's
+// `Display for JsError` prints the raw multi-frame quickjs stack, e.g.
+//   Error: fail
+//       at construct ([native code])
+//       at
+//       at [native code]
+//       at global code (a.js:1:25)
+// where V8 prints just `Error: fail\n    at a.js:1:16`.
+//
+// We close the gap with our own `Error.prepareStackTrace`, installed ONLY on
+// runtimes that called SetPrepareStackTraceCallback (deno_core — never the bare
+// rusty_v8 cell, which keeps quickjs's native stack untouched). It reads the
+// fork's CallSites and re-formats them V8-style: native/file-less frames are
+// dropped, top-level frames print without a function name, and `new X()`
+// construct columns are moved from the call `(` back to the `new` keyword
+// (recovered from the source line registered at eval time).
+// ---------------------------------------------------------------------------
+
+use std::os::raw::c_int;
+
+thread_local! {
+  static PREPARE_STACK_ACTIVE: std::cell::Cell<bool> =
+    const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn is_prepare_stack_active() -> bool {
+  PREPARE_STACK_ACTIVE.with(|c| c.get())
+}
+
+/// Record that this thread's runtime registered a PrepareStackTraceCallback, so
+/// new contexts get our `Error.prepareStackTrace` from `install_default_globals`.
+pub(crate) fn activate_prepare_stack() {
+  PREPARE_STACK_ACTIVE.with(|c| c.set(true));
+}
+
+/// Install our `Error.prepareStackTrace` on `ctx`. No-op unless a
+/// PrepareStackTraceCallback was registered for this isolate (see above).
+pub(crate) fn install_prepare_stack_trace(ctx: *mut JSContext) {
+  if ctx.is_null() || !is_prepare_stack_active() {
+    return;
+  }
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let error = JS_GetPropertyStr(ctx, global, c"Error".as_ptr());
+    JS_FreeValue(ctx, global);
+    if error.tag == JS_TAG_EXCEPTION || !JS_IsFunction(ctx, error) {
+      JS_FreeValue(ctx, error);
+      return;
+    }
+    let f = JS_NewCFunction(
+      ctx,
+      qjs_prepare_stack_trace,
+      c"prepareStackTrace".as_ptr(),
+      2,
+    );
+    JS_SetPropertyStr(ctx, error, c"prepareStackTrace".as_ptr(), f);
+    JS_FreeValue(ctx, error);
+  }
+}
+
+/// Coerce a JSValue to a Rust string, but only for actual strings — null /
+/// undefined (e.g. a CallSite's absent file name) return `None`.
+unsafe fn js_string_value(
+  ctx: *mut JSContext,
+  v: JSValue,
+) -> Option<std::string::String> {
+  if v.tag != JS_TAG_STRING && v.tag != JS_TAG_STRING_ROPE {
+    return None;
+  }
+  let mut len: usize = 0;
+  let s = unsafe { JS_ToCStringLen(ctx, &mut len, v) };
+  if s.is_null() {
+    unsafe { clear_pending(ctx) };
+    return None;
+  }
+  let bytes = unsafe { std::slice::from_raw_parts(s as *const u8, len) };
+  let out = std::string::String::from_utf8_lossy(bytes).into_owned();
+  unsafe { JS_FreeCString(ctx, s) };
+  Some(out)
+}
+
+unsafe fn read_str_prop(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: &std::ffi::CStr,
+) -> Option<std::string::String> {
+  let v = unsafe { JS_GetPropertyStr(ctx, obj, prop.as_ptr()) };
+  if v.tag == JS_TAG_EXCEPTION {
+    unsafe { clear_pending(ctx) };
+    return None;
+  }
+  let out = unsafe { js_string_value(ctx, v) };
+  unsafe { JS_FreeValue(ctx, v) };
+  out
+}
+
+/// Call a 0-arg method on a CallSite; returns `undefined` on any failure.
+unsafe fn call_site_method(
+  ctx: *mut JSContext,
+  site: JSValue,
+  name: &std::ffi::CStr,
+) -> JSValue {
+  let m = unsafe { JS_GetPropertyStr(ctx, site, name.as_ptr()) };
+  if m.tag == JS_TAG_EXCEPTION || !unsafe { JS_IsFunction(ctx, m) } {
+    unsafe { JS_FreeValue(ctx, m) };
+    unsafe { clear_pending(ctx) };
+    return jsv_undefined();
+  }
+  let ret = unsafe { JS_Call(ctx, m, site, 0, ptr::null_mut()) };
+  unsafe { JS_FreeValue(ctx, m) };
+  if ret.tag == JS_TAG_EXCEPTION {
+    unsafe { clear_pending(ctx) };
+    return jsv_undefined();
+  }
+  ret
+}
+
+unsafe fn call_site_str(
+  ctx: *mut JSContext,
+  site: JSValue,
+  name: &std::ffi::CStr,
+) -> Option<std::string::String> {
+  let v = unsafe { call_site_method(ctx, site, name) };
+  let out = unsafe { js_string_value(ctx, v) };
+  unsafe { JS_FreeValue(ctx, v) };
+  out
+}
+
+unsafe fn call_site_int(
+  ctx: *mut JSContext,
+  site: JSValue,
+  name: &std::ffi::CStr,
+) -> i32 {
+  let v = unsafe { call_site_method(ctx, site, name) };
+  let mut out: i32 = 0;
+  let ok = unsafe { JS_ToInt32(ctx, &mut out, v) };
+  unsafe { JS_FreeValue(ctx, v) };
+  if ok < 0 {
+    unsafe { clear_pending(ctx) };
+    return 0;
+  }
+  out
+}
+
+fn append_location(
+  out: &mut std::string::String,
+  file: &str,
+  line: i32,
+  col: i32,
+) {
+  out.push_str(file);
+  if line >= 1 {
+    out.push(':');
+    out.push_str(&line.to_string());
+    if col >= 1 {
+      out.push(':');
+      out.push_str(&col.to_string());
+    }
+  }
+}
+
+/// V8 reports the `new` keyword as the column of a `new X()` construct frame;
+/// quickjs reports a position inside the `new <member>(` span instead (the
+/// whitespace after `new`, or the call's `(`, depending on the build). Given
+/// the source `line` and quickjs's 1-based `col`, walk left across the
+/// construct expression to the introducing `new` keyword and return its 1-based
+/// column. If `col` isn't a `new <member>(` site, return it unchanged.
+fn v8_new_expr_column(line: &str, col: i32) -> i32 {
+  let chars: Vec<char> = line.chars().collect();
+  let n = chars.len() as i32;
+  if col < 1 || col > n {
+    return col;
+  }
+  let is_member =
+    |c: char| c.is_alphanumeric() || c == '_' || c == '$' || c == '.';
+  let is_word = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+  let is_new_kw = |i: i32| {
+    i >= 2
+      && chars[i as usize] == 'w'
+      && chars[(i - 1) as usize] == 'e'
+      && chars[(i - 2) as usize] == 'n'
+      && (i - 2 == 0 || !is_word(chars[(i - 3) as usize]))
+  };
+  let mut i = col - 1; // 0-based, at the reported column
+  // Step over the construct's own opening paren if the column points at it
+  // (`new X(` ← col on the `(`). Only this one paren is consumed — we must not
+  // cross into an enclosing call, so a nested-argument frame like the `bar()`
+  // in `new Foo(bar())` is left untouched.
+  if chars[i as usize] == '(' {
+    i -= 1;
+  }
+  loop {
+    while i >= 0 && chars[i as usize].is_whitespace() {
+      i -= 1;
+    }
+    if i < 0 {
+      return col;
+    }
+    if is_new_kw(i) {
+      return i - 2 + 1; // 1-based column of the `n`
+    }
+    // Skip one member-expression token (identifiers, `.`, `$`, `_`) and retry,
+    // e.g. `new a.b.c(`. No progress → not a `new` site, leave `col` alone.
+    let before = i;
+    while i >= 0 && is_member(chars[i as usize]) {
+      i -= 1;
+    }
+    if i == before {
+      return col;
+    }
+  }
+}
+
+/// `Error.prepareStackTrace(error, callSites)` — see the module note above.
+unsafe extern "C" fn qjs_prepare_stack_trace(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  if argc < 2 || argv.is_null() || ctx.is_null() {
+    return jsv_undefined();
+  }
+  let error = unsafe { *argv.add(0) };
+  let sites = unsafe { *argv.add(1) };
+
+  // Header: `name: message` (V8's first stack line).
+  let name = unsafe { read_str_prop(ctx, error, c"name") }
+    .unwrap_or_else(|| "Error".to_string());
+  let message =
+    unsafe { read_str_prop(ctx, error, c"message") }.unwrap_or_default();
+  let mut out = if message.is_empty() {
+    name
+  } else if name.is_empty() {
+    message
+  } else {
+    format!("{name}: {message}")
+  };
+
+  let len = {
+    let l = unsafe { JS_GetPropertyStr(ctx, sites, c"length".as_ptr()) };
+    let mut n: i32 = 0;
+    if unsafe { JS_ToInt32(ctx, &mut n, l) } < 0 {
+      unsafe { clear_pending(ctx) };
+    }
+    unsafe { JS_FreeValue(ctx, l) };
+    n.max(0)
+  };
+
+  for i in 0..len as u32 {
+    let site = unsafe { JS_GetPropertyUint32(ctx, sites, i) };
+    if site.tag == JS_TAG_EXCEPTION {
+      unsafe { clear_pending(ctx) };
+      continue;
+    }
+    let file = unsafe { call_site_str(ctx, site, c"getFileName") };
+    // Drop native / file-less frames — V8 elides quickjs's synthetic
+    // Promise.reject / Error-construct frames.
+    let Some(file) = file else {
+      unsafe { JS_FreeValue(ctx, site) };
+      continue;
+    };
+    let line = unsafe { call_site_int(ctx, site, c"getLineNumber") };
+    let mut col = unsafe { call_site_int(ctx, site, c"getColumnNumber") };
+    let func = unsafe { call_site_str(ctx, site, c"getFunctionName") };
+    unsafe { JS_FreeValue(ctx, site) };
+
+    // Recover V8's `new`-keyword column for `new X()` frames.
+    if let Some(src) = super::core::script_source_line(&file, line) {
+      col = v8_new_expr_column(&src, col);
+    }
+
+    // quickjs names top-level script frames `global code` / `<eval>`; V8
+    // reports none, so deno prints them as `at file:line:col` (no wrapper).
+    let is_top_level = matches!(
+      func.as_deref(),
+      None | Some("") | Some("global code") | Some("<eval>")
+    );
+
+    out.push_str("\n    at ");
+    if is_top_level {
+      append_location(&mut out, &file, line, col);
+    } else {
+      out.push_str(func.as_deref().unwrap_or("<anonymous>"));
+      out.push_str(" (");
+      append_location(&mut out, &file, line, col);
+      out.push(')');
+    }
+  }
+
+  let bytes = out.as_bytes();
+  unsafe { JS_NewStringLen(ctx, bytes.as_ptr() as *const c_char, bytes.len()) }
+}

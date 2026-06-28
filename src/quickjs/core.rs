@@ -624,6 +624,9 @@ pub(crate) fn install_default_globals(ctx: *mut JSContext) {
     }
     JS_FreeValue(ctx, global);
   }
+  // Install our V8-accurate `Error.prepareStackTrace` (no-op unless deno
+  // registered a PrepareStackTraceCallback — see exception.rs).
+  super::exception::install_prepare_stack_trace(ctx);
 }
 
 fn install_intl_stub(ctx: *mut JSContext, _global: JSValue) {
@@ -729,6 +732,47 @@ thread_local! {
   static SCRIPT_RESOURCE_NAMES: RefCell<
     std::collections::HashMap<usize, std::ffi::CString>,
   > = RefCell::new(std::collections::HashMap::new());
+
+  // Source text per script filename, captured at eval time. Used by the
+  // error-stack `Error.prepareStackTrace` shim (see `exception.rs`) to recover
+  // V8's `new`-keyword column for `new X()` frames: quickjs records the
+  // construct CALL position (the `(`), V8 records the `new` token, and the only
+  // way to bridge that gap shim-side is to re-read the source line.
+  static SCRIPT_SOURCES: RefCell<
+    std::collections::HashMap<std::string::String, std::string::String>,
+  > = RefCell::new(std::collections::HashMap::new());
+}
+
+/// Remember a script's source under its eval filename so the stack-trace shim
+/// can map a reported column back to the source line. Bounded to the most
+/// recent entries so a long-lived runtime evaluating many scripts can't grow
+/// this map without limit.
+pub(crate) fn register_script_source(filename: &str, source: &str) {
+  if filename.is_empty() {
+    return;
+  }
+  SCRIPT_SOURCES.with(|m| {
+    let mut map = m.borrow_mut();
+    if map.len() > 256 && !map.contains_key(filename) {
+      map.clear();
+    }
+    map.insert(filename.to_string(), source.to_string());
+  });
+}
+
+/// Return the 1-based `line` of the source registered for `filename`, if known.
+pub(crate) fn script_source_line(
+  filename: &str,
+  line: i32,
+) -> Option<std::string::String> {
+  if line < 1 {
+    return None;
+  }
+  SCRIPT_SOURCES.with(|m| {
+    m.borrow()
+      .get(filename)
+      .and_then(|src| src.lines().nth((line - 1) as usize).map(str::to_string))
+  })
 }
 
 // Pull the resource-name string out of a `ScriptOrigin` (slot 0 holds the
@@ -808,6 +852,13 @@ pub extern "C" fn v8__Script__Run(
     Some(name) => name.as_ptr(),
     None => c"<eval>".as_ptr(),
   };
+  // Capture the source under its eval filename for the stack-trace shim.
+  if let Some(name) = fname_owned.as_ref()
+    && let Ok(fname) = name.to_str()
+  {
+    let bytes = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+    register_script_source(fname, &String::from_utf8_lossy(bytes));
+  }
   let result =
     unsafe { JS_Eval(ctx, cstr, len, fname_ptr, global_eval_flags()) };
   unsafe { JS_FreeCString(ctx, cstr) };
