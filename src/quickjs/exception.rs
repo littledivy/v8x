@@ -39,7 +39,7 @@ use std::os::raw::c_char;
 use std::ptr;
 
 unsafe fn peek_pending(ctx: *mut JSContext) -> Option<JSValue> {
-  if ctx.is_null() || JS_HasException(ctx) == 0 {
+  if ctx.is_null() || !JS_HasException(ctx) {
     return None;
   }
 
@@ -50,7 +50,7 @@ unsafe fn peek_pending(ctx: *mut JSContext) -> Option<JSValue> {
 }
 
 unsafe fn clear_pending(ctx: *mut JSContext) {
-  if ctx.is_null() || JS_HasException(ctx) == 0 {
+  if ctx.is_null() || !JS_HasException(ctx) {
     return;
   }
   let exc = JS_GetException(ctx);
@@ -750,7 +750,7 @@ pub extern "C" fn v8__TryCatch__HasCaught(this: *const TryCatch) -> bool {
   }
   unsafe {
     let ctx = tc_ctx(this);
-    !ctx.is_null() && JS_HasException(ctx) != 0
+    !ctx.is_null() && JS_HasException(ctx)
   }
 }
 

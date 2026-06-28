@@ -319,7 +319,7 @@ unsafe extern "C" fn dynamic_import_hook(
 
   let promise_ptr = unsafe { cb(ctx_l, ho_l, ref_l, spec_l, attr_l) };
   if promise_ptr.is_null() {
-    if unsafe { JS_HasException(ctx) } != 0 {
+    if unsafe { JS_HasException(ctx) } {
       let mut a = [unsafe { JS_GetException(ctx) }];
       let r =
         unsafe { JS_Call(ctx, reject, jsv_undefined(), 1, a.as_mut_ptr()) };

@@ -270,7 +270,7 @@ pub extern "C" fn v8__Object__Set(
 }
 
 unsafe fn swallow_write_rejection(ctx: *mut JSContext) -> bool {
-  if unsafe { JS_HasException(ctx) } == 0 {
+  if !unsafe { JS_HasException(ctx) } {
     return true;
   }
   let exc = unsafe { JS_GetException(ctx) };
@@ -540,7 +540,7 @@ pub extern "C" fn v8__Object__GetConstructorName(
     let fallback = || intern::<V8String>(JS_NewString(ctx, c"Object".as_ptr()));
 
     let drain_exc = || {
-      if JS_HasException(ctx) != 0 {
+      if JS_HasException(ctx) {
         JS_FreeValue(ctx, JS_GetException(ctx));
       }
     };

@@ -10,21 +10,124 @@ use crate::{
   RealIsolate, Value,
 };
 use std::mem::MaybeUninit;
-use std::os::raw::c_void;
+use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+
+// --- code generation from strings (V8 `Context::AllowCodeGenerationFromStrings`)
+//
+// QuickJS has no native toggle for `eval` / `new Function`, so we emulate V8's
+// per-context flag by swapping the context's global `eval` and `Function`
+// bindings for a thrower while codegen is disallowed, and restoring the
+// originals when it's re-allowed. The thrower raises an `EvalError` whose
+// message matches V8's ("Code generation from strings disallowed for this
+// context"), which now propagates to a C++ `TryCatch` correctly (see the
+// `JS_HasException` ABI fix). Inert unless a context actually disables codegen,
+// so it never touches the common path.
+thread_local! {
+  // ctx -> (saved global.eval, saved global.Function), both owning one ref.
+  static CODEGEN_DISABLED: std::cell::RefCell<
+    std::collections::HashMap<*mut JSContext, (JSValue, JSValue)>,
+  > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+unsafe extern "C" fn codegen_thrower(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
+  const MSG: &str = "Code generation from strings disallowed for this context";
+  unsafe {
+    // Build `new EvalError(MSG)` and throw it; fall back to a TypeError with
+    // the same message if the EvalError constructor is somehow unavailable.
+    let global = JS_GetGlobalObject(ctx);
+    let ctor = JS_GetPropertyStr(ctx, global, c"EvalError".as_ptr());
+    JS_FreeValue(ctx, global);
+    if ctor.tag == JS_TAG_EXCEPTION || JS_IsConstructor(ctx, ctor) == 0 {
+      JS_FreeValue(ctx, ctor);
+      // MSG is a fixed literal with no `%`, so using it directly as the
+      // printf-style format string is safe.
+      return JS_ThrowTypeError(
+        ctx,
+        c"Code generation from strings disallowed for this context".as_ptr(),
+      );
+    }
+    let msg = JS_NewStringLen(ctx, MSG.as_ptr() as *const c_char, MSG.len());
+    let mut args = [msg];
+    let err = JS_CallConstructor(ctx, ctor, 1, args.as_mut_ptr());
+    JS_FreeValue(ctx, ctor);
+    JS_FreeValue(ctx, msg);
+    if err.tag == JS_TAG_EXCEPTION {
+      return err; // exception already pending
+    }
+    JS_Throw(ctx, err)
+  }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__AllowCodeGenerationFromStrings(
-  _this: *const Context,
-  _allow: bool,
+  this: *const Context,
+  allow: bool,
 ) {
+  let ctx = ctx_of(this);
+  if ctx.is_null() {
+    return;
+  }
+  unsafe {
+    if allow {
+      // Restore the original eval/Function bindings, if we swapped them.
+      if let Some((eval, func)) =
+        CODEGEN_DISABLED.with(|m| m.borrow_mut().remove(&ctx))
+      {
+        let global = JS_GetGlobalObject(ctx);
+        JS_SetPropertyStr(ctx, global, c"eval".as_ptr(), eval);
+        JS_SetPropertyStr(ctx, global, c"Function".as_ptr(), func);
+        JS_FreeValue(ctx, global);
+      }
+    } else {
+      // Already disabled? Nothing to do (don't clobber the saved originals).
+      if CODEGEN_DISABLED.with(|m| m.borrow().contains_key(&ctx)) {
+        return;
+      }
+      let global = JS_GetGlobalObject(ctx);
+      // Save the current bindings (owning a ref each) so we can restore them.
+      let saved_eval = JS_GetPropertyStr(ctx, global, c"eval".as_ptr());
+      let saved_func = JS_GetPropertyStr(ctx, global, c"Function".as_ptr());
+      let thrower_eval =
+        JS_NewCFunction(ctx, codegen_thrower, c"eval".as_ptr(), 1);
+      let thrower_func =
+        JS_NewCFunction(ctx, codegen_thrower, c"Function".as_ptr(), 1);
+      JS_SetPropertyStr(ctx, global, c"eval".as_ptr(), thrower_eval);
+      JS_SetPropertyStr(ctx, global, c"Function".as_ptr(), thrower_func);
+      JS_FreeValue(ctx, global);
+      CODEGEN_DISABLED
+        .with(|m| m.borrow_mut().insert(ctx, (saved_eval, saved_func)));
+    }
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context_IsCodeGenerationFromStringsAllowed(
-  _this: *const Context,
+  this: *const Context,
 ) -> bool {
-  true
+  let ctx = ctx_of(this);
+  if ctx.is_null() {
+    return true;
+  }
+  !CODEGEN_DISABLED.with(|m| m.borrow().contains_key(&ctx))
+}
+
+/// Release any saved `eval`/`Function` bindings for `ctx` before its
+/// `JSContext` is freed. Called from `v8__Isolate__Dispose` for every context.
+pub(crate) fn codegen_release_ctx(ctx: *mut JSContext) {
+  if let Some((eval, func)) =
+    CODEGEN_DISABLED.with(|m| m.borrow_mut().remove(&ctx))
+  {
+    unsafe {
+      JS_FreeValue(ctx, eval);
+      JS_FreeValue(ctx, func);
+    }
+  }
 }
 
 #[unsafe(no_mangle)]
