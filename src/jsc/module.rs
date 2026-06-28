@@ -518,10 +518,13 @@ unsafe extern "C" fn dynamic_import_js_cb(
       // instead of surfacing the RangeError the runaway recursion is supposed
       // to throw. Bail out with a throwable error while there is still stack to
       // unwind through — this both avoids the crash AND gives the test the
-      // RangeError it expects. 512 KiB is far more than the host callback needs
-      // yet a tiny fraction of a normal thread stack, so a legitimately-shallow
-      // `import()` never trips it.
-      const MIN_STACK_HEADROOM: usize = 512 * 1024;
+      // RangeError it expects. The host callback only needs a handful of native
+      // frames (a few KiB), so 64 KiB is ample headroom for it yet small enough
+      // that a legitimate `import()` reached through a deep-but-normal frame
+      // chain — e.g. on a 512 KiB worker thread that has already consumed some
+      // stack — still passes; only genuine runaway recursion approaching the
+      // guard page trips it.
+      const MIN_STACK_HEADROOM: usize = 64 * 1024;
       if stack_headroom_bytes() < MIN_STACK_HEADROOM {
         if !exception.is_null() {
           *exception =
@@ -693,6 +696,11 @@ unsafe fn eval_value_as_script(
     let rewritten = rewrite_dynamic_import_calls(&src);
     if rewritten != src {
       let referrer = source_url.unwrap_or("");
+      // `{:?}` emits the referrer as a Rust `Debug` string — double-quoted with
+      // backslash escapes — which coincides with JS string-literal syntax, so it
+      // safely embeds a referrer (always a resource URL here) without manual
+      // escaping. The `CString::new` below rejects any embedded NUL, so a NUL in
+      // the referrer fails the rewrite cleanly rather than producing bad JS.
       let prelude = format!(
         "var __v82jsc_dynImport=(s,o)=>globalThis.__v82jsc_dynamicImport(s,{:?},o);",
         referrer
