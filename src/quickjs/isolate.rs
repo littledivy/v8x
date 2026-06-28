@@ -530,12 +530,14 @@ pub extern "C" fn v8__Isolate__SetCaptureStackTraceForUncaughtExceptions(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetPrepareStackTraceCallback(
   isolate: *mut RealIsolate,
-  _callback: crate::isolate::PrepareStackTraceCallback<'static>,
+  callback: crate::isolate::PrepareStackTraceCallback<'static>,
 ) {
-  // We don't invoke deno's native callback (its formatter would read the
-  // fork's placeholder CallSite values); instead install our own V8-accurate
-  // `Error.prepareStackTrace` on this isolate's contexts and any created later.
-  super::exception::activate_prepare_stack();
+  // Install our V8-accurate `Error.prepareStackTrace` on this isolate's contexts
+  // and any created later. It first computes corrected CallSite frames (the
+  // fork's native CallSites carry placeholder column/flags), then forwards them
+  // into deno's native `callback` so its formatter can apply source maps before
+  // producing the final stack string.
+  super::exception::set_prepare_stack_trace_cb(callback);
   if isolate.is_null() {
     return;
   }
