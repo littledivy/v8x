@@ -36,6 +36,14 @@ pub(crate) struct IsoState {
     Option<crate::isolate::HostInitializeImportMetaObjectCallback>,
 
   pub cpp_heap: *mut c_void,
+
+  /// Lazily-created fallback context used when a value must be materialised
+  /// but no `Context` has been entered (e.g. `v8::External::new` called on a
+  /// bare `HandleScope`, as in rusty_v8's `test_simple_external`). V8 lets you
+  /// create primitives/externals without an active context; JSC has no such
+  /// notion, so we keep one throwaway global context per isolate to host them.
+  /// Released in `Isolate::Dispose`.
+  pub base_ctx: JSGlobalContextRef,
 }
 
 thread_local! {
@@ -145,6 +153,28 @@ fn fallback_ctx(iso: *mut RealIsolate) -> JSContextRef {
     .unwrap_or(ptr::null_mut()) as JSContextRef
 }
 
+/// A context guaranteed to be non-null (as long as the isolate is live):
+/// the entered/owned context if there is one, otherwise the isolate's lazily
+/// created base context. Use this when a value MUST be materialised even
+/// though the embedder hasn't entered a `Context` (V8 allows this; JSC needs
+/// a concrete `JSContextRef`). See [`IsoState::base_ctx`].
+#[inline]
+pub(crate) fn ensure_ctx(iso: *mut RealIsolate) -> JSContextRef {
+  if iso.is_null() {
+    return ptr::null();
+  }
+  let ctx = fallback_ctx(iso);
+  if !ctx.is_null() {
+    return ctx;
+  }
+  let st = iso_state(iso);
+  if st.base_ctx.is_null() {
+    st.base_ctx =
+      unsafe { JSGlobalContextCreateInGroup(st.group, ptr::null_mut()) };
+  }
+  st.base_ctx as JSContextRef
+}
+
 #[inline]
 pub(crate) fn is_non_value_handle(
   iso: *mut RealIsolate,
@@ -250,6 +280,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     pending_exception: None,
     import_meta_cb: None,
     cpp_heap: crate::jsc::misc::current_cpp_heap(),
+    base_ctx: ptr::null_mut(),
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;
   // Arm the execution-time-limit watchdog so `TerminateExecution` and the
@@ -305,6 +336,10 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
     }
     for ctx in st.owned_contexts.drain(..) {
       JSGlobalContextRelease(ctx);
+    }
+    if !st.base_ctx.is_null() {
+      JSGlobalContextRelease(st.base_ctx);
+      st.base_ctx = ptr::null_mut();
     }
     JSContextGroupRelease(st.group);
   }
