@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 export const ROOT = path.resolve(fileURLToPath(import.meta.url), "../../..");
 export const STATUS_DIR = path.join(ROOT, "tests/status");
 export const BASELINE_DIR = path.join(STATUS_DIR, "baselines");
+export const MANIFEST_DIR = path.join(STATUS_DIR, "manifest");
 export const RUNS_DIR = path.join(STATUS_DIR, ".runs");
 
 export function loadConfig() {
@@ -58,6 +59,43 @@ export function saveBaseline(backendId, suiteId, names) {
     `# Ratchet — CI goes red if any of these regress. Add new passes here\n` +
     `# (run.mjs --update). ${sorted.length} passing. DO NOT hand-sort; the\n` +
     `# harness keeps this sorted + unique.\n`;
+  fs.writeFileSync(p, header + sorted.join("\n") + (sorted.length ? "\n" : ""));
+  return sorted.length;
+}
+
+// --- manifest: the FULL known test set for a suite, shared across backends ---
+// One file per SUITE (not per backend): the same deno_core / rusty_v8 tests run
+// against every v8 backend, so the denominator is backend-independent. It is the
+// monotonic union of every test name ever ENUMERATED (passing ∪ failing) on ANY
+// backend — so it never shrinks, and a backend that under-discovers (e.g. a test
+// binary that won't link) is measured against the full set (95/303), not its own
+// truncated total (95/95). This is the fixed "all tests" denominator agents
+// hill-climb toward.
+export function manifestPath(suiteId) {
+  return path.join(MANIFEST_DIR, `${suiteId}.txt`);
+}
+
+export function loadManifest(suiteId) {
+  const p = manifestPath(suiteId);
+  if (!fs.existsSync(p)) return new Set();
+  return new Set(
+    fs
+      .readFileSync(p, "utf8")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith("#")),
+  );
+}
+
+export function saveManifest(suiteId, names) {
+  const p = manifestPath(suiteId);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  const sorted = [...names].sort();
+  const header =
+    `# Manifest: the FULL known test set for suite=${suiteId} (shared across\n` +
+    `# backends). The fixed denominator — pass/total is measured against THIS,\n` +
+    `# so under-discovery shows as e.g. 95/303 red, not 95/95 green. Monotonic:\n` +
+    `# only grows (union of every enumerated test), never shrinks. ${sorted.length} tests.\n`;
   fs.writeFileSync(p, header + sorted.join("\n") + (sorted.length ? "\n" : ""));
   return sorted.length;
 }
