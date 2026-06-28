@@ -463,6 +463,36 @@ pub unsafe extern "C" fn v82jsc_dynamic_import(
   }
 }
 
+/// Remaining native-stack headroom (bytes) on the current thread. Both JSC
+/// backends are macOS, so the pthread stack-introspection APIs are available.
+/// Returns `usize::MAX` (i.e. "don't guard") if introspection looks wrong, so a
+/// surprising platform can never spuriously trip the guard below.
+fn stack_headroom_bytes() -> usize {
+  unsafe extern "C" {
+    fn pthread_self() -> *mut std::ffi::c_void;
+    fn pthread_get_stackaddr_np(
+      t: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    fn pthread_get_stacksize_np(t: *mut std::ffi::c_void) -> usize;
+  }
+  let probe: u8 = 0;
+  let sp = &probe as *const u8 as usize;
+  unsafe {
+    let t = pthread_self();
+    if t.is_null() {
+      return usize::MAX;
+    }
+    // macOS: stack grows down, `stackaddr` is the high bound (top of stack).
+    let base = pthread_get_stackaddr_np(t) as usize;
+    let size = pthread_get_stacksize_np(t);
+    let low = base.wrapping_sub(size);
+    if base == 0 || size == 0 || sp > base || sp < low {
+      return usize::MAX;
+    }
+    sp - low
+  }
+}
+
 /// JS-callable bridge `globalThis.__v82jsc_dynamicImport(specifier, referrer)`.
 /// The module-source rewriter turns dynamic `import(...)` into a call to this so
 /// dynamic import works WITHOUT a native module-loader hook -- crucial for the
@@ -475,10 +505,30 @@ unsafe extern "C" fn dynamic_import_js_cb(
   _this: JSObjectRef,
   argc: usize,
   argv: *const JSValueRef,
-  _exception: *mut JSValueRef,
+  exception: *mut JSValueRef,
 ) -> JSValueRef {
   crate::jsc::core::ffi_guard(
     || unsafe {
+      // Native-stack guard. A runaway-recursion script — e.g. deno_core's
+      // `dyn_import_recurse_err`: `function bar(){ bar(import(0)); } bar()` —
+      // recurses in JS until just under JSC's stack limit, then calls this
+      // bridge on the deepest frame. The host dynamic-import callback needs a
+      // non-trivial amount of native stack; entering it with almost none left
+      // overflows the C stack (a SIGSEGV that even ffi_guard can't unwind)
+      // instead of surfacing the RangeError the runaway recursion is supposed
+      // to throw. Bail out with a throwable error while there is still stack to
+      // unwind through — this both avoids the crash AND gives the test the
+      // RangeError it expects. 512 KiB is far more than the host callback needs
+      // yet a tiny fraction of a normal thread stack, so a legitimately-shallow
+      // `import()` never trips it.
+      const MIN_STACK_HEADROOM: usize = 512 * 1024;
+      if stack_headroom_bytes() < MIN_STACK_HEADROOM {
+        if !exception.is_null() {
+          *exception =
+            make_generic_error(ctx, "Maximum call stack size exceeded");
+        }
+        return JSValueMakeUndefined(ctx);
+      }
       if argc < 1 || argv.is_null() {
         return JSValueMakeUndefined(ctx);
       }
