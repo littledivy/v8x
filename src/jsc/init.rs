@@ -26,9 +26,10 @@ pub extern "C" fn v8__V8__InitializePlatform(_platform: *mut Platform) {
   //   `ERROR: invalid option: JSC_useExplicitResourceManagement=1` to stderr at
   //   Options::initialize(). That raw fd-2 write interleaves into libtest's
   //   `test NAME ... ok` line and non-deterministically breaks the harness
-  //   parser → baselined tests flap as "MISSING" and the sys-jsc rusty_v8 cell
-  //   flips pass/fail with no code change (denoland/divybot#653). The option is
-  //   an unrecognized no-op on that JSC anyway, so skip it there.
+  //   parser → baselined tests flap as "MISSING" and the sys-jsc cells flip
+  //   pass/fail with no code change (denoland/divybot#653). The option is an
+  //   unrecognized no-op on that JSC anyway, so skip it there.
+  // - useSharedArrayBuffer: the `SharedArrayBuffer` global (deno exposes it;
   //   Workers/Atomics rely on it). Recognized on both, so always set.
   // - useFTLJIT=0: FTL's B3 backend optimizes a side-effect-free infinite loop
   //   (`for(;;){}`) into a bare machine loop with no `op_loop_hint` safe-point,
@@ -36,8 +37,7 @@ pub extern "C" fn v8__V8__InitializePlatform(_platform: *mut Platform) {
   //   (see jsc/terminate.rs) can never interrupt it and the loop hangs forever.
   //   The DFG/baseline tiers keep the safe-point, so dropping just FTL makes such
   //   loops terminable while staying fast. (Allocating loops already hit GC
-  //   safe-points.) vendor_jsc only — same as above, Apple's framework rejects
-  //   the unknown option and pollutes stderr.
+  //   safe-points.) vendor_jsc only — same stderr rejection as above.
   let mut opts: Vec<(&str, &str)> = vec![("JSC_useSharedArrayBuffer", "1")];
   #[cfg(feature = "vendor_jsc")]
   {
