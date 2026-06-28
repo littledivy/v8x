@@ -231,12 +231,33 @@ unsafe fn dispatch(
   argc: c_int,
   argv: *mut JSValue,
 ) -> JSValue {
+  let iso = current_iso();
+
+  // Emulate `v8::Isolate::TerminateExecution`: once a termination is pending, V8
+  // throws an uncatchable exception at the next safe point and runs no further
+  // JS until it is cancelled. The most important safe point for deno_core is the
+  // op call itself — e.g. after an unhandled-rejection handler calls
+  // `reportUnhandledException` (which dispatches an exception and terminates),
+  // the runtime would otherwise go on to `op_dispatch_exception` the *original*
+  // rejection, overwriting the reported one. Refuse to run the op and surface an
+  // uncatchable "interrupted" error instead.
+  if !iso.is_null() && iso_state(iso).is_terminating() {
+    unsafe {
+      // `JS_GetException` takes the pending exception (clearing it), so mark it
+      // uncatchable and re-throw — mirroring QuickJS's own `JS_ThrowInterrupted`.
+      JS_ThrowInternalError(ctx, c"interrupted".as_ptr());
+      let exc = JS_GetException(ctx);
+      JS_SetUncatchableError(ctx, exc);
+      JS_Throw(ctx, exc);
+    }
+    return jsv_exception();
+  }
+
   let n = argc.max(0) as usize;
   let mut args = Vec::with_capacity(n);
   for i in 0..n {
     args.push(unsafe { *argv.add(i) });
   }
-  let iso = current_iso();
 
   // Every handle the callback interns (its arguments, `data`, `this`, any Local
   // it creates) lands in the isolate's handle arena. V8 frees those when the

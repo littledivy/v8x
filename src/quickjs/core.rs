@@ -91,6 +91,20 @@ pub(crate) struct IsoState {
   pub main_ctx_claimed: bool,
 
   pub extra_contexts: Vec<*mut JSContext>,
+
+  // Emulates `v8::Isolate::TerminateExecution`. Set by `TerminateExecution`,
+  // cleared by `CancelTerminateExecution`; while set, the op-dispatch boundary
+  // and the microtask/job drain refuse to run JS (matching V8, which throws an
+  // uncatchable termination exception on the next safe point). An `AtomicBool`
+  // because V8's terminate may be requested from another thread.
+  pub terminating: std::sync::atomic::AtomicBool,
+}
+
+impl IsoState {
+  #[inline(always)]
+  pub fn is_terminating(&self) -> bool {
+    self.terminating.load(std::sync::atomic::Ordering::Acquire)
+  }
 }
 
 thread_local! {
@@ -330,8 +344,21 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     ext_class_id,
     main_ctx_claimed: false,
     extra_contexts: Vec::new(),
+    terminating: std::sync::atomic::AtomicBool::new(false),
   });
-  Box::into_raw(state) as *mut RealIsolate
+  let iso = Box::into_raw(state) as *mut RealIsolate;
+  // Arm the interrupt handler so a runaway loop unwinds once
+  // `TerminateExecution` is requested (the op-dispatch boundary handles the
+  // common "next op after terminate" case directly). The opaque is the isolate
+  // pointer so the handler can read its `terminating` flag.
+  unsafe {
+    JS_SetInterruptHandler(
+      rt,
+      Some(super::isolate::terminate_interrupt_handler),
+      iso as *mut c_void,
+    );
+  }
+  iso
 }
 
 #[unsafe(no_mangle)]

@@ -2414,6 +2414,16 @@ pub extern "C" fn v8__Module__Evaluate(
   } else {
     iso_state(iso).rt
   };
+  // If `Isolate::TerminateExecution` is pending, V8's `Module::Evaluate` returns
+  // an empty handle so the embedder surfaces the termination (deno's mod_evaluate
+  // then sends `ExecutionTerminated`). Mirror that here: otherwise the per-op
+  // interrupt thrown during evaluation is swallowed below and a *resolved*
+  // promise is returned, whose deno completion callback is itself blocked by the
+  // still-pending termination → the evaluation future never settles (hang). This
+  // is the terminate feature's concern, not module loading.
+  if !iso.is_null() && iso_state(iso).is_terminating() {
+    return ptr::null();
+  }
   let _t0 = if std::env::var_os("V82JSC_TIMING").is_some() {
     Some(std::time::Instant::now())
   } else {

@@ -236,6 +236,11 @@ pub type JSHostPromiseRejectionTracker = unsafe extern "C" fn(
   opaque: *mut c_void,
 );
 
+// `typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);`
+// Return != 0 to interrupt the running JS.
+pub type JSInterruptHandler =
+  unsafe extern "C" fn(rt: *mut JSRuntime, opaque: *mut c_void) -> c_int;
+
 unsafe extern "C" {
   pub fn JS_GetVersion() -> *const std::os::raw::c_char;
   pub fn JS_NewRuntime() -> *mut JSRuntime;
@@ -256,6 +261,21 @@ unsafe extern "C" {
     rt: *mut JSRuntime,
     pctx: *mut *mut JSContext,
   ) -> c_int;
+
+  // Installs a callback QuickJS polls at safe points (loop back-edges, calls)
+  // while JS executes; returning non-zero raises an *uncatchable* "interrupted"
+  // InternalError that unwinds the running script. Used to emulate
+  // `v8::Isolate::TerminateExecution` for long-running loops.
+  pub fn JS_SetInterruptHandler(
+    rt: *mut JSRuntime,
+    cb: Option<JSInterruptHandler>,
+    opaque: *mut c_void,
+  );
+
+  // Marks an error value (must be a pending exception) so `try`/`catch` cannot
+  // catch it — the same property QuickJS gives its own interrupt exception. Used
+  // when we synthesize a termination exception from a native callback boundary.
+  pub fn JS_SetUncatchableError(ctx: *mut JSContext, val: JSValue);
 
   pub fn JS_NewContext(rt: *mut JSRuntime) -> *mut JSContext;
   pub fn JS_NewContextRaw(rt: *mut JSRuntime) -> *mut JSContext;

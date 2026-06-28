@@ -151,6 +151,43 @@ pub extern "C" fn v8__Context__GetDataFromSnapshotOnce(
   ptr::null()
 }
 
+/// Native `getContinuationPreservedEmbedderData` for the extras binding object.
+/// Reads the SAME per-thread store as
+/// `v8__Context__GetContinuationPreservedEmbedderData` (`CONTINUATION_DATA`) so
+/// the JS-visible "async context" (deno's `getAsyncContext`) and the native one
+/// deno's Rust reads inside `promise_reject_callback` are one and the same.
+/// Before this, the extras object stored it in a JS closure variable, so the
+/// async context captured at promise-rejection time (read natively) was always
+/// `undefined`.
+unsafe extern "C" fn extras_get_cped(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
+  let stored = CONTINUATION_DATA.with(|c| c.get());
+  unsafe { JS_DupValue(ctx, stored) }
+}
+
+/// Native `setContinuationPreservedEmbedderData` for the extras binding object;
+/// writes the shared `CONTINUATION_DATA` store (see [`extras_get_cped`]).
+unsafe extern "C" fn extras_set_cped(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  let v = if argc >= 1 {
+    unsafe { *argv }
+  } else {
+    jsv_undefined()
+  };
+  let new = unsafe { JS_DupValue(ctx, v) };
+  let old = CONTINUATION_DATA.with(|c| c.replace(new));
+  unsafe { JS_FreeValue(ctx, old) };
+  jsv_undefined()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetExtrasBindingObject(
   this: *const Context,
@@ -159,36 +196,37 @@ pub extern "C" fn v8__Context__GetExtrasBindingObject(
   if ctx.is_null() {
     return ptr::null();
   }
-  const SRC: &[u8] = b"(function(){\
-        var __cped = undefined;\
-        return {\
-            console: {},\
-            getContinuationPreservedEmbedderData: function(){ return __cped; },\
-            setContinuationPreservedEmbedderData: function(v){ __cped = v; },\
-        };\
-    })()\0";
-  let fname = c"<extras>";
-  let obj = unsafe {
-    JS_Eval(
-      ctx,
-      SRC.as_ptr() as *const std::os::raw::c_char,
-      SRC.len() - 1,
-      fname.as_ptr(),
-      JS_EVAL_TYPE_GLOBAL,
-    )
-  };
-  if obj.tag == JS_TAG_EXCEPTION {
-    let exc = unsafe { JS_GetException(ctx) };
-    unsafe { JS_FreeValue(ctx, exc) };
-    let o = unsafe { JS_NewObject(ctx) };
-    let console = unsafe { JS_NewObject(ctx) };
-    unsafe {
-      JS_SetPropertyStr(ctx, o, c"console".as_ptr(), console);
-    }
-    return intern::<Object>(o);
-  }
+  unsafe {
+    let o = JS_NewObject(ctx);
+    let console = JS_NewObject(ctx);
+    JS_SetPropertyStr(ctx, o, c"console".as_ptr(), console);
 
-  intern::<Object>(obj)
+    let getf = JS_NewCFunction(
+      ctx,
+      extras_get_cped,
+      c"getContinuationPreservedEmbedderData".as_ptr(),
+      0,
+    );
+    let setf = JS_NewCFunction(
+      ctx,
+      extras_set_cped,
+      c"setContinuationPreservedEmbedderData".as_ptr(),
+      1,
+    );
+    JS_SetPropertyStr(
+      ctx,
+      o,
+      c"getContinuationPreservedEmbedderData".as_ptr(),
+      getf,
+    );
+    JS_SetPropertyStr(
+      ctx,
+      o,
+      c"setContinuationPreservedEmbedderData".as_ptr(),
+      setf,
+    );
+    intern::<Object>(o)
+  }
 }
 
 thread_local! {
@@ -398,23 +436,64 @@ pub extern "C" fn v8__Context__GetContinuationPreservedEmbedderData(
   intern_dup::<Value>(ctx, stored)
 }
 
+/// Resolve the isolate to operate on: the explicit argument if non-null,
+/// otherwise the current/last isolate on this thread (the C-ABI surface
+/// sometimes passes null and relies on the thread's active isolate, mirroring
+/// other entry points here).
+fn terminate_target(isolate: *const RealIsolate) -> *mut RealIsolate {
+  if isolate.is_null() {
+    current_iso()
+  } else {
+    isolate as *mut RealIsolate
+  }
+}
+
+/// QuickJS interrupt callback. Returns non-zero (→ uncatchable "interrupted"
+/// error that unwinds the running script) once `TerminateExecution` is
+/// requested. Polled at loop back-edges and calls, so it terminates a runaway
+/// loop; the op-dispatch boundary (see `function.rs`) handles the more common
+/// "first op after terminate" case immediately, without waiting for a poll.
+pub(crate) unsafe extern "C" fn terminate_interrupt_handler(
+  _rt: *mut JSRuntime,
+  opaque: *mut c_void,
+) -> c_int {
+  let iso = opaque as *mut RealIsolate;
+  if iso.is_null() {
+    return 0;
+  }
+  iso_state(iso).is_terminating() as c_int
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__TerminateExecution(
-  _isolate: *const RealIsolate,
-) {
+pub extern "C" fn v8__Isolate__TerminateExecution(isolate: *const RealIsolate) {
+  let iso = terminate_target(isolate);
+  if iso.is_null() {
+    return;
+  }
+  iso_state(iso)
+    .terminating
+    .store(true, std::sync::atomic::Ordering::Release);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__IsExecutionTerminating(
-  _isolate: *const RealIsolate,
+  isolate: *const RealIsolate,
 ) -> bool {
-  false
+  let iso = terminate_target(isolate);
+  !iso.is_null() && iso_state(iso).is_terminating()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__CancelTerminateExecution(
-  _isolate: *const RealIsolate,
+  isolate: *const RealIsolate,
 ) {
+  let iso = terminate_target(isolate);
+  if iso.is_null() {
+    return;
+  }
+  iso_state(iso)
+    .terminating
+    .store(false, std::sync::atomic::Ordering::Release);
 }
 
 #[unsafe(no_mangle)]
