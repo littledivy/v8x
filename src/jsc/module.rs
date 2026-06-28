@@ -64,6 +64,11 @@ struct SyntheticModule {
 
   source: Option<std::string::String>,
 
+  // The `//# sourceMappingURL=` magic-comment value (if any), extracted from the
+  // original module source at compile. deno reads this via
+  // UnboundModuleScript::GetSourceMappingURL to register native source maps.
+  source_map_url: Option<std::string::String>,
+
   import_specifiers: Vec<std::string::String>,
 
   namespace: JSObjectRef,
@@ -1350,6 +1355,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
           export_names: Vec::new(),
           eval_steps: None,
           source: None,
+          source_map_url: extract_source_mapping_url(&text),
           import_specifiers: specs,
           namespace: ptr::null_mut(),
           specifier,
@@ -1416,6 +1422,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
       export_names: rewrite.export_names,
       eval_steps: None,
       source: Some(rewrite.body),
+      source_map_url: extract_source_mapping_url(&text),
       import_specifiers: rewrite.imports,
       namespace,
       specifier,
@@ -2307,14 +2314,48 @@ pub(crate) fn make_placeholder_code_cache() -> *mut CachedData<'static> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__UnboundModuleScript__GetSourceMappingURL(
-  _script: *const UnboundModuleScript,
+  script: *const UnboundModuleScript,
 ) -> *const Value {
   let ctx = current_ctx();
   if ctx.is_null() {
     return ptr::null();
   }
+  // GetUnboundModuleScript returns the Module value unchanged, so `script` is the
+  // module handle; recover its `//# sourceMappingURL=` (extracted at compile).
+  // deno reads this to register native source maps (inline data: or external).
+  let url = module_state(script as *const Module)
+    .and_then(|m| m.source_map_url.clone());
+  if let Some(url) = url {
+    if let Ok(c) = std::ffi::CString::new(url) {
+      unsafe {
+        let s = JSStringCreateWithUTF8CString(c.as_ptr());
+        let v = JSValueMakeString(ctx, s);
+        JSStringRelease(s);
+        return intern_ctx::<Value>(ctx, v);
+      }
+    }
+  }
   let v = unsafe { JSValueMakeUndefined(ctx) };
   intern_ctx::<Value>(ctx, v)
+}
+
+/// Extract the last `//# sourceMappingURL=<url>` (or legacy `//@`) magic comment
+/// from module source, mirroring V8's UnboundModuleScript::GetSourceMappingURL.
+/// V8 honours the LAST occurrence; the URL is the trimmed remainder of the line.
+fn extract_source_mapping_url(text: &str) -> Option<std::string::String> {
+  let mut found: Option<std::string::String> = None;
+  for line in text.lines() {
+    let t = line.trim();
+    for prefix in ["//# sourceMappingURL=", "//@ sourceMappingURL="] {
+      if let Some(rest) = t.strip_prefix(prefix) {
+        let url = rest.trim();
+        if !url.is_empty() {
+          found = Some(url.to_string());
+        }
+      }
+    }
+  }
+  found
 }
 
 #[unsafe(no_mangle)]
@@ -3352,6 +3393,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
     export_names: names,
     eval_steps: Some(steps),
     source: None,
+    source_map_url: None,
     import_specifiers: Vec::new(),
     namespace,
     specifier,
