@@ -1253,8 +1253,13 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
 
   // Corrected frames, collected for deno's native (source-mapping) formatter:
   // (file, line, column, function-name, is_top_level).
-  let mut frames: Vec<(std::string::String, i32, i32, Option<std::string::String>, bool)> =
-    Vec::new();
+  let mut frames: Vec<(
+    std::string::String,
+    i32,
+    i32,
+    Option<std::string::String>,
+    bool,
+  )> = Vec::new();
 
   for i in 0..len as u32 {
     let site = unsafe { JS_GetPropertyUint32(ctx, sites, i) };
@@ -1304,9 +1309,7 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
   // hand it the SAME corrected frames computed above as synthetic CallSite
   // objects, so the column/function-name fixes survive and unmapped frames
   // (e.g. no source map) format identically to the string built here.
-  if let Some(mapped) =
-    unsafe { source_mapped_stack(ctx, error, &frames) }
-  {
+  if let Some(mapped) = unsafe { source_mapped_stack(ctx, error, &frames) } {
     return mapped;
   }
 
@@ -1344,7 +1347,13 @@ const CALLSITE_FACTORY_SRC: &str = "(function(d){return d.map(function(f){\
 /// an owned (+1) JSValue array, or `None` on failure.
 unsafe fn build_callsites(
   ctx: *mut JSContext,
-  frames: &[(std::string::String, i32, i32, Option<std::string::String>, bool)],
+  frames: &[(
+    std::string::String,
+    i32,
+    i32,
+    Option<std::string::String>,
+    bool,
+  )],
 ) -> Option<JSValue> {
   unsafe {
     // Evaluate the factory function.
@@ -1370,18 +1379,12 @@ unsafe fn build_callsites(
     }
     for (i, (file, line, col, func, top)) in frames.iter().enumerate() {
       let row = JS_NewArray(ctx);
-      let fv = JS_NewStringLen(
-        ctx,
-        file.as_ptr() as *const c_char,
-        file.len(),
-      );
+      let fv = JS_NewStringLen(ctx, file.as_ptr() as *const c_char, file.len());
       JS_SetPropertyUint32(ctx, row, 0, fv);
       JS_SetPropertyUint32(ctx, row, 1, JS_NewInt32(ctx, *line));
       JS_SetPropertyUint32(ctx, row, 2, JS_NewInt32(ctx, *col));
       let fnv = match func {
-        Some(f) => {
-          JS_NewStringLen(ctx, f.as_ptr() as *const c_char, f.len())
-        }
+        Some(f) => JS_NewStringLen(ctx, f.as_ptr() as *const c_char, f.len()),
         None => jsv_null(),
       };
       JS_SetPropertyUint32(ctx, row, 3, fnv);
@@ -1405,9 +1408,7 @@ unsafe fn build_callsites(
 /// object handle and the saved callback to restore afterwards). deno's native
 /// callback re-dispatches to a user `Error.prepareStackTrace` if present — which
 /// is *this* shim — so it must be cleared while we invoke the callback.
-unsafe fn take_prepare_stack_trace(
-  ctx: *mut JSContext,
-) -> (JSValue, JSValue) {
+unsafe fn take_prepare_stack_trace(ctx: *mut JSContext) -> (JSValue, JSValue) {
   unsafe {
     let global = JS_GetGlobalObject(ctx);
     let error = JS_GetPropertyStr(ctx, global, c"Error".as_ptr());
@@ -1417,8 +1418,7 @@ unsafe fn take_prepare_stack_trace(
       JS_FreeValue(ctx, error);
       return (jsv_undefined(), jsv_undefined());
     }
-    let saved =
-      JS_GetPropertyStr(ctx, error, c"prepareStackTrace".as_ptr());
+    let saved = JS_GetPropertyStr(ctx, error, c"prepareStackTrace".as_ptr());
     JS_SetPropertyStr(
       ctx,
       error,
@@ -1454,7 +1454,13 @@ unsafe fn restore_prepare_stack_trace(
 unsafe fn source_mapped_stack(
   ctx: *mut JSContext,
   error: JSValue,
-  frames: &[(std::string::String, i32, i32, Option<std::string::String>, bool)],
+  frames: &[(
+    std::string::String,
+    i32,
+    i32,
+    Option<std::string::String>,
+    bool,
+  )],
 ) -> Option<JSValue> {
   let cb = PREPARE_STACK_TRACE_CB.with(|c| c.get())?;
   if ctx.is_null() {
