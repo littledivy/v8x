@@ -1,6 +1,6 @@
 {
-  "generated": "2026-06-28T13:40:31.034Z",
-  "commit": "304dfeb97cecd86bad8e1bd6187f14a8acb334bb",
+  "generated": "2026-06-28T14:31:24.051Z",
+  "commit": "bfcda7b999bc58e07c07f85c8b027c0b68946485",
   "backends": [
     {
       "id": "jsc",
@@ -9,8 +9,8 @@
     },
     {
       "id": "sys-jsc",
-      "label": "JavaScriptCore System 20621.3.11.11.3",
-      "version": "20621.3.11.11.3"
+      "label": "JavaScriptCore System 21624.1.16.11.4",
+      "version": "21624.1.16.11.4"
     },
     {
       "id": "quickjs",
@@ -77,17 +77,17 @@
         "fresh": true
       },
       "deno_core": {
-        "pass": 376,
+        "pass": 377,
         "total": 416,
-        "baseline": 376,
-        "fail": 30,
+        "baseline": 377,
+        "fail": 29,
         "tier": "build",
         "fresh": true
       }
     }
   },
   "totals": {
-    "pass": 1257,
+    "pass": 1258,
     "known": 2049
   }
 }
