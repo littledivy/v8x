@@ -365,6 +365,28 @@ fn parse_loc(loc: &str) -> (&str, i32, i32) {
   (file, line, col)
 }
 
+/// Return the `(line, col)` of the first `    at <…>:line:col` frame in a stack
+/// string, or `(0, 0)` if none. Used by `Script::Compile` to recover a
+/// SyntaxError's parse location for deno's `from_v8_message` fallback.
+pub(crate) fn first_frame_line_col(stack: &str) -> (i32, i32) {
+  for line in stack.lines() {
+    let t = line.trim();
+    let Some(rest) = t.strip_prefix("at ") else {
+      continue;
+    };
+    // `<func> (<loc>)` or bare `<loc>`.
+    let loc = match (rest.find('('), rest.strip_suffix(')')) {
+      (Some(p), Some(_)) => &rest[p + 1..rest.len() - 1],
+      _ => rest,
+    };
+    let (_, line_no, col_no) = parse_loc(loc.trim());
+    if line_no > 0 {
+      return (line_no, col_no);
+    }
+  }
+  (0, 0)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackTrace__CurrentStackTrace(
   isolate: *mut RealIsolate,
@@ -1243,6 +1265,13 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     let Some(file) = file else {
       unsafe { JS_FreeValue(ctx, site) };
       continue;
+    };
+    // V8 reports an unnamed (eval'd) script as `<anonymous>`; quickjs uses our
+    // `<eval>` sentinel. Normalise so deno's stack matches V8.
+    let file = if file == "<eval>" {
+      "<anonymous>".to_string()
+    } else {
+      file
     };
     let line = unsafe { call_site_int(ctx, site, c"getLineNumber") };
     let mut col = unsafe { call_site_int(ctx, site, c"getColumnNumber") };

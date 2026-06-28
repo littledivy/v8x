@@ -183,6 +183,7 @@ deno_core::runtime::ops::tests::test_op_async_state
 deno_core::runtime::ops::tests::test_op_async_void
 deno_core::runtime::ops::tests::test_op_bool
 deno_core::runtime::ops::tests::test_op_bool_to_from_v8
+deno_core::runtime::ops::tests::test_op_bool_to_from_v8_error
 deno_core::runtime::ops::tests::test_op_buffer_any
 deno_core::runtime::ops::tests::test_op_buffer_any_length
 deno_core::runtime::ops::tests::test_op_buffer_bytesmut
@@ -204,6 +205,7 @@ deno_core::runtime::ops::tests::test_op_strings
 deno_core::runtime::ops::tests::test_op_v8_types
 deno_core::runtime::ops::tests::test_typed_external
 deno_core::runtime::tests::error::fast_call_error_preserves_class
+deno_core::runtime::tests::error::syntax_error
 deno_core::runtime::tests::error::test_error_builder
 deno_core::runtime::tests::jsrealm::js_realm_ref_unref_ops
 deno_core::runtime::tests::jsrealm::lazy
