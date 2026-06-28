@@ -153,6 +153,12 @@ struct ModuleState {
 
   source_text: std::string::String,
   source_name: std::string::String,
+
+  // The `//# sourceMappingURL=` magic-comment value (if any), extracted from the
+  // module source at compile time. deno reads it via
+  // UnboundModuleScript::GetSourceMappingURL to register native source maps
+  // (inline `data:` payloads or external `.map` files).
+  source_map_url: Option<std::string::String>,
 }
 
 thread_local! {
@@ -746,6 +752,26 @@ fn parse_import_specifiers(
 /// `specifiers`. This is V8's `ModuleRequest::source_offset` /
 /// deno's `referrer_source_offset`. A cursor advances past each match so a later
 /// identical specifier resolves to its own occurrence.
+/// Extract the last `//# sourceMappingURL=<url>` (or legacy `//@`) magic comment
+/// from module source, mirroring V8's UnboundModuleScript::GetSourceMappingURL.
+/// V8 honours the LAST occurrence; the URL is the trimmed remainder of the line.
+/// Trailing content/blank lines after the directive are ignored (deno#21988).
+fn extract_source_mapping_url(text: &str) -> Option<std::string::String> {
+  let mut found: Option<std::string::String> = None;
+  for line in text.lines() {
+    let t = line.trim();
+    for prefix in ["//# sourceMappingURL=", "//@ sourceMappingURL="] {
+      if let Some(rest) = t.strip_prefix(prefix) {
+        let url = rest.trim();
+        if !url.is_empty() {
+          found = Some(url.to_string());
+        }
+      }
+    }
+  }
+  found
+}
+
 fn compute_import_offsets(
   text: &str,
   specifiers: &[std::string::String],
@@ -1767,6 +1793,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
       source_imports,
       synthetic: false,
       is_async,
+      source_map_url: extract_source_mapping_url(&text),
       source_text: text,
       source_name: fname.clone(),
     },
@@ -1940,8 +1967,28 @@ pub extern "C" fn v8__UnboundScript__GetSourceMappingURL(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__UnboundModuleScript__GetSourceMappingURL(
-  _script: *const UnboundModuleScript,
+  script: *const UnboundModuleScript,
 ) -> *const Value {
+  let ctx = current_ctx();
+  // GetUnboundModuleScript returns the Module value unchanged (dup'd), so the
+  // `script` handle shares the Module's underlying JSObject pointer — recover the
+  // `//# sourceMappingURL=` extracted at compile time. deno reads this to
+  // register native source maps (inline `data:` or external `.map`).
+  let url =
+    with_module_state(script as *const Module, |m| m.source_map_url.clone())
+      .flatten();
+  if !ctx.is_null() {
+    if let Some(url) = url {
+      let val = unsafe {
+        JS_NewStringLen(
+          ctx,
+          url.as_ptr() as *const std::os::raw::c_char,
+          url.len(),
+        )
+      };
+      return intern::<Value>(val);
+    }
+  }
   intern::<Value>(jsv_undefined())
 }
 
@@ -2801,6 +2848,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
       source_imports: Vec::new(),
       synthetic: true,
       is_async: false,
+      source_map_url: None,
       source_text: std::string::String::new(),
       source_name: std::string::String::new(),
     },

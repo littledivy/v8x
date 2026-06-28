@@ -1005,10 +1005,30 @@ use std::os::raw::c_int;
 thread_local! {
   static PREPARE_STACK_ACTIVE: std::cell::Cell<bool> =
     const { std::cell::Cell::new(false) };
+
+  // deno's native PrepareStackTraceCallback (registered via
+  // v8__Isolate__SetPrepareStackTraceCallback). QuickJS has no engine hook for
+  // it, so our JS `Error.prepareStackTrace` forwards the (corrected) frames into
+  // this callback when it's set — deno's formatter then applies native source
+  // maps (the `//# sourceMappingURL=` payloads surfaced by
+  // UnboundModuleScript::GetSourceMappingURL) before producing the stack string.
+  static PREPARE_STACK_TRACE_CB: std::cell::Cell<
+    Option<crate::isolate::PrepareStackTraceCallback<'static>>,
+  > = const { std::cell::Cell::new(None) };
 }
 
 pub(crate) fn is_prepare_stack_active() -> bool {
   PREPARE_STACK_ACTIVE.with(|c| c.get())
+}
+
+/// Store deno's native PrepareStackTraceCallback so our `Error.prepareStackTrace`
+/// can forward into it (enabling source-map resolution). Also flips the active
+/// flag so new contexts install the shim.
+pub(crate) fn set_prepare_stack_trace_cb(
+  cb: crate::isolate::PrepareStackTraceCallback<'static>,
+) {
+  PREPARE_STACK_TRACE_CB.with(|c| c.set(Some(cb)));
+  activate_prepare_stack();
 }
 
 /// Record that this thread's runtime registered a PrepareStackTraceCallback, so
@@ -1231,6 +1251,11 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     n.max(0)
   };
 
+  // Corrected frames, collected for deno's native (source-mapping) formatter:
+  // (file, line, column, function-name, is_top_level).
+  let mut frames: Vec<(std::string::String, i32, i32, Option<std::string::String>, bool)> =
+    Vec::new();
+
   for i in 0..len as u32 {
     let site = unsafe { JS_GetPropertyUint32(ctx, sites, i) };
     if site.tag == JS_TAG_EXCEPTION {
@@ -1261,6 +1286,8 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
       None | Some("") | Some("global code") | Some("<eval>")
     );
 
+    frames.push((file.clone(), line, col, func.clone(), is_top_level));
+
     out.push_str("\n    at ");
     if is_top_level {
       append_location(&mut out, &file, line, col);
@@ -1272,6 +1299,194 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     }
   }
 
+  // Prefer deno's native formatter when it's registered: it applies source maps
+  // (the `//# sourceMappingURL=` payloads) to each frame's file/line/column. We
+  // hand it the SAME corrected frames computed above as synthetic CallSite
+  // objects, so the column/function-name fixes survive and unmapped frames
+  // (e.g. no source map) format identically to the string built here.
+  if let Some(mapped) =
+    unsafe { source_mapped_stack(ctx, error, &frames) }
+  {
+    return mapped;
+  }
+
   let bytes = out.as_bytes();
   unsafe { JS_NewStringLen(ctx, bytes.as_ptr() as *const c_char, bytes.len()) }
+}
+
+/// JS factory that turns rows of `[file, line, col, funcOrNull, isTopLevel]`
+/// into the V8-shaped CallSite objects deno's `from_callsite_object` consumes
+/// (it calls each accessor and applies source maps to file/line/column).
+const CALLSITE_FACTORY_SRC: &str = "(function(d){return d.map(function(f){\
+  var file=f[0],line=f[1],col=f[2],top=f[4],fn=top?null:f[3];\
+  return {\
+    getFileName:function(){return file||undefined;},\
+    getScriptNameOrSourceURL:function(){return file||undefined;},\
+    getLineNumber:function(){return line||undefined;},\
+    getColumnNumber:function(){return col||undefined;},\
+    getFunctionName:function(){return fn;},\
+    getMethodName:function(){return fn;},\
+    getTypeName:function(){return null;},\
+    getEvalOrigin:function(){return undefined;},\
+    getThis:function(){return undefined;},\
+    getFunction:function(){return undefined;},\
+    isToplevel:function(){return top;},\
+    isEval:function(){return false;},\
+    isNative:function(){return false;},\
+    isConstructor:function(){return false;},\
+    isAsync:function(){return false;},\
+    isPromiseAll:function(){return false;},\
+    getPromiseIndex:function(){return null;},\
+    toString:function(){return fn?(fn+' ('+file+':'+line+':'+col+')'):(file+':'+line+':'+col);}\
+  };});})\0";
+
+/// Build the synthetic CallSite array (one entry per corrected frame). Returns
+/// an owned (+1) JSValue array, or `None` on failure.
+unsafe fn build_callsites(
+  ctx: *mut JSContext,
+  frames: &[(std::string::String, i32, i32, Option<std::string::String>, bool)],
+) -> Option<JSValue> {
+  unsafe {
+    // Evaluate the factory function.
+    let factory = JS_Eval(
+      ctx,
+      CALLSITE_FACTORY_SRC.as_ptr() as *const c_char,
+      CALLSITE_FACTORY_SRC.len() - 1,
+      c"<callsite-factory>".as_ptr(),
+      JS_EVAL_TYPE_GLOBAL,
+    );
+    if factory.tag == JS_TAG_EXCEPTION || !JS_IsFunction(ctx, factory) {
+      clear_pending(ctx);
+      JS_FreeValue(ctx, factory);
+      return None;
+    }
+
+    // Build the input rows array.
+    let rows = JS_NewArray(ctx);
+    if rows.tag == JS_TAG_EXCEPTION {
+      clear_pending(ctx);
+      JS_FreeValue(ctx, factory);
+      return None;
+    }
+    for (i, (file, line, col, func, top)) in frames.iter().enumerate() {
+      let row = JS_NewArray(ctx);
+      let fv = JS_NewStringLen(
+        ctx,
+        file.as_ptr() as *const c_char,
+        file.len(),
+      );
+      JS_SetPropertyUint32(ctx, row, 0, fv);
+      JS_SetPropertyUint32(ctx, row, 1, JS_NewInt32(ctx, *line));
+      JS_SetPropertyUint32(ctx, row, 2, JS_NewInt32(ctx, *col));
+      let fnv = match func {
+        Some(f) => {
+          JS_NewStringLen(ctx, f.as_ptr() as *const c_char, f.len())
+        }
+        None => jsv_null(),
+      };
+      JS_SetPropertyUint32(ctx, row, 3, fnv);
+      JS_SetPropertyUint32(ctx, row, 4, JS_NewBool(ctx, *top as c_int));
+      JS_SetPropertyUint32(ctx, rows, i as u32, row);
+    }
+
+    let mut args = [rows];
+    let sites = JS_Call(ctx, factory, jsv_undefined(), 1, args.as_mut_ptr());
+    JS_FreeValue(ctx, rows);
+    JS_FreeValue(ctx, factory);
+    if sites.tag == JS_TAG_EXCEPTION {
+      clear_pending(ctx);
+      return None;
+    }
+    Some(sites)
+  }
+}
+
+/// Temporarily clear `globalThis.Error.prepareStackTrace` (returns the Error
+/// object handle and the saved callback to restore afterwards). deno's native
+/// callback re-dispatches to a user `Error.prepareStackTrace` if present — which
+/// is *this* shim — so it must be cleared while we invoke the callback.
+unsafe fn take_prepare_stack_trace(
+  ctx: *mut JSContext,
+) -> (JSValue, JSValue) {
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let error = JS_GetPropertyStr(ctx, global, c"Error".as_ptr());
+    JS_FreeValue(ctx, global);
+    if error.tag == JS_TAG_EXCEPTION || !JS_IsFunction(ctx, error) {
+      clear_pending(ctx);
+      JS_FreeValue(ctx, error);
+      return (jsv_undefined(), jsv_undefined());
+    }
+    let saved =
+      JS_GetPropertyStr(ctx, error, c"prepareStackTrace".as_ptr());
+    JS_SetPropertyStr(
+      ctx,
+      error,
+      c"prepareStackTrace".as_ptr(),
+      jsv_undefined(),
+    );
+    (error, saved)
+  }
+}
+
+/// Restore the previously-saved `Error.prepareStackTrace`.
+unsafe fn restore_prepare_stack_trace(
+  ctx: *mut JSContext,
+  error: JSValue,
+  saved: JSValue,
+) {
+  unsafe {
+    if error.tag == JS_TAG_EXCEPTION || !JS_IsFunction(ctx, error) {
+      JS_FreeValue(ctx, error);
+      JS_FreeValue(ctx, saved);
+      return;
+    }
+    // JS_SetPropertyStr consumes `saved`.
+    JS_SetPropertyStr(ctx, error, c"prepareStackTrace".as_ptr(), saved);
+    JS_FreeValue(ctx, error);
+  }
+}
+
+/// Forward the corrected `frames` into deno's native PrepareStackTraceCallback,
+/// returning the source-mapped, V8-formatted stack string. `None` when no
+/// callback is registered (the bare rusty_v8 cell) or anything fails, so the
+/// caller keeps its own string.
+unsafe fn source_mapped_stack(
+  ctx: *mut JSContext,
+  error: JSValue,
+  frames: &[(std::string::String, i32, i32, Option<std::string::String>, bool)],
+) -> Option<JSValue> {
+  let cb = PREPARE_STACK_TRACE_CB.with(|c| c.get())?;
+  if ctx.is_null() {
+    return None;
+  }
+  let sites = unsafe { build_callsites(ctx, frames) }?;
+
+  let (error_obj, saved) = unsafe { take_prepare_stack_trace(ctx) };
+
+  let out = unsafe {
+    let ctx_h = super::core::intern_ctx(ctx);
+    let err_h = intern_dup::<Value>(ctx, error);
+    let sites_h = intern::<crate::Array>(sites); // consumes `sites`
+    match (
+      crate::Local::from_raw(ctx_h),
+      crate::Local::from_raw(err_h),
+      crate::Local::from_raw(sites_h),
+    ) {
+      (Some(c_l), Some(e_l), Some(s_l)) => {
+        let ret = cb(c_l, e_l, s_l);
+        // PrepareStackTraceCallbackRet wraps a private `*const Value`.
+        let v: *const Value = std::mem::transmute(ret);
+        if v.is_null() {
+          None
+        } else {
+          Some(JS_DupValue(ctx, jsval_of(v)))
+        }
+      }
+      _ => None,
+    }
+  };
+
+  unsafe { restore_prepare_stack_trace(ctx, error_obj, saved) };
+  out
 }
