@@ -1,6 +1,6 @@
 {
-  "generated": "2026-06-28T07:00:00.503Z",
-  "commit": "14582a0d9fe8a9608a06f62e5b77bfad6221d5d9",
+  "generated": "2026-06-28T07:33:41.867Z",
+  "commit": "248e41a58693a8dfb639e82f3966923212af62ac",
   "backends": [
     {
       "id": "jsc",
@@ -9,8 +9,8 @@
     },
     {
       "id": "sys-jsc",
-      "label": "JavaScriptCore System 20621.3.11.11.3",
-      "version": "20621.3.11.11.3"
+      "label": "JavaScriptCore System 21624.1.16.11.4",
+      "version": "21624.1.16.11.4"
     },
     {
       "id": "quickjs",
@@ -60,7 +60,7 @@
       },
       "deno_core": {
         "pass": 95,
-        "total": 95,
+        "total": 303,
         "baseline": 95,
         "fail": 0,
         "tier": "build",
@@ -69,16 +69,16 @@
     },
     "quickjs": {
       "rusty_v8": {
-        "pass": 44,
-        "total": 265,
-        "baseline": 44,
+        "pass": 43,
+        "total": 264,
+        "baseline": 45,
         "fail": 221,
         "tier": "build",
         "fresh": true
       },
       "deno_core": {
         "pass": 95,
-        "total": 95,
+        "total": 303,
         "baseline": 95,
         "fail": 0,
         "tier": "build",
@@ -87,7 +87,7 @@
     }
   },
   "totals": {
-    "pass": 586,
-    "known": 1286
+    "pass": 585,
+    "known": 1701
   }
 }
