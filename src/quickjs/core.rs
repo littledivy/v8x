@@ -74,6 +74,13 @@ pub(crate) struct IsoState {
 
   pub data_slots: [*mut c_void; 4],
 
+  // QuickJS class id for `v8::External` objects. Registered on the runtime
+  // BEFORE the first JSContext is created (see `v8__Isolate__New`): a context
+  // sizes its per-context `class_proto` array to `rt->class_count` at creation
+  // time and never grows it, so a class registered afterward would make
+  // `JS_NewObjectClass(ctx, id)` read `class_proto[id]` out of bounds.
+  pub ext_class_id: JSClassID,
+
   // Whether the bootstrap context (`ctx`) has been handed out by
   // `v8__Context__New`. QuickJS has one global object per JSContext, but
   // deno_core uses multiple v8::Contexts (notably during snapshot creation,
@@ -301,6 +308,13 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
       ptr::null_mut(),
     )
   };
+  // Register custom classes (currently just `v8::External`) on the runtime
+  // BEFORE creating the context, so the context's `class_proto` array is sized
+  // to include them. Registering after `JS_NewContext` would leave
+  // `JS_NewObjectClass` indexing `class_proto` out of bounds (heap overflow that
+  // hands back a garbage prototype and later corrupts the GC heap).
+  let ext_class_id = super::function::register_external_class(rt);
+
   let ctx = unsafe { JS_NewContext(rt) };
   assert!(!ctx.is_null(), "JS_NewContext failed");
 
@@ -313,6 +327,7 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     contexts: Vec::new(),
     handles: Vec::new(),
     data_slots: [ptr::null_mut(); 4],
+    ext_class_id,
     main_ctx_claimed: false,
     extra_contexts: Vec::new(),
   });
