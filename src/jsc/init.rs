@@ -29,11 +29,21 @@ pub extern "C" fn v8__V8__InitializePlatform(_platform: *mut Platform) {
   //   parser → baselined tests flap as "MISSING" and the sys-jsc rusty_v8 cell
   //   flips pass/fail with no code change (denoland/divybot#653). The option is
   //   an unrecognized no-op on that JSC anyway, so skip it there.
-  // - useSharedArrayBuffer: the `SharedArrayBuffer` global (deno exposes it;
   //   Workers/Atomics rely on it). Recognized on both, so always set.
+  // - useFTLJIT=0: FTL's B3 backend optimizes a side-effect-free infinite loop
+  //   (`for(;;){}`) into a bare machine loop with no `op_loop_hint` safe-point,
+  //   so the execution-time-limit watchdog backing `Isolate::TerminateExecution`
+  //   (see jsc/terminate.rs) can never interrupt it and the loop hangs forever.
+  //   The DFG/baseline tiers keep the safe-point, so dropping just FTL makes such
+  //   loops terminable while staying fast. (Allocating loops already hit GC
+  //   safe-points.) vendor_jsc only — same as above, Apple's framework rejects
+  //   the unknown option and pollutes stderr.
   let mut opts: Vec<(&str, &str)> = vec![("JSC_useSharedArrayBuffer", "1")];
   #[cfg(feature = "vendor_jsc")]
-  opts.push(("JSC_useExplicitResourceManagement", "1"));
+  {
+    opts.push(("JSC_useExplicitResourceManagement", "1"));
+    opts.push(("JSC_useFTLJIT", "0"));
+  }
   for (key, val) in opts {
     if std::env::var_os(key).is_none() {
       // SAFETY: called once at platform init, before any threads spawn a VM.
