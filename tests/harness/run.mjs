@@ -184,7 +184,10 @@ async function runOneBin(bin, cwd, baseArgs) {
       ? ["--exact", ...timedOut.flatMap((t) => ["--skip", t])]
       : [];
     const r = await streamWithWatchdog(bin, [...baseArgs, ...skipArgs], cwd);
-    combined += r.output;
+    // A SIGKILL mid-test leaves a dangling `test <name> ... ` line with no
+    // newline; terminate it so the next round's output (or the synthetic FAILED
+    // lines below) can't merge into it and confuse the libtest parser.
+    combined += r.output.endsWith("\n") ? r.output : r.output + "\n";
     if (!r.killed) break; // binary finished on its own
     if (!r.inFlight || timedOut.includes(r.inFlight)) {
       console.error(
