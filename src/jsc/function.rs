@@ -312,6 +312,10 @@ thread_local! {
     static STR_NAME: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
     static STR_PROTOTYPE: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
     static STR_FUNCTION: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
+    static STR_OBJECT: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
+    static STR_DEFINE_PROPERTY: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
+    static STR_VALUE: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
+    static STR_CONFIGURABLE: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
 }
 
 #[inline]
@@ -590,12 +594,66 @@ pub extern "C" fn v8__Function__SetName(
     return;
   }
   let obj = jsval(this) as JSObjectRef;
-  let key = unsafe { JSStringCreateWithUTF8CString(c"name".as_ptr()) };
-  let mut exc: JSValueRef = ptr::null();
+  // A function inherits `name` (value "") from `Function.prototype` as a
+  // non-writable data property. A plain `[[Set]]` (`JSObjectSetProperty`) walks
+  // the prototype chain, finds that non-writable `name`, and silently does
+  // nothing — so the op's real name never sticks and `fn.name` reads "". Force
+  // an *own*, configurable `name` via `Object.defineProperty`, matching V8's
+  // function-name descriptor (writable:false, enumerable:false, configurable).
+  unsafe { define_own_name(ctx, obj, jsval(name)) };
+}
 
+/// `Object.defineProperty(obj, "name", { value, writable:false,
+/// enumerable:false, configurable:true })`. Used to overwrite the inherited
+/// non-writable `Function.prototype.name`, which a plain `[[Set]]` can't shadow.
+unsafe fn define_own_name(
+  ctx: JSContextRef,
+  obj: JSObjectRef,
+  value: JSValueRef,
+) {
   unsafe {
-    JSObjectSetProperty(ctx, obj, key, jsval(name), 0, &mut exc);
-    JSStringRelease(key);
+    let global = JSContextGetGlobalObject(ctx);
+    let okey = cached_str(&STR_OBJECT, c"Object".as_ptr());
+    let mut exc: JSValueRef = ptr::null();
+    let object_ctor = JSObjectGetProperty(ctx, global, okey, &mut exc);
+    if object_ctor.is_null() || !JSValueIsObject(ctx, object_ctor) {
+      return;
+    }
+    let dpkey = cached_str(&STR_DEFINE_PROPERTY, c"defineProperty".as_ptr());
+    let define =
+      JSObjectGetProperty(ctx, object_ctor as JSObjectRef, dpkey, &mut exc);
+    if define.is_null() || !JSValueIsObject(ctx, define) {
+      return;
+    }
+    let define = define as JSObjectRef;
+    if !JSObjectIsFunction(ctx, define) {
+      return;
+    }
+
+    let desc = JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut());
+    let value_str = cached_str(&STR_VALUE, c"value".as_ptr());
+    JSObjectSetProperty(ctx, desc, value_str, value, 0, &mut exc);
+    let conf_str = cached_str(&STR_CONFIGURABLE, c"configurable".as_ptr());
+    JSObjectSetProperty(
+      ctx,
+      desc,
+      conf_str,
+      JSValueMakeBoolean(ctx, true),
+      0,
+      &mut exc,
+    );
+
+    let name_key = cached_str(&STR_NAME, c"name".as_ptr());
+    let name_val = JSValueMakeString(ctx, name_key);
+    let args = [obj as JSValueRef, name_val, desc as JSValueRef];
+    JSObjectCallAsFunction(
+      ctx,
+      define,
+      ptr::null_mut(),
+      args.len(),
+      args.as_ptr(),
+      &mut exc,
+    );
   }
 }
 
@@ -932,17 +990,15 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
 
   if let Some(name) = &t.class_name {
     if let Ok(cname) = std::ffi::CString::new(name.as_str()) {
-      let key = unsafe { cached_str(&STR_NAME, c"name".as_ptr()) };
       let nameval = unsafe {
         let s = JSStringCreateWithUTF8CString(cname.as_ptr());
         let v = JSValueMakeString(ctx, s);
         JSStringRelease(s);
         v
       };
-      let mut exc: JSValueRef = ptr::null();
-      unsafe {
-        JSObjectSetProperty(ctx, f, key, nameval, 0, &mut exc);
-      }
+      // Force an own `name` — a plain set can't shadow the inherited
+      // non-writable `Function.prototype.name` (see `v8__Function__SetName`).
+      unsafe { define_own_name(ctx, f, nameval) };
     }
   }
 
