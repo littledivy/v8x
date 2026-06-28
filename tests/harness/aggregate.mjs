@@ -14,7 +14,9 @@ import {
   STATUS_DIR,
   loadBaseline,
   loadConfig,
+  loadManifest,
   saveBaseline,
+  saveManifest,
 } from "./lib.mjs";
 
 const args = process.argv.slice(2);
@@ -54,6 +56,23 @@ if (args.includes("--write-baselines")) {
     const n = saveBaseline(r.backend, r.suite, merged);
     console.error(`baseline ${key}: ${n} passing (monotonic, +${n - prev.size})`);
   }
+  // MANIFEST (per suite): the fixed "all tests" denominator. Union every test
+  // name ENUMERATED this round (passing ∪ failing) across ALL backends into the
+  // suite manifest — monotonic, never shrinks. The backend that discovers the
+  // most (e.g. jsc enumerating all 303 deno_core tests) seeds the full set, so a
+  // backend that under-discovers (quickjs linking only 95) is scored 95/303, not
+  // 95/95. Done on main only (single writer) alongside baselines.
+  const seenBySuite = {};
+  for (const r of Object.values(runResults)) {
+    const set = seenBySuite[r.suite] || (seenBySuite[r.suite] = new Set());
+    for (const t of r.passing || []) set.add(t);
+    for (const t of r.failing || []) set.add(t);
+  }
+  for (const [suiteId, seen] of Object.entries(seenBySuite)) {
+    const prev = loadManifest(suiteId);
+    const m = saveManifest(suiteId, new Set([...prev, ...seen]));
+    console.error(`manifest ${suiteId}: ${m} tests (+${m - prev.size})`);
+  }
 }
 
 const cells = {};
@@ -66,7 +85,13 @@ for (const b of cfg.backends) {
     const run = runResults[`${b.id}__${s.id}`];
     // pass: live run if present, else the committed baseline floor.
     const pass = run ? run.pass : baseline;
-    const total = run ? run.total : null;
+    // total: the FIXED per-suite manifest (all known tests, shared across
+    // backends, monotonic) — never the run's own enumeration. So a cell reads
+    // pass/ALL (e.g. quickjs deno_core 95/303), exposing under-discovery instead
+    // of showing a truncated 95/95 "green". Fall back to run.total only before
+    // the manifest has been seeded.
+    const manifestTotal = loadManifest(s.id).size;
+    const total = manifestTotal || (run ? run.total : null);
     cells[b.id][s.id] = {
       pass,
       total,
