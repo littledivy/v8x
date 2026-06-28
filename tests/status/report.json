@@ -1,6 +1,6 @@
 {
-  "generated": "2026-06-28T05:42:39.859Z",
-  "commit": "4f920df9e749291b08700610421da2e7f85db2c7",
+  "generated": "2026-06-28T06:03:49.379Z",
+  "commit": "7142adad6cc4069229499ef6dfd1b790c286acb6",
   "backends": [
     {
       "id": "jsc",
@@ -59,10 +59,10 @@
         "fresh": true
       },
       "deno_core": {
-        "pass": 260,
-        "total": 303,
-        "baseline": 260,
-        "fail": 43,
+        "pass": 95,
+        "total": 95,
+        "baseline": 95,
+        "fail": 0,
         "tier": "build",
         "fresh": true
       }
@@ -87,7 +87,7 @@
     }
   },
   "totals": {
-    "pass": 742,
-    "known": 1493
+    "pass": 577,
+    "known": 1285
   }
 }
