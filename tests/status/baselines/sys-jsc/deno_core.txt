@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=sys-jsc suite=deno_core.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 179 passing. DO NOT hand-sort; the
+# (run.mjs --update). 256 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 deno_core::arena::raw_arena::tests::test_add_clear_many
 deno_core::arena::raw_arena::tests::test_add_remove_many
@@ -34,7 +34,6 @@ deno_core::async_cancel::tests::future_cancels_itself_before_completion
 deno_core::async_cell::tests::async_ref_cell_borrow
 deno_core::async_cell::tests::async_ref_cell_try_borrow
 deno_core::async_cell::tests::rc_ref_map
-deno_core::convert::tests::derive_from_struct
 deno_core::convert::tests::derive_from_tuple_struct
 deno_core::convert::tests::derive_struct
 deno_core::convert::tests::derive_to_struct
@@ -167,10 +166,10 @@ deno_core::runtime::ops::tests::test_op_arraybuffer_slice
 deno_core::runtime::ops::tests::test_op_async_buffer
 deno_core::runtime::ops::tests::test_op_async_deferred
 deno_core::runtime::ops::tests::test_op_async_external
-deno_core::runtime::ops::tests::test_op_async_lazy
 deno_core::runtime::ops::tests::test_op_async_number
 deno_core::runtime::ops::tests::test_op_async_result_impl
 deno_core::runtime::ops::tests::test_op_async_serde_option_v8
+deno_core::runtime::ops::tests::test_op_async_sleep
 deno_core::runtime::ops::tests::test_op_async_sleep_error
 deno_core::runtime::ops::tests::test_op_async_state
 deno_core::runtime::ops::tests::test_op_async_void
@@ -181,3 +180,81 @@ deno_core::runtime::ops::tests::test_op_buffer_any_length
 deno_core::runtime::ops::tests::test_op_buffer_bytesmut
 deno_core::runtime::ops::tests::test_op_buffer_copy
 deno_core::runtime::ops::tests::test_op_buffer_jsbuffer
+deno_core::runtime::ops::tests::test_op_cppgc_object
+deno_core::runtime::ops::tests::test_op_fail
+deno_core::runtime::ops::tests::test_op_float
+deno_core::runtime::ops::tests::test_op_number_to_from_v8
+deno_core::runtime::ops::tests::test_op_result_primitive
+deno_core::runtime::ops::tests::test_op_result_void
+deno_core::runtime::ops::tests::test_op_result_void_switch
+deno_core::runtime::ops::tests::test_op_serde_v8
+deno_core::runtime::ops::tests::test_op_smi_to_from_v8
+deno_core::runtime::ops::tests::test_op_state
+deno_core::runtime::ops::tests::test_op_string_returns
+deno_core::runtime::ops::tests::test_op_strings
+deno_core::runtime::ops::tests::test_typed_external
+deno_core::runtime::tests::error::fast_call_error_preserves_class
+deno_core::runtime::tests::error::test_error_builder
+deno_core::runtime::tests::jsrealm::js_realm_ref_unref_ops
+deno_core::runtime::tests::jsrealm::lazy
+deno_core::runtime::tests::jsrealm::test_set_format_exception_callback_realms
+deno_core::runtime::tests::misc::dangling_shared_isolate
+deno_core::runtime::tests::misc::generic_in_extension_middleware
+deno_core::runtime::tests::misc::icu
+deno_core::runtime::tests::misc::inspector
+deno_core::runtime::tests::misc::task_spawner
+deno_core::runtime::tests::misc::task_spawner_cross_thread
+deno_core::runtime::tests::misc::task_spawner_cross_thread_blocking
+deno_core::runtime::tests::misc::test_execute_script_return_value
+deno_core::runtime::tests::misc::test_heap_limit_cb_remove
+deno_core::runtime::tests::misc::test_next_tick
+deno_core::runtime::tests::misc::test_next_tick_error_continues_drain
+deno_core::runtime::tests::misc::test_nexttick_ordering_after_await
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_01_no_reject::module_1_true
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_01_no_reject::module_2_false
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_02_no_handler::module_1_true
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_02_no_handler::module_2_false
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_03_exception_true::module_1_true
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_03_exception_true::module_2_false
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_05_return_true::module_1_true
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_05_return_true::module_2_false
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_06_return_false::module_1_true
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_06_return_false::module_2_false
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_07_throw_true::module_1_true
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_07_throw_true::module_2_false
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_08_throw_false::module_1_true
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_08_throw_false::module_2_false
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_09_async_op_eager_true::module_1_true
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_09_async_op_eager_true::module_2_false
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_10_async_op_eager_false::module_1_true
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_10_async_op_eager_false::module_2_false
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_11_async_op_deferred_true::module_1_true
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_11_async_op_deferred_true::module_2_false
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_12_async_op_deferred_false::module_1_true
+deno_core::runtime::tests::misc::test_promise_rejection_handler::case_12_async_op_deferred_false::module_2_false
+deno_core::runtime::tests::misc::test_promise_rejection_nexttick_interleave
+deno_core::runtime::tests::misc::test_resolve_promise::case_1
+deno_core::runtime::tests::misc::test_resolve_promise::case_2
+deno_core::runtime::tests::misc::test_resolve_promise::case_4
+deno_core::runtime::tests::misc::test_resolve_value::case_01
+deno_core::runtime::tests::misc::test_resolve_value::case_02
+deno_core::runtime::tests::misc::test_resolve_value::case_03
+deno_core::runtime::tests::misc::test_resolve_value::case_04
+deno_core::runtime::tests::misc::test_resolve_value::case_05
+deno_core::runtime::tests::misc::test_resolve_value::case_06
+deno_core::runtime::tests::misc::test_resolve_value::case_07
+deno_core::runtime::tests::misc::test_resolve_value::case_08
+deno_core::runtime::tests::misc::test_resolve_value::case_09
+deno_core::runtime::tests::misc::test_resolve_value::case_10
+deno_core::runtime::tests::misc::test_resolve_value::case_11
+deno_core::runtime::tests::misc::test_resolve_value::case_12
+deno_core::runtime::tests::misc::test_resolve_value::case_13
+deno_core::runtime::tests::misc::test_resolve_value::case_14
+deno_core::runtime::tests::misc::test_resolve_value::case_15
+deno_core::runtime::tests::misc::test_set_macrotask_callback_set_next_tick_callback
+deno_core::runtime::tests::misc::test_v8_platform
+deno_core::runtime::tests::misc::test_wakers_for_async_ops
+deno_core::runtime::tests::misc::tla_in_esm_extensions_panics - should panic
+deno_core::runtime::tests::ops::duplicate_op_names - should panic
+deno_core::runtime::tests::ops::test_async_op_serialize_object_with_numbers_as_keys
+deno_core::runtime::tests::ops::test_async_opstate_borrow

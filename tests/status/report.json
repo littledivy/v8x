@@ -1,6 +1,6 @@
 {
-  "generated": "2026-06-28T02:35:15.654Z",
-  "commit": "0cf25b71c0023eb4eb435effd7fa966c9420f6eb",
+  "generated": "2026-06-28T03:31:00.939Z",
+  "commit": "ad85152b7d11728280ebfedc3dcc6f6d9b0a7689",
   "backends": [
     {
       "id": "jsc",
@@ -9,8 +9,8 @@
     },
     {
       "id": "sys-jsc",
-      "label": "JavaScriptCore System 20621.3.11.11.3",
-      "version": "20621.3.11.11.3"
+      "label": "JavaScriptCore System 21624.1.16.11.4",
+      "version": "21624.1.16.11.4"
     },
     {
       "id": "quickjs",
@@ -41,12 +41,12 @@
         "fresh": true
       },
       "deno_core": {
-        "pass": 0,
-        "total": null,
-        "baseline": 0,
-        "fail": null,
+        "pass": 262,
+        "total": 304,
+        "baseline": 262,
+        "fail": 42,
         "tier": "build",
-        "fresh": false
+        "fresh": true
       }
     },
     "sys-jsc": {
@@ -59,19 +59,19 @@
         "fresh": true
       },
       "deno_core": {
-        "pass": 179,
-        "total": null,
-        "baseline": 179,
-        "fail": null,
+        "pass": 256,
+        "total": 314,
+        "baseline": 256,
+        "fail": 58,
         "tier": "build",
-        "fresh": false
+        "fresh": true
       }
     },
     "quickjs": {
       "rusty_v8": {
-        "pass": 44,
-        "total": 265,
-        "baseline": 44,
+        "pass": 43,
+        "total": 264,
+        "baseline": 43,
         "fail": 221,
         "tier": "build",
         "fresh": true
@@ -87,7 +87,7 @@
     }
   },
   "totals": {
-    "pass": 400,
-    "known": 888
+    "pass": 738,
+    "known": 1505
   }
 }
