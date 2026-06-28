@@ -103,9 +103,7 @@ pub(crate) struct IsoState {
 impl IsoState {
   #[inline(always)]
   pub fn is_terminating(&self) -> bool {
-    self
-      .terminating
-      .load(std::sync::atomic::Ordering::Acquire)
+    self.terminating.load(std::sync::atomic::Ordering::Acquire)
   }
 }
 

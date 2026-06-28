@@ -465,9 +465,7 @@ pub(crate) unsafe extern "C" fn terminate_interrupt_handler(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__TerminateExecution(
-  isolate: *const RealIsolate,
-) {
+pub extern "C" fn v8__Isolate__TerminateExecution(isolate: *const RealIsolate) {
   let iso = terminate_target(isolate);
   if iso.is_null() {
     return;
