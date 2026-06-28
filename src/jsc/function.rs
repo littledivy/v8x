@@ -135,10 +135,15 @@ fn fn_class() -> JSClassRef {
 }
 
 unsafe extern "C" fn fn_finalize(object: JSObjectRef) {
-  let p = unsafe { JSObjectGetPrivate(object) } as *mut FnBridge;
-  if !p.is_null() {
-    drop(unsafe { Box::from_raw(p) });
-  }
+  crate::jsc::core::ffi_guard(
+    || {
+      let p = unsafe { JSObjectGetPrivate(object) } as *mut FnBridge;
+      if !p.is_null() {
+        drop(unsafe { Box::from_raw(p) });
+      }
+    },
+    || (),
+  )
 }
 
 unsafe fn dispatch(
@@ -197,21 +202,46 @@ unsafe extern "C" fn fn_trampoline(
   argv: *const JSValueRef,
   exception: *mut JSValueRef,
 ) -> JSValueRef {
-  let bridge = unsafe { JSObjectGetPrivate(function) } as *const FnBridge;
-  if bridge.is_null() {
-    return unsafe { JSValueMakeUndefined(ctx) };
-  }
+  crate::jsc::core::ffi_guard(
+    || {
+      let bridge = unsafe { JSObjectGetPrivate(function) } as *const FnBridge;
+      if bridge.is_null() {
+        return unsafe { JSValueMakeUndefined(ctx) };
+      }
+      unsafe {
+        dispatch(
+          ctx,
+          &*bridge,
+          this_object as JSValueRef,
+          JSValueMakeUndefined(ctx),
+          false,
+          argc,
+          argv,
+          exception,
+        )
+      }
+    },
+    || unsafe { panic_to_exception(ctx, exception) },
+  )
+}
+
+/// Fallback for a panicking call/construct trampoline: surface the panic as a
+/// thrown JS exception (so the JS call fails deterministically instead of
+/// aborting the process) and return `undefined`.
+unsafe fn panic_to_exception(
+  ctx: JSContextRef,
+  exception: *mut JSValueRef,
+) -> JSValueRef {
   unsafe {
-    dispatch(
-      ctx,
-      &*bridge,
-      this_object as JSValueRef,
-      JSValueMakeUndefined(ctx),
-      false,
-      argc,
-      argv,
-      exception,
-    )
+    if !exception.is_null() && (*exception).is_null() {
+      let msg = JSStringCreateWithUTF8CString(
+        c"v82jsc: rust panic in native callback".as_ptr(),
+      );
+      let s = JSValueMakeString(ctx, msg);
+      JSStringRelease(msg);
+      *exception = s;
+    }
+    JSValueMakeUndefined(ctx)
   }
 }
 
@@ -222,43 +252,51 @@ unsafe extern "C" fn fn_construct_trampoline(
   argv: *const JSValueRef,
   exception: *mut JSValueRef,
 ) -> JSObjectRef {
-  let bridge = unsafe { JSObjectGetPrivate(function) } as *const FnBridge;
-  if bridge.is_null() {
-    return unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
-  }
+  crate::jsc::core::ffi_guard(
+    || {
+      let bridge = unsafe { JSObjectGetPrivate(function) } as *const FnBridge;
+      if bridge.is_null() {
+        return unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
+      }
 
-  let this = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
-  unsafe {
-    let proto_key = JSStringCreateWithUTF8CString(c"prototype".as_ptr());
-    let mut exc: JSValueRef = ptr::null();
-    let proto = JSObjectGetProperty(ctx, function, proto_key, &mut exc);
-    JSStringRelease(proto_key);
-    if !proto.is_null() && JSValueIsObject(ctx, proto) {
-      JSObjectSetPrototype(ctx, this, proto);
-    }
-  }
-  let r = unsafe {
-    dispatch(
-      ctx,
-      &*bridge,
-      this as JSValueRef,
-      function as JSValueRef,
-      true,
-      argc,
-      argv,
-      exception,
-    )
-  };
+      let this = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
+      unsafe {
+        let proto_key = JSStringCreateWithUTF8CString(c"prototype".as_ptr());
+        let mut exc: JSValueRef = ptr::null();
+        let proto = JSObjectGetProperty(ctx, function, proto_key, &mut exc);
+        JSStringRelease(proto_key);
+        if !proto.is_null() && JSValueIsObject(ctx, proto) {
+          JSObjectSetPrototype(ctx, this, proto);
+        }
+      }
+      let r = unsafe {
+        dispatch(
+          ctx,
+          &*bridge,
+          this as JSValueRef,
+          function as JSValueRef,
+          true,
+          argc,
+          argv,
+          exception,
+        )
+      };
 
-  if !exception.is_null() && !unsafe { *exception }.is_null() {
-    return unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
-  }
+      if !exception.is_null() && !unsafe { *exception }.is_null() {
+        return unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
+      }
 
-  if !r.is_null() && unsafe { JSValueIsObject(ctx, r) } {
-    r as JSObjectRef
-  } else {
-    this
-  }
+      if !r.is_null() && unsafe { JSValueIsObject(ctx, r) } {
+        r as JSObjectRef
+      } else {
+        this
+      }
+    },
+    || unsafe {
+      panic_to_exception(ctx, exception);
+      JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut())
+    },
+  )
 }
 
 unsafe fn make_function(
@@ -274,9 +312,6 @@ thread_local! {
     static STR_NAME: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
     static STR_PROTOTYPE: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
     static STR_FUNCTION: std::cell::Cell<JSStringRef> = const { std::cell::Cell::new(ptr::null_mut()) };
-
-    static FN_PROTO_CACHE: std::cell::Cell<(JSGlobalContextRef, JSValueRef)> =
-        const { std::cell::Cell::new((ptr::null_mut(), ptr::null_mut())) };
 }
 
 #[inline]
@@ -333,12 +368,16 @@ unsafe fn make_function_len(
 }
 
 unsafe fn function_prototype(ctx: JSContextRef) -> JSValueRef {
-  let gctx = unsafe { JSContextGetGlobalContext(ctx) };
-
-  let cached = FN_PROTO_CACHE.with(|c| c.get());
-  if cached.0 == gctx && !cached.1.is_null() {
-    return cached.1;
-  }
+  // Fetch `Function.prototype` FRESH from the current context every time. It
+  // must NOT be cached keyed by the global-context pointer: deno_core creates
+  // and disposes a JsRuntime (and thus a JSGlobalContextRef) per test, and the
+  // allocator readily reuses a freed gctx's address for the next runtime. A
+  // pointer-keyed cache then returns the *dangling* Function.prototype of the
+  // freed context; using it as a new object's prototype corrupts JSC's
+  // structure chain and sends `JSObject::didBecomePrototype` into unbounded
+  // recursion → stack-overflow SIGSEGV that non-deterministically truncated the
+  // whole binary (denoland/divybot#653). `Function.prototype` is a permanent
+  // global of the live context, so it needs no protect.
   unsafe {
     let global = JSContextGetGlobalObject(ctx);
     let fkey = cached_str(&STR_FUNCTION, c"Function".as_ptr());
@@ -348,12 +387,7 @@ unsafe fn function_prototype(ctx: JSContextRef) -> JSValueRef {
       return ptr::null();
     }
     let pkey = cached_str(&STR_PROTOTYPE, c"prototype".as_ptr());
-    let fp = JSObjectGetProperty(ctx, func_ctor as JSObjectRef, pkey, &mut exc);
-    if !fp.is_null() {
-      JSValueProtect(gctx, fp);
-      FN_PROTO_CACHE.with(|c| c.set((gctx, fp)));
-    }
-    fp
+    JSObjectGetProperty(ctx, func_ctor as JSObjectRef, pkey, &mut exc)
   }
 }
 

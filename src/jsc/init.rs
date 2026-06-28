@@ -21,12 +21,20 @@ pub extern "C" fn v8__V8__InitializePlatform(_platform: *mut Platform) {
   //
   // - useExplicitResourceManagement: TC39 `using`/`await using` +
   //   Symbol.dispose/asyncDispose (deno's transpiler emits these verbatim).
+  //   ONLY on the vendored (built-from-source, newer) WebKit — Apple's shipped
+  //   `JavaScriptCore.framework` predates this option and JSC prints
+  //   `ERROR: invalid option: JSC_useExplicitResourceManagement=1` to stderr at
+  //   Options::initialize(). That raw fd-2 write interleaves into libtest's
+  //   `test NAME ... ok` line and non-deterministically breaks the harness
+  //   parser → baselined tests flap as "MISSING" and the sys-jsc rusty_v8 cell
+  //   flips pass/fail with no code change (denoland/divybot#653). The option is
+  //   an unrecognized no-op on that JSC anyway, so skip it there.
   // - useSharedArrayBuffer: the `SharedArrayBuffer` global (deno exposes it;
-  //   Workers/Atomics rely on it).
-  for (key, val) in [
-    ("JSC_useExplicitResourceManagement", "1"),
-    ("JSC_useSharedArrayBuffer", "1"),
-  ] {
+  //   Workers/Atomics rely on it). Recognized on both, so always set.
+  let mut opts: Vec<(&str, &str)> = vec![("JSC_useSharedArrayBuffer", "1")];
+  #[cfg(feature = "vendor_jsc")]
+  opts.push(("JSC_useExplicitResourceManagement", "1"));
+  for (key, val) in opts {
     if std::env::var_os(key).is_none() {
       // SAFETY: called once at platform init, before any threads spawn a VM.
       unsafe {

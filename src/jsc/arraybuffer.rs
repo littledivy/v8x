@@ -210,13 +210,18 @@ pub extern "C" fn v8__ArrayBuffer__New__with_backing_store(
 
   unsafe { (*inner).refcount.fetch_add(1, Ordering::SeqCst) };
   unsafe extern "C" fn dealloc(_bytes: *mut c_void, ctx: *mut c_void) {
-    let inner = ctx as *mut BsInner;
-    if inner.is_null() {
-      return;
-    }
-    if unsafe { (*inner).refcount.fetch_sub(1, Ordering::SeqCst) } == 1 {
-      unsafe { BsInner::destroy(inner) };
-    }
+    crate::jsc::core::ffi_guard(
+      || {
+        let inner = ctx as *mut BsInner;
+        if inner.is_null() {
+          return;
+        }
+        if unsafe { (*inner).refcount.fetch_sub(1, Ordering::SeqCst) } == 1 {
+          unsafe { BsInner::destroy(inner) };
+        }
+      },
+      || (),
+    )
   }
   let obj = unsafe {
     JSObjectMakeArrayBufferWithBytesNoCopy(
@@ -714,13 +719,18 @@ pub extern "C" fn v8__SharedArrayBuffer__New__with_backing_store(
   let (data, len) = unsafe { ((*inner).data, (*inner).byte_length) };
   unsafe { (*inner).refcount.fetch_add(1, Ordering::SeqCst) };
   unsafe extern "C" fn dealloc(_bytes: *mut c_void, ctx: *mut c_void) {
-    let inner = ctx as *mut BsInner;
-    if inner.is_null() {
-      return;
-    }
-    if unsafe { (*inner).refcount.fetch_sub(1, Ordering::SeqCst) } == 1 {
-      unsafe { BsInner::destroy(inner) };
-    }
+    crate::jsc::core::ffi_guard(
+      || {
+        let inner = ctx as *mut BsInner;
+        if inner.is_null() {
+          return;
+        }
+        if unsafe { (*inner).refcount.fetch_sub(1, Ordering::SeqCst) } == 1 {
+          unsafe { BsInner::destroy(inner) };
+        }
+      },
+      || (),
+    )
   }
   let obj = unsafe {
     JSObjectMakeArrayBufferWithBytesNoCopy(

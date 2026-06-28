@@ -45,6 +45,17 @@ unsafe extern "C" fn unhandled_rejection_trampoline(
   argv: *const JSValueRef,
   _exception: *mut JSValueRef,
 ) -> JSValueRef {
+  crate::jsc::core::ffi_guard(
+    || unsafe { unhandled_rejection_impl(_ctx, argc, argv) },
+    || unsafe { JSValueMakeUndefined(_ctx) },
+  )
+}
+
+unsafe fn unhandled_rejection_impl(
+  _ctx: JSContextRef,
+  argc: usize,
+  argv: *const JSValueRef,
+) -> JSValueRef {
   if std::env::var("V82JSC_DEBUG").is_ok() {
     eprintln!(
       "[v82jsc] unhandled_rejection_trampoline fired argc={}",

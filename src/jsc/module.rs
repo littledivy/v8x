@@ -299,23 +299,28 @@ unsafe fn native_parse(
 }
 
 unsafe extern "C" fn mod_finalize(object: JSObjectRef) {
-  let p = unsafe { JSObjectGetPrivate(object) } as *mut SyntheticModule;
-  if !p.is_null() {
-    let m = unsafe { Box::from_raw(p) };
-    if !m.namespace.is_null() && !m.ctx.is_null() {
-      unsafe { JSValueUnprotect(m.ctx, m.namespace as JSValueRef) };
-    }
-    #[cfg(feature = "vendor_jsc")]
-    if !m.native.is_null() {
-      let rec = unsafe { v82jsc_module_record_ptr(m.native) };
-      if !rec.is_null() {
-        NATIVE_RECORD_MAP.with(|map| {
-          map.borrow_mut().remove(&(rec as usize));
-        });
+  crate::jsc::core::ffi_guard(
+    || {
+      let p = unsafe { JSObjectGetPrivate(object) } as *mut SyntheticModule;
+      if !p.is_null() {
+        let m = unsafe { Box::from_raw(p) };
+        if !m.namespace.is_null() && !m.ctx.is_null() {
+          unsafe { JSValueUnprotect(m.ctx, m.namespace as JSValueRef) };
+        }
+        #[cfg(feature = "vendor_jsc")]
+        if !m.native.is_null() {
+          let rec = unsafe { v82jsc_module_record_ptr(m.native) };
+          if !rec.is_null() {
+            NATIVE_RECORD_MAP.with(|map| {
+              map.borrow_mut().remove(&(rec as usize));
+            });
+          }
+          unsafe { v82jsc_module_release(m.native) };
+        }
       }
-      unsafe { v82jsc_module_release(m.native) };
-    }
-  }
+    },
+    || (),
+  )
 }
 
 thread_local! {
@@ -472,31 +477,34 @@ unsafe extern "C" fn dynamic_import_js_cb(
   argv: *const JSValueRef,
   _exception: *mut JSValueRef,
 ) -> JSValueRef {
-  unsafe {
-    if argc < 1 || argv.is_null() {
-      return JSValueMakeUndefined(ctx);
-    }
-    let mut exc: JSValueRef = ptr::null();
-    let spec = JSValueToStringCopy(ctx, *argv, &mut exc);
-    if spec.is_null() {
-      return JSValueMakeUndefined(ctx);
-    }
-    let referrer = if argc >= 2 && JSValueIsString(ctx, *argv.add(1)) {
-      JSValueToStringCopy(ctx, *argv.add(1), &mut exc)
-    } else {
-      ptr::null_mut()
-    };
-    let promise = v82jsc_dynamic_import(ctx, spec, referrer, 0);
-    JSStringRelease(spec);
-    if !referrer.is_null() {
-      JSStringRelease(referrer);
-    }
-    if promise.is_null() {
-      JSValueMakeUndefined(ctx)
-    } else {
-      promise
-    }
-  }
+  crate::jsc::core::ffi_guard(
+    || unsafe {
+      if argc < 1 || argv.is_null() {
+        return JSValueMakeUndefined(ctx);
+      }
+      let mut exc: JSValueRef = ptr::null();
+      let spec = JSValueToStringCopy(ctx, *argv, &mut exc);
+      if spec.is_null() {
+        return JSValueMakeUndefined(ctx);
+      }
+      let referrer = if argc >= 2 && JSValueIsString(ctx, *argv.add(1)) {
+        JSValueToStringCopy(ctx, *argv.add(1), &mut exc)
+      } else {
+        ptr::null_mut()
+      };
+      let promise = v82jsc_dynamic_import(ctx, spec, referrer, 0);
+      JSStringRelease(spec);
+      if !referrer.is_null() {
+        JSStringRelease(referrer);
+      }
+      if promise.is_null() {
+        JSValueMakeUndefined(ctx)
+      } else {
+        promise
+      }
+    },
+    || unsafe { JSValueMakeUndefined(ctx) },
+  )
 }
 
 /// Install `globalThis.__v82jsc_dynamicImport` on a context. Called for every
