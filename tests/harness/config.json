@@ -53,7 +53,12 @@
       "tier": "build",
       "kind": "cargo-deno",
       "comment": "cargo test -p deno_core in the patched deno checkout. Links our v8 shim but does NOT build the full deno binary.",
-      "package": "deno_core"
+      "package": "deno_core",
+      "ignore_comment": "Known-flaky tests, quarantined from the ratchet: NEVER run (skipped up-front) and excluded from pass/fail/baseline, so the cell is deterministic. `ignore` applies to all backends; `ignore_by_backend` adds per-backend ones. Bare libtest paths (no `deno_core::` prefix). dyn_import_recurse_err overflows the stack non-deterministically on quickjs (ASLR-dependent recursion depth) and, by aborting the single-process run at a random point, makes every later test's pass/hang order-dependent — quarantining it on quickjs makes that cell reproducible. (It is fixed on the JSC backends by the margin-probe in #22, so it is NOT quarantined there.)",
+      "ignore": [],
+      "ignore_by_backend": {
+        "quickjs": ["modules::tests::dyn_import_recurse_err"]
+      }
     }
   ]
 }

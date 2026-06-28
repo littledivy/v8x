@@ -46,6 +46,17 @@ if (!suiteId || !backendId) die("usage: run.mjs <suite> <backend> [--check|--upd
 const cfg = loadConfig();
 const s = suite(cfg, suiteId);
 const b = backend(cfg, backendId);
+
+// Known-flaky tests to quarantine for this suite/backend: bare libtest paths
+// (no `<bin>::` prefix). They are skipped up-front so they never run (a hang
+// would block the binary; a crash would truncate it and make later tests'
+// outcomes order-dependent) AND excluded from pass/fail/baseline below, so the
+// cell is reproducible. From config `ignore` (all backends) + per-backend
+// `ignore_by_backend`.
+const IGNORE = new Set([
+  ...(s.ignore || []),
+  ...((s.ignore_by_backend || {})[backendId] || []),
+]);
 const isMac = os.platform() === "darwin";
 const needsCodesign = isMac && b.os === "macos"; // JSC JIT entitlements
 const ENT = path.join(ROOT, "tools/jit-entitlements.plist");
@@ -179,38 +190,70 @@ function streamWithWatchdog(bin, args, cwd) {
           ` | ${res ? res[0] : "no summary line (truncated/crashed)"}` +
           ` | exit ${signal ? `signal ${signal}` : `code ${code}`}`,
       );
-      // The offending test is the dangling `test <name> ... ` start line.
-      const tail = output.slice(output.lastIndexOf("\n") + 1);
-      const m = tail.match(/^test (.+?) \.\.\. *$/);
-      resolve({ output, killed, code, signal, inFlight: m ? m[1] : null });
+      // The offending test is the last `test <name> ... ` start line with no
+      // result suffix. A crash does NOT always leave that line LAST: a panic,
+      // a `fatal runtime error: stack overflow` message, or the signal-handler
+      // crash logger can print extra lines AFTER it, so checking only the final
+      // line misses the culprit (inFlight=null → no recovery → the whole run
+      // truncates). Scan the entire output instead. A cleanly-finished test
+      // always carries its result on the same line (`test X ... ok`), so this
+      // pattern only matches a started-but-unfinished test and stays null on a
+      // clean finish.
+      // `(?: - should panic)?` strips libtest's display annotation so the name
+      // is the bare test PATH `--skip` expects (the panic suffix is not part of
+      // the filter name).
+      let inFlight = null;
+      const startRe = /^test (.+?)(?: - should panic)? \.\.\. *$/gm;
+      for (let m; (m = startRe.exec(output)) !== null; ) inFlight = m[1];
+      resolve({ output, killed, code, signal, inFlight });
     });
   });
 }
 
 // Run a libtest binary to completion, tolerating tests that HANG or CRASH the
-// process. After each round we look for a dangling in-flight test (a deadlock
-// the watchdog killed, or a SIGABRT that truncated the run); we record it and
-// re-run skipping every known-bad test, until the binary finishes cleanly (no
-// dangling test) or we can no longer identify a fresh culprit. Without this a
-// single bad test would zero the cell (hang -> CI timeout) or truncate it
-// (crash -> every later test silently MISSING). Bad tests are surfaced as
-// synthetic FAILED lines so they show in the run result and are never baselined.
+// process. libtest with `--test-threads 1` runs tests sequentially, so a test
+// that deadlocks (watchdog SIGKILL) or aborts the process (SIGABRT/SIGSEGV/
+// SIGBUS, plus a stack-overflow `fatal runtime error`) truncates EVERY test
+// after it. Each round we identify the dangling in-flight test and re-run,
+// SKIPPING both it and every test already finished — so each round runs only
+// the still-unseen suffix (total work ~= O(tests), not O(rounds x tests),
+// which matters for a cell with many independent crashers). We stop when a
+// round finishes with no dangling test. Without this a single bad test would
+// zero the cell (hang -> CI timeout) or truncate it (crash -> every later test
+// silently MISSING). Crashed/hung tests are surfaced as synthetic FAILED lines
+// so they show in the run result and are never baselined.
 async function runOneBin(bin, cwd, baseArgs) {
-  const bad = []; // [{ name, reason }]
+  const seen = new Set(); // test paths that produced a result (ok/FAILED/ignored)
+  const bad = []; // [{ name, reason }] — tests that hung or crashed the process
+  // Quarantined tests are skipped from the very first round (treated as
+  // already-handled) so a flaky hang/crash can't block or truncate the run.
+  const quarantined = [...IGNORE];
+  // `(?: - should panic)?` strips the display annotation so the captured name
+  // is the bare test PATH (what `--skip` matches).
+  const resultRe =
+    /^test (.+?)(?: - should panic)? \.\.\. (?:ok|FAILED|ignored)\b/gm;
   let combined = "";
-  for (let round = 0; round < 64; round++) {
-    const skipArgs = bad.length
-      ? ["--exact", ...bad.flatMap((t) => ["--skip", t.name])]
+  // A generous cap (a cell may have dozens of independent crashers); each round
+  // strictly shrinks the unseen set, so this terminates well before the cap.
+  const MAX_ROUNDS = 1024;
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    const skipNames = [...seen, ...bad.map((t) => t.name), ...quarantined];
+    const skipArgs = skipNames.length
+      ? ["--exact", ...skipNames.flatMap((n) => ["--skip", n])]
       : [];
     const r = await streamWithWatchdog(bin, [...baseArgs, ...skipArgs], cwd);
     // A kill/crash mid-test leaves a dangling `test <name> ... ` line with no
     // newline; terminate it so the next round's output (or the synthetic FAILED
     // lines below) can't merge into it and confuse the libtest parser.
     combined += r.output.endsWith("\n") ? r.output : r.output + "\n";
+    // Record every test that produced a result this round (so we skip it next).
+    for (let m; (m = resultRe.exec(r.output)) !== null; ) seen.add(m[1]);
     if (!r.inFlight) break; // finished with no test left dangling
-    if (bad.some((t) => t.name === r.inFlight)) {
+    if (seen.has(r.inFlight) || bad.some((t) => t.name === r.inFlight)) {
+      // The dangling test was already accounted for (a skip that didn't take or
+      // a name we can't match) — re-running would loop, so stop here.
       console.error(
-        `  [recover] '${r.inFlight}' is still in flight after being skipped — ` +
+        `  [recover] '${r.inFlight}' still in flight after being skipped — ` +
           `stopping retries for ${bin}`,
       );
       break;
@@ -218,8 +261,8 @@ async function runOneBin(bin, cwd, baseArgs) {
     const reason = r.killed ? "hang (timeout)" : `crash (${r.signal || `exit ${r.code}`})`;
     bad.push({ name: r.inFlight, reason });
     console.error(
-      `  [recover] '${r.inFlight}' ${reason} — re-running with it skipped ` +
-        `(${bad.length} bad so far)`,
+      `  [recover] '${r.inFlight}' ${reason} — re-running remaining tests ` +
+        `with it skipped (${bad.length} bad, ${seen.size} done)`,
     );
   }
   // Mark each bad test as FAILED so it's visible (and excluded from baselines).
@@ -350,7 +393,21 @@ function engineVersion() {
   return null;
 }
 
+// Drop quarantined tests from a result set. parseLibtest prefixes each name
+// with its binary (`deno_core::<path>`); IGNORE holds bare `<path>`, so match
+// against the name with the leading `<bin>::` segment stripped.
+function dropIgnored(set) {
+  if (!IGNORE.size) return;
+  for (const n of [...set]) {
+    const bare = n.includes("::") ? n.slice(n.indexOf("::") + 2) : n;
+    if (IGNORE.has(bare) || IGNORE.has(n)) set.delete(n);
+  }
+}
+
 function finalize(parsed) {
+  dropIgnored(parsed.pass);
+  dropIgnored(parsed.fail);
+  dropIgnored(parsed.skip);
   return {
     backend: backendId,
     suite: suiteId,
