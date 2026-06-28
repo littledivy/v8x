@@ -463,6 +463,36 @@ pub unsafe extern "C" fn v82jsc_dynamic_import(
   }
 }
 
+/// Remaining native-stack headroom (bytes) on the current thread. Both JSC
+/// backends are macOS, so the pthread stack-introspection APIs are available.
+/// Returns `usize::MAX` (i.e. "don't guard") if introspection looks wrong, so a
+/// surprising platform can never spuriously trip the guard below.
+fn stack_headroom_bytes() -> usize {
+  unsafe extern "C" {
+    fn pthread_self() -> *mut std::ffi::c_void;
+    fn pthread_get_stackaddr_np(
+      t: *mut std::ffi::c_void,
+    ) -> *mut std::ffi::c_void;
+    fn pthread_get_stacksize_np(t: *mut std::ffi::c_void) -> usize;
+  }
+  let probe: u8 = 0;
+  let sp = &probe as *const u8 as usize;
+  unsafe {
+    let t = pthread_self();
+    if t.is_null() {
+      return usize::MAX;
+    }
+    // macOS: stack grows down, `stackaddr` is the high bound (top of stack).
+    let base = pthread_get_stackaddr_np(t) as usize;
+    let size = pthread_get_stacksize_np(t);
+    let low = base.wrapping_sub(size);
+    if base == 0 || size == 0 || sp > base || sp < low {
+      return usize::MAX;
+    }
+    sp - low
+  }
+}
+
 /// JS-callable bridge `globalThis.__v82jsc_dynamicImport(specifier, referrer)`.
 /// The module-source rewriter turns dynamic `import(...)` into a call to this so
 /// dynamic import works WITHOUT a native module-loader hook -- crucial for the
@@ -475,10 +505,33 @@ unsafe extern "C" fn dynamic_import_js_cb(
   _this: JSObjectRef,
   argc: usize,
   argv: *const JSValueRef,
-  _exception: *mut JSValueRef,
+  exception: *mut JSValueRef,
 ) -> JSValueRef {
   crate::jsc::core::ffi_guard(
     || unsafe {
+      // Native-stack guard. A runaway-recursion script — e.g. deno_core's
+      // `dyn_import_recurse_err`: `function bar(){ bar(import(0)); } bar()` —
+      // recurses in JS until just under JSC's stack limit, then calls this
+      // bridge on the deepest frame. The host dynamic-import callback needs a
+      // non-trivial amount of native stack; entering it with almost none left
+      // overflows the C stack (a SIGSEGV that even ffi_guard can't unwind)
+      // instead of surfacing the RangeError the runaway recursion is supposed
+      // to throw. Bail out with a throwable error while there is still stack to
+      // unwind through — this both avoids the crash AND gives the test the
+      // RangeError it expects. The host callback only needs a handful of native
+      // frames (a few KiB), so 64 KiB is ample headroom for it yet small enough
+      // that a legitimate `import()` reached through a deep-but-normal frame
+      // chain — e.g. on a 512 KiB worker thread that has already consumed some
+      // stack — still passes; only genuine runaway recursion approaching the
+      // guard page trips it.
+      const MIN_STACK_HEADROOM: usize = 64 * 1024;
+      if stack_headroom_bytes() < MIN_STACK_HEADROOM {
+        if !exception.is_null() {
+          *exception =
+            make_generic_error(ctx, "Maximum call stack size exceeded");
+        }
+        return JSValueMakeUndefined(ctx);
+      }
       if argc < 1 || argv.is_null() {
         return JSValueMakeUndefined(ctx);
       }
@@ -621,6 +674,68 @@ unsafe fn eval_value_as_script(
     return ptr::null();
   }
   let mut exc: JSValueRef = ptr::null();
+
+  // System JavaScriptCore has NO `moduleLoaderImportModule` hook — that is the
+  // vendored-only WebKit C++ patch — so a plain-script `import()` evaluated via
+  // `JSEvaluateScript` can't reach the dynamic-import bridge through `sourceURL`
+  // at all. Do here what the module/CJS eval paths already do for system JSC:
+  // rewrite `import(` → `__v82jsc_dynImport(` and inject a per-script closure
+  // forwarding to `globalThis.__v82jsc_dynamicImport` (installed on every
+  // context) with the ScriptOrigin resource name as the referrer. The vendored
+  // backend keeps its native `sourceURL`-based hook untouched (gated below).
+  //
+  // Only rewrite when the source actually contains a dynamic import (the rewrite
+  // changed something) so the common no-`import()` script is byte-for-byte
+  // unchanged — no injected prelude, no line/column shift in stack traces. The
+  // prelude carries no trailing newline so the body's line N stays line N, and
+  // uses `var` (not `const`) so re-evaluating another `import()` script in the
+  // same global context can't trip a lexical redeclaration error.
+  #[cfg(not(feature = "vendor_jsc"))]
+  {
+    let src = unsafe { jsstring_to_rust(ctx, source_val) };
+    let rewritten = rewrite_dynamic_import_calls(&src);
+    if rewritten != src {
+      let referrer = source_url.unwrap_or("");
+      // `{:?}` emits the referrer as a Rust `Debug` string — double-quoted with
+      // backslash escapes — which coincides with JS string-literal syntax, so it
+      // safely embeds a referrer (always a resource URL here) without manual
+      // escaping. The `CString::new` below rejects any embedded NUL, so a NUL in
+      // the referrer fails the rewrite cleanly rather than producing bad JS.
+      let prelude = format!(
+        "var __v82jsc_dynImport=(s,o)=>globalThis.__v82jsc_dynamicImport(s,{:?},o);",
+        referrer
+      );
+      let wrapped = format!("{prelude}{rewritten}");
+      if let Ok(cstr) = std::ffi::CString::new(wrapped) {
+        let js_src = unsafe { JSStringCreateWithUTF8CString(cstr.as_ptr()) };
+        let src_url_cstr =
+          source_url.and_then(|u| std::ffi::CString::new(u).ok());
+        let src_url_js = src_url_cstr
+          .as_ref()
+          .map(|c| unsafe { JSStringCreateWithUTF8CString(c.as_ptr()) })
+          .unwrap_or(ptr::null_mut());
+        let result = unsafe {
+          JSEvaluateScript(
+            ctx,
+            js_src,
+            ptr::null_mut(),
+            src_url_js,
+            1,
+            &mut exc,
+          )
+        };
+        unsafe { JSStringRelease(js_src) };
+        if !src_url_js.is_null() {
+          unsafe { JSStringRelease(src_url_js) };
+        }
+        if result.is_null() && !exc.is_null() {
+          unsafe { crate::jsc::core::record_pending_exception(ctx, exc) };
+        }
+        return result;
+      }
+    }
+  }
+
   let src_str = unsafe { JSValueToStringCopy(ctx, source_val, &mut exc) };
   if src_str.is_null() {
     return ptr::null();
