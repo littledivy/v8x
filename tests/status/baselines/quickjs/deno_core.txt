@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=deno_core.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 364 passing. DO NOT hand-sort; the
+# (run.mjs --update). 372 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 deno_core::arena::raw_arena::tests::test_add_clear_many
 deno_core::arena::raw_arena::tests::test_add_remove_many
@@ -100,18 +100,26 @@ deno_core::modules::tests::dyn_import_ok
 deno_core::modules::tests::evaluate_already_evaluated_module
 deno_core::modules::tests::evaluate_already_evaluated_module_sync
 deno_core::modules::tests::ext_module_loader_relative
+deno_core::modules::tests::import_meta_filename_dirname
+deno_core::modules::tests::import_meta_resolve
 deno_core::modules::tests::invalid_utf8_module
 deno_core::modules::tests::loader_disappears_after_error
 deno_core::modules::tests::main_and_side_module
 deno_core::modules::tests::no_duplicate_loads
+deno_core::modules::tests::recursive_load_main_with_code
 deno_core::modules::tests::slow_never_ready_modules
 deno_core::modules::tests::test_code_cache_not_created_for_json_module
+deno_core::modules::tests::test_custom_module_type_callback_computed
 deno_core::modules::tests::test_custom_module_type_callback_synthetic
 deno_core::modules::tests::test_custom_module_type_default
+deno_core::modules::tests::test_json_text_bytes_modules
 deno_core::modules::tests::test_lazy_load_esm_evaluates_pre_instantiated_sibling
 deno_core::modules::tests::test_lazy_loaded_esm_concurrent_loads
 deno_core::modules::tests::test_lazy_loaded_script_not_found
+deno_core::modules::tests::test_mods
+deno_core::modules::tests::test_recursive_load
 deno_core::modules::tests::test_tla_with_tick_scheduled_no_hang
+deno_core::modules::tests::test_validate_import_attributes_callback
 deno_core::modules::tests::test_validate_import_attributes_callback2
 deno_core::modules::tests::test_validate_import_attributes_default
 deno_core::runtime::op_driver::erased_future::tests::test_in_arena_selfref_easy

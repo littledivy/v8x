@@ -139,6 +139,12 @@ struct ModuleState {
 
   import_specifiers: Vec<(std::string::String, Option<std::string::String>)>,
 
+  // Parallel to `import_specifiers`: byte offset of each specifier literal's
+  // opening quote in the module source (deno's `referrer_source_offset`) and
+  // the full `with { ... }` attribute key/value set for that import.
+  import_offsets: Vec<i32>,
+  import_attributes: Vec<Vec<(std::string::String, std::string::String)>>,
+
   source_imports: Vec<(u64, std::string::String)>,
 
   synthetic: bool,
@@ -184,11 +190,43 @@ thread_local! {
     static IMPORT_META_ENABLED: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
 
+    // deno's real HostInitializeImportMetaObjectCallback. When set we route
+    // import.meta population through it (so url/main/resolve/filename/dirname all
+    // match deno exactly — notably `import.meta.resolve` uses the embedder's
+    // loader). Only the native fallback below runs when this is None.
+    static IMPORT_META_CB: std::cell::Cell<
+        Option<crate::isolate::HostInitializeImportMetaObjectCallback>,
+    > = const { std::cell::Cell::new(None) };
+
+    // Maps a module's source name -> the raw `JSValue` of its deno Module
+    // WRAPPER (the handle CompileModule returned). deno's import_meta callback
+    // looks the module up by Global identity (`get_name_by_module`), so we must
+    // hand it a handle naming the EXACT object deno registered. We store the raw
+    // JSValue (not the interned handle pointer) because the handle's heap box is
+    // freed when its HandleScope unwinds — the object itself stays alive via
+    // deno's Global, so the JSValue payload (`u.ptr`) remains a valid identity.
+    static MODULE_WRAPPER_BY_NAME: RefCell<HashMap<std::string::String, JSValue>> =
+        RefCell::new(HashMap::new());
+
     // URL of the main module — the first user (file://http(s)) module deno
     // compiles. Used to set `import.meta.main` (deno's host callback, which we
     // bypass, would normally do this).
     static MAIN_MODULE_URL: std::cell::RefCell<Option<std::string::String>> =
         const { std::cell::RefCell::new(None) };
+}
+
+fn record_module_wrapper(name: &str, wrapper: *const Module) {
+  if name.is_empty() || wrapper.is_null() {
+    return;
+  }
+  let v = jsval_of(wrapper);
+  MODULE_WRAPPER_BY_NAME.with(|t| {
+    t.borrow_mut().insert(name.to_string(), v);
+  });
+}
+
+fn lookup_module_wrapper(name: &str) -> Option<JSValue> {
+  MODULE_WRAPPER_BY_NAME.with(|t| t.borrow().get(name).copied())
 }
 
 fn note_main_module(name: &str) {
@@ -211,9 +249,10 @@ fn is_main_module(name: &str) -> bool {
 }
 
 pub(crate) fn set_import_meta_callback(
-  _cb: crate::isolate::HostInitializeImportMetaObjectCallback,
+  cb: crate::isolate::HostInitializeImportMetaObjectCallback,
 ) {
   IMPORT_META_ENABLED.with(|c| c.set(true));
+  IMPORT_META_CB.with(|c| c.set(Some(cb)));
 }
 
 thread_local! {
@@ -367,6 +406,45 @@ unsafe fn populate_import_meta(
 ) {
   if def.is_null() || !IMPORT_META_ENABLED.with(|c| c.get()) {
     return;
+  }
+
+  // Preferred path: hand the meta object to deno's real
+  // HostInitializeImportMetaObjectCallback. It populates url/main/filename/
+  // dirname and installs `import.meta.resolve` backed by the embedder's loader —
+  // none of which the native fallback below can do faithfully. Requires the
+  // exact Module wrapper deno registered (matched by Global identity).
+  if let Some(cb) = IMPORT_META_CB.with(|c| c.get()) {
+    if let Some(wrapper_val) = lookup_module_wrapper(name) {
+      // Re-intern a fresh scope-bound handle naming deno's registered wrapper
+      // object (the stored handle's box may already have been freed).
+      let wrapper = intern_dup::<Module>(ctx, wrapper_val);
+      if wrapper.is_null() {
+        return;
+      }
+      let meta = unsafe { JS_GetImportMeta(ctx, def) };
+      if meta.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return;
+      }
+      let context = intern_ctx(ctx);
+      let meta_handle = intern::<Object>(meta);
+      let (Some(ctx_l), Some(mod_l), Some(meta_l)) = (
+        unsafe { crate::Local::from_raw(context) },
+        unsafe { crate::Local::from_raw(wrapper) },
+        unsafe { crate::Local::from_raw(meta_handle) },
+      ) else {
+        return;
+      };
+      unsafe { cb(ctx_l, mod_l, meta_l) };
+      // deno's callback may throw (e.g. WebAssembly-unavailable); clear so a
+      // spurious pending exception doesn't poison the subsequent eval.
+      if unsafe { JS_HasException(ctx) } {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+      }
+      return;
+    }
   }
 
   if !(name.starts_with("file://")
@@ -660,6 +738,83 @@ fn parse_import_specifiers(
     }
 
     i += 1;
+  }
+  out
+}
+
+/// Byte offset of each specifier literal's opening quote in `text`, parallel to
+/// `specifiers`. This is V8's `ModuleRequest::source_offset` /
+/// deno's `referrer_source_offset`. A cursor advances past each match so a later
+/// identical specifier resolves to its own occurrence.
+fn compute_import_offsets(
+  text: &str,
+  specifiers: &[std::string::String],
+) -> Vec<i32> {
+  let mut cursor = 0usize;
+  let mut out = Vec::with_capacity(specifiers.len());
+  for spec in specifiers {
+    let mut found = -1i32;
+    for quote in ['"', '\''] {
+      let needle = format!("{quote}{spec}{quote}");
+      if let Some(rel) = text[cursor..].find(&needle) {
+        let pos = cursor + rel;
+        if found < 0 || (pos as i32) < found {
+          found = pos as i32;
+        }
+      }
+    }
+    if found >= 0 {
+      cursor = (found as usize + 1).min(text.len());
+      out.push(found);
+    } else {
+      out.push(0);
+    }
+  }
+  out
+}
+
+/// Full per-import `with { ... }` / `assert { ... }` attribute key/value pairs,
+/// parallel to `specifiers`. QuickJS's loader doesn't expose attributes through
+/// its C-ABI, so scan the clause that immediately follows each specifier literal
+/// in the source. Best-effort, sufficient for deno's flat `key: "value"` form.
+fn compute_import_attributes(
+  text: &str,
+  specifiers: &[std::string::String],
+) -> Vec<Vec<(std::string::String, std::string::String)>> {
+  let offsets = compute_import_offsets(text, specifiers);
+  let mut out = Vec::with_capacity(specifiers.len());
+  for (i, spec) in specifiers.iter().enumerate() {
+    let mut attrs = Vec::new();
+    let off = offsets[i];
+    if off >= 0 {
+      // Position just past the specifier's closing quote.
+      let after = (off as usize + spec.len() + 2).min(text.len());
+      let tail = text[after..].trim_start();
+      let kw = ["with", "assert"].iter().find_map(|k| {
+        tail.strip_prefix(*k).filter(|rest| {
+          rest.starts_with(|c: char| c.is_whitespace() || c == '{')
+        })
+      });
+      if let Some(rest) = kw {
+        if let Some(open) = rest.find('{') {
+          if let Some(close_rel) = rest[open + 1..].find('}') {
+            let body = &rest[open + 1..open + 1 + close_rel];
+            for pair in body.split(',') {
+              if let Some((k, v)) = pair.split_once(':') {
+                let key =
+                  k.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                let val =
+                  v.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                if !key.is_empty() {
+                  attrs.push((key, val));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    out.push(attrs);
   }
   out
 }
@@ -1573,6 +1728,10 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   };
 
   let import_specifiers = parse_import_specifiers(&text);
+  let spec_strs: Vec<std::string::String> =
+    import_specifiers.iter().map(|(s, _)| s.clone()).collect();
+  let import_offsets = compute_import_offsets(&text, &spec_strs);
+  let import_attributes = compute_import_attributes(&text, &spec_strs);
   let is_async = has_top_level_await(&text);
 
   register_module_source(&fname, &text);
@@ -1603,13 +1762,18 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
       module_def: ptr::null_mut(),
       bytecode: None,
       import_specifiers,
+      import_offsets,
+      import_attributes,
       source_imports,
       synthetic: false,
       is_async,
       source_text: text,
-      source_name: fname,
+      source_name: fname.clone(),
     },
   );
+  // Map name -> this wrapper so deno's import.meta callback can be handed the
+  // exact handle it registered (it looks modules up by Global identity).
+  record_module_wrapper(&fname, this);
   this
 }
 
@@ -1820,8 +1984,13 @@ pub extern "C" fn v8__Module__GetModuleRequests(
   if ctx.is_null() {
     return ptr::null();
   }
-  let (specs, src_imports) = with_module_state(this, |m| {
-    (m.import_specifiers.clone(), m.source_imports.clone())
+  let (specs, offsets, attrs, src_imports) = with_module_state(this, |m| {
+    (
+      m.import_specifiers.clone(),
+      m.import_offsets.clone(),
+      m.import_attributes.clone(),
+      m.source_imports.clone(),
+    )
   })
   .unwrap_or_default();
 
@@ -1855,7 +2024,7 @@ pub extern "C" fn v8__Module__GetModuleRequests(
     }
     idx += 1;
   }
-  for (spec, ty) in specs.iter() {
+  for (si, (spec, ty)) in specs.iter().enumerate() {
     let req = unsafe { JS_NewObject(ctx) };
     if req.tag == JS_TAG_EXCEPTION {
       unsafe { JS_FreeValue(ctx, req) };
@@ -1873,6 +2042,54 @@ pub extern "C" fn v8__Module__GetModuleRequests(
         unsafe { JS_SetPropertyStr(ctx, req, c"__attr_type".as_ptr(), tval) };
       }
     }
+
+    // Byte offset of the specifier literal's opening quote (deno's
+    // `referrer_source_offset`), surfaced via `GetSourceOffset`.
+    let off = offsets.get(si).copied().unwrap_or(0);
+    unsafe {
+      JS_SetPropertyStr(
+        ctx,
+        req,
+        c"__source_offset".as_ptr(),
+        JS_NewInt32(ctx, off),
+      );
+    }
+
+    // Full `with { ... }` attributes as a flat [k0, v0, k1, v1, ...] string
+    // array, surfaced as `[k, v, source_offset]` triples by GetImportAttributes.
+    if let Some(pairs) = attrs.get(si) {
+      if !pairs.is_empty() {
+        let kv = unsafe { JS_NewArray(ctx) };
+        if kv.tag != JS_TAG_EXCEPTION {
+          let mut ki = 0u32;
+          for (k, v) in pairs.iter() {
+            if let (Ok(ck), Ok(cv)) =
+              (CString::new(k.as_str()), CString::new(v.as_str()))
+            {
+              unsafe {
+                JS_SetPropertyUint32(
+                  ctx,
+                  kv,
+                  ki,
+                  JS_NewString(ctx, ck.as_ptr()),
+                );
+                JS_SetPropertyUint32(
+                  ctx,
+                  kv,
+                  ki + 1,
+                  JS_NewString(ctx, cv.as_ptr()),
+                );
+              }
+              ki += 2;
+            }
+          }
+          unsafe { JS_SetPropertyStr(ctx, req, c"__attr_kv".as_ptr(), kv) };
+        } else {
+          unsafe { JS_FreeValue(ctx, kv) };
+        }
+      }
+    }
+
     unsafe {
       JS_SetPropertyStr(
         ctx,
@@ -2569,6 +2786,8 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
       module_def: def,
       bytecode: None,
       import_specifiers: Vec::new(),
+      import_offsets: Vec::new(),
+      import_attributes: Vec::new(),
       source_imports: Vec::new(),
       synthetic: true,
       is_async: false,
@@ -2729,9 +2948,21 @@ pub extern "C" fn v8__ModuleRequest__GetPhase(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ModuleRequest__GetSourceOffset(
-  _this: *const ModuleRequest,
+  this: *const ModuleRequest,
 ) -> int {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return 0;
+  }
+  let v = jsval_of(this);
+  let off = unsafe { JS_GetPropertyStr(ctx, v, c"__source_offset".as_ptr()) };
+  let n = match off.tag {
+    JS_TAG_INT => unsafe { off.u.int32 },
+    JS_TAG_FLOAT64 => (unsafe { off.u.float64 }) as i32,
+    _ => 0,
+  };
+  unsafe { JS_FreeValue(ctx, off) };
+  n as int
 }
 
 #[unsafe(no_mangle)]
@@ -2751,17 +2982,52 @@ pub extern "C" fn v8__ModuleRequest__GetImportAttributes(
 
   if !this.is_null() {
     let req = jsval_of(this);
-    let ty = unsafe { JS_GetPropertyStr(ctx, req, c"__attr_type".as_ptr()) };
-    if jsv_is_string(&ty) {
-      unsafe {
-        let key = JS_NewString(ctx, c"type".as_ptr());
-        JS_SetPropertyUint32(ctx, arr, 0, key);
-
-        JS_SetPropertyUint32(ctx, arr, 1, ty);
-        JS_SetPropertyUint32(ctx, arr, 2, JS_NewInt32(ctx, 0));
+    // Prefer the full `with { ... }` attribute set (flat [k0,v0,k1,v1,...]
+    // string array) so deno's validate-import-attributes callback and custom
+    // module-type machinery see every key, not just `type`.
+    let kv = unsafe { JS_GetPropertyStr(ctx, req, c"__attr_kv".as_ptr()) };
+    let mut emitted = false;
+    if jsv_is_object(&kv) {
+      let len_v = unsafe { JS_GetPropertyStr(ctx, kv, c"length".as_ptr()) };
+      let kv_len = match len_v.tag {
+        JS_TAG_INT => unsafe { len_v.u.int32 },
+        JS_TAG_FLOAT64 => (unsafe { len_v.u.float64 }) as i32,
+        _ => 0,
+      };
+      unsafe { JS_FreeValue(ctx, len_v) };
+      let mut out = 0u32;
+      let mut i = 0i32;
+      while i + 1 < kv_len {
+        let k = unsafe { JS_GetPropertyUint32(ctx, kv, i as u32) };
+        let v = unsafe { JS_GetPropertyUint32(ctx, kv, (i + 1) as u32) };
+        unsafe {
+          // Static-import attributes are triples (key, value, source_offset).
+          JS_SetPropertyUint32(ctx, arr, out, k);
+          JS_SetPropertyUint32(ctx, arr, out + 1, v);
+          JS_SetPropertyUint32(ctx, arr, out + 2, JS_NewInt32(ctx, 0));
+        }
+        out += 3;
+        emitted = true;
+        i += 2;
       }
-    } else {
-      unsafe { JS_FreeValue(ctx, ty) };
+    }
+    unsafe { JS_FreeValue(ctx, kv) };
+
+    if !emitted {
+      // Fallback: legacy `type`-only path (synthetic/source-phase requests that
+      // never recorded a full `with {}` clause).
+      let ty = unsafe { JS_GetPropertyStr(ctx, req, c"__attr_type".as_ptr()) };
+      if jsv_is_string(&ty) {
+        unsafe {
+          let key = JS_NewString(ctx, c"type".as_ptr());
+          JS_SetPropertyUint32(ctx, arr, 0, key);
+
+          JS_SetPropertyUint32(ctx, arr, 1, ty);
+          JS_SetPropertyUint32(ctx, arr, 2, JS_NewInt32(ctx, 0));
+        }
+      } else {
+        unsafe { JS_FreeValue(ctx, ty) };
+      }
     }
   }
   intern::<FixedArray>(arr)
