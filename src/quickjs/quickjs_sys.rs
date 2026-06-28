@@ -504,6 +504,9 @@ unsafe extern "C" {
   -> std::os::raw::c_int;
   pub fn v82jsc_module_eval_started(m: *mut JSModuleDef)
   -> std::os::raw::c_int;
+  pub fn v82jsc_module_is_evaluating_async(
+    m: *mut JSModuleDef,
+  ) -> std::os::raw::c_int;
   pub fn v82jsc_has_loaded_module(
     ctx: *mut JSContext,
     name: *const std::os::raw::c_char,

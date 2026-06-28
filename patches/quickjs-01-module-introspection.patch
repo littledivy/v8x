@@ -2,7 +2,7 @@ diff --git a/quickjs.c b/quickjs.c
 index 11caae0..a5d29c7 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -988,6 +988,58 @@ struct JSModuleDef {
+@@ -988,6 +988,67 @@ struct JSModuleDef {
      JSValue private_value; /* private value for C modules */
  };
  
@@ -28,6 +28,15 @@ index 11caae0..a5d29c7 100644
 +    return m && (m->status == JS_MODULE_STATUS_EVALUATING ||
 +                 m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
 +                 m->status == JS_MODULE_STATUS_EVALUATED);
++}
++
++/* v82jsc: report whether a module is parked in the EVALUATING_ASYNC state — its
++   body ran to a top-level `await` whose promise has not settled. A module whose
++   TLA resolves transitions on to EVALUATED, so a module still in this state once
++   the event loop is otherwise idle has a STALLED top-level await. The v8x Module
++   shim uses this for v8::Module::GetStalledTopLevelAwaitMessages. */
++int v82jsc_module_is_evaluating_async(JSModuleDef *m) {
++    return m && (m->status == JS_MODULE_STATUS_EVALUATING_ASYNC);
 +}
 +
 +static JSModuleDef *js_find_loaded_module(JSContext *ctx, JSAtom name);

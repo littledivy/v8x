@@ -2911,12 +2911,89 @@ pub extern "C" fn v8__Module__GetUnboundModuleScript(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
-  _this: *const Module,
+  this: *const Module,
   _isolate: *const RealIsolate,
-  _out_vec: *mut StalledTopLevelAwaitMessage,
-  _vec_len: usize,
+  out_vec: *mut StalledTopLevelAwaitMessage,
+  vec_len: usize,
 ) -> usize {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() || out_vec.is_null() || vec_len == 0 {
+    return 0;
+  }
+
+  // Resolve `this` module's underlying QuickJS def. After evaluation the def is
+  // recorded in ModuleState; fall back to the by-name cache for paths that only
+  // populate it there.
+  let (def, source_name) = with_module_state(this, |m| {
+    let def = if !m.module_def.is_null() {
+      m.module_def
+    } else {
+      MODULE_DEF_CACHE
+        .with(|c| c.borrow().get(&m.source_name).copied())
+        .map(|d| d as *mut JSModuleDef)
+        .unwrap_or(ptr::null_mut())
+    };
+    (def, m.source_name.clone())
+  })
+  .unwrap_or((ptr::null_mut(), std::string::String::new()));
+
+  // Only a module still parked in EVALUATING_ASYNC has an unresolved top-level
+  // await. A resolved TLA advances the module to EVALUATED; deno only reaches
+  // here once the event loop is otherwise idle, so this state means "stalled".
+  // deno iterates the whole module graph itself (root first, then every module),
+  // so checking `this` alone covers every realm without walking dependencies.
+  if def.is_null() || unsafe { v82jsc_module_is_evaluating_async(def) } == 0 {
+    return 0;
+  }
+
+  let message = build_stalled_tla_message(ctx, &source_name);
+  if message.is_null() {
+    return 0;
+  }
+
+  let module = intern_dup::<Module>(ctx, jsval_of(this));
+  unsafe {
+    (*out_vec) = StalledTopLevelAwaitMessage { module, message };
+  }
+  1
+}
+
+/// Build the `v8::Message` that deno surfaces for a stalled top-level await.
+/// `v8__Message__*` accessors read the value's string form (`.get()`) plus the
+/// `fileName`/`lineNumber`/`columnNumber` properties, so we hand back a plain
+/// object whose `toString` is V8's fixed text and whose location points at the
+/// start of the offending module (line 1, column 0 → deno reports column 1).
+fn build_stalled_tla_message(
+  ctx: *mut JSContext,
+  source_name: &str,
+) -> *const Message {
+  let factory_src = c"(file)=>{const o={fileName:file,lineNumber:1,columnNumber:0};o.toString=()=>\"Top-level await promise never resolved\";return o;}";
+  let factory = unsafe {
+    JS_Eval(
+      ctx,
+      factory_src.as_ptr(),
+      factory_src.to_bytes().len(),
+      c"<stalled-tla>".as_ptr(),
+      JS_EVAL_TYPE_GLOBAL,
+    )
+  };
+  if factory.tag == JS_TAG_EXCEPTION {
+    unsafe { JS_FreeValue(ctx, JS_GetException(ctx)) };
+    return ptr::null();
+  }
+  let file = CString::new(source_name).unwrap_or_default();
+  let mut arg = [unsafe { JS_NewString(ctx, file.as_ptr()) }];
+  let obj =
+    unsafe { JS_Call(ctx, factory, jsv_undefined(), 1, arg.as_mut_ptr()) };
+  unsafe {
+    JS_FreeValue(ctx, arg[0]);
+    JS_FreeValue(ctx, factory);
+  }
+  if obj.tag == JS_TAG_EXCEPTION {
+    unsafe { JS_FreeValue(ctx, JS_GetException(ctx)) };
+    return ptr::null();
+  }
+  intern::<Message>(obj)
 }
 
 #[unsafe(no_mangle)]

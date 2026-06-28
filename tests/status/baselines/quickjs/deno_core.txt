@@ -273,6 +273,7 @@ deno_core::runtime::tests::misc::test_resolve_value::case_13
 deno_core::runtime::tests::misc::test_resolve_value::case_14
 deno_core::runtime::tests::misc::test_resolve_value::case_15
 deno_core::runtime::tests::misc::test_set_macrotask_callback_set_next_tick_callback
+deno_core::runtime::tests::misc::test_stalled_tla
 deno_core::runtime::tests::misc::test_v8_platform
 deno_core::runtime::tests::misc::test_wakers_for_async_ops
 deno_core::runtime::tests::ops::duplicate_op_names - should panic
