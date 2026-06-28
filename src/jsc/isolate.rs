@@ -405,17 +405,44 @@ pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(
   if ctx.is_null() {
     return;
   }
+  unsafe { drive_microtask_checkpoint(ctx) }
+}
+
+/// Drain the embedder microtask queue and JSC's promise-reaction queue to a
+/// fixed point — V8 semantics: a checkpoint runs enqueued microtasks
+/// (`EnqueueMicrotask`, e.g. deno's `op_queue_microtask`) and promise reaction
+/// jobs as ONE FIFO, run to completion at the checkpoint (NOT synchronously at
+/// enqueue time).
+///
+/// JSC has no public API to inspect/drive its promise-job queue, but a JS API
+/// entry/exit (`JSEvaluateScript`) drains JSC's microtask queue to EMPTY on the
+/// way out (`drainMicrotasks` runs transitively, including jobs queued *during*
+/// the drain). So one `JSEvaluateScript("0")` settles every JSC promise
+/// reaction that is currently ready. The only work that crosses the JSC↔embedder
+/// boundary is: an embedder microtask resolving a promise (→ new JSC jobs) and a
+/// JSC reaction calling back into deno (→ new embedder microtasks). We therefore
+/// alternate draining each side until a full pass produces NOTHING new.
+///
+/// Previously this was a fixed 64× pump. A fixed count is *perturbable*: whether
+/// async-op result delivery lands its final reaction on iteration 63 vs 64
+/// depends on GC / op-completion timing, so a deno_core run could leave the last
+/// reaction undrained on some runs and not others (the `test_op_async_*` /
+/// `test_op_string_returns` flakiness, denoland/divybot#655). Draining to a fixed
+/// point makes the settled set independent of timing.
+unsafe fn drive_microtask_checkpoint(ctx: JSContextRef) {
   unsafe {
-    // V8 runs enqueued microtasks (EnqueueMicrotask callbacks, e.g. deno's
-    // op_queue_microtask) and promise reaction jobs in one FIFO at the
-    // checkpoint -- NOT synchronously at enqueue time. Drain both here. A
-    // callback may enqueue more microtasks / promise jobs, so loop until both
-    // queues are quiet (bounded). JSC drains its own promise-job queue when a
-    // JS API entry unwinds, hence the `JSEvaluateScript("0")` pump.
     let s = JSStringCreateWithUTF8CString(c"0".as_ptr());
-    for _ in 0..64 {
-      // Run all currently-queued embedder microtasks (FIFO). New ones queued
-      // during a callback are picked up on the next inner iteration.
+    // Safety cap: a self-perpetuating microtask cycle would also spin V8's
+    // checkpoint forever; break out far above any real promise-reaction depth so
+    // a pathological test can't wedge the whole binary. deno never enqueues an
+    // unbounded microtask chain (recurring work uses timers/macrotasks).
+    const MAX_PASSES: u32 = 1 << 20;
+    let mut passes = 0u32;
+    loop {
+      // Run every currently-queued embedder microtask (FIFO). Callbacks may
+      // enqueue more embedder microtasks (picked up by this same inner loop) or
+      // resolve promises (→ JSC jobs, pumped below).
+      let mut ran_any = false;
       loop {
         let item = MICROTASK_QUEUE.with(|q| {
           let mut b = q.borrow_mut();
@@ -426,6 +453,7 @@ pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(
           }
         });
         let Some((gctx, f)) = item else { break };
+        ran_any = true;
         let mut exc: JSValueRef = ptr::null();
         JSObjectCallAsFunction(
           gctx,
@@ -437,9 +465,20 @@ pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(
         );
         JSValueUnprotect(gctx, f as JSValueRef);
       }
-      // Pump one layer of JSC promise-reaction jobs.
+      // Pump JSC's promise-reaction queue to empty. Reactions may call back into
+      // deno and enqueue fresh embedder microtasks.
       let mut exc: JSValueRef = ptr::null();
       JSEvaluateScript(ctx, s, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+      // Fixed point: a full pass that ran no embedder microtask AND left the
+      // queue empty after the JSC drain means every queue is quiet — done.
+      let pending = MICROTASK_QUEUE.with(|q| !q.borrow().is_empty());
+      if !ran_any && !pending {
+        break;
+      }
+      passes += 1;
+      if passes >= MAX_PASSES {
+        break;
+      }
     }
     JSStringRelease(s);
   }
