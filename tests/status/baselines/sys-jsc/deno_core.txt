@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=sys-jsc suite=deno_core.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 260 passing. DO NOT hand-sort; the
+# (run.mjs --update). 261 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 deno_core::arena::raw_arena::tests::test_add_clear_many
 deno_core::arena::raw_arena::tests::test_add_remove_many
@@ -209,6 +209,7 @@ deno_core::runtime::tests::misc::inspector
 deno_core::runtime::tests::misc::task_spawner
 deno_core::runtime::tests::misc::task_spawner_cross_thread
 deno_core::runtime::tests::misc::task_spawner_cross_thread_blocking
+deno_core::runtime::tests::misc::terminate_execution_run_event_loop_js
 deno_core::runtime::tests::misc::test_execute_script_return_value
 deno_core::runtime::tests::misc::test_heap_limit_cb_remove
 deno_core::runtime::tests::misc::test_next_tick
