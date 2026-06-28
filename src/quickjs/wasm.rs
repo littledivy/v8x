@@ -957,7 +957,7 @@ unsafe fn instantiate(
     let val = unsafe { get_prop(ctx, modobj, &name) };
     unsafe { JS_FreeValue(ctx, modobj) };
 
-    if kind == WASM_EXTERN_FUNC && unsafe { JS_IsFunction(ctx, val) } != 0 {
+    if kind == WASM_EXTERN_FUNC && unsafe { JS_IsFunction(ctx, val) } {
       let ft = unsafe { wasm_externtype_as_functype_const(ext_ty) };
       let result_kinds = valtype_kinds(unsafe { wasm_functype_results(ft) });
       let env = Box::into_raw(Box::new(ImportEnv {

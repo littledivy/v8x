@@ -72,7 +72,7 @@ unsafe fn make_named_error(message: *const String, name: &str) -> JSValue {
   };
   let ctor = JS_GetPropertyStr(ctx, global, cname.as_ptr());
   JS_FreeValue(ctx, global);
-  if ctor.tag == JS_TAG_EXCEPTION || JS_IsConstructor(ctx, ctor) == 0 {
+  if ctor.tag == JS_TAG_EXCEPTION || !JS_IsConstructor(ctx, ctor) {
     JS_FreeValue(ctx, ctor);
     return jsv_undefined();
   }
@@ -282,7 +282,7 @@ unsafe fn current_backtrace_string(ctx: *mut JSContext) -> std::string::String {
   let global = unsafe { JS_GetGlobalObject(ctx) };
   let ctor = unsafe { JS_GetPropertyStr(ctx, global, c"Error".as_ptr()) };
   unsafe { JS_FreeValue(ctx, global) };
-  if unsafe { JS_IsConstructor(ctx, ctor) } == 0 {
+  if !unsafe { JS_IsConstructor(ctx, ctor) } {
     unsafe { JS_FreeValue(ctx, ctor) };
     return std::string::String::new();
   }
@@ -515,7 +515,7 @@ unsafe fn call_promise_method(
   }
   let pv = jsval_of(promise);
   let f = JS_GetPropertyStr(ctx, pv, method.as_ptr() as *const c_char);
-  if f.tag == JS_TAG_EXCEPTION || JS_IsFunction(ctx, f) == 0 {
+  if f.tag == JS_TAG_EXCEPTION || !JS_IsFunction(ctx, f) {
     JS_FreeValue(ctx, f);
     clear_pending(ctx);
     return ptr::null();
@@ -618,7 +618,7 @@ unsafe fn resolver_settle(
   }
   let holder = jsval_of(this);
   let f = JS_GetPropertyStr(ctx, holder, fn_prop.as_ptr() as *const c_char);
-  if f.tag == JS_TAG_EXCEPTION || JS_IsFunction(ctx, f) == 0 {
+  if f.tag == JS_TAG_EXCEPTION || !JS_IsFunction(ctx, f) {
     JS_FreeValue(ctx, f);
     clear_pending(ctx);
     return MaybeBool::Nothing;

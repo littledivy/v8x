@@ -43,7 +43,7 @@ unsafe extern "C" fn codegen_thrower(
     let global = JS_GetGlobalObject(ctx);
     let ctor = JS_GetPropertyStr(ctx, global, c"EvalError".as_ptr());
     JS_FreeValue(ctx, global);
-    if ctor.tag == JS_TAG_EXCEPTION || JS_IsConstructor(ctx, ctor) == 0 {
+    if ctor.tag == JS_TAG_EXCEPTION || !JS_IsConstructor(ctx, ctor) {
       JS_FreeValue(ctx, ctor);
       // MSG is a fixed literal with no `%`, so using it directly as the
       // printf-style format string is safe.
@@ -556,7 +556,7 @@ pub extern "C" fn v8__Isolate__EnqueueMicrotask(
   }
   let f = jsval_of(function);
   unsafe {
-    if JS_IsFunction(ctx, f) == 0 {
+    if !JS_IsFunction(ctx, f) {
       return;
     }
     let helper = ENQUEUE_HELPER.with(|c| {
@@ -579,7 +579,7 @@ pub extern "C" fn v8__Isolate__EnqueueMicrotask(
       c.set(Some(h));
       h
     });
-    if JS_IsFunction(ctx, helper) == 0 {
+    if !JS_IsFunction(ctx, helper) {
       return;
     }
     let mut argv = [JS_DupValue(ctx, f)];
@@ -777,7 +777,7 @@ pub extern "C" fn v8__MicrotaskQueue__EnqueueMicrotask(
   }
   let f = jsval_of(microtask);
   unsafe {
-    if JS_IsFunction(ctx, f) != 0 {
+    if JS_IsFunction(ctx, f) {
       let ret = JS_Call(ctx, f, jsv_undefined(), 0, ptr::null_mut());
       if ret.tag == JS_TAG_EXCEPTION {
         let exc = JS_GetException(ctx);

@@ -945,7 +945,7 @@ pub extern "C" fn v8__DataView__New(
     let global = JS_GetGlobalObject(ctx);
     let ctor = JS_GetPropertyStr(ctx, global, c"DataView".as_ptr());
     JS_FreeValue(ctx, global);
-    if ctor.tag == JS_TAG_EXCEPTION || JS_IsConstructor(ctx, ctor) == 0 {
+    if ctor.tag == JS_TAG_EXCEPTION || !JS_IsConstructor(ctx, ctor) {
       JS_FreeValue(ctx, ctor);
       return ptr::null();
     }

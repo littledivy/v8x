@@ -312,9 +312,7 @@ pub extern "C" fn v8__Value__IsArray(this: *const Value) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsFunction(this: *const Value) -> bool {
   let c = ctx();
-  !c.is_null()
-    && !this.is_null()
-    && unsafe { JS_IsFunction(c, jsval_of(this)) != 0 }
+  !c.is_null() && !this.is_null() && unsafe { JS_IsFunction(c, jsval_of(this)) }
 }
 
 #[unsafe(no_mangle)]
@@ -382,7 +380,7 @@ pub extern "C" fn v8__Value__IsGeneratorFunction(this: *const Value) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsPromise(this: *const Value) -> bool {
-  !this.is_null() && unsafe { JS_IsPromise(jsval_of(this)) != 0 }
+  !this.is_null() && unsafe { JS_IsPromise(jsval_of(this)) }
 }
 
 #[unsafe(no_mangle)]
@@ -728,7 +726,7 @@ pub extern "C" fn v8__Value__TypeOf(
     JS_TAG_SYMBOL => b"symbol\0",
     JS_TAG_BIG_INT | JS_TAG_SHORT_BIG_INT => b"bigint\0",
     JS_TAG_OBJECT => {
-      if unsafe { JS_IsFunction(ctx, v) } != 0 {
+      if unsafe { JS_IsFunction(ctx, v) } {
         b"function\0"
       } else {
         b"object\0"

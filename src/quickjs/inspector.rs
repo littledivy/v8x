@@ -498,7 +498,7 @@ mod cdp {
       "bigint"
     } else if jsv_is_symbol(&v) {
       "symbol"
-    } else if unsafe { JS_IsFunction(ctx, v) } != 0 {
+    } else if unsafe { JS_IsFunction(ctx, v) } {
       "function"
     } else {
       "object"
@@ -647,7 +647,7 @@ mod cdp {
   }
 
   unsafe fn await_value(ctx: *mut JSContext, v: JSValue) -> JSValue {
-    if !jsv_is_object(&v) || unsafe { JS_IsPromise(v) } == 0 {
+    if !jsv_is_object(&v) || !unsafe { JS_IsPromise(v) } {
       return v;
     }
     unsafe { drain_jobs(ctx) };

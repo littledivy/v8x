@@ -1012,7 +1012,7 @@ pub extern "C" fn v8__Object__PreviewEntries(
   unsafe {
     let is_map = {
       let m = JS_GetPropertyStr(ctx, jsval_of(this), c"set".as_ptr());
-      let is_fn = JS_IsFunction(ctx, m) != 0;
+      let is_fn = JS_IsFunction(ctx, m);
       JS_FreeValue(ctx, m);
       is_fn
     };
