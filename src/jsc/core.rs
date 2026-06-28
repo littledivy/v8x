@@ -239,7 +239,7 @@ pub(crate) fn peek_pending_exception(iso: *mut RealIsolate) -> JSValueRef {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
+pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   let group = unsafe { JSContextGroupCreate() };
   let state = Box::new(IsoState {
     group,
@@ -251,7 +251,23 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     import_meta_cb: None,
     cpp_heap: crate::jsc::misc::current_cpp_heap(),
   });
-  Box::into_raw(state) as *mut RealIsolate
+  let iso = Box::into_raw(state) as *mut RealIsolate;
+  // Arm the execution-time-limit watchdog so `TerminateExecution` and the
+  // near-heap-limit callback have a JSC-side hook to fire through.
+  crate::jsc::terminate::install(iso, group, heap_limit_from_params(params));
+  iso
+}
+
+/// Pull the configured max heap size out of a raw `CreateParams` pointer, if
+/// any. Layout (see `isolate_create_params::raw`): word 0 is the
+/// `code_event_handler` pointer, then `ResourceConstraints` whose second word
+/// (params word 2) is `max_old_generation_size_` — what `heap_limits(_, max)`
+/// stores. 0 means no limit was set.
+fn heap_limit_from_params(params: *const c_void) -> usize {
+  if params.is_null() {
+    return 0;
+  }
+  unsafe { *(params as *const usize).add(2) }
 }
 
 #[unsafe(no_mangle)]
@@ -273,6 +289,8 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
   if this.is_null() {
     return;
   }
+  // Disarm the watchdog (and drop its state) before the group is released.
+  crate::jsc::terminate::uninstall(this);
   unsafe {
     let mut st = Box::from_raw(this as *mut IsoState);
     if let Some((ctx, v)) = st.pending_exception.take() {

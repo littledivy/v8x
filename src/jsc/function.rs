@@ -498,6 +498,17 @@ pub extern "C" fn v8__Function__Call(
   if ctx.is_null() || this.is_null() {
     return ptr::null();
   }
+  // Once execution has been terminated, the JS loop only resumes through call
+  // boundaries like this one (e.g. deno resolving a completed op). A tight CPU
+  // loop unwinds via the watchdog, but a loop that yields on `await` does not —
+  // so refuse to re-enter JS and surface an empty (undefined) pending exception
+  // that deno turns into "execution terminated".
+  let iso = crate::jsc::core::current_iso();
+  if !iso.is_null() && crate::jsc::terminate::is_terminating(iso) {
+    let undef = unsafe { JSValueMakeUndefined(ctx) };
+    crate::jsc::core::record_pending_exception(ctx, undef);
+    return ptr::null();
+  }
   let func = jsval(this) as JSObjectRef;
   let recv_obj = if recv.is_null() {
     ptr::null_mut()

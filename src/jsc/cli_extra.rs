@@ -69,10 +69,15 @@ pub extern "C" fn icu_get_default_locale(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__AddNearHeapLimitCallback(
-  _isolate: *mut c_void,
-  _callback: *const c_void,
-  _data: *mut c_void,
+  isolate: *mut c_void,
+  callback: crate::isolate::NearHeapLimitCallback,
+  data: *mut c_void,
 ) {
+  crate::jsc::terminate::set_heap_callback(
+    isolate as *mut crate::RealIsolate,
+    callback,
+    data,
+  );
 }
 
 #[unsafe(no_mangle)]

@@ -20,4 +20,5 @@ pub(crate) mod serializer;
 pub(crate) mod shims;
 pub(crate) mod simdutf;
 pub(crate) mod string;
+pub(crate) mod terminate;
 pub(crate) mod value;
