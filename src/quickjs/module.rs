@@ -2306,7 +2306,7 @@ pub extern "C" fn v8__Module__Evaluate(
       }
       unsafe { JS_FreeValue(ctx, exc) };
     } else if result.tag == JS_TAG_OBJECT
-      && unsafe { JS_IsPromise(result) } != 0
+      && unsafe { JS_IsPromise(result) }
       && unsafe { JS_PromiseState(ctx, result) } == 0
     {
       async_promise = Some(result);
@@ -2406,8 +2406,7 @@ pub extern "C" fn v8__Module__Evaluate(
         unsafe { JS_FreeValue(ctx, exc) };
       } else {
         if std::env::var_os("QJS_DEBUG_MOD").is_some() {
-          if result.tag == JS_TAG_OBJECT && unsafe { JS_IsPromise(result) } != 0
-          {
+          if result.tag == JS_TAG_OBJECT && unsafe { JS_IsPromise(result) } {
             let state = unsafe { JS_PromiseState(ctx, result) };
             eprintln!("[QJS Evaluate-result] promise state={state}");
             if state == 2 {
@@ -2428,7 +2427,7 @@ pub extern "C" fn v8__Module__Evaluate(
           }
         }
         if result.tag == JS_TAG_OBJECT
-          && unsafe { JS_IsPromise(result) } != 0
+          && unsafe { JS_IsPromise(result) }
           && unsafe { JS_PromiseState(ctx, result) } == 0
         {
           async_promise = Some(result);

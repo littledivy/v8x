@@ -787,7 +787,7 @@ unsafe fn call_collection_method(
 ) -> JSValue {
   unsafe {
     let f = JS_GetPropertyStr(ctx, this, method);
-    if JS_IsFunction(ctx, f) == 0 {
+    if !JS_IsFunction(ctx, f) {
       JS_FreeValue(ctx, f);
       return jsv_exception();
     }
@@ -821,7 +821,7 @@ fn new_builtin(isolate: *mut RealIsolate, ctor_name: *const c_char) -> JSValue {
     let global = JS_GetGlobalObject(ctx);
     let ctor = JS_GetPropertyStr(ctx, global, ctor_name);
     JS_FreeValue(ctx, global);
-    if JS_IsConstructor(ctx, ctor) == 0 {
+    if !JS_IsConstructor(ctx, ctor) {
       JS_FreeValue(ctx, ctor);
       return jsv_exception();
     }
@@ -899,7 +899,7 @@ pub extern "C" fn v8__Set__New(isolate: *mut RealIsolate) -> *const crate::Set {
     let global = JS_GetGlobalObject(ctx);
     let ctor = JS_GetPropertyStr(ctx, global, c"Set".as_ptr());
     JS_FreeValue(ctx, global);
-    if JS_IsConstructor(ctx, ctor) == 0 {
+    if !JS_IsConstructor(ctx, ctor) {
       JS_FreeValue(ctx, ctor);
       return ptr::null();
     }
@@ -926,7 +926,7 @@ pub extern "C" fn v8__Set__Add(
   }
   unsafe {
     let add = JS_GetPropertyStr(ctx, jsval_of(this), c"add".as_ptr());
-    if JS_IsFunction(ctx, add) == 0 {
+    if !JS_IsFunction(ctx, add) {
       JS_FreeValue(ctx, add);
       return ptr::null();
     }
@@ -958,7 +958,7 @@ pub extern "C" fn v8__Date__New(
     let global = JS_GetGlobalObject(ctx);
     let ctor = JS_GetPropertyStr(ctx, global, c"Date".as_ptr());
     JS_FreeValue(ctx, global);
-    if JS_IsConstructor(ctx, ctor) == 0 {
+    if !JS_IsConstructor(ctx, ctor) {
       JS_FreeValue(ctx, ctor);
       return ptr::null();
     }
@@ -982,7 +982,7 @@ pub extern "C" fn v8__Date__ValueOf(this: *const crate::Date) -> f64 {
   }
   unsafe {
     let vo = JS_GetPropertyStr(ctx, jsval_of(this), c"valueOf".as_ptr());
-    if JS_IsFunction(ctx, vo) == 0 {
+    if !JS_IsFunction(ctx, vo) {
       JS_FreeValue(ctx, vo);
       return 0.0;
     }

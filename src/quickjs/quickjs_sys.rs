@@ -338,8 +338,8 @@ unsafe extern "C" {
   ) -> JSValue;
 
   pub fn JS_IsArray(v: JSValue) -> bool;
-  pub fn JS_IsFunction(ctx: *mut JSContext, v: JSValue) -> c_int;
-  pub fn JS_IsConstructor(ctx: *mut JSContext, v: JSValue) -> c_int;
+  pub fn JS_IsFunction(ctx: *mut JSContext, v: JSValue) -> bool;
+  pub fn JS_IsConstructor(ctx: *mut JSContext, v: JSValue) -> bool;
   pub fn JS_GetPropertyStr(
     ctx: *mut JSContext,
     this_obj: JSValue,
@@ -463,7 +463,7 @@ unsafe extern "C" {
   ) -> JSValue;
   pub fn JS_PromiseState(ctx: *mut JSContext, promise: JSValue) -> c_int;
   pub fn JS_PromiseResult(ctx: *mut JSContext, promise: JSValue) -> JSValue;
-  pub fn JS_IsPromise(v: JSValue) -> c_int;
+  pub fn JS_IsPromise(v: JSValue) -> bool;
   pub fn JS_SetHostPromiseRejectionTracker(
     rt: *mut JSRuntime,
     cb: Option<JSHostPromiseRejectionTracker>,
