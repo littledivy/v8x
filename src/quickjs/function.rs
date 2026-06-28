@@ -237,6 +237,23 @@ unsafe fn dispatch(
     args.push(unsafe { *argv.add(i) });
   }
   let iso = current_iso();
+
+  // Every handle the callback interns (its arguments, `data`, `this`, any Local
+  // it creates) lands in the isolate's handle arena. V8 frees those when the
+  // callback's implicit HandleScope unwinds; we have no such scope, so without
+  // this boundary they accumulate for the lifetime of the *enclosing* scope —
+  // which, for an op called in a 6000-iteration JIT-warmup loop, means tens of
+  // thousands of live arena slots, each pinning a QuickJS reference (notably the
+  // op's `data` External, whose refcount then balloons into the thousands).
+  // Bracket each callback with a save/restore of the arena depth so it behaves
+  // like V8's per-callback HandleScope. Record the depth now and release
+  // everything the callback added once we're done.
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+
   let info = Box::new(CbInfo {
     isolate: iso,
     ctx,
@@ -253,14 +270,30 @@ unsafe fn dispatch(
   let info = unsafe { Box::from_raw(info_ptr as *mut CbInfo) };
   let ret = *info.return_slot;
 
-  if unsafe { JS_HasException(ctx) } {
-    return jsv_exception();
-  }
-  if jsv_is_undefined(&ret) {
-    return jsv_undefined();
+  // Materialize the result as a value we own *before* tearing down the arena:
+  // `ret` is only a borrowed copy of whatever Local the callback stored via
+  // ReturnValue::set, and that Local lives in the slots we're about to free.
+  let result = if unsafe { JS_HasException(ctx) } {
+    jsv_exception()
+  } else if jsv_is_undefined(&ret) {
+    jsv_undefined()
+  } else {
+    unsafe { JS_DupValue(ctx, ret) }
+  };
+
+  if !iso.is_null() {
+    let st = iso_state(iso);
+    while st.handles.len() > saved_depth {
+      if let Some(slot) = st.handles.pop() {
+        unsafe {
+          JS_FreeValue(st.ctx, *slot);
+          drop(Box::from_raw(slot));
+        }
+      }
+    }
   }
 
-  unsafe { JS_DupValue(ctx, ret) }
+  result
 }
 
 unsafe extern "C" fn fn_trampoline(
@@ -418,31 +451,36 @@ fn cbinfo<'a>(this: *const FunctionCallbackInfo) -> &'a mut CbInfo {
   unsafe { &mut *(this as *mut CbInfo) }
 }
 
-thread_local! {
-    static EXT_CLASS_ID: std::cell::Cell<JSClassID> = const { std::cell::Cell::new(0) };
-}
-
 unsafe extern "C" fn ext_finalize(_rt: *mut JSRuntime, _val: JSValue) {}
 
-fn ext_class_id(rt: *mut JSRuntime) -> JSClassID {
-  EXT_CLASS_ID.with(|c| {
-    let existing = c.get();
-    if existing != 0 {
-      return existing;
-    }
-    let mut id: JSClassID = 0;
-    let id = unsafe { JS_NewClassID(rt, &mut id) };
-    let def = JSClassDef {
-      class_name: c"v8jsc_external".as_ptr(),
-      finalizer: Some(ext_finalize),
-      gc_mark: ptr::null(),
-      call: ptr::null(),
-      exotic: ptr::null(),
-    };
-    unsafe { JS_NewClass(rt, id, &def) };
-    c.set(id);
-    id
-  })
+/// Allocate a class id and register the `v8::External` class on `rt`. Must be
+/// called BEFORE the runtime's first context is created (a context sizes its
+/// `class_proto` array to `rt->class_count` at creation time and never grows it,
+/// so a class registered afterward makes `JS_NewObjectClass` read `class_proto`
+/// out of bounds). Called once per isolate from `v8__Isolate__New`; the id is
+/// stored in `IsoState` rather than a thread-local so it stays correct across
+/// multiple isolates on one thread (each runtime registers its own class).
+pub(crate) fn register_external_class(rt: *mut JSRuntime) -> JSClassID {
+  let mut id: JSClassID = 0;
+  let id = unsafe { JS_NewClassID(rt, &mut id) };
+  let def = JSClassDef {
+    class_name: c"v8jsc_external".as_ptr(),
+    finalizer: Some(ext_finalize),
+    gc_mark: ptr::null(),
+    call: ptr::null(),
+    exotic: ptr::null(),
+  };
+  unsafe { JS_NewClass(rt, id, &def) };
+  id
+}
+
+/// The `v8::External` class id for the current isolate (0 if unavailable).
+fn ext_class_id_current() -> JSClassID {
+  let iso = current_iso();
+  if iso.is_null() {
+    return 0;
+  }
+  iso_state(iso).ext_class_id
 }
 
 #[unsafe(no_mangle)]
@@ -458,7 +496,7 @@ pub extern "C" fn v8__External__New(
   if ctx.is_null() {
     return ptr::null();
   }
-  let cid = ext_class_id(st.rt);
+  let cid = st.ext_class_id;
   let obj = unsafe { JS_NewObjectClass(ctx, cid as c_int) };
   if jsv_is_exception(&obj) {
     return ptr::null();
@@ -473,11 +511,7 @@ pub extern "C" fn v8__External__Value(this: *const External) -> *mut c_void {
   if this.is_null() {
     return ptr::null_mut();
   }
-  let iso = current_iso();
-  if iso.is_null() {
-    return ptr::null_mut();
-  }
-  let cid = EXT_CLASS_ID.with(|c| c.get());
+  let cid = ext_class_id_current();
   if cid == 0 {
     return ptr::null_mut();
   }
@@ -488,7 +522,7 @@ pub(crate) fn value_is_external(v: JSValue) -> bool {
   if !jsv_is_object(&v) {
     return false;
   }
-  let cid = EXT_CLASS_ID.with(|c| c.get());
+  let cid = ext_class_id_current();
   if cid == 0 {
     return false;
   }
@@ -884,7 +918,17 @@ pub extern "C" fn v8__Template__Set(
   }
   let raw = this as *const c_void as usize;
 
+  // The `key` and `value` arrive as borrowed handles (Local) owned by the
+  // caller's HandleScope; the props Vec outlives that scope (it lives for the
+  // template's lifetime). Storing the raw JSValue would leave a dangling
+  // reference once the scope frees the handle — a use-after-free that QuickJS's
+  // GC later trips over (NULL/garbage `shape` while marking) once the freed
+  // slot is reused. So take our own reference on anything refcounted.
+  let ctx = current_ctx();
+  let key_owned = own_template_value(ctx, jsval_of(key));
   let stored = if is_template_ptr(value as *const c_void) {
+    // A FunctionTemplate/ObjectTemplate pointer tagged for later
+    // materialization — a raw pointer, not a refcounted JSValue.
     make_value(
       JS_TAG_TEMPLATE,
       JSValueUnion {
@@ -892,11 +936,23 @@ pub extern "C" fn v8__Template__Set(
       },
     )
   } else {
-    jsval_of(value)
+    own_template_value(ctx, jsval_of(value))
   };
   with_template_props(raw, |props| {
-    props.push((jsval_of(key), stored, attr.as_u32_lenient()));
+    props.push((key_owned, stored, attr.as_u32_lenient()));
   });
+}
+
+/// Take an owning reference on a JSValue that is about to be stashed in a
+/// long-lived template structure (props / accessors). No-op for non-refcounted
+/// values (ints, bools, the `JS_TAG_TEMPLATE`/`JS_TAG_V8_CONTEXT` sentinels) and
+/// when no context is available.
+#[inline]
+fn own_template_value(ctx: *mut JSContext, v: JSValue) -> JSValue {
+  if ctx.is_null() {
+    return v;
+  }
+  unsafe { JS_DupValue(ctx, v) }
 }
 
 const JS_TAG_TEMPLATE: i64 = 0x7633;
@@ -1209,8 +1265,11 @@ pub extern "C" fn v8__ObjectTemplate__SetAccessorProperty(
     return;
   }
   let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  // Own the key for the accessor's lifetime — see `own_template_value` in
+  // `v8__Template__Set`: the borrowed handle would otherwise dangle.
+  let key_owned = own_template_value(current_ctx(), jsval_of(key));
   t.accessors.push(TemplAccessor {
-    key: jsval_of(key),
+    key: key_owned,
     getter: getter as *const FnTemplate,
     setter: setter as *const FnTemplate,
     attr: attr.as_u32_lenient(),
