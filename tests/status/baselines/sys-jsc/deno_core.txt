@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=sys-jsc suite=deno_core.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 259 passing. DO NOT hand-sort; the
+# (run.mjs --update). 260 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 deno_core::arena::raw_arena::tests::test_add_clear_many
 deno_core::arena::raw_arena::tests::test_add_remove_many
@@ -34,6 +34,7 @@ deno_core::async_cancel::tests::future_cancels_itself_before_completion
 deno_core::async_cell::tests::async_ref_cell_borrow
 deno_core::async_cell::tests::async_ref_cell_try_borrow
 deno_core::async_cell::tests::rc_ref_map
+deno_core::convert::tests::derive_from_struct
 deno_core::convert::tests::derive_from_tuple_struct
 deno_core::convert::tests::derive_struct
 deno_core::convert::tests::derive_to_struct
