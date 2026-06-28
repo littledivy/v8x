@@ -817,14 +817,117 @@ pub extern "C" fn v8__Script__Compile(
     return ptr::null();
   }
 
+  let name = unsafe { origin_resource_name(ctx, origin) };
+
+  // Syntax-check now: V8 reports syntax errors at *compile* time, and deno's
+  // `execute_script` reads the exception straight from a failed compile. QuickJS
+  // only surfaces the parse error when the script is run, and the resulting
+  // SyntaxError carries no `fileName`/`lineNumber`/`columnNumber` properties, so
+  // deno's `JsStackFrame::from_v8_message` fallback (the path for frame-less
+  // errors) finds no location and produces zero frames. Compile with
+  // COMPILE_ONLY here; on failure, stamp the parse location onto the SyntaxError
+  // and leave it pending so the compile returns null with a located error.
+  unsafe {
+    let mut len: usize = 0;
+    let cstr = JS_ToCStringLen(ctx, &mut len, jsval_of(source));
+    if !cstr.is_null() {
+      let url_ptr = match name.as_ref() {
+        Some(n) => n.as_ptr(),
+        None => c"<anonymous>".as_ptr(),
+      };
+      let compiled = JS_Eval(
+        ctx,
+        cstr,
+        len,
+        url_ptr,
+        global_eval_flags() | JS_EVAL_FLAG_COMPILE_ONLY,
+      );
+      JS_FreeCString(ctx, cstr);
+      if compiled.tag == JS_TAG_EXCEPTION {
+        stamp_syntax_error_location(ctx, name.as_ref());
+        return ptr::null();
+      }
+      JS_FreeValue(ctx, compiled);
+    }
+  }
+
   let handle = intern_dup::<crate::Script>(ctx, jsval_of(source));
   if !handle.is_null()
-    && let Some(name) = unsafe { origin_resource_name(ctx, origin) }
+    && let Some(name) = name
   {
     SCRIPT_RESOURCE_NAMES
       .with(|m| m.borrow_mut().insert(handle as usize, name));
   }
   handle
+}
+
+/// After a failed COMPILE_ONLY in `v8__Script__Compile`, stamp the pending
+/// SyntaxError with `fileName`/`lineNumber`/`columnNumber` so deno's
+/// `from_v8_message` fallback builds a located frame, then re-arm it as pending.
+/// Line/column come from the error's parsed backtrace (quickjs records the
+/// offending token's position there via our `js_parse_error` patch).
+unsafe fn stamp_syntax_error_location(
+  ctx: *mut JSContext,
+  resource: Option<&std::ffi::CString>,
+) {
+  if !unsafe { JS_HasException(ctx) } {
+    return;
+  }
+  // Takes ownership and clears the pending slot; we re-throw it below.
+  let exc = unsafe { JS_GetException(ctx) };
+
+  let (line, col) = unsafe { error_backtrace_location(ctx, exc) };
+
+  if let Some(name) = resource {
+    let fname = unsafe { JS_NewString(ctx, name.as_ptr()) };
+    unsafe {
+      JS_SetPropertyStr(ctx, exc, c"fileName".as_ptr(), fname);
+    }
+  }
+  if line > 0 {
+    let v = unsafe { JS_NewInt32(ctx, line) };
+    unsafe {
+      JS_SetPropertyStr(ctx, exc, c"lineNumber".as_ptr(), v);
+    }
+  }
+  if col > 0 {
+    // deno's `GetStartColumn` returns this raw and re-adds 1, so store the
+    // 0-based column (quickjs/our backtrace reports 1-based).
+    let v = unsafe { JS_NewInt32(ctx, col - 1) };
+    unsafe {
+      JS_SetPropertyStr(ctx, exc, c"columnNumber".as_ptr(), v);
+    }
+  }
+
+  unsafe {
+    JS_Throw(ctx, exc);
+  }
+}
+
+/// Read an error's `.stack` and return the `(line, col)` of its first frame, or
+/// `(0, 0)` if none. Used to recover a SyntaxError's parse location.
+unsafe fn error_backtrace_location(
+  ctx: *mut JSContext,
+  exc: JSValue,
+) -> (i32, i32) {
+  let stack = unsafe { JS_GetPropertyStr(ctx, exc, c"stack".as_ptr()) };
+  if stack.tag == JS_TAG_EXCEPTION {
+    unsafe {
+      let e = JS_GetException(ctx);
+      JS_FreeValue(ctx, e);
+    }
+    return (0, 0);
+  }
+  let mut len: usize = 0;
+  let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, stack) };
+  unsafe { JS_FreeValue(ctx, stack) };
+  if cstr.is_null() {
+    return (0, 0);
+  }
+  let bytes = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+  let s = String::from_utf8_lossy(bytes).into_owned();
+  unsafe { JS_FreeCString(ctx, cstr) };
+  super::exception::first_frame_line_col(&s)
 }
 
 #[unsafe(no_mangle)]
