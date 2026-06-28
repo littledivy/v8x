@@ -30,11 +30,16 @@ use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// How often (seconds) JSC polls the watchdog while JS runs. Small enough that
-/// a cross-thread terminate unwinds promptly and a runaway allocation is caught
-/// long before it can exhaust memory, large enough not to burden normal scripts
-/// (which finish in well under this and never reach the callback).
-const WATCHDOG_INTERVAL_SECS: f64 = 0.01;
+/// The execution-time budget (seconds) after which JSC invokes the watchdog
+/// while JS runs. JSC's watchdog is effectively one-shot per VM entry — it fires
+/// the callback once when the budget elapses and (in this build) does not keep
+/// re-polling a still-running script — so this doubles as the worst-case latency
+/// between a cross-thread `terminate_execution` and the running script noticing.
+/// It must comfortably exceed the ~100ms deno's termination tests wait before
+/// requesting termination, so the single poll lands *after* the request; 250ms
+/// gives margin while staying well under any per-test timeout. Scripts that
+/// finish sooner never reach the callback at all.
+const WATCHDOG_INTERVAL_SECS: f64 = 0.25;
 
 /// Per-isolate watchdog state. Reached two ways: directly via a raw pointer
 /// handed to JSC as the time-limit callback context (the hot path, no locking),
