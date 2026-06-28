@@ -621,6 +621,63 @@ unsafe fn eval_value_as_script(
     return ptr::null();
   }
   let mut exc: JSValueRef = ptr::null();
+
+  // System JavaScriptCore has NO `moduleLoaderImportModule` hook — that is the
+  // vendored-only WebKit C++ patch — so a plain-script `import()` evaluated via
+  // `JSEvaluateScript` can't reach the dynamic-import bridge through `sourceURL`
+  // at all. Do here what the module/CJS eval paths already do for system JSC:
+  // rewrite `import(` → `__v82jsc_dynImport(` and inject a per-script closure
+  // forwarding to `globalThis.__v82jsc_dynamicImport` (installed on every
+  // context) with the ScriptOrigin resource name as the referrer. The vendored
+  // backend keeps its native `sourceURL`-based hook untouched (gated below).
+  //
+  // Only rewrite when the source actually contains a dynamic import (the rewrite
+  // changed something) so the common no-`import()` script is byte-for-byte
+  // unchanged — no injected prelude, no line/column shift in stack traces. The
+  // prelude carries no trailing newline so the body's line N stays line N, and
+  // uses `var` (not `const`) so re-evaluating another `import()` script in the
+  // same global context can't trip a lexical redeclaration error.
+  #[cfg(not(feature = "vendor_jsc"))]
+  {
+    let src = unsafe { jsstring_to_rust(ctx, source_val) };
+    let rewritten = rewrite_dynamic_import_calls(&src);
+    if rewritten != src {
+      let referrer = source_url.unwrap_or("");
+      let prelude = format!(
+        "var __v82jsc_dynImport=(s,o)=>globalThis.__v82jsc_dynamicImport(s,{:?},o);",
+        referrer
+      );
+      let wrapped = format!("{prelude}{rewritten}");
+      if let Ok(cstr) = std::ffi::CString::new(wrapped) {
+        let js_src = unsafe { JSStringCreateWithUTF8CString(cstr.as_ptr()) };
+        let src_url_cstr =
+          source_url.and_then(|u| std::ffi::CString::new(u).ok());
+        let src_url_js = src_url_cstr
+          .as_ref()
+          .map(|c| unsafe { JSStringCreateWithUTF8CString(c.as_ptr()) })
+          .unwrap_or(ptr::null_mut());
+        let result = unsafe {
+          JSEvaluateScript(
+            ctx,
+            js_src,
+            ptr::null_mut(),
+            src_url_js,
+            1,
+            &mut exc,
+          )
+        };
+        unsafe { JSStringRelease(js_src) };
+        if !src_url_js.is_null() {
+          unsafe { JSStringRelease(src_url_js) };
+        }
+        if result.is_null() && !exc.is_null() {
+          unsafe { crate::jsc::core::record_pending_exception(ctx, exc) };
+        }
+        return result;
+      }
+    }
+  }
+
   let src_str = unsafe { JSValueToStringCopy(ctx, source_val, &mut exc) };
   if src_str.is_null() {
     return ptr::null();
