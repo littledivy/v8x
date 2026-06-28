@@ -936,19 +936,38 @@ pub extern "C" fn v8__Script__Compile(
   if ctx.is_null() || src_val.is_null() {
     return ptr::null();
   }
+  let name = unsafe { origin_resource_name(ctx, origin) };
   unsafe {
     let mut exc: JSValueRef = ptr::null();
     let src_str = JSValueToStringCopy(ctx, src_val, &mut exc);
     if src_str.is_null() {
       return ptr::null();
     }
-    let ok = JSCheckScriptSyntax(ctx, src_str, ptr::null_mut(), 1, &mut exc);
+    // Pass the script's resource name as the sourceURL so a SyntaxError
+    // carries `.sourceURL`/`.line`/`.column` — deno's `from_v8_message` frame
+    // fallback bails without a resource name, and `tc_scope.exception()`
+    // requires the recorded exception (see below).
+    let source_url = name
+      .as_deref()
+      .and_then(|n| std::ffi::CString::new(n).ok())
+      .map(|c| JSStringCreateWithUTF8CString(c.as_ptr()))
+      .unwrap_or(ptr::null_mut());
+    let ok = JSCheckScriptSyntax(ctx, src_str, source_url, 1, &mut exc);
     JSStringRelease(src_str);
+    if !source_url.is_null() {
+      JSStringRelease(source_url);
+    }
     if !ok {
+      // deno reads the compile error via `tc_scope.exception().unwrap()`;
+      // record the SyntaxError as pending so that returns the real error
+      // (with location) instead of panicking on a missing exception.
+      if !exc.is_null() {
+        crate::jsc::core::record_pending_exception(ctx, exc);
+      }
       return ptr::null();
     }
   }
-  if let Some(name) = unsafe { origin_resource_name(ctx, origin) } {
+  if let Some(name) = name {
     SCRIPT_RESOURCE_NAMES
       .with(|m| m.borrow_mut().insert(src_val as usize, name));
   }
