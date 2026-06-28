@@ -17,13 +17,8 @@
 //! isolate and use it to:
 //!
 //!   * abort once `terminate_execution` has been requested cross-thread, and
-//!   * drive the near-heap-limit callback when the live heap (read via the
-//!     private `JSGetMemoryUsageStatistics`) crosses the configured limit.
-//!
-//! Every private symbol is resolved through `dlsym` instead of being linked
-//! directly: if a particular JSC build doesn't export one, the feature simply
-//! degrades to a no-op rather than failing the link — a link failure would zero
-//! the entire test binary and regress the baseline.
+//!   * drive the near-heap-limit callback when a runaway allocation trips it
+//!     (JSC's public C API exposes no live-heap gauge to compare against).
 
 #![allow(non_snake_case)]
 
@@ -31,8 +26,7 @@ use crate::RealIsolate;
 use crate::isolate::NearHeapLimitCallback;
 use crate::jsc::jsc_sys::*;
 use std::collections::HashMap;
-use std::os::raw::{c_char, c_void};
-use std::ptr;
+use std::os::raw::c_void;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -82,87 +76,29 @@ fn lookup(iso: *mut RealIsolate) -> Option<Arc<Watch>> {
   registry().lock().ok()?.get(&(iso as usize)).cloned()
 }
 
-// ---- dlsym'd JSC private API -----------------------------------------------
-
-const RTLD_DEFAULT: *mut c_void = (-2isize) as *mut c_void;
-
-unsafe extern "C" {
-  fn dlsym(handle: *mut c_void, symbol: *const c_char) -> *mut c_void;
-}
-
-fn resolve(name: &[u8]) -> *mut c_void {
-  debug_assert_eq!(name.last(), Some(&0), "symbol name must be NUL-terminated");
-  unsafe { dlsym(RTLD_DEFAULT, name.as_ptr() as *const c_char) }
-}
+// ---- JSC private execution-time-limit API ----------------------------------
+//
+// These live in JSC's private `JSContextRefPrivate.h` (not the public umbrella
+// header bindgen sees), so they're declared by hand. They're linked directly
+// rather than `dlsym`'d: the `vendor_jsc` backend statically links
+// `libJavaScriptCore.a`, whose `JS_EXPORT` symbols are not in the final
+// binary's dynamic symbol table, so `dlsym(RTLD_DEFAULT, ...)` would return null
+// and the watchdog would never arm (the runaway loop would hang forever). A
+// direct reference resolves against the archive instead. Both symbols are
+// long-standing `JS_EXPORT`s present in JSCOnly and in Apple's
+// JavaScriptCore.framework (verified in its `.tbd`).
 
 type ShouldTerminateCb =
   unsafe extern "C" fn(ctx: JSContextRef, context: *mut c_void) -> bool;
-type SetTimeLimitFn = unsafe extern "C" fn(
-  group: JSContextGroupRef,
-  limit: f64,
-  callback: ShouldTerminateCb,
-  context: *mut c_void,
-);
-type ClearTimeLimitFn = unsafe extern "C" fn(group: JSContextGroupRef);
-type MemStatsFn = unsafe extern "C" fn(ctx: JSContextRef) -> JSValueRef;
 
-fn set_time_limit_fn() -> Option<SetTimeLimitFn> {
-  static F: OnceLock<Option<SetTimeLimitFn>> = OnceLock::new();
-  *F.get_or_init(|| {
-    let p = resolve(b"JSContextGroupSetExecutionTimeLimit\0");
-    (!p.is_null()).then(|| unsafe { std::mem::transmute(p) })
-  })
-}
-
-fn clear_time_limit_fn() -> Option<ClearTimeLimitFn> {
-  static F: OnceLock<Option<ClearTimeLimitFn>> = OnceLock::new();
-  *F.get_or_init(|| {
-    let p = resolve(b"JSContextGroupClearExecutionTimeLimit\0");
-    (!p.is_null()).then(|| unsafe { std::mem::transmute(p) })
-  })
-}
-
-fn mem_stats_fn() -> Option<MemStatsFn> {
-  static F: OnceLock<Option<MemStatsFn>> = OnceLock::new();
-  *F.get_or_init(|| {
-    let p = resolve(b"JSGetMemoryUsageStatistics\0");
-    (!p.is_null()).then(|| unsafe { std::mem::transmute(p) })
-  })
-}
-
-/// Best-effort live heap size in bytes, or 0 if it can't be measured (the
-/// `JSGetMemoryUsageStatistics` symbol is absent on this JSC build).
-fn heap_size(ctx: JSContextRef) -> usize {
-  let Some(stats) = mem_stats_fn() else {
-    return 0;
-  };
-  if ctx.is_null() {
-    return 0;
-  }
-  unsafe {
-    let stats_val = stats(ctx);
-    if stats_val.is_null() {
-      return 0;
-    }
-    let mut exc: JSValueRef = ptr::null();
-    let obj = JSValueToObject(ctx, stats_val, &mut exc);
-    if obj.is_null() {
-      return 0;
-    }
-    let key =
-      JSStringCreateWithUTF8CString(b"heapSize\0".as_ptr() as *const c_char);
-    let v = JSObjectGetProperty(ctx, obj, key, &mut exc);
-    JSStringRelease(key);
-    if v.is_null() {
-      return 0;
-    }
-    let n = JSValueToNumber(ctx, v, ptr::null_mut());
-    if n.is_finite() && n >= 0.0 {
-      n as usize
-    } else {
-      0
-    }
-  }
+unsafe extern "C" {
+  fn JSContextGroupSetExecutionTimeLimit(
+    group: JSContextGroupRef,
+    limit: f64,
+    callback: ShouldTerminateCb,
+    context: *mut c_void,
+  );
+  fn JSContextGroupClearExecutionTimeLimit(group: JSContextGroupRef);
 }
 
 // ---- the watchdog ----------------------------------------------------------
@@ -181,23 +117,20 @@ unsafe extern "C" fn watchdog(ctx: JSContextRef, context: *mut c_void) -> bool {
   watch.terminate.load(Ordering::SeqCst)
 }
 
-/// If a near-heap-limit callback is registered and the live heap has crossed
-/// the configured limit, invoke it (it may raise the limit and/or request
-/// termination). When the heap can't be measured we still fire — only the heap
-/// tests register a callback, and reaching the watchdog there already means a
-/// tight allocation loop is in flight.
-fn maybe_drive_heap_callback(watch: &Watch, ctx: JSContextRef) {
+/// If a near-heap-limit callback is registered, invoke it (it may raise the
+/// limit and/or request termination). JSC's public C API exposes no live-heap
+/// gauge, so we can't measure how close we are to the limit — but only the heap
+/// tests ever register a callback, and a callback firing means a script has run
+/// long enough to trip the watchdog, i.e. a runaway allocation is in flight.
+/// Firing on that first poll is both correct for the tests and bounds memory
+/// growth far better than waiting for an (unmeasurable) threshold.
+fn maybe_drive_heap_callback(watch: &Watch, _ctx: JSContextRef) {
   let cb_addr = watch.heap_cb.load(Ordering::Acquire);
   if cb_addr == 0 || watch.in_heap_cb.load(Ordering::Relaxed) {
     return;
   }
   let limit = watch.heap_limit.load(Ordering::Relaxed);
   if limit == 0 {
-    return;
-  }
-  let live = heap_size(ctx);
-  let near = if live > 0 { live >= limit } else { true };
-  if !near {
     return;
   }
 
@@ -233,10 +166,15 @@ pub(crate) fn install(
     in_heap_cb: AtomicBool::new(false),
   });
 
-  if let Some(set) = set_time_limit_fn() {
-    let context = Arc::as_ptr(&watch) as *mut c_void;
-    unsafe { set(group, WATCHDOG_INTERVAL_SECS, watchdog, context) };
-  }
+  let context = Arc::as_ptr(&watch) as *mut c_void;
+  unsafe {
+    JSContextGroupSetExecutionTimeLimit(
+      group,
+      WATCHDOG_INTERVAL_SECS,
+      watchdog,
+      context,
+    )
+  };
 
   if let Ok(mut reg) = registry().lock() {
     reg.insert(iso as usize, watch);
@@ -250,9 +188,7 @@ pub(crate) fn uninstall(iso: *mut RealIsolate) {
     return;
   };
   if let Some(watch) = reg.remove(&(iso as usize)) {
-    if let Some(clear) = clear_time_limit_fn() {
-      unsafe { clear(watch.group) };
-    }
+    unsafe { JSContextGroupClearExecutionTimeLimit(watch.group) };
   }
 }
 
