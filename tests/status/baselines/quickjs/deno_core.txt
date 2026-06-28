@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=deno_core.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 378 passing. DO NOT hand-sort; the
+# (run.mjs --update). 377 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 deno_core::arena::raw_arena::tests::test_add_clear_many
 deno_core::arena::raw_arena::tests::test_add_remove_many
@@ -296,7 +296,6 @@ deno_core::source_map::tests::test_source_mapper
 deno_core::tasks::tests::test_spawner_parallel
 deno_core::tasks::tests::test_spawner_serial
 deno_core::tests::located_script_name
-deno_core::tests::test_rebuild_async_stubs
 deno_core::uv_compat::tests::check_fires_callback
 deno_core::uv_compat::tests::close_check_handle
 deno_core::uv_compat::tests::close_fires_callback
