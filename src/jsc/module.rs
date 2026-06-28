@@ -458,9 +458,78 @@ pub unsafe extern "C" fn v82jsc_dynamic_import(
     ) else {
       return ptr::null();
     };
+
+    // JS-stack-exhaustion guard. deno's host dynamic-import callback
+    // (bindings.rs `host_import_module_dynamically`) does
+    // `v8::PromiseResolver::new(scope).unwrap()` — i.e. our
+    // `JSObjectMakeDeferredPromise`. A runaway recursion that reaches `import()`
+    // — deno_core's `dyn_import_recurse_err`: `function bar(v){ bar(import(0)); }
+    // bar("foo")` — drives JSC to its *JS* stack limit, at which point that
+    // allocation returns null and deno's `.unwrap()` panics. The panic unwinds
+    // across rusty_v8's `extern "C"` dynamic-import abi_adapter, which aborts the
+    // process ("panic in a function that cannot unwind", SIGABRT) — uncatchable
+    // by our `ffi_guard`, so it truncates the whole test binary. The
+    // native-C-stack guard in `dynamic_import_js_cb` can't catch this: JSC hits
+    // its JS recursion limit while the native stack still has >100 KiB free.
+    // Probe the exact operation that fails — try to make a deferred promise on
+    // this context. JSC gates promise allocation on the native stack pointer, so
+    // we must probe with at least as much native stack already consumed as deno
+    // burns between here and its own `PromiseResolver::new` (the `extern "C"`
+    // abi_adapter, the callback scope, and the callback body's locals); see
+    // [`can_alloc_promise_with_margin`]. If the probe fails the JS stack is
+    // exhausted, so refuse to enter deno's callback and return null; the runaway
+    // recursion still throws the RangeError the test expects, and no abort
+    // occurs.
+    if !can_alloc_promise_with_margin(ctx) {
+      return ptr::null();
+    }
+
     let promise = cb(c_l, h_l, r_l, s_l, a_l);
     promise as JSValueRef
   }
+}
+
+/// Native-stack margin (bytes) reserved before probing promise allocation, to
+/// cover what deno's host dynamic-import callback burns between
+/// `v82jsc_dynamic_import` calling into it and its own
+/// `v8::PromiseResolver::new(scope).unwrap()`: the `extern "C"` abi_adapter, the
+/// `CallbackScope`, and the callback body's locals/strings. JSC fails promise
+/// allocation as a function of the native stack pointer, so probing at the
+/// current depth succeeds while deno's deeper allocation still null-faults and
+/// aborts. Probing with this much stack already consumed makes the probe
+/// predict deno's failure. Comfortably exceeds deno's actual frame depth (a few
+/// KiB); over-reserving only bails a doomed runaway recursion an iteration
+/// sooner (it still throws its RangeError) and never trips a legitimate
+/// `import()`, which runs with megabytes of headroom.
+const DYN_IMPORT_FRAME_MARGIN: usize = 64 * 1024;
+
+/// True if JSC can allocate a deferred promise (what deno's dynamic-import
+/// callback does via `v8::PromiseResolver::new`) with [`DYN_IMPORT_FRAME_MARGIN`]
+/// bytes of native stack already consumed — i.e. with margin for deno's own
+/// frames. Bails to `false` (don't enter the callback) if there isn't even
+/// enough headroom to safely reserve the margin, so the probe can never itself
+/// overflow the native stack. Marked `#[inline(never)]` so the reserved buffer
+/// is a real stack frame the probe runs beneath.
+#[inline(never)]
+unsafe fn can_alloc_promise_with_margin(ctx: JSContextRef) -> bool {
+  // Don't burn margin we don't have — that would risk a native overflow inside
+  // the probe. Treating "too little headroom to probe safely" as "can't alloc"
+  // is correct: that only happens deep in a runaway recursion.
+  if stack_headroom_bytes() < DYN_IMPORT_FRAME_MARGIN + 16 * 1024 {
+    return false;
+  }
+  let mut reserve = [0u8; DYN_IMPORT_FRAME_MARGIN];
+  // Keep the buffer live across the allocation so the probe truly runs beneath
+  // it; `black_box` also blocks the optimizer from eliding the reservation.
+  std::hint::black_box(reserve.as_mut_ptr());
+  let mut resolve: JSObjectRef = ptr::null_mut();
+  let mut reject: JSObjectRef = ptr::null_mut();
+  let mut exc: JSValueRef = ptr::null();
+  let p = unsafe {
+    JSObjectMakeDeferredPromise(ctx, &mut resolve, &mut reject, &mut exc)
+  };
+  std::hint::black_box(reserve.as_mut_ptr());
+  !p.is_null()
 }
 
 /// Remaining native-stack headroom (bytes) on the current thread. Both JSC
