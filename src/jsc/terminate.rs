@@ -112,9 +112,14 @@ unsafe extern "C" fn watchdog(ctx: JSContextRef, context: *mut c_void) -> bool {
   // disarmed in `uninstall`, so this reference is valid for the call.
   let watch = unsafe { &*(context as *const Watch) };
 
-  maybe_drive_heap_callback(watch, ctx);
-
-  watch.terminate.load(Ordering::SeqCst)
+  // This runs at a JSC C frame: a panic unwinding across it would abort the
+  // process (SIGABRT) and truncate the test binary. Contain any panic from the
+  // user-supplied heap callback and fall back to "don't terminate".
+  std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    maybe_drive_heap_callback(watch, ctx);
+    watch.terminate.load(Ordering::SeqCst)
+  }))
+  .unwrap_or(false)
 }
 
 /// If a near-heap-limit callback is registered, invoke it (it may raise the
