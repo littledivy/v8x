@@ -354,6 +354,12 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
       JS_FreeValue(st.ctx, v);
       drop(Box::from_raw(slot));
     }
+    // Release any saved eval/Function bindings a context held while code
+    // generation from strings was disabled, before its JSContext is freed.
+    for c in &st.extra_contexts {
+      super::isolate::codegen_release_ctx(*c);
+    }
+    super::isolate::codegen_release_ctx(st.ctx);
     for c in st.extra_contexts.drain(..) {
       JS_FreeContext(c);
     }

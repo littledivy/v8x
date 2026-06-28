@@ -477,7 +477,7 @@ mod cdp {
   }
 
   unsafe fn drain_exc(ctx: *mut JSContext) {
-    if unsafe { JS_HasException(ctx) } != 0 {
+    if unsafe { JS_HasException(ctx) } {
       let e = unsafe { JS_GetException(ctx) };
       unsafe { JS_FreeValue(ctx, e) };
     }

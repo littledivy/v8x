@@ -253,7 +253,7 @@ unsafe fn dispatch(
   let info = unsafe { Box::from_raw(info_ptr as *mut CbInfo) };
   let ret = *info.return_slot;
 
-  if unsafe { JS_HasException(ctx) } != 0 {
+  if unsafe { JS_HasException(ctx) } {
     return jsv_exception();
   }
   if jsv_is_undefined(&ret) {

@@ -530,7 +530,14 @@ unsafe extern "C" {
 
   pub fn JS_Throw(ctx: *mut JSContext, obj: JSValue) -> JSValue;
   pub fn JS_GetException(ctx: *mut JSContext) -> JSValue;
-  pub fn JS_HasException(ctx: *mut JSContext) -> c_int;
+  // QuickJS declares this `bool` (1 byte). Binding it as `c_int` is a latent
+  // ABI bug: on x86_64 a `bool` return only defines the low byte of the return
+  // register (the upper bytes are garbage), so `JS_HasException(ctx) != 0`
+  // reads true even when the real bool is false — which spuriously trips
+  // `TryCatch::HasCaught` after a JS `try/catch` swallows a native-callback
+  // exception. (aarch64 zero-extends the byte, so the bug is invisible on the
+  // macOS worker.) Must match the C signature exactly.
+  pub fn JS_HasException(ctx: *mut JSContext) -> bool;
   pub fn JS_ResetUncatchableError(ctx: *mut JSContext);
   pub fn JS_ThrowTypeError(
     ctx: *mut JSContext,
