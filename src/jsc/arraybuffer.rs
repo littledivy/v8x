@@ -12,15 +12,51 @@ use crate::{
   BackingStoreDeleterCallback, Context, DataView, RealIsolate,
   SharedArrayBuffer, Uint8ClampedArray, Value,
 };
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct MemorySpan {
   data: *mut u8,
   size: usize,
+}
+
+// Fallback detach tracking. JSC's C API has no detach primitive, so
+// `v8__ArrayBuffer__Detach` neuters the buffer at the JS level via
+// `ArrayBuffer.prototype.transfer()`. On a JSC build/framework where that path
+// does NOT actually neuter the buffer (older `JavaScriptCore.framework`, or a
+// wrapped no-copy buffer it refuses to transfer), we still must report the
+// buffer as detached for the C-ABI contract (`byte_length()==0`,
+// `was_detached()==true`). We record such buffers here, keyed by their JS
+// object pointer, and have ByteLength/Data/WasDetached consult it.
+//
+// Keying by a raw object pointer is safe here precisely because it is ONLY
+// populated when `transfer()` failed to detach: when transfer works (modern
+// JSC, the deno_core path), this set stays empty, so there is never a stale
+// pointer to alias a later buffer. `DETACHED_ANY` gates the lookup so the
+// common (nothing-detached) hot path takes no lock.
+static DETACHED_ANY: AtomicUsize = AtomicUsize::new(0);
+
+fn detached_set() -> &'static Mutex<HashSet<usize>> {
+  static S: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+  S.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn mark_detached(obj: usize) {
+  if detached_set().lock().unwrap().insert(obj) {
+    DETACHED_ANY.fetch_add(1, Ordering::SeqCst);
+  }
+}
+
+fn is_marked_detached(obj: usize) -> bool {
+  if DETACHED_ANY.load(Ordering::SeqCst) == 0 {
+    return false;
+  }
+  detached_set().lock().unwrap().contains(&obj)
 }
 
 struct BsInner {
@@ -244,13 +280,11 @@ pub extern "C" fn v8__ArrayBuffer__ByteLength(
   if ctx.is_null() || this.is_null() {
     return 0;
   }
-  unsafe {
-    JSObjectGetArrayBufferByteLength(
-      ctx,
-      jsval(this) as JSObjectRef,
-      ptr::null_mut(),
-    )
+  let obj = jsval(this) as JSObjectRef;
+  if is_marked_detached(obj as usize) {
+    return 0;
   }
+  unsafe { JSObjectGetArrayBufferByteLength(ctx, obj, ptr::null_mut()) }
 }
 
 #[unsafe(no_mangle)]
@@ -261,13 +295,11 @@ pub extern "C" fn v8__ArrayBuffer__Data(
   if ctx.is_null() || this.is_null() {
     return ptr::null_mut();
   }
-  unsafe {
-    JSObjectGetArrayBufferBytesPtr(
-      ctx,
-      jsval(this) as JSObjectRef,
-      ptr::null_mut(),
-    )
+  let obj = jsval(this) as JSObjectRef;
+  if is_marked_detached(obj as usize) {
+    return ptr::null_mut();
   }
+  unsafe { JSObjectGetArrayBufferBytesPtr(ctx, obj, ptr::null_mut()) }
 }
 
 #[unsafe(no_mangle)]
@@ -285,17 +317,16 @@ pub extern "C" fn v8__ArrayBuffer__WasDetached(
   if ctx.is_null() || this.is_null() {
     return false;
   }
+  let obj = jsval(this) as JSObjectRef;
+  if is_marked_detached(obj as usize) {
+    return true;
+  }
   // A detached ArrayBuffer reports a null bytes pointer in JSC. Freshly
   // created (incl. zero-length) buffers always have a non-null backing — our
   // `New__with_byte_length` allocates `byte_length.max(1)` precisely so an
   // empty-but-live buffer is distinguishable from a detached one here.
-  let data = unsafe {
-    JSObjectGetArrayBufferBytesPtr(
-      ctx,
-      jsval(this) as JSObjectRef,
-      ptr::null_mut(),
-    )
-  };
+  let data =
+    unsafe { JSObjectGetArrayBufferBytesPtr(ctx, obj, ptr::null_mut()) };
   data.is_null()
 }
 
@@ -310,7 +341,10 @@ pub extern "C" fn v8__ArrayBuffer__Detach(
     return MaybeBool::Nothing;
   }
   let obj = jsval(this) as JSObjectRef;
-  // Already detached (null bytes ptr): detaching twice is a no-op success.
+  // Already detached (marked, or null bytes ptr): detaching twice is a no-op.
+  if is_marked_detached(obj as usize) {
+    return MaybeBool::JustTrue;
+  }
   let data =
     unsafe { JSObjectGetArrayBufferBytesPtr(ctx, obj, ptr::null_mut()) };
   if data.is_null() {
@@ -318,8 +352,6 @@ pub extern "C" fn v8__ArrayBuffer__Detach(
   }
   // JSC's C API exposes no detach primitive, so detach at the JS level via
   // `ArrayBuffer.prototype.transfer()` (ES2024), which neuters the receiver.
-  // Any failure (e.g. a build lacking `transfer`) is swallowed — the buffer
-  // simply stays live, matching the non-crashing-stub contract.
   unsafe {
     let mut exc: JSValueRef = ptr::null();
     let src = b"(function(buf){buf.transfer();})\0";
@@ -329,22 +361,29 @@ pub extern "C" fn v8__ArrayBuffer__Detach(
     let fnv =
       JSEvaluateScript(ctx, fs, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
     JSStringRelease(fs);
-    if !exc.is_null() {
-      return MaybeBool::JustTrue;
+    if exc.is_null() {
+      let fnobj = JSValueToObject(ctx, fnv, &mut exc);
+      if !fnobj.is_null() {
+        let args = [jsval(this)];
+        JSObjectCallAsFunction(
+          ctx,
+          fnobj,
+          ptr::null_mut(),
+          1,
+          args.as_ptr(),
+          &mut exc,
+        );
+      }
     }
-    let fnobj = JSValueToObject(ctx, fnv, &mut exc);
-    if fnobj.is_null() {
-      return MaybeBool::JustTrue;
-    }
-    let args = [jsval(this)];
-    JSObjectCallAsFunction(
-      ctx,
-      fnobj,
-      ptr::null_mut(),
-      1,
-      args.as_ptr(),
-      &mut exc,
-    );
+  }
+  // If `transfer()` did not actually neuter the buffer (build lacking transfer,
+  // or a no-copy buffer JSC refused to transfer), fall back to the marker set
+  // so the C-ABI still observes the detach. When transfer worked, bytes ptr is
+  // now null and we leave the set untouched (keeps the deno_core path clean).
+  let after =
+    unsafe { JSObjectGetArrayBufferBytesPtr(ctx, obj, ptr::null_mut()) };
+  if !after.is_null() {
+    mark_detached(obj as usize);
   }
   MaybeBool::JustTrue
 }
