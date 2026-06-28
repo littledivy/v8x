@@ -131,10 +131,17 @@ function cargoBuild(extraArgs, cwd, selectBackend = true) {
 // Run a single libtest binary once, streaming its output behind a watchdog.
 // With --test-threads 1 libtest's pretty formatter prints `test <name> ... `
 // (flushed) BEFORE running each test and appends `ok`/`FAILED`/`ignored` after.
-// A hung test therefore leaves that start line dangling and emits no further
-// output; if nothing arrives for PER_TEST_TIMEOUT_MS we SIGKILL the process and
-// report the dangling test as the hung one. Returns the captured output, whether
-// we killed it, and the name of the test that was in flight at kill time.
+// So a test that misbehaves leaves that start line DANGLING (no result), in two
+// cases we must recover from:
+//   * HANG — the test deadlocks and emits nothing more. If no output arrives for
+//     PER_TEST_TIMEOUT_MS we SIGKILL the process (killed=true).
+//   * CRASH — the test aborts the whole process (SIGABRT/SIGSEGV), which on
+//     `--test-threads 1` truncates every test after it (libtest prints no
+//     summary, exits via signal / non-success). The dangling start line still
+//     identifies the offender.
+// Either way the dangling `test <name> ... ` line pins the offending test.
+// Returns the captured output, whether the watchdog killed it, the exit
+// code/signal, and the in-flight test name (null on a clean finish).
 function streamWithWatchdog(bin, args, cwd) {
   return new Promise((resolve) => {
     console.error(`\$ ${bin} ${args.join(" ")}  (cwd: ${cwd})`);
@@ -160,50 +167,66 @@ function streamWithWatchdog(bin, args, cwd) {
       output += `\n[spawn error] ${e.message}\n`;
     });
     arm();
-    child.on("close", () => {
+    child.on("close", (code, signal) => {
       clearTimeout(timer);
       output = output.replace(/\x1b\[[0-9;]*m/g, "");
-      // The hung test is the dangling `test <name> ... ` start line (no result).
+      // Surface libtest's enumeration count + summary so the CI log distinguishes
+      // a truncated run (ran < enumerated) from a genuinely small suite.
+      const hdr = output.match(/^running (\d+) tests?$/m);
+      const res = output.match(/^test result:.*$/m);
+      console.error(
+        `  [run] ${hdr ? `enumerated ${hdr[1]}` : "no header"}` +
+          ` | ${res ? res[0] : "no summary line (truncated/crashed)"}` +
+          ` | exit ${signal ? `signal ${signal}` : `code ${code}`}`,
+      );
+      // The offending test is the dangling `test <name> ... ` start line.
       const tail = output.slice(output.lastIndexOf("\n") + 1);
       const m = tail.match(/^test (.+?) \.\.\. *$/);
-      resolve({ output, killed, inFlight: m ? m[1] : null });
+      resolve({ output, killed, code, signal, inFlight: m ? m[1] : null });
     });
   });
 }
 
-// Run a libtest binary to completion, tolerating tests that hang forever. On a
-// watchdog kill we record the in-flight test as a timeout and re-run skipping
-// every known-hung test, until the binary finishes on its own (or we can no
-// longer identify a fresh culprit). Timed-out tests are surfaced as synthetic
-// FAILED lines so they show in the run result and are never silently baselined.
+// Run a libtest binary to completion, tolerating tests that HANG or CRASH the
+// process. After each round we look for a dangling in-flight test (a deadlock
+// the watchdog killed, or a SIGABRT that truncated the run); we record it and
+// re-run skipping every known-bad test, until the binary finishes cleanly (no
+// dangling test) or we can no longer identify a fresh culprit. Without this a
+// single bad test would zero the cell (hang -> CI timeout) or truncate it
+// (crash -> every later test silently MISSING). Bad tests are surfaced as
+// synthetic FAILED lines so they show in the run result and are never baselined.
 async function runOneBin(bin, cwd, baseArgs) {
-  const timedOut = [];
+  const bad = []; // [{ name, reason }]
   let combined = "";
   for (let round = 0; round < 64; round++) {
-    const skipArgs = timedOut.length
-      ? ["--exact", ...timedOut.flatMap((t) => ["--skip", t])]
+    const skipArgs = bad.length
+      ? ["--exact", ...bad.flatMap((t) => ["--skip", t.name])]
       : [];
     const r = await streamWithWatchdog(bin, [...baseArgs, ...skipArgs], cwd);
-    // A SIGKILL mid-test leaves a dangling `test <name> ... ` line with no
+    // A kill/crash mid-test leaves a dangling `test <name> ... ` line with no
     // newline; terminate it so the next round's output (or the synthetic FAILED
     // lines below) can't merge into it and confuse the libtest parser.
     combined += r.output.endsWith("\n") ? r.output : r.output + "\n";
-    if (!r.killed) break; // binary finished on its own
-    if (!r.inFlight || timedOut.includes(r.inFlight)) {
+    if (!r.inFlight) break; // finished with no test left dangling
+    if (bad.some((t) => t.name === r.inFlight)) {
       console.error(
-        `  [timeout] killed after ${PER_TEST_TIMEOUT_MS / 1000}s but could not ` +
-          `identify a new hung test — stopping retries for ${bin}`,
+        `  [recover] '${r.inFlight}' is still in flight after being skipped — ` +
+          `stopping retries for ${bin}`,
       );
       break;
     }
-    timedOut.push(r.inFlight);
+    const reason = r.killed ? "hang (timeout)" : `crash (${r.signal || `exit ${r.code}`})`;
+    bad.push({ name: r.inFlight, reason });
     console.error(
-      `  [timeout] '${r.inFlight}' exceeded ${PER_TEST_TIMEOUT_MS / 1000}s — ` +
-        `SIGKILLed; re-running with it skipped (${timedOut.length} hung so far)`,
+      `  [recover] '${r.inFlight}' ${reason} — re-running with it skipped ` +
+        `(${bad.length} bad so far)`,
     );
   }
-  // Mark each hung test as FAILED so it's visible (and excluded from baselines).
-  for (const t of timedOut) combined += `test ${t} ... FAILED\n`;
+  // Mark each bad test as FAILED so it's visible (and excluded from baselines).
+  for (const t of bad) combined += `test ${t.name} ... FAILED\n`;
+  if (bad.length) {
+    console.error(`  [recover] ${bad.length} test(s) skipped: ${bad.map((t) => `${t.name} [${t.reason}]`).join(", ")}`);
+  }
   return combined;
 }
 
