@@ -41,8 +41,27 @@ use crate::{
   Context, Data, Object, Primitive, RealIsolate, String as V8String, Value,
 };
 use std::cell::RefCell;
-use std::os::raw::c_void;
+use std::os::raw::{c_int, c_void};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Process-wide "force strict mode" flag, toggled by
+/// `v8__V8__SetFlagsFromString` when it sees V8's `--use_strict` flag. V8
+/// applies `--use_strict` globally (which is why the rusty_v8 test that uses it
+/// lives in its own process), so a process-wide atomic faithfully mirrors that:
+/// every subsequently compiled global script is evaluated in strict mode.
+pub(crate) static FORCE_STRICT: AtomicBool = AtomicBool::new(false);
+
+/// The `JS_EVAL_TYPE_GLOBAL` flags to use when running a top-level script,
+/// folding in strict mode if `--use_strict` was set.
+#[inline]
+pub(crate) fn global_eval_flags() -> c_int {
+  let mut flags = JS_EVAL_TYPE_GLOBAL;
+  if FORCE_STRICT.load(Ordering::Relaxed) {
+    flags |= JS_EVAL_FLAG_STRICT;
+  }
+  flags
+}
 
 pub(crate) struct IsoState {
   pub rt: *mut JSRuntime,
@@ -742,7 +761,7 @@ pub extern "C" fn v8__Script__Run(
     None => c"<eval>".as_ptr(),
   };
   let result =
-    unsafe { JS_Eval(ctx, cstr, len, fname_ptr, JS_EVAL_TYPE_GLOBAL) };
+    unsafe { JS_Eval(ctx, cstr, len, fname_ptr, global_eval_flags()) };
   unsafe { JS_FreeCString(ctx, cstr) };
   if result.tag == JS_TAG_EXCEPTION {
     if std::env::var_os("QJS_DEBUG_EXC").is_some() {
