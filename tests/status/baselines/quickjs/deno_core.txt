@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=deno_core.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 340 passing. DO NOT hand-sort; the
+# (run.mjs --update). 321 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 deno_core::arena::raw_arena::tests::test_add_clear_many
 deno_core::arena::raw_arena::tests::test_add_remove_many
@@ -152,25 +152,6 @@ deno_core::runtime::op_driver::tests::test_driver_yield::case_1_futures_unordere
 deno_core::runtime::op_driver::tests::test_driver_yield::case_1_futures_unordered::count_2_16::outer_2_5::scheduling_1_OpScheduling__Eager
 deno_core::runtime::op_driver::tests::test_driver_yield::case_1_futures_unordered::count_2_16::outer_2_5::scheduling_2_OpScheduling__Lazy
 deno_core::runtime::op_driver::tests::test_driver_yield::case_1_futures_unordered::count_2_16::outer_2_5::scheduling_3_OpScheduling__Deferred
-deno_core::runtime::ops::tests::test_external
-deno_core::runtime::ops::tests::test_isolate
-deno_core::runtime::ops::tests::test_jsruntimestate
-deno_core::runtime::ops::tests::test_op_async_external
-deno_core::runtime::ops::tests::test_op_async_serde_option_v8
-deno_core::runtime::ops::tests::test_op_async_sleep
-deno_core::runtime::ops::tests::test_op_async_sleep_error
-deno_core::runtime::ops::tests::test_op_async_state
-deno_core::runtime::ops::tests::test_op_async_void
-deno_core::runtime::ops::tests::test_op_bool_to_from_v8
-deno_core::runtime::ops::tests::test_op_buffer_bytesmut
-deno_core::runtime::ops::tests::test_op_buffer_copy
-deno_core::runtime::ops::tests::test_op_buffer_jsbuffer
-deno_core::runtime::ops::tests::test_op_cppgc_object
-deno_core::runtime::ops::tests::test_op_fail
-deno_core::runtime::ops::tests::test_op_number_to_from_v8
-deno_core::runtime::ops::tests::test_op_result_void_switch
-deno_core::runtime::ops::tests::test_op_smi_to_from_v8
-deno_core::runtime::ops::tests::test_typed_external
 deno_core::runtime::tests::error::fast_call_error_preserves_class
 deno_core::runtime::tests::error::test_error_builder
 deno_core::runtime::tests::jsrealm::js_realm_ref_unref_ops
