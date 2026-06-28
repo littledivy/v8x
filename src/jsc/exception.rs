@@ -116,6 +116,27 @@ pub extern "C" fn v8__Message__GetScriptResourceName(
   if ctx.is_null() {
     return ptr::null();
   }
+  // deno's `JsStackFrame::from_v8_message` fallback (used when an error carries
+  // no structured call sites) requires the resource name to be a *string* — it
+  // bails to "no frame" on anything else. JSC stamps the throw site's URL onto
+  // the Error as `.sourceURL`, so surface that as the script name. Without it,
+  // syntax errors and native op errors produce zero frames.
+  if !this.is_null() {
+    unsafe {
+      let mut exc: JSValueRef = ptr::null();
+      let obj = JSValueToObject(ctx, jsval(this), &mut exc);
+      if !obj.is_null() {
+        let key = JSStringCreateWithUTF8CString(
+          b"sourceURL\0".as_ptr() as *const c_char
+        );
+        let v = JSObjectGetProperty(ctx, obj, key, &mut exc);
+        JSStringRelease(key);
+        if !v.is_null() && JSValueIsString(ctx, v) {
+          return intern_ctx::<Value>(ctx, v);
+        }
+      }
+    }
+  }
   let v = unsafe { JSValueMakeUndefined(ctx) };
   intern_ctx::<Value>(ctx, v)
 }
@@ -167,7 +188,13 @@ pub extern "C" fn v8__Message__GetStartColumn(this: *const Message) -> int {
       return 0;
     }
     let n = JSValueToNumber(ctx, v, &mut exc);
-    if n.is_nan() { 0 } else { n as int }
+    if n.is_nan() {
+      0
+    } else {
+      // JSC reports 1-based columns; V8's `GetStartColumn` is 0-based (deno
+      // re-adds 1). Convert so the final 1-based column matches V8.
+      ((n as int) - 1).max(0)
+    }
   }
 }
 

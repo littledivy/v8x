@@ -64,7 +64,23 @@ struct SyntheticModule {
 
   source: Option<std::string::String>,
 
+  // The `//# sourceMappingURL=` magic-comment value (if any), extracted from the
+  // original module source at compile. deno reads this via
+  // UnboundModuleScript::GetSourceMappingURL to register native source maps.
+  source_map_url: Option<std::string::String>,
+
   import_specifiers: Vec<std::string::String>,
+
+  // Byte offset of each import's specifier literal (opening quote) in the
+  // original source, parallel to import_specifiers. V8's ModuleRequest
+  // source_offset; deno records it as `referrer_source_offset`.
+  import_offsets: Vec<i32>,
+
+  // Import attributes (`with { type: "json", ... }`) per import, parallel to
+  // import_specifiers, extracted from source. JSC's record only exposes a coarse
+  // type enum (json/wasm), so deno can't see `type: "text"/"bytes"/<custom>` or
+  // arbitrary keys without this. Surfaced via ModuleRequest::GetImportAttributes.
+  import_attributes: Vec<Vec<(std::string::String, std::string::String)>>,
 
   namespace: JSObjectRef,
 
@@ -936,19 +952,38 @@ pub extern "C" fn v8__Script__Compile(
   if ctx.is_null() || src_val.is_null() {
     return ptr::null();
   }
+  let name = unsafe { origin_resource_name(ctx, origin) };
   unsafe {
     let mut exc: JSValueRef = ptr::null();
     let src_str = JSValueToStringCopy(ctx, src_val, &mut exc);
     if src_str.is_null() {
       return ptr::null();
     }
-    let ok = JSCheckScriptSyntax(ctx, src_str, ptr::null_mut(), 1, &mut exc);
+    // Pass the script's resource name as the sourceURL so a SyntaxError
+    // carries `.sourceURL`/`.line`/`.column` — deno's `from_v8_message` frame
+    // fallback bails without a resource name, and `tc_scope.exception()`
+    // requires the recorded exception (see below).
+    let source_url = name
+      .as_deref()
+      .and_then(|n| std::ffi::CString::new(n).ok())
+      .map(|c| JSStringCreateWithUTF8CString(c.as_ptr()))
+      .unwrap_or(ptr::null_mut());
+    let ok = JSCheckScriptSyntax(ctx, src_str, source_url, 1, &mut exc);
     JSStringRelease(src_str);
+    if !source_url.is_null() {
+      JSStringRelease(source_url);
+    }
     if !ok {
+      // deno reads the compile error via `tc_scope.exception().unwrap()`;
+      // record the SyntaxError as pending so that returns the real error
+      // (with location) instead of panicking on a missing exception.
+      if !exc.is_null() {
+        crate::jsc::core::record_pending_exception(ctx, exc);
+      }
       return ptr::null();
     }
   }
-  if let Some(name) = unsafe { origin_resource_name(ctx, origin) } {
+  if let Some(name) = name {
     SCRIPT_RESOURCE_NAMES
       .with(|m| m.borrow_mut().insert(src_val as usize, name));
   }
@@ -1331,6 +1366,9 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
           export_names: Vec::new(),
           eval_steps: None,
           source: None,
+          source_map_url: extract_source_mapping_url(&text),
+          import_offsets: compute_import_offsets(&text, &specs),
+          import_attributes: compute_import_attributes(&text, &specs),
           import_specifiers: specs,
           namespace: ptr::null_mut(),
           specifier,
@@ -1397,6 +1435,9 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
       export_names: rewrite.export_names,
       eval_steps: None,
       source: Some(rewrite.body),
+      source_map_url: extract_source_mapping_url(&text),
+      import_offsets: compute_import_offsets(&text, &rewrite.imports),
+      import_attributes: compute_import_attributes(&text, &rewrite.imports),
       import_specifiers: rewrite.imports,
       namespace,
       specifier,
@@ -2288,14 +2329,132 @@ pub(crate) fn make_placeholder_code_cache() -> *mut CachedData<'static> {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__UnboundModuleScript__GetSourceMappingURL(
-  _script: *const UnboundModuleScript,
+  script: *const UnboundModuleScript,
 ) -> *const Value {
   let ctx = current_ctx();
   if ctx.is_null() {
     return ptr::null();
   }
+  // GetUnboundModuleScript returns the Module value unchanged, so `script` is the
+  // module handle; recover its `//# sourceMappingURL=` (extracted at compile).
+  // deno reads this to register native source maps (inline data: or external).
+  let url = module_state(script as *const Module)
+    .and_then(|m| m.source_map_url.clone());
+  if let Some(url) = url {
+    if let Ok(c) = std::ffi::CString::new(url) {
+      unsafe {
+        let s = JSStringCreateWithUTF8CString(c.as_ptr());
+        let v = JSValueMakeString(ctx, s);
+        JSStringRelease(s);
+        return intern_ctx::<Value>(ctx, v);
+      }
+    }
+  }
   let v = unsafe { JSValueMakeUndefined(ctx) };
   intern_ctx::<Value>(ctx, v)
+}
+
+/// Byte offset of each import's specifier literal (the opening quote) in the
+/// source, matching V8's `ModuleRequest::GetSourceOffset`. Specifiers are
+/// resolved in requested-module order, advancing a cursor so repeated specifiers
+/// map to successive occurrences. Returns 0 for any not found (best-effort).
+/// ASCII offsets == V8's positions for these test sources.
+fn compute_import_offsets(
+  text: &str,
+  specifiers: &[std::string::String],
+) -> Vec<i32> {
+  let bytes = text.as_bytes();
+  let mut cursor = 0usize;
+  let mut out = Vec::with_capacity(specifiers.len());
+  for spec in specifiers {
+    let mut found = -1i32;
+    for quote in ['"', '\''] {
+      let needle = format!("{quote}{spec}{quote}");
+      if let Some(rel) = text[cursor..].find(&needle) {
+        let pos = cursor + rel;
+        // Prefer the earliest of the two quote styles.
+        if found < 0 || (pos as i32) < found {
+          found = pos as i32;
+        }
+      }
+    }
+    if found >= 0 {
+      // Advance past this specifier so a later identical specifier resolves to
+      // its own occurrence.
+      cursor = (found as usize + 1).min(bytes.len());
+      out.push(found);
+    } else {
+      out.push(0);
+    }
+  }
+  out
+}
+
+/// Per-import `with { ... }` / `assert { ... }` attributes, parallel to
+/// `specifiers`. JSC's module record only exposes a coarse type enum, so parse
+/// the attribute clause that follows each specifier literal in the source.
+/// Best-effort source scan (sufficient for deno's flat key:"value" attributes).
+fn compute_import_attributes(
+  text: &str,
+  specifiers: &[std::string::String],
+) -> Vec<Vec<(std::string::String, std::string::String)>> {
+  let offsets = compute_import_offsets(text, specifiers);
+  let mut out = Vec::with_capacity(specifiers.len());
+  for (i, spec) in specifiers.iter().enumerate() {
+    let mut attrs = Vec::new();
+    let off = offsets[i];
+    if off >= 0 {
+      // Position just past the specifier's closing quote.
+      let after = (off as usize + spec.len() + 2).min(text.len());
+      let tail = text[after..].trim_start();
+      // The attribute clause must immediately follow (modulo whitespace) and be
+      // introduced by a `with`/`assert` keyword at a word boundary.
+      let kw = ["with", "assert"].iter().find_map(|k| {
+        tail.strip_prefix(*k).filter(|rest| {
+          rest.starts_with(|c: char| c.is_whitespace() || c == '{')
+        })
+      });
+      if let Some(rest) = kw {
+        if let Some(open) = rest.find('{') {
+          if let Some(close_rel) = rest[open + 1..].find('}') {
+            let body = &rest[open + 1..open + 1 + close_rel];
+            for pair in body.split(',') {
+              if let Some((k, v)) = pair.split_once(':') {
+                let key =
+                  k.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                let val =
+                  v.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
+                if !key.is_empty() {
+                  attrs.push((key, val));
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    out.push(attrs);
+  }
+  out
+}
+
+/// Extract the last `//# sourceMappingURL=<url>` (or legacy `//@`) magic comment
+/// from module source, mirroring V8's UnboundModuleScript::GetSourceMappingURL.
+/// V8 honours the LAST occurrence; the URL is the trimmed remainder of the line.
+fn extract_source_mapping_url(text: &str) -> Option<std::string::String> {
+  let mut found: Option<std::string::String> = None;
+  for line in text.lines() {
+    let t = line.trim();
+    for prefix in ["//# sourceMappingURL=", "//@ sourceMappingURL="] {
+      if let Some(rest) = t.strip_prefix(prefix) {
+        let url = rest.trim();
+        if !url.is_empty() {
+          found = Some(url.to_string());
+        }
+      }
+    }
+  }
+  found
 }
 
 #[unsafe(no_mangle)]
@@ -2378,6 +2537,13 @@ pub extern "C" fn v8__Module__GetModuleRequests(
   let specs: Vec<std::string::String> = module_state(this)
     .map(|m| m.import_specifiers.clone())
     .unwrap_or_default();
+  let offsets: Vec<i32> = module_state(this)
+    .map(|m| m.import_offsets.clone())
+    .unwrap_or_default();
+  let attributes: Vec<Vec<(std::string::String, std::string::String)>> =
+    module_state(this)
+      .map(|m| m.import_attributes.clone())
+      .unwrap_or_default();
   let native = module_state(this)
     .map(|m| m.native)
     .unwrap_or(ptr::null_mut());
@@ -2393,6 +2559,55 @@ pub extern "C" fn v8__Module__GetModuleRequests(
         let key = JSStringCreateWithUTF8CString(c"specifier".as_ptr());
         JSObjectSetProperty(ctx, req, key, sval, 0, ptr::null_mut());
         JSStringRelease(key);
+      }
+
+      // Carry the specifier-literal source offset (deno's referrer_source_offset).
+      let off = offsets.get(idx).copied().unwrap_or(0);
+      let okey = JSStringCreateWithUTF8CString(c"__source_offset".as_ptr());
+      JSObjectSetProperty(
+        ctx,
+        req,
+        okey,
+        JSValueMakeNumber(ctx, off as f64),
+        1 << 1,
+        ptr::null_mut(),
+      );
+      JSStringRelease(okey);
+
+      // Carry the import's `with { ... }` attributes (source-extracted) as a flat
+      // [key, value, key, value, ...] string array for GetImportAttributes.
+      if let Some(pairs) = attributes.get(idx) {
+        if !pairs.is_empty() {
+          let mut kv: Vec<JSValueRef> = Vec::with_capacity(pairs.len() * 2);
+          for (k, v) in pairs {
+            for s in [k, v] {
+              if let Ok(cs) = std::ffi::CString::new(s.as_str()) {
+                let js = JSStringCreateWithUTF8CString(cs.as_ptr());
+                kv.push(JSValueMakeString(ctx, js));
+                JSStringRelease(js);
+              } else {
+                kv.push(JSValueMakeString(
+                  ctx,
+                  JSStringCreateWithUTF8CString(c"".as_ptr()),
+                ));
+              }
+            }
+          }
+          let arr =
+            JSObjectMakeArray(ctx, kv.len(), kv.as_ptr(), ptr::null_mut());
+          if !arr.is_null() {
+            let akey = JSStringCreateWithUTF8CString(c"__attrs".as_ptr());
+            JSObjectSetProperty(
+              ctx,
+              req,
+              akey,
+              arr as JSValueRef,
+              1 << 1,
+              ptr::null_mut(),
+            );
+            JSStringRelease(akey);
+          }
+        }
       }
 
       // Carry the native import-attribute type (3=JSON, 2=wasm) so
@@ -3333,6 +3548,9 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
     export_names: names,
     eval_steps: Some(steps),
     source: None,
+    source_map_url: None,
+    import_offsets: Vec::new(),
+    import_attributes: Vec::new(),
     import_specifiers: Vec::new(),
     namespace,
     specifier,
@@ -3435,9 +3653,24 @@ pub extern "C" fn v8__ModuleRequest__GetPhase(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ModuleRequest__GetSourceOffset(
-  _this: *const ModuleRequest,
+  this: *const ModuleRequest,
 ) -> int {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return 0;
+  }
+  unsafe {
+    let obj = jsval(this) as JSObjectRef;
+    let key = JSStringCreateWithUTF8CString(c"__source_offset".as_ptr());
+    let mut exc: JSValueRef = ptr::null();
+    let v = JSObjectGetProperty(ctx, obj, key, &mut exc);
+    JSStringRelease(key);
+    if v.is_null() || JSValueIsUndefined(ctx, v) {
+      return 0;
+    }
+    let n = JSValueToNumber(ctx, v, &mut exc);
+    if n.is_nan() { 0 } else { n as int }
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -3449,37 +3682,67 @@ pub extern "C" fn v8__ModuleRequest__GetImportAttributes(
     return ptr::null();
   }
   // V8 returns static-import attributes as [key, value, source_offset] triples.
-  // We carry only the `type` attribute (json/webassembly), read from the request
-  // object's __attr_type marker set by GetModuleRequests.
+  // Prefer the full source-extracted attribute set (`__attrs`, a flat [key,
+  // value, ...] array set by GetModuleRequests) so deno sees ALL attributes
+  // (`type: "text"/"bytes"/<custom>`, arbitrary keys). Fall back to the coarse
+  // `__attr_type` (json/wasm) the native record exposes.
   let mut elems: Vec<JSValueRef> = Vec::new();
   unsafe {
     let mut exc: JSValueRef = ptr::null();
+    let mk = |s: &str| -> JSValueRef {
+      let c = std::ffi::CString::new(s).unwrap_or_default();
+      let js = JSStringCreateWithUTF8CString(c.as_ptr());
+      let v = JSValueMakeString(ctx, js);
+      JSStringRelease(js);
+      v
+    };
     if !this.is_null() {
       let obj = jsval(this) as JSObjectRef;
-      let akey = JSStringCreateWithUTF8CString(c"__attr_type".as_ptr());
-      let at_val = JSObjectGetProperty(ctx, obj, akey, &mut exc);
-      JSStringRelease(akey);
-      let at = if at_val.is_null() {
-        0.0
+      // Source-extracted attributes: flat [key, value, ...] array.
+      let attrs_key = JSStringCreateWithUTF8CString(c"__attrs".as_ptr());
+      let attrs_val = JSObjectGetProperty(ctx, obj, attrs_key, &mut exc);
+      JSStringRelease(attrs_key);
+      let attrs_arr = if !attrs_val.is_null() && JSValueIsObject(ctx, attrs_val)
+      {
+        Some(attrs_val as JSObjectRef)
       } else {
-        JSValueToNumber(ctx, at_val, &mut exc)
+        None
       };
-      let type_str = match at as i32 {
-        3 => Some("json"),
-        2 => Some("webassembly"),
-        _ => None,
-      };
-      if let Some(ts) = type_str {
-        let mk = |s: &str| -> JSValueRef {
-          let c = std::ffi::CString::new(s).unwrap();
-          let js = JSStringCreateWithUTF8CString(c.as_ptr());
-          let v = JSValueMakeString(ctx, js);
-          JSStringRelease(js);
-          v
+      if let Some(arr) = attrs_arr {
+        let len_key = JSStringCreateWithUTF8CString(c"length".as_ptr());
+        let len_val = JSObjectGetProperty(ctx, arr, len_key, &mut exc);
+        JSStringRelease(len_key);
+        let len = JSValueToNumber(ctx, len_val, &mut exc) as usize;
+        let mut i = 0;
+        while i + 1 < len {
+          let k = JSObjectGetPropertyAtIndex(ctx, arr, i as u32, &mut exc);
+          let v =
+            JSObjectGetPropertyAtIndex(ctx, arr, (i + 1) as u32, &mut exc);
+          elems.push(k);
+          elems.push(v);
+          elems.push(JSValueMakeNumber(ctx, 0.0)); // attribute source offset
+          i += 2;
+        }
+      } else {
+        // Fallback: coarse type enum from the native record.
+        let akey = JSStringCreateWithUTF8CString(c"__attr_type".as_ptr());
+        let at_val = JSObjectGetProperty(ctx, obj, akey, &mut exc);
+        JSStringRelease(akey);
+        let at = if at_val.is_null() {
+          0.0
+        } else {
+          JSValueToNumber(ctx, at_val, &mut exc)
         };
-        elems.push(mk("type"));
-        elems.push(mk(ts));
-        elems.push(JSValueMakeNumber(ctx, 0.0)); // source offset
+        let type_str = match at as i32 {
+          3 => Some("json"),
+          2 => Some("webassembly"),
+          _ => None,
+        };
+        if let Some(ts) = type_str {
+          elems.push(mk("type"));
+          elems.push(mk(ts));
+          elems.push(JSValueMakeNumber(ctx, 0.0));
+        }
       }
     }
     let arr = JSObjectMakeArray(ctx, elems.len(), elems.as_ptr(), &mut exc);

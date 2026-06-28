@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=sys-jsc suite=deno_core.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 362 passing. DO NOT hand-sort; the
+# (run.mjs --update). 372 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 deno_core::arena::raw_arena::tests::test_add_clear_many
 deno_core::arena::raw_arena::tests::test_add_remove_many
@@ -107,8 +107,10 @@ deno_core::modules::tests::invalid_utf8_module
 deno_core::modules::tests::loader_disappears_after_error
 deno_core::modules::tests::main_and_side_module
 deno_core::modules::tests::no_duplicate_loads
+deno_core::modules::tests::recursive_load_main_with_code
 deno_core::modules::tests::slow_never_ready_modules
 deno_core::modules::tests::test_code_cache_not_created_for_json_module
+deno_core::modules::tests::test_custom_module_type_callback_computed
 deno_core::modules::tests::test_custom_module_type_callback_synthetic
 deno_core::modules::tests::test_custom_module_type_default
 deno_core::modules::tests::test_dyn_import_async_graph_with_lazy_esm_no_stall
@@ -116,7 +118,14 @@ deno_core::modules::tests::test_lazy_load_esm_evaluates_pre_instantiated_sibling
 deno_core::modules::tests::test_lazy_loaded_esm_concurrent_loads
 deno_core::modules::tests::test_lazy_loaded_esm_with_tla_no_panic
 deno_core::modules::tests::test_lazy_loaded_script_not_found
+deno_core::modules::tests::test_mods
+deno_core::modules::tests::test_native_external_source_map_with_relative_path
+deno_core::modules::tests::test_native_source_map_synthetic_bundle_path
+deno_core::modules::tests::test_native_source_map_with_absolute_path_outside_cwd
+deno_core::modules::tests::test_native_source_map_with_trailing_content
+deno_core::modules::tests::test_recursive_load
 deno_core::modules::tests::test_tla_with_tick_scheduled_no_hang
+deno_core::modules::tests::test_validate_import_attributes_callback
 deno_core::modules::tests::test_validate_import_attributes_callback2
 deno_core::modules::tests::test_validate_import_attributes_default
 deno_core::runtime::op_driver::erased_future::tests::test_in_arena_selfref_easy
@@ -264,6 +273,7 @@ deno_core::runtime::tests::misc::test_v8_platform
 deno_core::runtime::tests::misc::test_wakers_for_async_ops
 deno_core::runtime::tests::misc::tla_in_esm_extensions_panics - should panic
 deno_core::runtime::tests::ops::duplicate_op_names - should panic
+deno_core::runtime::tests::ops::ops_in_js_have_proper_names
 deno_core::runtime::tests::ops::test_async_op_serialize_object_with_numbers_as_keys
 deno_core::runtime::tests::ops::test_async_opstate_borrow
 deno_core::runtime::tests::ops::test_dispatch

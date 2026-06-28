@@ -515,6 +515,9 @@ pub extern "C" fn v8__Context__New(
 
   unsafe { crate::jsc::isolate::install_unhandled_rejection_bridge(ctx) };
   unsafe { crate::jsc::module::install_dynamic_import_global(ctx) };
+  if prepare_stack_trace_cb_is_set() {
+    unsafe { install_prepare_stack_trace_bridge(ctx) };
+  }
   ctx as *const Context
 }
 
@@ -642,6 +645,156 @@ unsafe fn install_stacktrace_shim(ctx: JSGlobalContextRef) {
     JSEvaluateScript(ctx, js, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
     JSStringRelease(js);
   }
+}
+
+thread_local! {
+  // deno's native PrepareStackTraceCallback (set via
+  // v8__Isolate__SetPrepareStackTraceCallback). When `error.stack` is read,
+  // V8 calls this *instead of* a JS `Error.prepareStackTrace`. JSC has no such
+  // engine hook, so we bridge through a JS `Error.prepareStackTrace` that
+  // forwards into this callback (see install_prepare_stack_trace_bridge).
+  static PREPARE_STACK_TRACE_CB: std::cell::Cell<
+    Option<crate::isolate::PrepareStackTraceCallback<'static>>,
+  > = const { std::cell::Cell::new(None) };
+}
+
+unsafe extern "C" fn prepare_stack_trace_trampoline(
+  ctx: JSContextRef,
+  _function: JSObjectRef,
+  _this: JSObjectRef,
+  argc: usize,
+  argv: *const JSValueRef,
+  _exception: *mut JSValueRef,
+) -> JSValueRef {
+  ffi_guard(
+    || unsafe { prepare_stack_trace_impl(ctx, argc, argv) },
+    || unsafe { JSValueMakeUndefined(ctx) },
+  )
+}
+
+unsafe fn prepare_stack_trace_impl(
+  ctx: JSContextRef,
+  argc: usize,
+  argv: *const JSValueRef,
+) -> JSValueRef {
+  let Some(cb) = PREPARE_STACK_TRACE_CB.with(|c| c.get()) else {
+    return unsafe { JSValueMakeUndefined(ctx) };
+  };
+  if argc < 2 || argv.is_null() {
+    return unsafe { JSValueMakeUndefined(ctx) };
+  }
+  unsafe {
+    restore_current(current_iso());
+    let error = *argv;
+    let sites = *argv.add(1);
+    let context = ctx as *const Context;
+    let err_h = intern_ctx::<crate::Value>(ctx, error);
+    let sites_h = intern_ctx::<crate::Array>(ctx, sites);
+    let (Some(c_l), Some(e_l), Some(s_l)) = (
+      crate::Local::from_raw(context),
+      crate::Local::from_raw(err_h),
+      crate::Local::from_raw(sites_h),
+    ) else {
+      return JSValueMakeUndefined(ctx);
+    };
+    let ret = cb(c_l, e_l, s_l);
+    // PrepareStackTraceCallbackRet is repr(C)(*const Value); its field is
+    // private, so transmute to read the returned (source-mapped) stack string.
+    let v: *const crate::Value = std::mem::transmute(ret);
+    if v.is_null() {
+      return JSValueMakeUndefined(ctx);
+    }
+    jsval(v)
+  }
+}
+
+/// Wire `Error.prepareStackTrace` to deno's native callback. The
+/// `install_stacktrace_shim` lazy `.stack` getter already builds V8-shaped
+/// CallSite objects and calls `Error.prepareStackTrace(error, sites)` when one
+/// is set — but deno registers a *native* callback, not a JS one. Bridge them:
+/// a JS wrapper forwards `(error, sites)` into the native trampoline, clearing
+/// the hook for the duration so deno's own re-dispatch to
+/// `Error.prepareStackTrace` (it calls the user hook if present) can't recurse.
+pub(crate) unsafe fn install_prepare_stack_trace_bridge(
+  ctx: JSGlobalContextRef,
+) {
+  if ctx.is_null() {
+    return;
+  }
+  unsafe {
+    let name =
+      JSStringCreateWithUTF8CString(c"__v8jsc_denoPrepareNative".as_ptr());
+    let f = JSObjectMakeFunctionWithCallback(
+      ctx,
+      name,
+      Some(prepare_stack_trace_trampoline),
+    );
+    if !f.is_null() {
+      let global = JSContextGetGlobalObject(ctx);
+      JSObjectSetProperty(
+        ctx,
+        global,
+        name,
+        f as JSValueRef,
+        0,
+        ptr::null_mut(),
+      );
+    }
+    JSStringRelease(name);
+    if f.is_null() {
+      return;
+    }
+    const SRC: &[u8] = b"(function(){\
+      var native = globalThis.__v8jsc_denoPrepareNative;\
+      try { delete globalThis.__v8jsc_denoPrepareNative; } catch(e){}\
+      Error.prepareStackTrace = function(error, sites){\
+        var saved = Error.prepareStackTrace;\
+        Error.prepareStackTrace = undefined;\
+        try { return native(error, sites); }\
+        finally { Error.prepareStackTrace = saved; }\
+      };\
+    })()\0";
+    let js = JSStringCreateWithUTF8CString(
+      SRC.as_ptr() as *const std::os::raw::c_char
+    );
+    let mut exc: JSValueRef = ptr::null();
+    JSEvaluateScript(ctx, js, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+    JSStringRelease(js);
+  }
+}
+
+/// Store deno's PrepareStackTraceCallback and install the JS bridge on every
+/// known context of `iso` (mirrors SetPromiseRejectCallback's fan-out).
+pub(crate) fn set_prepare_stack_trace_cb(
+  iso: *mut RealIsolate,
+  cb: crate::isolate::PrepareStackTraceCallback<'static>,
+) {
+  PREPARE_STACK_TRACE_CB.with(|c| c.set(Some(cb)));
+  let iso = if iso.is_null() { current_iso() } else { iso };
+  if iso.is_null() {
+    return;
+  }
+  let st = iso_state(iso);
+  let ctxs: Vec<JSGlobalContextRef> = st
+    .owned_contexts
+    .iter()
+    .chain(st.contexts.iter())
+    .copied()
+    .collect();
+  for gctx in ctxs {
+    if !gctx.is_null() {
+      unsafe { install_prepare_stack_trace_bridge(gctx) };
+    }
+  }
+}
+
+pub(crate) fn prepare_stack_trace_cb_is_set() -> bool {
+  PREPARE_STACK_TRACE_CB.with(|c| {
+    let v = c.get();
+    let set = v.is_some();
+    c.set(v);
+    set
+  })
 }
 
 unsafe fn install_context_compat_shims(ctx: JSGlobalContextRef) {

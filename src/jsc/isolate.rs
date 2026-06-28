@@ -344,9 +344,10 @@ pub extern "C" fn v8__Isolate__SetCaptureStackTraceForUncaughtExceptions(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetPrepareStackTraceCallback(
-  _isolate: *mut RealIsolate,
-  _callback: crate::isolate::PrepareStackTraceCallback,
+  isolate: *mut RealIsolate,
+  callback: crate::isolate::PrepareStackTraceCallback<'static>,
 ) {
+  crate::jsc::core::set_prepare_stack_trace_cb(isolate, callback);
 }
 
 #[unsafe(no_mangle)]
