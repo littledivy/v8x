@@ -295,22 +295,22 @@ thread_local! {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__TerminateExecution(
-  _isolate: *const RealIsolate,
-) {
+pub extern "C" fn v8__Isolate__TerminateExecution(isolate: *const RealIsolate) {
+  crate::jsc::terminate::request_terminate(isolate as *mut RealIsolate);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__IsExecutionTerminating(
-  _isolate: *const RealIsolate,
+  isolate: *const RealIsolate,
 ) -> bool {
-  false
+  crate::jsc::terminate::is_terminating(isolate as *mut RealIsolate)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__CancelTerminateExecution(
-  _isolate: *const RealIsolate,
+  isolate: *const RealIsolate,
 ) {
+  crate::jsc::terminate::cancel_terminate(isolate as *mut RealIsolate);
 }
 
 #[unsafe(no_mangle)]
@@ -367,10 +367,11 @@ pub extern "C" fn v8__Isolate__GetHeapStatistics(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__RemoveNearHeapLimitCallback(
-  _isolate: *mut RealIsolate,
+  isolate: *mut RealIsolate,
   _callback: crate::isolate::NearHeapLimitCallback,
   _heap_limit: usize,
 ) {
+  crate::jsc::terminate::clear_heap_callback(isolate);
 }
 
 #[unsafe(no_mangle)]
@@ -778,11 +779,14 @@ pub extern "C" fn v8__ResourceConstraints__ConfigureDefaults(
 pub extern "C" fn v8__ResourceConstraints__ConfigureDefaultsFromHeapSize(
   constraints: *mut RC,
   _initial_heap_size_in_bytes: usize,
-  _maximum_heap_size_in_bytes: usize,
+  maximum_heap_size_in_bytes: usize,
 ) {
   if !constraints.is_null() {
     unsafe {
-      ptr::write_bytes(constraints as *mut u8, 0, std::mem::size_of::<RC>())
+      ptr::write_bytes(constraints as *mut u8, 0, std::mem::size_of::<RC>());
+      // Record the requested hard heap cap as the old-generation limit — the
+      // value our near-heap-limit watchdog compares the live heap against.
+      rc_set_word(constraints, 1, maximum_heap_size_in_bytes);
     };
   }
 }

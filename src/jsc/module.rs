@@ -759,10 +759,19 @@ unsafe fn eval_value_as_script(
     unsafe { JSStringRelease(src_url_js) };
   }
   unsafe { JSStringRelease(src_str) };
-  // Surface the eval error so deno's TryCatch (execute_script) sees has_caught()
-  // instead of asserting on a null return with no pending exception.
-  if result.is_null() && !exc.is_null() {
-    unsafe { crate::jsc::core::record_pending_exception(ctx, exc) };
+  if result.is_null() {
+    let iso = crate::jsc::core::current_iso();
+    if !iso.is_null() && crate::jsc::terminate::is_terminating(iso) {
+      // The watchdog aborted this script. Replace JSC's own termination
+      // exception with an empty (undefined) one: deno pairs that with
+      // `is_execution_terminating()` to build "execution terminated".
+      let undef = unsafe { JSValueMakeUndefined(ctx) };
+      unsafe { crate::jsc::core::record_pending_exception(ctx, undef) };
+    } else if !exc.is_null() {
+      // Surface the eval error so deno's TryCatch (execute_script) sees
+      // has_caught() instead of asserting on a null return with no exception.
+      unsafe { crate::jsc::core::record_pending_exception(ctx, exc) };
+    }
   }
   result
 }
@@ -924,8 +933,14 @@ pub extern "C" fn v8__Script__Run(
                 &mut exc,
               )
             });
-            if r.is_null() && !exc.is_null() {
-              crate::jsc::core::record_pending_exception(ctx, exc);
+            if r.is_null() {
+              let iso = crate::jsc::core::current_iso();
+              if !iso.is_null() && crate::jsc::terminate::is_terminating(iso) {
+                let undef = JSValueMakeUndefined(ctx);
+                crate::jsc::core::record_pending_exception(ctx, undef);
+              } else if !exc.is_null() {
+                crate::jsc::core::record_pending_exception(ctx, exc);
+              }
             }
             r
           }
