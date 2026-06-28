@@ -1117,6 +1117,7 @@ unsafe extern "C" fn memory_buffer_get(
 
   let buf =
     unsafe { JS_NewArrayBuffer(ctx, dptr, size, None, ptr::null_mut(), false) };
+  crate::quickjs::arraybuffer::mark_buffer_nondetachable(ctx, buf);
 
   env.cached.set(unsafe { JS_DupValue(ctx, buf) });
   buf
@@ -1235,6 +1236,148 @@ unsafe fn make_global_obj(
     );
     JS_FreeAtom(ctx, atom);
   }
+  obj
+}
+
+// Standalone `new WebAssembly.Memory({ initial, maximum })`. Unlike the
+// instance-exported memories above (backed by a live `wasm_memory_t`), a
+// user-constructed Memory is JS-backed: we own a plain zeroed ArrayBuffer of
+// `pages * 65536` bytes and re-allocate it on `grow`. The buffer is marked
+// non-detachable (see `mark_buffer_nondetachable`) so deno's detach ops throw
+// "expected: detachable" rather than stealing WASM-memory bytes.
+const WASM_PAGE: usize = 65536;
+
+struct JsMemEnv {
+  buf: std::cell::Cell<JSValue>,
+  pages: std::cell::Cell<u32>,
+  max_pages: u32,
+}
+
+unsafe fn js_mem_new_buffer(ctx: *mut JSContext, bytes: usize) -> JSValue {
+  let zeros = vec![0u8; bytes];
+  let buf = unsafe { JS_NewArrayBufferCopy(ctx, zeros.as_ptr(), bytes) };
+  crate::quickjs::arraybuffer::mark_buffer_nondetachable(ctx, buf);
+  buf
+}
+
+unsafe extern "C" fn js_mem_buffer_get(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+  _magic: c_int,
+  data: *mut JSValue,
+) -> JSValue {
+  let mut envp = 0i64;
+  unsafe { JS_ToBigInt64(ctx, &mut envp, *data) };
+  if envp == 0 {
+    return jsv_undefined();
+  }
+  let env = unsafe { &*(envp as *const JsMemEnv) };
+  unsafe { JS_DupValue(ctx, env.buf.get()) }
+}
+
+unsafe extern "C" fn js_mem_grow(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  _magic: c_int,
+  data: *mut JSValue,
+) -> JSValue {
+  let mut envp = 0i64;
+  unsafe { JS_ToBigInt64(ctx, &mut envp, *data) };
+  if envp == 0 {
+    return jsv_undefined();
+  }
+  let env = unsafe { &*(envp as *const JsMemEnv) };
+  let mut delta = 0i32;
+  if argc >= 1 {
+    unsafe { JS_ToInt32(ctx, &mut delta, *argv) };
+  }
+  if delta < 0 {
+    return unsafe { throw(ctx, "WebAssembly.Memory.grow: negative delta") };
+  }
+  let old_pages = env.pages.get();
+  let new_pages = old_pages.saturating_add(delta as u32);
+  if new_pages > env.max_pages {
+    return unsafe { throw(ctx, "WebAssembly.Memory.grow: exceeds maximum") };
+  }
+  let new_buf =
+    unsafe { js_mem_new_buffer(ctx, new_pages as usize * WASM_PAGE) };
+  let old = env.buf.get();
+  let mut old_len = 0usize;
+  let old_ptr = unsafe { JS_GetArrayBuffer(ctx, &mut old_len, old) };
+  if !old_ptr.is_null() {
+    let mut new_len = 0usize;
+    let new_ptr = unsafe { JS_GetArrayBuffer(ctx, &mut new_len, new_buf) };
+    if !new_ptr.is_null() {
+      unsafe {
+        ptr::copy_nonoverlapping(old_ptr, new_ptr, old_len.min(new_len));
+      }
+    }
+  }
+  unsafe { JS_FreeValue(ctx, old) };
+  env.buf.set(new_buf);
+  env.pages.set(new_pages);
+  unsafe { JS_NewInt32(ctx, old_pages as i32) }
+}
+
+unsafe extern "C" fn wa_memory_ctor(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  let mut initial: i64 = 0;
+  let mut maximum: i64 = -1;
+  if argc >= 1 {
+    let desc = unsafe { *argv };
+    let initv = unsafe { JS_GetPropertyStr(ctx, desc, c"initial".as_ptr()) };
+    unsafe { JS_ToInt64(ctx, &mut initial, initv) };
+    unsafe { JS_FreeValue(ctx, initv) };
+    let maxv = unsafe { JS_GetPropertyStr(ctx, desc, c"maximum".as_ptr()) };
+    if maxv.tag != JS_TAG_UNDEFINED {
+      unsafe { JS_ToInt64(ctx, &mut maximum, maxv) };
+    }
+    unsafe { JS_FreeValue(ctx, maxv) };
+  }
+  let pages = initial.max(0) as u32;
+  // 65536 == the WASM32 max # of 64KiB pages (4GiB address space).
+  let max_pages = if maximum < 0 {
+    65536u32
+  } else {
+    maximum as u32
+  };
+  let buf = unsafe { js_mem_new_buffer(ctx, pages as usize * WASM_PAGE) };
+
+  let env = Box::into_raw(Box::new(JsMemEnv {
+    buf: std::cell::Cell::new(buf),
+    pages: std::cell::Cell::new(pages),
+    max_pages,
+  }));
+
+  let obj = unsafe { JS_NewObject(ctx) };
+  let mut bd = [unsafe { JS_NewBigInt64(ctx, env as i64) }];
+  let getter = unsafe {
+    JS_NewCFunctionData(ctx, js_mem_buffer_get, 0, 0, 1, bd.as_mut_ptr())
+  };
+  let atom = unsafe { JS_NewAtom(ctx, c"buffer".as_ptr()) };
+  unsafe {
+    JS_DefinePropertyGetSet(
+      ctx,
+      obj,
+      atom,
+      getter,
+      jsv_undefined(),
+      JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE,
+    );
+    JS_FreeAtom(ctx, atom);
+  }
+  let mut gd = [unsafe { JS_NewBigInt64(ctx, env as i64) }];
+  let grow_fn =
+    unsafe { JS_NewCFunctionData(ctx, js_mem_grow, 1, 0, 1, gd.as_mut_ptr()) };
+  unsafe { JS_SetPropertyStr(ctx, obj, c"grow".as_ptr(), grow_fn) };
   obj
 }
 
@@ -1582,6 +1725,7 @@ pub(crate) fn install_webassembly(ctx: *mut JSContext) {
     set_fn(wa, c"validate", wa_validate, 1);
     set_ctor(wa, c"Module", wa_module_ctor, 1);
     set_ctor(wa, c"Instance", wa_instance_ctor, 2);
+    set_ctor(wa, c"Memory", wa_memory_ctor, 1);
     set_fn(wa, c"compile", wa_compile, 1);
     set_fn(wa, c"instantiate", wa_instantiate, 2);
 
