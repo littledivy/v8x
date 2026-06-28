@@ -94,6 +94,34 @@ fn refresh_current_ctx(st: &IsoState) {
   CURRENT_CTX.with(|c| *c.borrow_mut() = ctx);
 }
 
+/// Run a JSC→Rust callback body, converting any Rust panic into `fallback`
+/// instead of letting it unwind across JSC's C frame.
+///
+/// JSC invokes our trampolines / finalizers / deallocators through plain
+/// `extern "C"` function pointers. A Rust panic that tries to unwind through
+/// the intervening C (interpreter / JIT / GC) frame is undefined behaviour and
+/// the runtime turns it into an immediate `abort()` ("panic in a function that
+/// cannot unwind"). Because GC finalizers and promise/microtask callbacks run
+/// at non-deterministic times, such a panic shows up as a non-deterministic
+/// SIGABRT that truncates the whole test binary (denoland/divybot#653).
+///
+/// Catching the unwind at the boundary keeps the process alive: the offending
+/// operation fails locally (the default panic hook still prints the panic
+/// message + location to stderr, so CI logs pinpoint the culprit) but the
+/// binary runs to completion deterministically. `AssertUnwindSafe` is sound
+/// here: we never observe broken invariants of a poisoned value across the
+/// boundary — on panic we discard the result and return a fresh fallback.
+#[inline]
+pub(crate) fn ffi_guard<R>(
+  body: impl FnOnce() -> R,
+  fallback: impl FnOnce() -> R,
+) -> R {
+  match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+    Ok(r) => r,
+    Err(_) => fallback(),
+  }
+}
+
 #[inline(always)]
 pub(crate) fn jsval<T>(p: *const T) -> JSValueRef {
   p as JSValueRef
