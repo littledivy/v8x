@@ -237,11 +237,6 @@ unsafe extern "C" {
     finalizer: Option<unsafe extern "C" fn(*mut c_void)>,
   );
 
-  pub fn wasm_ref_set_host_info_with_finalizer(
-    r: *mut wasm_ref_t,
-    info: *mut c_void,
-    finalizer: Option<unsafe extern "C" fn(*mut c_void)>,
-  );
 }
 
 #[repr(C)]
@@ -840,8 +835,8 @@ unsafe extern "C" fn table_set(
     if !r.is_null() {
       let boxed = unsafe { box_externref(ctx, val) };
       unsafe {
-        wasm_ref_set_host_info_with_finalizer(
-          r,
+        wasm_foreign_set_host_info_with_finalizer(
+          foreign,
           boxed,
           Some(externref_box_free),
         )
@@ -1280,6 +1275,9 @@ unsafe extern "C" fn global_value_set(
   }
   let env = unsafe { &*(envp as *const GlobalEnv) };
   let gt = unsafe { wasm_global_type(env.global) };
+  if unsafe { wasm_globaltype_mutability(gt) } == 0 {
+    return unsafe { throw(ctx, "WebAssembly.Global.value: immutable global") };
+  }
   let kind = unsafe { wasm_valtype_kind(wasm_globaltype_content(gt)) };
   let newval = if argc >= 1 {
     unsafe { *argv }
