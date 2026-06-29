@@ -297,7 +297,11 @@ unsafe fn js_to_externref(ctx: *mut JSContext, v: JSValue) -> u64 {
   }
   let boxed = unsafe { box_externref(ctx, v) };
   unsafe {
-    wasm_ref_set_host_info_with_finalizer(r, boxed, Some(externref_box_free))
+    wasm_foreign_set_host_info_with_finalizer(
+      foreign,
+      boxed,
+      Some(externref_box_free),
+    )
   };
   r as u64
 }
