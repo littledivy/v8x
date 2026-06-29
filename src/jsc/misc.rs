@@ -140,13 +140,7 @@ pub extern "C" fn v8__Isolate__RequestGarbageCollectionForTesting(
   };
   if !isolate.is_null() {
     let st = crate::jsc::core::iso_state(isolate);
-    let released = st
-      .external_string_memory
-      .swap(0, std::sync::atomic::Ordering::SeqCst);
-    if released != 0 {
-      st.external_memory
-        .fetch_sub(released, std::sync::atomic::Ordering::SeqCst);
-    }
+    crate::jsc::core::release_external_string_memory(st);
   }
 }
 
