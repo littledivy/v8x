@@ -1,0 +1,284 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21019,7 +21019,185 @@
+     return 0;
+ }
+ 
+-static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
++/* v82jsc: build a CallSite-shaped JS object for an injected async frame.
++   Used to satisfy embedders (e.g. deno's `has_call_site`) that gate stack
++   preservation on a populated `#callSiteEvals` private. Returns a fresh,
++   self-contained object; the embedder reads file/line/col via methods. */
++static JSValue js_v82jsc_make_async_callsite(JSContext *ctx, const char *file,
++                                             int line, int col)
++{
++    static const char src[] =
++        "(function(file, line, col) { return {\n"
++        "  getFileName: function () { return file; },\n"
++        "  getLineNumber: function () { return line; },\n"
++        "  getColumnNumber: function () { return col; },\n"
++        "  getFunctionName: function () { return null; },\n"
++        "  getMethodName: function () { return null; },\n"
++        "  getTypeName: function () { return null; },\n"
++        "  getEvalOrigin: function () { return null; },\n"
++        "  getPromiseIndex: function () { return null; },\n"
++        "  isToplevel: function () { return true; },\n"
++        "  isEval: function () { return false; },\n"
++        "  isNative: function () { return false; },\n"
++        "  isConstructor: function () { return false; },\n"
++        "  isAsync: function () { return true; },\n"
++        "  isPromiseAll: function () { return false; },\n"
++        "}; })";
++    JSValue factory = JS_Eval(ctx, src, sizeof(src) - 1,
++                              "<v82jsc-async-callsite>", JS_EVAL_TYPE_GLOBAL);
++    if (JS_IsException(factory))
++        return JS_NULL;
++    JSValue argv[3];
++    argv[0] = JS_NewString(ctx, file ? file : "");
++    argv[1] = js_int32(line);
++    argv[2] = js_int32(col);
++    JSValue cs = JS_Call(ctx, factory, JS_UNDEFINED, 3, vc(argv));
++    JS_FreeValue(ctx, factory);
++    JS_FreeValue(ctx, argv[0]);
++    if (JS_IsException(cs)) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        return JS_NULL;
++    }
++    return cs;
++}
++
++/* v82jsc: look up (or create) the embedder's private-symbol key for the
++   structured-frames array. deno uses `Symbol.for("v82jsc_private:<name>")`
++   via the shim's v8__Private__ForApi; we mirror that here so the same atom
++   is shared. Returns JS_ATOM_NULL on failure. */
++static JSAtom js_v82jsc_private_atom(JSContext *ctx, const char *name)
++{
++    JSValue global = JS_GetGlobalObject(ctx);
++    JSValue symbol_ctor = JS_GetPropertyStr(ctx, global, "Symbol");
++    JS_FreeValue(ctx, global);
++    if (!JS_IsObject(symbol_ctor)) {
++        JS_FreeValue(ctx, symbol_ctor);
++        return JS_ATOM_NULL;
++    }
++    JSValue symbol_for = JS_GetPropertyStr(ctx, symbol_ctor, "for");
++    if (!JS_IsFunction(ctx, symbol_for)) {
++        JS_FreeValue(ctx, symbol_for);
++        JS_FreeValue(ctx, symbol_ctor);
++        return JS_ATOM_NULL;
++    }
++    JSValue arg = JS_NewString(ctx, name);
++    JSValue sym = JS_Call(ctx, symbol_for, symbol_ctor, 1, vc(&arg));
++    JS_FreeValue(ctx, arg);
++    JS_FreeValue(ctx, symbol_for);
++    JS_FreeValue(ctx, symbol_ctor);
++    if (JS_IsException(sym)) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        return JS_ATOM_NULL;
++    }
++    JSAtom atom = JS_ValueToAtom(ctx, sym);
++    JS_FreeValue(ctx, sym);
++    return atom;
++}
++
++/* v82jsc: append "    at async <file>:<line>:<col>" to the error's stack
++   property so an unhandled rejection propagating through an async function's
++   await surfaces the awaiting frame (V8-style async stack stitching). Also
++   appends a synthetic CallSite to the embedder's `#callSiteEvals` private so
++   gates like deno's `has_call_site` (which would otherwise rebuild a fresh
++   stack-less exception through `catch_dynamic_import_promise_error`) see a
++   populated structured-frames array and preserve the augmented stack.
++   No-op for non-object errors and when stack/file are absent. */
++static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
++                                         const char *file, int line, int col)
++{
++    JSValue stack, new_stack;
++    DynBuf dbuf;
++    const char *cs;
++    size_t len;
++
++    if (!file || JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
++        return;
++    stack = JS_GetProperty(ctx, error, JS_ATOM_stack);
++    if (JS_IsException(stack)) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        return;
++    }
++    js_dbuf_init(ctx, &dbuf);
++    if (JS_IsString(stack)) {
++        cs = JS_ToCStringLen(ctx, &len, stack);
++        if (cs) {
++            dbuf_put(&dbuf, (const uint8_t *)cs, len);
++            if (len == 0 || cs[len - 1] != '\n')
++                dbuf_putc(&dbuf, '\n');
++            JS_FreeCString(ctx, cs);
++        }
++    }
++    JS_FreeValue(ctx, stack);
++    dbuf_printf(&dbuf, "    at async %s", file);
++    if (line >= 1) {
++        dbuf_printf(&dbuf, ":%d", line);
++        if (col >= 1)
++            dbuf_printf(&dbuf, ":%d", col);
++    }
++    if (dbuf_error(&dbuf)) {
++        dbuf_free(&dbuf);
++        return;
++    }
++    new_stack = JS_NewStringLen(ctx, (const char *)dbuf.buf, dbuf.size);
++    dbuf_free(&dbuf);
++    if (JS_IsException(new_stack)) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        return;
++    }
++    /* Install as an own data property; shadows js_error_get_stack so the
++       header isn't re-prepended (our string already carries it via the
++       prior accessor read). */
++    if (JS_DefinePropertyValue(ctx, error, JS_ATOM_stack, new_stack,
++                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    }
++
++    /* Mirror the frame into the embedder's structured-frames array so
++       deno's `has_call_site` returns true and `catch_dynamic_import_promise_error`
++       rethrows the original (with our augmented stack) instead of building a
++       fresh stack-less exception. Best-effort — failures are swallowed since
++       a missing entry only degrades to the pre-patch behavior. */
++    JSAtom key_atom = js_v82jsc_private_atom(ctx,
++        "v82jsc_private:deno_core::call_site_evals");
++    if (key_atom != JS_ATOM_NULL) {
++        JSValue existing = JS_GetProperty(ctx, error, key_atom);
++        JSValue arr;
++        uint32_t next_idx = 0;
++        if (JS_IsArray(existing)) {
++            arr = existing;
++            JSValue len_v = JS_GetPropertyStr(ctx, arr, "length");
++            JS_ToUint32(ctx, &next_idx, len_v);
++            JS_FreeValue(ctx, len_v);
++        } else {
++            JS_FreeValue(ctx, existing);
++            arr = JS_NewArray(ctx);
++            if (JS_IsException(arr)) {
++                JS_FreeValue(ctx, JS_GetException(ctx));
++                JS_FreeAtom(ctx, key_atom);
++                return;
++            }
++        }
++        JSValue cs_obj = js_v82jsc_make_async_callsite(ctx, file, line, col);
++        if (!JS_IsNull(cs_obj)) {
++            JS_DefinePropertyValueUint32(ctx, arr, next_idx, cs_obj,
++                                         JS_PROP_C_W_E);
++        }
++        /* Stash the array back as the private property. */
++        if (JS_DefinePropertyValue(ctx, error, key_atom, arr,
++                                   JS_PROP_C_W_E) < 0) {
++            JS_FreeValue(ctx, JS_GetException(ctx));
++        }
++        JS_FreeAtom(ctx, key_atom);
++    }
++}
++
++/* v82jsc: `async_file`/`line`/`col` describe the call's await site; if non-NULL,
++   the helper above is invoked on an unhandled rejection so the resumed frame
++   shows up on the error's stack. Initial-call resumes pass NULL — V8 only
++   stitches async frames for the resume-after-rejection path. */
++static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s,
++                                     const char *async_file,
++                                     int async_line, int async_col)
+ {
+     bool is_success = true;
+     JSValue func_ret, ret2;
+@@ -21031,6 +21209,9 @@
+             is_success = false;
+         } else {
+             JSValue error = JS_GetException(ctx);
++            if (async_file)
++                js_v82jsc_append_async_frame(ctx, error, async_file,
++                                             async_line, async_col);
+             ret2 = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED,
+                            1, vc(&error));
+             JS_FreeValue(ctx, error);
+@@ -21097,6 +21278,9 @@
+     JSObject *p = JS_VALUE_GET_OBJ(func_obj);
+     JSAsyncFunctionData *s = p->u.async_function_data;
+     bool is_reject = p->class_id - JS_CLASS_ASYNC_FUNCTION_RESOLVE;
++    const char *async_file = NULL;
++    int async_line = 0, async_col = 0;
++    bool ok;
+     JSValueConst arg;
+ 
+     if (argc > 0)
+@@ -21110,7 +21294,34 @@
+         /* return value of await */
+         s->func_state.frame.cur_sp[-1] = js_dup(arg);
+     }
+-    if (!js_async_function_resume(ctx, s))
++    /* v82jsc: on the rejection path, capture the await site from the suspended
++       frame so js_async_function_resume can attach it to the propagated error
++       (matches v8 zero-cost async stack traces). */
++    if (is_reject) {
++        JSValue fobj = s->func_state.frame.cur_func;
++        if (JS_VALUE_GET_TAG(fobj) == JS_TAG_OBJECT) {
++            JSObject *fp = JS_VALUE_GET_OBJ(fobj);
++            if (js_class_has_bytecode(fp->class_id) &&
++                fp->u.func.function_bytecode &&
++                s->func_state.frame.cur_pc) {
++                JSFunctionBytecode *b = fp->u.func.function_bytecode;
++                uint32_t pc = s->func_state.frame.cur_pc - b->byte_code_buf - 1;
++                async_line = find_line_num(ctx, b, pc, &async_col);
++                /* v82jsc: quickjs's pc2line stores `mark - eol` and s->eol is
++                   initialised to buf_start (not buf_start-1), so the first
++                   character on line 1 winds up at offset 0 even though v8
++                   reports it at 1-based col 1. Normalise by +1 on line 1. */
++                if (async_line == 1)
++                    async_col += 1;
++                if (b->filename != JS_ATOM_NULL)
++                    async_file = JS_AtomToCString(ctx, b->filename);
++            }
++        }
++    }
++    ok = js_async_function_resume(ctx, s, async_file, async_line, async_col);
++    if (async_file)
++        JS_FreeCString(ctx, async_file);
++    if (!ok)
+         return JS_EXCEPTION;
+     return JS_UNDEFINED;
+ }
+@@ -21143,7 +21354,7 @@
+     }
+     s->is_active = true;
+ 
+-    if (!js_async_function_resume(ctx, s))
++    if (!js_async_function_resume(ctx, s, NULL, 0, 0))
+         goto fail;
+ 
+     js_async_function_free(ctx->rt, s);
+@@ -27389,19 +27600,27 @@
+             return -1;
+         parse_flags = 0;
+         break;
+-    case TOK_AWAIT:
++    case TOK_AWAIT: {
++        int await_line_num, await_col_num;
+         if (!(s->cur_func->func_kind & JS_FUNC_ASYNC))
+             return js_parse_error(s, "unexpected 'await' keyword");
+         if (!s->cur_func->in_function_body)
+             return js_parse_error(s, "await in default expression");
++        /* v82jsc: capture the await keyword position before next_token advances
++           past it, so the OP_await opcode can carry its source loc — v8's
++           async-stack frame `at async <file>:<line>:<col>` points at `await`. */
++        await_line_num = s->token.line_num;
++        await_col_num = s->token.col_num;
+         if (next_token(s))
+             return -1;
+         if (js_parse_unary(s, PF_POW_FORBIDDEN))
+             return -1;
++        emit_source_loc_at(s, await_line_num, await_col_num);
+         emit_op(s, OP_await);
+         s->cur_func->has_await = true;
+         parse_flags = 0;
+         break;
++    }
+     default:
+         if (js_parse_postfix_expr(s, PF_POSTFIX_CALL))
+             return -1;
