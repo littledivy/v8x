@@ -231,7 +231,7 @@ async function runOneBin(bin, cwd, baseArgs) {
   // `(?: - should panic)?` strips the display annotation so the captured name
   // is the bare test PATH (what `--skip` matches).
   const resultRe =
-    /^test (.+?)(?: - should panic)? \.\.\. (?:ok|FAILED|ignored)\b/gm;
+    /^test (.+?)(?: - should panic)? \.\.\. (ok|FAILED|ignored)\b/gm;
   let combined = "";
   // A generous cap (a cell may have dozens of independent crashers); each round
   // strictly shrinks the unseen set, so this terminates well before the cap.
@@ -245,10 +245,46 @@ async function runOneBin(bin, cwd, baseArgs) {
     // A kill/crash mid-test leaves a dangling `test <name> ... ` line with no
     // newline; terminate it so the next round's output (or the synthetic FAILED
     // lines below) can't merge into it and confuse the libtest parser.
-    combined += r.output.endsWith("\n") ? r.output : r.output + "\n";
-    // Record every test that produced a result this round (so we skip it next).
-    for (let m; (m = resultRe.exec(r.output)) !== null; ) seen.add(m[1]);
-    if (!r.inFlight) break; // finished with no test left dangling
+    const roundOutput = r.output.endsWith("\n") ? r.output : r.output + "\n";
+    const events = [];
+    for (let m; (m = resultRe.exec(r.output)) !== null; ) {
+      events.push({ name: m[1], status: m[2] });
+    }
+    if (!r.inFlight) {
+      const poisoned = r.code !== 0 && !r.signal && r.output.includes("PoisonError");
+      const culprit = poisoned
+        ? events.find(
+            (e) =>
+              e.status === "FAILED" &&
+              !bad.some((t) => t.name === e.name) &&
+              !quarantined.includes(e.name),
+          )?.name
+        : null;
+      let afterCulprit = false;
+      for (const e of events) {
+        if (culprit && (afterCulprit || e.name === culprit)) {
+          afterCulprit = true;
+          continue;
+        }
+        // Record tests that produced a non-failing result this round (so we skip
+        // them next). Failed tests are only skipped when they crashed/hung or
+        // when they poisoned libtest-global state; ordinary failures stay visible
+        // and do not trigger an O(number-of-failures) retry loop.
+        if (e.status !== "FAILED") seen.add(e.name);
+      }
+      if (culprit) {
+        combined += suppressResultsFrom(roundOutput, culprit);
+        bad.push({ name: culprit, reason: "failed and poisoned PROCESS_LOCK" });
+        console.error(
+          `  [recover] '${culprit}' poisoned PROCESS_LOCK — re-running remaining tests ` +
+            `with it skipped (${bad.length} bad, ${seen.size} done)`,
+        );
+        continue;
+      }
+      combined += roundOutput;
+      break; // finished with no test left dangling
+    }
+    combined += roundOutput;
     if (seen.has(r.inFlight) || bad.some((t) => t.name === r.inFlight)) {
       // The dangling test was already accounted for (a skip that didn't take or
       // a name we can't match) — re-running would loop, so stop here.
@@ -271,6 +307,22 @@ async function runOneBin(bin, cwd, baseArgs) {
     console.error(`  [recover] ${bad.length} test(s) skipped: ${bad.map((t) => `${t.name} [${t.reason}]`).join(", ")}`);
   }
   return combined;
+}
+
+function suppressResultsFrom(output, firstName) {
+  let suppress = false;
+  const lines = [];
+  for (const line of output.split("\n")) {
+    const m = line.match(
+      /^test (.+?)(?: - should panic)? \.\.\. (ok|FAILED|ignored)\b/,
+    );
+    if (m && (suppress || m[1] === firstName)) {
+      suppress = true;
+      continue;
+    }
+    lines.push(line);
+  }
+  return lines.join("\n");
 }
 
 async function runBins(bins, cwd) {
