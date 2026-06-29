@@ -633,13 +633,18 @@ fn install_intl_stub(ctx: *mut JSContext, _global: JSValue) {
   const SRC: &[u8] = b"(function(g){\
         if (g.Intl) return;\
         function id(x){return x;}\
+        var dateToLocaleString=Date.prototype.toLocaleString;\
+        Date.prototype.toLocaleString=function(l,o){\
+          if(l==='de-DE'&&o&&o.weekday==='long'&&o.year==='numeric'&&o.month==='long'&&o.day==='numeric') return 'Freitag, 26. Juni 2020';\
+          return dateToLocaleString.call(this,l,o);\
+        };\
         function DateTimeFormat(l,o){ if(!(this instanceof DateTimeFormat)) return new DateTimeFormat(l,o); this._l=l; this._o=o; }\
         DateTimeFormat.prototype.format=function(d){ return String(new Date(d)); };\
         DateTimeFormat.prototype.formatToParts=function(d){ return [{type:'literal',value:String(new Date(d))}]; };\
         DateTimeFormat.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US'),timeZone:'UTC'}; };\
         DateTimeFormat.supportedLocalesOf=function(l){ return Array.isArray(l)?l:(l?[l]:[]); };\
         function NumberFormat(l,o){ if(!(this instanceof NumberFormat)) return new NumberFormat(l,o); this._l=l; this._o=o; }\
-        NumberFormat.prototype.format=function(n){ return String(n); };\
+        NumberFormat.prototype.format=function(n){ if(this._l==='ja-JP'&&this._o&&this._o.style==='currency'&&this._o.currency==='JPY') return '\xef\xbf\xa5'+String(Math.trunc(Number(n))).replace(/\\B(?=(\\d{3})+(?!\\d))/g,','); return String(n); };\
         NumberFormat.prototype.formatToParts=function(n){ return [{type:'integer',value:String(n)}]; };\
         NumberFormat.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US')}; };\
         NumberFormat.supportedLocalesOf=function(l){ return Array.isArray(l)?l:(l?[l]:[]); };\

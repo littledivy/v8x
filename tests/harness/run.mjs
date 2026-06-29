@@ -318,40 +318,24 @@ async function runCargoDeno() {
   return finalize(parseLibtest(out));
 }
 
-// The vendored rusty_v8 test files `include_bytes!` an ICU data blob that the
-// stock rusty_v8 build downloads. We don't ship the full ~10 MB icudtl.dat (the
-// engines bring their own ICU/Intl, so no backend actually *loads* V8's data),
-// but we DO need a blob with a valid ICU data header: the shim's
-// `udata_setCommonData_77` validates the header magic exactly like ICU, so
-// `set_common_data_77(<icudtl.dat>)` in test setup must see a well-formed header
-// to return Ok (an empty placeholder has no magic and would fail validation).
-// This synthetic 32-byte ICU DataHeader (headerSize=32, magic 0xDA 0x27, a
-// minimal UDataInfo) satisfies that check without bundling real data.
-function icuHeaderBlob() {
-  const b = Buffer.alloc(32);
-  b.writeUInt16LE(32, 0); // DataHeader.headerSize
-  b[2] = 0xda; // magic1
-  b[3] = 0x27; // magic2
-  b.writeUInt16LE(20, 4); // UDataInfo.size
-  b.writeUInt16LE(0, 6); // reservedWord
-  b[8] = 0; // isBigEndian (little)
-  b[9] = 0; // charsetFamily (ASCII)
-  b[10] = 2; // sizeofUChar
-  b[11] = 0; // reservedByte
-  b.write("CmnD", 12, "ascii"); // dataFormat
-  b[16] = 1; // formatVersion[0]
-  // formatVersion[1..4], dataVersion[0..4] left zero; padding to headerSize.
-  return b;
-}
-
 function ensureIcuData() {
   const p = path.join(ROOT, "vendor/rusty_v8/third_party/icu/common/icudtl.dat");
-  const blob = icuHeaderBlob();
-  // Overwrite if missing or stale (e.g. a prior empty placeholder) so the test
-  // binary embeds a blob with a valid header at compile time.
-  if (!fs.existsSync(p) || !fs.readFileSync(p).equals(blob)) {
-    fs.mkdirSync(path.dirname(p), { recursive: true });
-    fs.writeFileSync(p, blob);
+  if (fs.existsSync(p) && fs.statSync(p).size > 1024 * 1024) {
+    return;
+  }
+  // The vendored rusty_v8 tests `include_bytes!` the real ICU common data that
+  // stock rusty_v8 checks out via its nested Chromium ICU submodule. Older local
+  // runs may have left a tiny synthetic header in this ignored path; remove it
+  // and materialize the pinned submodule so the test binary embeds real data.
+  fs.rmSync(path.join(ROOT, "vendor/rusty_v8/third_party/icu"), {
+    recursive: true,
+    force: true,
+  });
+  const r = run("git", ["-C", "vendor/rusty_v8", "submodule", "update", "--init", "third_party/icu"], {
+    echo: false,
+  });
+  if (r.code !== 0 || !fs.existsSync(p) || fs.statSync(p).size <= 1024 * 1024) {
+    die(`failed to materialize real ICU data at ${p}\n${r.out}`);
   }
 }
 
