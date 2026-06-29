@@ -215,6 +215,7 @@ deno_core::runtime::tests::misc::task_spawner
 deno_core::runtime::tests::misc::task_spawner_cross_thread
 deno_core::runtime::tests::misc::task_spawner_cross_thread_blocking
 deno_core::runtime::tests::misc::terminate_during_module_eval
+deno_core::runtime::tests::misc::test_dynamic_import_module_error_stack
 deno_core::runtime::tests::misc::test_execute_script_return_value
 deno_core::runtime::tests::misc::test_get_module_namespace
 deno_core::runtime::tests::misc::test_heap_limit_cb_remove
