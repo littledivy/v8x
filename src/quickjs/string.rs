@@ -17,12 +17,50 @@ use crate::isolate::RealIsolate;
 use crate::string::{Encoding, ExternalStringResourceBase, OneByteConst};
 use crate::support::{char, int, size_t};
 use crate::{Primitive, PrimitiveArray, String as V8String};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
 
 const K_NULL_TERMINATE: int =
   crate::binding::v8_String_WriteFlags_kNullTerminate as int;
+
+#[repr(C)]
+struct ExternalOneByteMeta {
+  bytes: Box<[u8]>,
+}
+
+enum ExternalMeta {
+  OneByte(Box<ExternalOneByteMeta>),
+  TwoByte,
+}
+
+thread_local! {
+  static EXTERNAL_STRINGS: RefCell<HashMap<usize, ExternalMeta>> = RefCell::new(HashMap::new());
+}
+
+fn remember_external_onebyte(handle: *const V8String, bytes: Box<[u8]>) {
+  if handle.is_null() {
+    return;
+  }
+  EXTERNAL_STRINGS.with(|m| {
+    m.borrow_mut().insert(
+      handle as usize,
+      ExternalMeta::OneByte(Box::new(ExternalOneByteMeta { bytes })),
+    );
+  });
+}
+
+fn remember_external_twobyte(handle: *const V8String) {
+  if handle.is_null() {
+    return;
+  }
+  EXTERNAL_STRINGS.with(|m| {
+    m.borrow_mut()
+      .insert(handle as usize, ExternalMeta::TwoByte);
+  });
+}
 
 #[inline]
 fn ctx_for(isolate: *mut RealIsolate) -> *mut JSContext {
@@ -100,7 +138,7 @@ pub extern "C" fn v8__String__NewFromTwoByte(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__IsOneByte(_this: *const V8String) -> bool {
-  false
+  v8__String__ContainsOnlyOneByte(_this)
 }
 
 #[unsafe(no_mangle)]
@@ -117,11 +155,14 @@ pub extern "C" fn v8__String__NewExternalOneByteConst(
   }
 
   let s: &str = unsafe { (*onebyte_const).as_str() };
+  let bytes = s.as_bytes();
   let v = unsafe { JS_NewStringLen(ctx, s.as_ptr() as *const c_char, s.len()) };
   if v.tag == JS_TAG_EXCEPTION {
     return ptr::null();
   }
-  intern::<V8String>(v)
+  let handle = intern::<V8String>(v);
+  remember_external_onebyte(handle, bytes.to_vec().into_boxed_slice());
+  handle
 }
 
 #[unsafe(no_mangle)]
@@ -149,7 +190,9 @@ pub extern "C" fn v8__String__NewExternalOneByteStatic(
   if v.tag == JS_TAG_EXCEPTION {
     return ptr::null();
   }
-  intern::<V8String>(v)
+  let handle = intern::<V8String>(v);
+  remember_external_onebyte(handle, bytes.to_vec().into_boxed_slice());
+  handle
 }
 
 #[unsafe(no_mangle)]
@@ -169,8 +212,9 @@ pub extern "C" fn v8__String__NewExternalOneByte(
 
   let bytes =
     unsafe { std::slice::from_raw_parts(buffer as *const u8, length) };
+  let owned = bytes.to_vec().into_boxed_slice();
   let utf8: std::string::String =
-    bytes.iter().map(|&b| b as ::std::primitive::char).collect();
+    owned.iter().map(|&b| b as ::std::primitive::char).collect();
   let v =
     unsafe { JS_NewStringLen(ctx, utf8.as_ptr() as *const c_char, utf8.len()) };
 
@@ -178,7 +222,9 @@ pub extern "C" fn v8__String__NewExternalOneByte(
   if v.tag == JS_TAG_EXCEPTION {
     return ptr::null();
   }
-  intern::<V8String>(v)
+  let handle = intern::<V8String>(v);
+  remember_external_onebyte(handle, owned);
+  handle
 }
 
 #[unsafe(no_mangle)]
@@ -203,18 +249,34 @@ pub extern "C" fn v8__String__NewExternalTwoByte(
   if v.tag == JS_TAG_EXCEPTION {
     return ptr::null();
   }
-  intern::<V8String>(v)
+  let handle = intern::<V8String>(v);
+  remember_external_twobyte(handle);
+  handle
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__GetExternalStringResourceBase(
-  _this: *const V8String,
+  this: *const V8String,
   encoding: *mut Encoding,
 ) -> *mut ExternalStringResourceBase {
+  let mut out = ptr::null_mut();
+  let mut enc = Encoding::Unknown;
+  EXTERNAL_STRINGS.with(|m| {
+    if let Some(meta) = m.borrow().get(&(this as usize)) {
+      match meta {
+        ExternalMeta::OneByte(resource) => {
+          enc = Encoding::OneByte;
+          out = (&**resource as *const ExternalOneByteMeta)
+            as *mut ExternalStringResourceBase;
+        }
+        ExternalMeta::TwoByte => enc = Encoding::TwoByte,
+      }
+    }
+  });
   if !encoding.is_null() {
-    unsafe { *encoding = Encoding::Unknown };
+    unsafe { *encoding = enc };
   }
-  ptr::null_mut()
+  out
 }
 
 #[unsafe(no_mangle)]
@@ -558,8 +620,9 @@ pub extern "C" fn v8__String__Length(this: *const V8String) -> c_int {
 
 #[repr(C)]
 struct ViewState {
-  data: *mut u16,
+  data: *mut c_void,
   len: usize,
+  is_one_byte: bool,
 }
 
 #[unsafe(no_mangle)]
@@ -585,12 +648,18 @@ pub extern "C" fn v8__String__ValueView__CONSTRUCT(
       out
     }
   };
-  let boxed = units.into_boxed_slice();
-  let len = boxed.len();
-  let data = Box::into_raw(boxed) as *mut u16;
+  let is_one_byte = units.iter().all(|&u| u <= 0xFF);
+  let len = units.len();
+  let data = if is_one_byte {
+    let bytes: Box<[u8]> = units.iter().map(|&u| u as u8).collect();
+    Box::into_raw(bytes) as *mut c_void
+  } else {
+    Box::into_raw(units.into_boxed_slice()) as *mut c_void
+  };
   unsafe {
     (*buf).data = data;
     (*buf).len = len;
+    (*buf).is_one_byte = is_one_byte;
   }
 }
 
@@ -599,19 +668,25 @@ pub extern "C" fn v8__String__ValueView__DESTRUCT(this: *mut ViewState) {
   unsafe {
     let st = &mut *this;
     if !st.data.is_null() {
-      let slice = ptr::slice_from_raw_parts_mut(st.data, st.len);
-      drop(Box::from_raw(slice));
+      if st.is_one_byte {
+        let slice = ptr::slice_from_raw_parts_mut(st.data as *mut u8, st.len);
+        drop(Box::from_raw(slice));
+      } else {
+        let slice = ptr::slice_from_raw_parts_mut(st.data as *mut u16, st.len);
+        drop(Box::from_raw(slice));
+      }
       st.data = ptr::null_mut();
       st.len = 0;
+      st.is_one_byte = true;
     }
   }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__ValueView__is_one_byte(
-  _this: *const ViewState,
+  this: *const ViewState,
 ) -> bool {
-  false
+  unsafe { !this.is_null() && (*this).is_one_byte }
 }
 
 #[unsafe(no_mangle)]
@@ -638,46 +713,80 @@ pub extern "C" fn v8__String__ValueView__length(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ExternalOneByteStringResource__data(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  if this.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    (*(this as *const ExternalOneByteMeta)).bytes.as_ptr() as *const c_void
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ExternalOneByteStringResource__length(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> usize {
-  0
+  if this.is_null() {
+    return 0;
+  }
+  unsafe { (&(*(this as *const ExternalOneByteMeta)).bytes).len() }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__Concat(
-  _isolate: *mut std::os::raw::c_void,
-  _left: *const std::os::raw::c_void,
-  _right: *const std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  isolate: *mut RealIsolate,
+  left: *const V8String,
+  right: *const V8String,
+) -> *const V8String {
+  let ctx = ctx_for(isolate);
+  if ctx.is_null() || left.is_null() || right.is_null() {
+    return ptr::null();
+  }
+  let mut units = handle_to_utf16(ctx, left);
+  units.extend(handle_to_utf16(ctx, right));
+  let s = std::string::String::from_utf16_lossy(&units);
+  let v = unsafe { JS_NewStringLen(ctx, s.as_ptr() as *const c_char, s.len()) };
+  if v.tag == JS_TAG_EXCEPTION {
+    return ptr::null();
+  }
+  intern::<V8String>(v)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__IsExternalOneByte(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  EXTERNAL_STRINGS.with(|m| {
+    matches!(
+      m.borrow().get(&(this as usize)),
+      Some(ExternalMeta::OneByte(_))
+    )
+  })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__IsExternalTwoByte(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  EXTERNAL_STRINGS.with(|m| {
+    matches!(
+      m.borrow().get(&(this as usize)),
+      Some(ExternalMeta::TwoByte)
+    )
+  })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__NewExternalTwoByteStatic(
-  _isolate: *mut std::os::raw::c_void,
-  _buffer: *const std::os::raw::c_void,
-  _length: crate::support::int,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  isolate: *mut RealIsolate,
+  buffer: *const u16,
+  length: crate::support::int,
+) -> *const V8String {
+  if buffer.is_null() || length < 0 {
+    return ptr::null();
+  }
+  let handle = v8__String__NewFromTwoByte(isolate, buffer, 0, length);
+  remember_external_twobyte(handle);
+  handle
 }
