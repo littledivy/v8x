@@ -12,6 +12,23 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::ptr;
+use std::sync::atomic::Ordering;
+
+#[inline]
+fn account_external_string_memory(isolate: *mut RealIsolate, bytes: usize) {
+  let isolate = if isolate.is_null() {
+    current_iso()
+  } else {
+    isolate
+  };
+  if isolate.is_null() || bytes == 0 {
+    return;
+  }
+  let bytes = bytes.min(i64::MAX as usize) as i64;
+  let st = iso_state(isolate);
+  st.external_memory.fetch_add(bytes, Ordering::SeqCst);
+  st.external_string_memory.fetch_add(bytes, Ordering::SeqCst);
+}
 
 #[repr(C)]
 struct ExternalOneByteMeta {
@@ -681,6 +698,7 @@ pub extern "C" fn v8__String__NewExternalOneByte(
   let out = intern_ctx::<V8String>(ctx, v);
   remember_external_onebyte(out, owned);
 
+  account_external_string_memory(isolate, length as usize);
   unsafe { free(buffer, length) };
   out
 }
@@ -699,6 +717,7 @@ pub extern "C" fn v8__String__NewExternalTwoByte(
   let v = unsafe { make_string_from_utf16(ctx, buffer, length as usize) };
   let out = intern_ctx::<V8String>(ctx, v);
   remember_external_twobyte(out);
+  account_external_string_memory(isolate, (length as usize).saturating_mul(2));
   unsafe { free(buffer, length) };
   out
 }

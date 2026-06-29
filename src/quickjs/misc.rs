@@ -24,6 +24,7 @@ use crate::{Context, Data, Object, RealIsolate, String as V8String, Value};
 
 use std::os::raw::{c_char, c_void};
 use std::ptr;
+use std::sync::atomic::Ordering;
 
 unsafe extern "C" {
 
@@ -150,6 +151,10 @@ pub extern "C" fn v8__Isolate__RequestGarbageCollectionForTesting(
   let st = iso_state(isolate);
   if !st.rt.is_null() {
     unsafe { JS_RunGC(st.rt) };
+  }
+  let released = st.external_string_memory.swap(0, Ordering::SeqCst);
+  if released != 0 {
+    st.external_memory.fetch_sub(released, Ordering::SeqCst);
   }
 }
 
@@ -1193,12 +1198,21 @@ pub extern "C" fn v8__Isolate__AddNearHeapLimitCallback(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__AdjustAmountOfExternalAllocatedMemory(
-  _isolate: *mut RealIsolate,
+  isolate: *mut RealIsolate,
   change_in_bytes: i64,
 ) -> i64 {
-  use std::sync::atomic::{AtomicI64, Ordering};
-  static TOTAL: AtomicI64 = AtomicI64::new(0);
-  TOTAL.fetch_add(change_in_bytes, Ordering::SeqCst) + change_in_bytes
+  let isolate = if isolate.is_null() {
+    current_iso()
+  } else {
+    isolate
+  };
+  if isolate.is_null() {
+    return change_in_bytes;
+  }
+  iso_state(isolate)
+    .external_memory
+    .fetch_add(change_in_bytes, Ordering::SeqCst)
+    + change_in_bytes
 }
 
 #[unsafe(no_mangle)]
@@ -1211,6 +1225,10 @@ pub extern "C" fn v8__Isolate__LowMemoryNotification(
   let st = iso_state(isolate);
   if !st.rt.is_null() {
     unsafe { JS_RunGC(st.rt) };
+  }
+  let released = st.external_string_memory.swap(0, Ordering::SeqCst);
+  if released != 0 {
+    st.external_memory.fetch_sub(released, Ordering::SeqCst);
   }
 }
 

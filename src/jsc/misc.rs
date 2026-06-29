@@ -123,7 +123,7 @@ pub extern "C" fn cppgc__Visitor__Trace__WeakMember(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__RequestGarbageCollectionForTesting(
-  _isolate: *mut crate::RealIsolate,
+  isolate: *mut crate::RealIsolate,
   _type: usize,
 ) {
   // Best-effort: run JSC's GC. Our cppgc shim doesn't reclaim native wrappers,
@@ -132,6 +132,21 @@ pub extern "C" fn v8__Isolate__RequestGarbageCollectionForTesting(
   let ctx = current_ctx();
   if !ctx.is_null() {
     unsafe { JSGarbageCollect(ctx) };
+  }
+  let isolate = if isolate.is_null() {
+    current_iso()
+  } else {
+    isolate
+  };
+  if !isolate.is_null() {
+    let st = crate::jsc::core::iso_state(isolate);
+    let released = st
+      .external_string_memory
+      .swap(0, std::sync::atomic::Ordering::SeqCst);
+    if released != 0 {
+      st.external_memory
+        .fetch_sub(released, std::sync::atomic::Ordering::SeqCst);
+    }
   }
 }
 

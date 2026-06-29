@@ -12,6 +12,7 @@ use crate::{
 use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+use std::sync::atomic::Ordering;
 
 // --- code generation from strings (V8 `Context::AllowCodeGenerationFromStrings`)
 //
@@ -550,7 +551,7 @@ pub extern "C" fn v8__Isolate__SetPrepareStackTraceCallback(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetHeapStatistics(
-  _this: *mut RealIsolate,
+  this: *mut RealIsolate,
   s: *mut crate::binding::v8__HeapStatistics,
 ) {
   if !s.is_null() {
@@ -560,6 +561,12 @@ pub extern "C" fn v8__Isolate__GetHeapStatistics(
         0,
         std::mem::size_of::<crate::binding::v8__HeapStatistics>(),
       );
+      if !this.is_null() {
+        (*s).external_memory_ = iso_state(this)
+          .external_memory
+          .load(Ordering::SeqCst)
+          .max(0) as usize;
+      }
     }
   }
 }

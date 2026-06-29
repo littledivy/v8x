@@ -11,7 +11,7 @@
 //! `intern_dup`.
 #![allow(non_snake_case)]
 
-use super::core::{current_ctx, intern, jsval_of};
+use super::core::{current_ctx, current_iso, intern, iso_state, jsval_of};
 use super::quickjs_sys::*;
 use crate::isolate::RealIsolate;
 use crate::string::{Encoding, ExternalStringResourceBase, OneByteConst};
@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
+use std::sync::atomic::Ordering;
 
 const K_NULL_TERMINATE: int =
   crate::binding::v8_String_WriteFlags_kNullTerminate as int;
@@ -73,6 +74,22 @@ fn ctx_for(isolate: *mut RealIsolate) -> *mut JSContext {
   } else {
     current_ctx()
   }
+}
+
+#[inline]
+fn account_external_string_memory(isolate: *mut RealIsolate, bytes: usize) {
+  let isolate = if isolate.is_null() {
+    current_iso()
+  } else {
+    isolate
+  };
+  if isolate.is_null() || bytes == 0 {
+    return;
+  }
+  let bytes = bytes.min(i64::MAX as usize) as i64;
+  let st = iso_state(isolate);
+  st.external_memory.fetch_add(bytes, Ordering::SeqCst);
+  st.external_string_memory.fetch_add(bytes, Ordering::SeqCst);
 }
 
 #[inline]
@@ -218,6 +235,7 @@ pub extern "C" fn v8__String__NewExternalOneByte(
   let v =
     unsafe { JS_NewStringLen(ctx, utf8.as_ptr() as *const c_char, utf8.len()) };
 
+  account_external_string_memory(isolate, length);
   unsafe { free(buffer, length) };
   if v.tag == JS_TAG_EXCEPTION {
     return ptr::null();
@@ -245,6 +263,7 @@ pub extern "C" fn v8__String__NewExternalTwoByte(
   let utf8 = std::string::String::from_utf16_lossy(units);
   let v =
     unsafe { JS_NewStringLen(ctx, utf8.as_ptr() as *const c_char, utf8.len()) };
+  account_external_string_memory(isolate, length.saturating_mul(2));
   unsafe { free(buffer, length) };
   if v.tag == JS_TAG_EXCEPTION {
     return ptr::null();
