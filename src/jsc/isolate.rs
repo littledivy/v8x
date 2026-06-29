@@ -20,6 +20,7 @@ use crate::{
 use std::mem::MaybeUninit;
 use std::os::raw::c_void;
 use std::ptr;
+use std::sync::atomic::Ordering;
 
 use crate::support::int;
 
@@ -352,7 +353,7 @@ pub extern "C" fn v8__Isolate__SetPrepareStackTraceCallback(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetHeapStatistics(
-  _this: *mut RealIsolate,
+  this: *mut RealIsolate,
   s: *mut crate::binding::v8__HeapStatistics,
 ) {
   if !s.is_null() {
@@ -362,6 +363,12 @@ pub extern "C" fn v8__Isolate__GetHeapStatistics(
         0,
         std::mem::size_of::<crate::binding::v8__HeapStatistics>(),
       );
+      if !this.is_null() {
+        (*s).external_memory_ = iso_state(this)
+          .external_memory
+          .load(Ordering::SeqCst)
+          .max(0) as usize;
+      }
     }
   }
 }
@@ -955,10 +962,21 @@ pub extern "C" fn v8__Isolate__AddGCEpilogueCallback(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__AdjustAmountOfExternalAllocatedMemory(
-  _isolate: *mut RealIsolate,
-  _change_in_bytes: i64,
+  isolate: *mut RealIsolate,
+  change_in_bytes: i64,
 ) -> i64 {
-  0
+  let isolate = if isolate.is_null() {
+    current_iso()
+  } else {
+    isolate
+  };
+  if isolate.is_null() {
+    return change_in_bytes;
+  }
+  iso_state(isolate)
+    .external_memory
+    .fetch_add(change_in_bytes, Ordering::SeqCst)
+    + change_in_bytes
 }
 
 #[unsafe(no_mangle)]
@@ -970,8 +988,21 @@ pub extern "C" fn v8__Isolate__DateTimeConfigurationChangeNotification(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__LowMemoryNotification(
-  _isolate: *mut RealIsolate,
+  isolate: *mut RealIsolate,
 ) {
+  let isolate = if isolate.is_null() {
+    current_iso()
+  } else {
+    isolate
+  };
+  if isolate.is_null() {
+    return;
+  }
+  let st = iso_state(isolate);
+  let released = st.external_string_memory.swap(0, Ordering::SeqCst);
+  if released != 0 {
+    st.external_memory.fetch_sub(released, Ordering::SeqCst);
+  }
 }
 
 #[unsafe(no_mangle)]

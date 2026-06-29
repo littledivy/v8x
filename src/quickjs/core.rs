@@ -43,7 +43,7 @@ use crate::{
 use std::cell::RefCell;
 use std::os::raw::{c_int, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 /// Process-wide "force strict mode" flag, toggled by
 /// `v8__V8__SetFlagsFromString` when it sees V8's `--use_strict` flag. V8
@@ -91,6 +91,10 @@ pub(crate) struct IsoState {
   pub main_ctx_claimed: bool,
 
   pub extra_contexts: Vec<*mut JSContext>,
+
+  pub external_memory: AtomicI64,
+
+  pub external_string_memory: AtomicI64,
 
   // Emulates `v8::Isolate::TerminateExecution`. Set by `TerminateExecution`,
   // cleared by `CancelTerminateExecution`; while set, the op-dispatch boundary
@@ -344,6 +348,8 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     ext_class_id,
     main_ctx_claimed: false,
     extra_contexts: Vec::new(),
+    external_memory: AtomicI64::new(0),
+    external_string_memory: AtomicI64::new(0),
     terminating: std::sync::atomic::AtomicBool::new(false),
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;

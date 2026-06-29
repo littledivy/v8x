@@ -18,6 +18,7 @@ use crate::{Context, Data, Object, Primitive, RealIsolate};
 use std::cell::RefCell;
 use std::os::raw::c_void;
 use std::ptr;
+use std::sync::atomic::AtomicI64;
 
 pub(crate) struct IsoState {
   pub group: JSContextGroupRef,
@@ -44,6 +45,10 @@ pub(crate) struct IsoState {
   /// notion, so we keep one throwaway global context per isolate to host them.
   /// Released in `Isolate::Dispose`.
   pub base_ctx: JSGlobalContextRef,
+
+  pub external_memory: AtomicI64,
+
+  pub external_string_memory: AtomicI64,
 }
 
 thread_local! {
@@ -281,6 +286,8 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     import_meta_cb: None,
     cpp_heap: crate::jsc::misc::current_cpp_heap(),
     base_ctx: ptr::null_mut(),
+    external_memory: AtomicI64::new(0),
+    external_string_memory: AtomicI64::new(0),
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;
   // Arm the execution-time-limit watchdog so `TerminateExecution` and the
