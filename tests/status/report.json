@@ -1,6 +1,6 @@
 {
-  "generated": "2026-06-29T16:09:20.641Z",
-  "commit": "527d2933e58a0d8873cc376baca476cf6cf81f5d",
+  "generated": "2026-06-29T16:20:02.550Z",
+  "commit": "2c373a944578cf9ec2303e69a34e93fa2f378ff7",
   "backends": [
     {
       "id": "jsc",
@@ -9,8 +9,8 @@
     },
     {
       "id": "sys-jsc",
-      "label": "JavaScriptCore System 20621.3.11.11.3",
-      "version": "20621.3.11.11.3"
+      "label": "JavaScriptCore System 21624.1.16.11.4",
+      "version": "21624.1.16.11.4"
     },
     {
       "id": "quickjs",
