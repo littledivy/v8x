@@ -2,7 +2,8 @@
 
 use crate::isolate::RealIsolate;
 use crate::jsc::core::{
-  ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval,
+  adjust_external_memory, adjust_external_string_memory, ctx_of, current_ctx,
+  current_iso, intern, intern_ctx, iso_state, jsval,
 };
 use crate::jsc::jsc_sys::*;
 use crate::string::{Encoding, NewStringType};
@@ -12,7 +13,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::raw::c_void;
 use std::ptr;
-use std::sync::atomic::Ordering;
 
 #[inline]
 fn account_external_string_memory(isolate: *mut RealIsolate, bytes: usize) {
@@ -26,8 +26,8 @@ fn account_external_string_memory(isolate: *mut RealIsolate, bytes: usize) {
   }
   let bytes = bytes.min(i64::MAX as usize) as i64;
   let st = iso_state(isolate);
-  st.external_memory.fetch_add(bytes, Ordering::SeqCst);
-  st.external_string_memory.fetch_add(bytes, Ordering::SeqCst);
+  adjust_external_memory(st, bytes);
+  adjust_external_string_memory(st, bytes);
 }
 
 #[repr(C)]

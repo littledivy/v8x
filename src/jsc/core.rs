@@ -18,7 +18,7 @@ use crate::{Context, Data, Object, Primitive, RealIsolate};
 use std::cell::RefCell;
 use std::os::raw::c_void;
 use std::ptr;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 pub(crate) struct IsoState {
   pub group: JSContextGroupRef,
@@ -61,6 +61,42 @@ thread_local! {
 #[inline(always)]
 pub(crate) fn iso_state<'a>(p: *mut RealIsolate) -> &'a mut IsoState {
   unsafe { &mut *(p as *mut IsoState) }
+}
+
+#[inline]
+fn adjust_i64(counter: &AtomicI64, delta: i64) -> i64 {
+  let mut current = counter.load(Ordering::SeqCst);
+  loop {
+    let next = current.saturating_add(delta);
+    match counter.compare_exchange(
+      current,
+      next,
+      Ordering::SeqCst,
+      Ordering::SeqCst,
+    ) {
+      Ok(_) => return next,
+      Err(actual) => current = actual,
+    }
+  }
+}
+
+#[inline]
+pub(crate) fn adjust_external_memory(st: &IsoState, delta: i64) -> i64 {
+  adjust_i64(&st.external_memory, delta)
+}
+
+#[inline]
+pub(crate) fn adjust_external_string_memory(st: &IsoState, delta: i64) -> i64 {
+  adjust_i64(&st.external_string_memory, delta)
+}
+
+#[inline]
+pub(crate) fn release_external_string_memory(st: &IsoState) -> i64 {
+  let released = st.external_string_memory.swap(0, Ordering::SeqCst);
+  if released > 0 {
+    adjust_external_memory(st, -released);
+  }
+  released
 }
 
 #[inline(always)]

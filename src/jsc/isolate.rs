@@ -10,7 +10,8 @@
 #![allow(non_snake_case, unused)]
 
 use crate::jsc::core::{
-  ctx_of, current_ctx, current_iso, intern, intern_ctx, iso_state, jsval,
+  adjust_external_memory, ctx_of, current_ctx, current_iso, intern, intern_ctx,
+  iso_state, jsval, release_external_string_memory,
 };
 use crate::jsc::jsc_sys::*;
 use crate::{
@@ -973,10 +974,7 @@ pub extern "C" fn v8__Isolate__AdjustAmountOfExternalAllocatedMemory(
   if isolate.is_null() {
     return change_in_bytes;
   }
-  iso_state(isolate)
-    .external_memory
-    .fetch_add(change_in_bytes, Ordering::SeqCst)
-    + change_in_bytes
+  adjust_external_memory(iso_state(isolate), change_in_bytes)
 }
 
 #[unsafe(no_mangle)]
@@ -999,10 +997,7 @@ pub extern "C" fn v8__Isolate__LowMemoryNotification(
     return;
   }
   let st = iso_state(isolate);
-  let released = st.external_string_memory.swap(0, Ordering::SeqCst);
-  if released != 0 {
-    st.external_memory.fetch_sub(released, Ordering::SeqCst);
-  }
+  release_external_string_memory(st);
 }
 
 #[unsafe(no_mangle)]

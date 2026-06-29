@@ -111,6 +111,42 @@ impl IsoState {
   }
 }
 
+#[inline]
+fn adjust_i64(counter: &AtomicI64, delta: i64) -> i64 {
+  let mut current = counter.load(Ordering::SeqCst);
+  loop {
+    let next = current.saturating_add(delta);
+    match counter.compare_exchange(
+      current,
+      next,
+      Ordering::SeqCst,
+      Ordering::SeqCst,
+    ) {
+      Ok(_) => return next,
+      Err(actual) => current = actual,
+    }
+  }
+}
+
+#[inline]
+pub(crate) fn adjust_external_memory(st: &IsoState, delta: i64) -> i64 {
+  adjust_i64(&st.external_memory, delta)
+}
+
+#[inline]
+pub(crate) fn adjust_external_string_memory(st: &IsoState, delta: i64) -> i64 {
+  adjust_i64(&st.external_string_memory, delta)
+}
+
+#[inline]
+pub(crate) fn release_external_string_memory(st: &IsoState) -> i64 {
+  let released = st.external_string_memory.swap(0, Ordering::SeqCst);
+  if released > 0 {
+    adjust_external_memory(st, -released);
+  }
+  released
+}
+
 thread_local! {
     static CURRENT_ISO: RefCell<*mut RealIsolate> = const { RefCell::new(ptr::null_mut()) };
     static CURRENT_CTX: RefCell<*mut JSContext> = const { RefCell::new(ptr::null_mut()) };
