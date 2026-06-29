@@ -535,17 +535,31 @@ pub extern "C" fn v8__StartupData__IsValid(_this: *const c_void) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StartupData__data__DELETE(_this: *const c_char) {}
 
-// ICU common-data loader (vendored rusty_v8 `icu::set_common_data_77`). V8 needs
-// its bundled icudtl.dat; JSC brings its own ICU/Intl, so loading v8's blob is a
-// no-op. Report success (error_code = 0) so `set_common_data_77` returns Ok and
-// test setup proceeds instead of failing to link / segfaulting.
+// ICU common-data loader (vendored rusty_v8 `icu::set_common_data_77`). JSC
+// brings its own ICU/Intl, so we never actually *load* V8's blob — but we do
+// validate its header exactly like ICU's `udata_setCommonData`: a real ICU data
+// file (icudtl.dat) begins with `headerSize:u16` followed by the format magic
+// bytes 0xDA 0x27. The test harness ships a blob with a valid header, so setup's
+// `set_common_data_77(<icudtl.dat>)` returns Ok; a garbage blob — e.g. the
+// `[1, 2, 3, 0, …]` from `icu_set_common_data_fail` — has the wrong magic and
+// must return `U_INVALID_FORMAT_ERROR`. No length crosses this C ABI, so we read
+// only the 4 header bytes every real caller is guaranteed to provide.
 #[unsafe(no_mangle)]
 pub extern "C" fn udata_setCommonData_77(
-  _data: *const u8,
+  data: *const u8,
   error_code: *mut i32,
 ) {
+  // ICU's UErrorCode for a bad/unrecognized data header.
+  const U_INVALID_FORMAT_ERROR: i32 = 3;
+  let valid = !data.is_null()
+    && unsafe {
+      // ICU DataHeader: bytes [2] and [3] are the magic 0xDA 0x27.
+      *data.add(2) == 0xDA && *data.add(3) == 0x27
+    };
   if !error_code.is_null() {
-    unsafe { *error_code = 0 };
+    unsafe {
+      *error_code = if valid { 0 } else { U_INVALID_FORMAT_ERROR };
+    }
   }
 }
 
