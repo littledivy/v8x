@@ -133,9 +133,11 @@ export function parseLibtest(output) {
   const skip = new Set();
   let bin = "";
   for (const line of output.split("\n")) {
-    const running = line.match(/Running (?:unittests |tests )?\S*?[\/\\]([A-Za-z0-9_]+)-[0-9a-f]+/);
+    const running = line.match(/^Running (?:unittests |tests )?(\S+)/);
     if (running) {
-      bin = running[1];
+      bin = path
+        .basename(running[1])
+        .replace(/-[0-9a-f]+(?:\.exe)?$/, "");
       continue;
     }
     const m = line.match(/^test (.+?) \.\.\. (ok|FAILED|ignored)\b/);

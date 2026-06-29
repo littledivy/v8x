@@ -42,6 +42,15 @@ apply_series() {
 # rusty_v8 is always needed — it's the crate's own source, used by both backends.
 apply_series vendor/rusty_v8 rusty_v8
 
+# rusty_v8's tests embed third_party/icu/common/icudtl.dat at compile time. Keep
+# the real pinned Chromium ICU data available, but do not commit the 10 MiB blob
+# in this repo (the path is ignored at the top level).
+if [ ! -s vendor/rusty_v8/third_party/icu/common/icudtl.dat ] || \
+   [ "$(wc -c < vendor/rusty_v8/third_party/icu/common/icudtl.dat 2>/dev/null || echo 0)" -lt 1048576 ]; then
+  rm -rf vendor/rusty_v8/third_party/icu
+  git -C vendor/rusty_v8 submodule update --init third_party/icu
+fi
+
 if [ "$MODE" = quickjs ]; then
   apply_series vendor/quickjs-ng quickjs
   apply_series vendor/wamr       wamr
