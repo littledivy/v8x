@@ -474,6 +474,19 @@ fn cbinfo<'a>(this: *const FunctionCallbackInfo) -> &'a mut CbInfo {
 
 unsafe extern "C" fn ext_finalize(_rt: *mut JSRuntime, _val: JSValue) {}
 
+fn external_values()
+-> &'static std::sync::Mutex<std::collections::HashMap<usize, usize>> {
+  static T: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, usize>>,
+  > = std::sync::OnceLock::new();
+  T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[inline]
+fn external_key(v: JSValue) -> usize {
+  jsv_get_ptr(&v) as usize
+}
+
 /// Allocate a class id and register the `v8::External` class on `rt`. Must be
 /// called BEFORE the runtime's first context is created (a context sizes its
 /// `class_proto` array to `rt->class_count` at creation time and never grows it,
@@ -523,6 +536,10 @@ pub extern "C" fn v8__External__New(
     return ptr::null();
   }
   unsafe { JS_SetOpaque(obj, value) };
+  external_values()
+    .lock()
+    .unwrap()
+    .insert(external_key(obj), value as usize);
 
   intern::<External>(obj)
 }
@@ -534,14 +551,36 @@ pub extern "C" fn v8__External__Value(this: *const External) -> *mut c_void {
   }
   let cid = ext_class_id_current();
   if cid == 0 {
-    return ptr::null_mut();
+    return external_values()
+      .lock()
+      .unwrap()
+      .get(&external_key(jsval_of(this)))
+      .copied()
+      .unwrap_or(0) as *mut c_void;
   }
-  unsafe { JS_GetOpaque(jsval_of(this), cid) }
+  let v = jsval_of(this);
+  let opaque = unsafe { JS_GetOpaque(v, cid) };
+  if !opaque.is_null() {
+    return opaque;
+  }
+  external_values()
+    .lock()
+    .unwrap()
+    .get(&external_key(v))
+    .copied()
+    .unwrap_or(0) as *mut c_void
 }
 
 pub(crate) fn value_is_external(v: JSValue) -> bool {
   if !jsv_is_object(&v) {
     return false;
+  }
+  if external_values()
+    .lock()
+    .unwrap()
+    .contains_key(&external_key(v))
+  {
+    return true;
   }
   let cid = ext_class_id_current();
   if cid == 0 {
