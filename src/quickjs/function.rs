@@ -317,6 +317,26 @@ unsafe fn dispatch(
   result
 }
 
+pub(crate) unsafe fn call_callback_for_wasm(
+  ctx: *mut JSContext,
+  callback: FunctionCallback,
+  data: JSValue,
+  args: &mut [JSValue],
+) -> JSValue {
+  unsafe {
+    dispatch(
+      ctx,
+      callback,
+      data,
+      jsv_undefined(),
+      jsv_undefined(),
+      false,
+      args.len() as c_int,
+      args.as_mut_ptr(),
+    )
+  }
+}
+
 unsafe extern "C" fn fn_trampoline(
   ctx: *mut JSContext,
   this_val: JSValue,

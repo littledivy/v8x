@@ -607,57 +607,64 @@ pub extern "C" fn v8__WeakCallbackInfo__SetSecondPassCallback(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WasmStreaming__Unpack(
   _isolate: *mut c_void,
-  _value: *const Value,
-  _that: *mut c_void,
+  value: *const Value,
+  that: *mut c_void,
 ) {
+  super::wasm::streaming_unpack(value, that);
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__WasmStreaming__shared_ptr_DESTRUCT(_this: *mut c_void) {}
+pub extern "C" fn v8__WasmStreaming__shared_ptr_DESTRUCT(this: *mut c_void) {
+  super::wasm::streaming_shared_ptr_destruct(this);
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WasmStreaming__OnBytesReceived(
-  _this: *mut c_void,
-  _data: *const u8,
-  _len: usize,
+  this: *mut c_void,
+  data: *const u8,
+  len: usize,
 ) {
+  super::wasm::streaming_on_bytes_received(this, data, len);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WasmStreaming__Finish(
-  _this: *mut c_void,
-  _callback: Option<unsafe extern "C" fn(*mut c_void)>,
+  this: *mut c_void,
+  callback: Option<unsafe extern "C" fn(*mut c_void)>,
 ) {
+  super::wasm::streaming_finish(this, callback);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WasmStreaming__Abort(
-  _this: *mut c_void,
-  _exception: *const Value,
+  this: *mut c_void,
+  exception: *const Value,
 ) {
+  super::wasm::streaming_abort(this, exception);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WasmStreaming__SetUrl(
-  _this: *mut c_void,
-  _url: *const c_char,
-  _len: usize,
+  this: *mut c_void,
+  url: *const c_char,
+  len: usize,
 ) {
+  super::wasm::streaming_set_url(this, url, len);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WasmModuleObject__FromCompiledModule(
-  _isolate: *mut c_void,
-  _compiled_module: *const c_void,
+  isolate: *mut c_void,
+  compiled_module: *const c_void,
 ) -> *const c_void {
-  ptr::null()
+  super::wasm::module_object_from_compiled_module(isolate, compiled_module)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WasmModuleObject__GetCompiledModule(
-  _this: *const c_void,
+  this: *const c_void,
 ) -> *mut c_void {
-  ptr::null_mut()
+  super::wasm::module_object_get_compiled_module(this)
 }
 
 #[unsafe(no_mangle)]
@@ -685,15 +692,19 @@ pub extern "C" fn v8__WasmModuleObject__Compile(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__CompiledWasmModule__DELETE(_this: *mut c_void) {}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__WasmModuleCompilation__NEW() -> *mut c_void {
-  ptr::null_mut()
+pub extern "C" fn v8__CompiledWasmModule__DELETE(this: *mut c_void) {
+  super::wasm::compiled_module_delete(this);
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__WasmModuleCompilation__DELETE(_this: *mut c_void) {}
+pub extern "C" fn v8__WasmModuleCompilation__NEW() -> *mut c_void {
+  super::wasm::module_compilation_new()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__WasmModuleCompilation__DELETE(this: *mut c_void) {
+  super::wasm::module_compilation_delete(this);
+}
 
 unsafe extern "C" {
   fn JS_JSONStringify(
@@ -1291,18 +1302,18 @@ pub extern "C" fn icu_set_default_locale(locale: *const c_char) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__CompiledWasmModule__GetWireBytesRef(
-  _this: *mut std::os::raw::c_void,
-  _length: *mut std::os::raw::c_void,
+  this: *mut std::os::raw::c_void,
+  length: *mut std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  super::wasm::compiled_module_wire_bytes(this, length)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__CompiledWasmModule__SourceUrl(
-  _this: *mut std::os::raw::c_void,
-  _length: *mut std::os::raw::c_void,
+  this: *mut std::os::raw::c_void,
+  length: *mut std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  super::wasm::compiled_module_source_url(this, length)
 }
 
 #[unsafe(no_mangle)]
@@ -1534,33 +1545,44 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_isolate(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WasmModuleCompilation__Abort(
-  _this: *mut std::os::raw::c_void,
+  this: *mut std::os::raw::c_void,
 ) {
+  super::wasm::module_compilation_abort(this);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WasmModuleCompilation__Finish(
-  _this: *mut std::os::raw::c_void,
-  _isolate: *mut std::os::raw::c_void,
-  _caching_callback: *const std::os::raw::c_void,
-  _resolution_callback: *const std::os::raw::c_void,
-  _resolution_data: *mut std::os::raw::c_void,
-  _drop_resolution_data: *const std::os::raw::c_void,
+  this: *mut std::os::raw::c_void,
+  isolate: *mut std::os::raw::c_void,
+  caching_callback: *const std::os::raw::c_void,
+  resolution_callback: *const std::os::raw::c_void,
+  resolution_data: *mut std::os::raw::c_void,
+  drop_resolution_data: *const std::os::raw::c_void,
 ) {
+  super::wasm::module_compilation_finish(
+    this,
+    isolate,
+    caching_callback,
+    resolution_callback,
+    resolution_data,
+    drop_resolution_data,
+  );
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WasmModuleCompilation__OnBytesReceived(
-  _this: *mut std::os::raw::c_void,
-  _bytes: *const std::os::raw::c_void,
-  _size: usize,
+  this: *mut std::os::raw::c_void,
+  bytes: *const std::os::raw::c_void,
+  size: usize,
 ) {
+  super::wasm::module_compilation_on_bytes_received(this, bytes, size);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WasmModuleCompilation__SetUrl(
-  _this: *mut std::os::raw::c_void,
-  _url: *const std::os::raw::c_void,
-  _length: usize,
+  this: *mut std::os::raw::c_void,
+  url: *const std::os::raw::c_void,
+  length: usize,
 ) {
+  super::wasm::module_compilation_set_url(this, url, length);
 }

@@ -449,8 +449,7 @@ pub extern "C" fn v8__Value__IsWasmMemoryObject(this: *const Value) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsWasmModuleObject(this: *const Value) -> bool {
-  let _ = this;
-  false
+  super::wasm::is_module_object(this)
 }
 
 #[unsafe(no_mangle)]
