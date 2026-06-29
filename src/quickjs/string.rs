@@ -26,6 +26,8 @@ use std::sync::atomic::Ordering;
 
 const K_NULL_TERMINATE: int =
   crate::binding::v8_String_WriteFlags_kNullTerminate as int;
+const K_MAX_STRING_LENGTH: usize =
+  crate::binding::v8__String__kMaxLength as usize;
 
 #[repr(C)]
 struct ExternalOneByteMeta {
@@ -138,6 +140,9 @@ pub extern "C" fn v8__String__NewFromTwoByte(
     return ptr::null();
   }
   let len = if length < 0 { 0 } else { length as usize };
+  if len > K_MAX_STRING_LENGTH {
+    return ptr::null();
+  }
 
   let utf8: std::string::String = if data.is_null() || len == 0 {
     std::string::String::new()
@@ -582,7 +587,17 @@ pub extern "C" fn v8__String__NewFromUtf8(
   } else {
     length as usize
   };
-  let v = unsafe { JS_NewStringLen(ctx, data, len) };
+  if len > K_MAX_STRING_LENGTH {
+    return ptr::null();
+  }
+  let bytes: &[u8] = if data.is_null() || len == 0 {
+    &[]
+  } else {
+    unsafe { std::slice::from_raw_parts(data as *const u8, len) }
+  };
+  let utf8 = std::string::String::from_utf8_lossy(bytes);
+  let v =
+    unsafe { JS_NewStringLen(ctx, utf8.as_ptr() as *const c_char, utf8.len()) };
   if v.tag == JS_TAG_EXCEPTION {
     return ptr::null();
   }
@@ -601,6 +616,9 @@ pub extern "C" fn v8__String__NewFromOneByte(
     return ptr::null();
   }
   let len = if length < 0 { 0 } else { length as usize };
+  if len > K_MAX_STRING_LENGTH {
+    return ptr::null();
+  }
 
   let bytes: &[u8] = if data.is_null() || len == 0 {
     &[]
