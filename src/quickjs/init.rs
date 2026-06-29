@@ -120,10 +120,21 @@ pub extern "C" fn v8__Platform__NewDefaultPlatform(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__PumpMessageLoop(
   _platform: *mut Platform,
-  _isolate: *mut std::ffi::c_void,
+  isolate: *mut std::ffi::c_void,
   _wait_for_work: bool,
 ) -> bool {
-  false
+  let isolate = isolate as *mut crate::RealIsolate;
+  if isolate.is_null() {
+    return false;
+  }
+  let st = super::core::iso_state(isolate);
+  if st.rt.is_null() {
+    return false;
+  }
+  unsafe {
+    let mut pctx = std::ptr::null_mut();
+    super::quickjs_sys::JS_ExecutePendingJob(st.rt, &mut pctx) > 0
+  }
 }
 
 #[unsafe(no_mangle)]

@@ -590,7 +590,7 @@ pub extern "C" fn v8__Isolate__HasPendingBackgroundTasks(
   if st.rt.is_null() {
     return false;
   }
-  unsafe { JS_IsJobPending(st.rt) }
+  super::wasm::has_pending_streaming_task() || unsafe { JS_IsJobPending(st.rt) }
 }
 
 #[unsafe(no_mangle)]
@@ -798,8 +798,9 @@ pub extern "C" fn v8__Isolate__SetWasmAsyncResolvePromiseCallback(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetWasmStreamingCallback(
   _isolate: *mut RealIsolate,
-  _callback: unsafe extern "C" fn(*const crate::function::FunctionCallbackInfo),
+  callback: unsafe extern "C" fn(*const crate::function::FunctionCallbackInfo),
 ) {
+  super::wasm::set_streaming_callback(Some(callback));
 }
 
 #[unsafe(no_mangle)]
