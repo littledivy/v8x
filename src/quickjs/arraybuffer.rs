@@ -389,7 +389,10 @@ fn new_buffer_from_inner(
   if jsv_is_object(&obj) {
     let obj_key = unsafe { obj.u.ptr } as usize;
     unsafe { (*owner).obj_key = obj_key };
-    buffer_registry().lock().unwrap().insert(obj_key, inner as usize);
+    buffer_registry()
+      .lock()
+      .unwrap()
+      .insert(obj_key, inner as usize);
   }
   obj
 }
