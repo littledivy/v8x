@@ -15,6 +15,7 @@ rv8_test_api::allow_scope_in_read_host_object
 rv8_test_api::array
 rv8_test_api::array_buffer
 rv8_test_api::array_buffer_view
+rv8_test_api::array_buffer_with_shared_backing_store
 rv8_test_api::backing_store_data
 rv8_test_api::backing_store_from_empty_boxed_slice
 rv8_test_api::backing_store_from_empty_vec

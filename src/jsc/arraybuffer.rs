@@ -12,9 +12,11 @@ use crate::{
   BackingStoreDeleterCallback, Context, DataView, RealIsolate,
   SharedArrayBuffer, Uint8ClampedArray, Value,
 };
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -87,6 +89,27 @@ struct BsInner {
   owns_malloc: bool,
 }
 
+fn backing_store_registry() -> &'static Mutex<HashMap<usize, usize>> {
+  static REG: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+  REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn registry_add(key: usize, inner: *mut BsInner) {
+  if key != 0 {
+    backing_store_registry().lock().unwrap().insert(key, inner as usize);
+  }
+}
+
+fn registry_remove(key: usize, inner: *mut BsInner) {
+  if key == 0 {
+    return;
+  }
+  let mut map = backing_store_registry().lock().unwrap();
+  if map.get(&key).copied() == Some(inner as usize) {
+    map.remove(&key);
+  }
+}
+
 unsafe extern "C" {
   fn malloc(size: usize) -> *mut c_void;
   fn calloc(count: usize, size: usize) -> *mut c_void;
@@ -121,11 +144,7 @@ impl BsInner {
   }
 
   fn new_allocated(byte_length: usize, is_shared: bool) -> *mut BsInner {
-    let data = if byte_length == 0 {
-      ptr::null_mut()
-    } else {
-      unsafe { calloc(byte_length, 1) }
-    };
+    let data = unsafe { calloc(byte_length.max(1), 1) };
     BsInner::boxed(
       data,
       byte_length,
@@ -140,6 +159,7 @@ impl BsInner {
     if ptr.is_null() {
       return;
     }
+    registry_remove(unsafe { (*ptr).data } as usize, ptr);
     let b = unsafe { Box::from_raw(ptr) };
     if !b.data.is_null() {
       if b.owns_malloc {
@@ -203,9 +223,58 @@ fn backing_store_for_buffer(
       JSObjectGetArrayBufferByteLength(ctx, obj, ptr::null_mut()),
     )
   };
+  if !data.is_null() {
+    let existing = backing_store_registry()
+      .lock()
+      .unwrap()
+      .get(&(data as usize))
+      .copied();
+    if let Some(existing) = existing {
+      let inner = existing as *mut BsInner;
+      if !inner.is_null() {
+        unsafe { (*inner).refcount.fetch_add(1, Ordering::SeqCst) };
+        return make_shared_ref(inner);
+      }
+    }
+  }
   let inner =
     BsInner::boxed(data, len, false, noop_deleter, ptr::null_mut(), false);
+  unsafe { (*inner).refcount.store(2, Ordering::SeqCst) };
+  registry_add(data as usize, inner);
   make_shared_ref(inner)
+}
+
+fn make_shared_array_buffer(ctx: JSContextRef, byte_length: usize) -> JSValueRef {
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    let mut exc: JSValueRef = ptr::null();
+    let src = b"(function(len){return new SharedArrayBuffer(len);})\0";
+    let fs = JSStringCreateWithUTF8CString(
+      src.as_ptr() as *const std::os::raw::c_char
+    );
+    let fnv =
+      JSEvaluateScript(ctx, fs, ptr::null_mut(), ptr::null_mut(), 1, &mut exc);
+    JSStringRelease(fs);
+    if !exc.is_null() || fnv.is_null() {
+      return ptr::null();
+    }
+    let fnobj = JSValueToObject(ctx, fnv, &mut exc);
+    if !exc.is_null() || fnobj.is_null() {
+      return ptr::null();
+    }
+    let args = [JSValueMakeNumber(ctx, byte_length as f64)];
+    let sab = JSObjectCallAsFunction(
+      ctx,
+      fnobj,
+      ptr::null_mut(),
+      1,
+      args.as_ptr(),
+      &mut exc,
+    );
+    if !exc.is_null() { ptr::null() } else { sab }
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -240,6 +309,7 @@ pub extern "C" fn v8__ArrayBuffer__New__with_byte_length(
       ptr::null_mut(),
     )
   };
+  registry_add(data as usize, inner);
   intern_ctx::<ArrayBuffer>(ctx, obj as JSValueRef)
 }
 
@@ -828,32 +898,19 @@ pub extern "C" fn v8__SharedArrayBuffer__New__with_backing_store(
     return ptr::null();
   }
   let (data, len) = unsafe { ((*inner).data, (*inner).byte_length) };
-  unsafe { (*inner).refcount.fetch_add(1, Ordering::SeqCst) };
-  unsafe extern "C" fn dealloc(_bytes: *mut c_void, ctx: *mut c_void) {
-    crate::jsc::core::ffi_guard(
-      || {
-        let inner = ctx as *mut BsInner;
-        if inner.is_null() {
-          return;
-        }
-        if unsafe { (*inner).refcount.fetch_sub(1, Ordering::SeqCst) } == 1 {
-          unsafe { BsInner::destroy(inner) };
-        }
-      },
-      || (),
-    )
+  let sab = make_shared_array_buffer(ctx, len);
+  if sab.is_null() {
+    return ptr::null();
   }
-  let obj = unsafe {
-    JSObjectMakeArrayBufferWithBytesNoCopy(
-      ctx,
-      data,
-      len,
-      Some(dealloc),
-      inner as *mut c_void,
-      ptr::null_mut(),
-    )
-  };
-  intern_ctx::<SharedArrayBuffer>(ctx, obj as JSValueRef)
+  if !data.is_null() && len != 0 {
+    let dst = unsafe {
+      JSObjectGetArrayBufferBytesPtr(ctx, sab as JSObjectRef, ptr::null_mut())
+    };
+    if !dst.is_null() {
+      unsafe { ptr::copy_nonoverlapping(data as *const u8, dst as *mut u8, len) };
+    }
+  }
+  intern_ctx::<SharedArrayBuffer>(ctx, sab)
 }
 
 #[unsafe(no_mangle)]
@@ -1140,18 +1197,36 @@ pub extern "C" fn v8__Float16Array__New(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SharedArrayBuffer__NewBackingStore__with_data(
-  _data: *mut std::os::raw::c_void,
-  _byte_length: usize,
-  _deleter: *const std::os::raw::c_void,
-  _deleter_data: *mut std::os::raw::c_void,
-) -> *mut std::os::raw::c_void {
-  std::ptr::null_mut()
+  data: *mut c_void,
+  byte_length: usize,
+  deleter: BackingStoreDeleterCallback,
+  deleter_data: *mut c_void,
+) -> *mut BackingStore {
+  BsInner::boxed(data, byte_length, true, deleter, deleter_data, false)
+    as *mut BackingStore
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SharedArrayBuffer__New__with_byte_length(
-  _isolate: *mut std::os::raw::c_void,
-  _byte_length: usize,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  isolate: *mut RealIsolate,
+  byte_length: usize,
+) -> *const SharedArrayBuffer {
+  let st = iso_state(isolate);
+  let ctx =
+    st.contexts.last().copied().unwrap_or(ptr::null_mut()) as JSContextRef;
+  let sab = make_shared_array_buffer(ctx, byte_length);
+  if sab.is_null() {
+    ptr::null()
+  } else {
+    intern_ctx::<SharedArrayBuffer>(ctx, sab)
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__SharedArrayBuffer__NewBackingStore__with_byte_length(
+  isolate: *mut RealIsolate,
+  byte_length: usize,
+) -> *mut BackingStore {
+  let _ = isolate;
+  BsInner::new_allocated(byte_length, true) as *mut BackingStore
 }

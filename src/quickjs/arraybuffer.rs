@@ -16,15 +16,12 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-// Registry of live "alias" backing stores (created by `backing_store_for_buffer`)
-// keyed by the QuickJS ArrayBuffer data pointer they alias. When that buffer is
-// detached (deno's `#[buffer(detach)]` path: get_backing_store THEN detach),
-// QuickJS frees the data out from under the still-outstanding backing store.
-// On detach we look the pointer up here and "steal" the bytes into a process-heap
-// malloc copy each aliasing store owns, so the SharedRef deno carries survives the
-// detach and is safe to read on another thread (worker postMessage transport).
-fn alias_registry() -> &'static Mutex<HashMap<usize, Vec<usize>>> {
-  static REG: OnceLock<Mutex<HashMap<usize, Vec<usize>>>> = OnceLock::new();
+// Registry of backing-store control blocks keyed by the JS ArrayBuffer data
+// pointer they alias. This gives repeated `get_backing_store()` calls the same
+// refcounted store (matching V8's externalized backing-store identity) and lets
+// detach steal bytes before QuickJS frees them.
+fn alias_registry() -> &'static Mutex<HashMap<usize, usize>> {
+  static REG: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
   REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -32,12 +29,7 @@ fn registry_add(key: usize, inner: *mut BsInner) {
   if key == 0 {
     return;
   }
-  alias_registry()
-    .lock()
-    .unwrap()
-    .entry(key)
-    .or_default()
-    .push(inner as usize);
+  alias_registry().lock().unwrap().insert(key, inner as usize);
 }
 
 fn registry_remove(key: usize, inner: *mut BsInner) {
@@ -45,13 +37,8 @@ fn registry_remove(key: usize, inner: *mut BsInner) {
     return;
   }
   let mut map = alias_registry().lock().unwrap();
-  if let Some(v) = map.get_mut(&key) {
-    if let Some(pos) = v.iter().position(|&p| p == inner as usize) {
-      v.swap_remove(pos);
-    }
-    if v.is_empty() {
-      map.remove(&key);
-    }
+  if map.get(&key).copied() == Some(inner as usize) {
+    map.remove(&key);
   }
 }
 
@@ -168,11 +155,7 @@ impl BsInner {
   }
 
   fn new_allocated(byte_length: usize, is_shared: bool) -> *mut BsInner {
-    let data = if byte_length == 0 {
-      ptr::null_mut()
-    } else {
-      unsafe { calloc(byte_length, 1) }
-    };
+    let data = unsafe { calloc(byte_length.max(1), 1) };
     BsInner::boxed(
       data,
       byte_length,
@@ -249,8 +232,20 @@ fn backing_store_for_buffer(
 ) -> SharedRef<BackingStore> {
   let mut len: usize = 0;
   let data = unsafe { JS_GetArrayBuffer(ctx, &mut len, buf) } as *mut c_void;
+  if !data.is_null() {
+    let existing = alias_registry().lock().unwrap().get(&(data as usize)).copied();
+    if let Some(existing) = existing {
+      let inner = existing as *mut BsInner;
+      if !inner.is_null() {
+        unsafe { (*inner).refcount.fetch_add(1, Ordering::SeqCst) };
+        return make_shared_ref(inner);
+      }
+    }
+  }
   let inner =
     BsInner::boxed(data, len, false, noop_deleter, ptr::null_mut(), false);
+  // Count both the JS ArrayBuffer and the SharedRef returned to Rust.
+  unsafe { (*inner).refcount.store(2, Ordering::SeqCst) };
 
   unsafe {
     (*inner).retained_ctx = ctx;
@@ -417,6 +412,7 @@ pub extern "C" fn v8__ArrayBuffer__New__with_backing_store(
     unsafe { bs_free_func(ptr::null_mut(), inner as *mut c_void, data) };
     return ptr::null();
   }
+  registry_add(data as usize, inner);
   intern::<ArrayBuffer>(obj)
 }
 
@@ -526,13 +522,10 @@ pub extern "C" fn v8__ArrayBuffer__Detach(
   let mut len: usize = 0;
   let data = unsafe { JS_GetArrayBuffer(ctx, &mut len, buf) } as *mut c_void;
   if !data.is_null() {
-    let inners = alias_registry().lock().unwrap().remove(&(data as usize));
-    if let Some(inners) = inners {
-      for inner_usize in inners {
-        let inner = inner_usize as *mut BsInner;
-        if inner.is_null() {
-          continue;
-        }
+    let inner = alias_registry().lock().unwrap().remove(&(data as usize));
+    if let Some(inner_usize) = inner {
+      let inner = inner_usize as *mut BsInner;
+      if !inner.is_null() {
         unsafe {
           let blen = (*inner).byte_length;
           let copy = if blen > 0 {
@@ -841,13 +834,14 @@ pub extern "C" fn v8__SharedArrayBuffer__New__with_backing_store(
       len,
       Some(bs_free_func),
       inner as *mut c_void,
-      false,
+      true,
     )
   };
   if obj.tag == JS_TAG_EXCEPTION {
     unsafe { bs_free_func(ptr::null_mut(), inner as *mut c_void, data) };
     return ptr::null();
   }
+  registry_add(data as usize, inner);
   intern::<SharedArrayBuffer>(obj)
 }
 
@@ -1099,18 +1093,52 @@ pub extern "C" fn v8__ArrayBuffer__Allocator__NewRustAllocator(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SharedArrayBuffer__NewBackingStore__with_data(
-  _data: *mut std::os::raw::c_void,
-  _byte_length: usize,
-  _deleter: *const std::os::raw::c_void,
-  _deleter_data: *mut std::os::raw::c_void,
-) -> *mut std::os::raw::c_void {
-  std::ptr::null_mut()
+  data: *mut c_void,
+  byte_length: usize,
+  deleter: BackingStoreDeleterCallback,
+  deleter_data: *mut c_void,
+) -> *mut BackingStore {
+  BsInner::boxed(data, byte_length, true, deleter, deleter_data, false)
+    as *mut BackingStore
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SharedArrayBuffer__New__with_byte_length(
-  _isolate: *mut std::os::raw::c_void,
-  _byte_length: usize,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  isolate: *mut RealIsolate,
+  byte_length: usize,
+) -> *const SharedArrayBuffer {
+  let st = iso_state(isolate);
+  let ctx = st.contexts.last().copied().unwrap_or(st.ctx);
+  if ctx.is_null() {
+    return ptr::null();
+  }
+
+  let data = if byte_length == 0 {
+    ptr::null_mut()
+  } else {
+    unsafe { calloc(byte_length, 1) as *mut u8 }
+  };
+  let obj = unsafe {
+    JS_NewArrayBuffer(
+      ctx,
+      data,
+      byte_length,
+      Some(malloc_free_func),
+      ptr::null_mut(),
+      true,
+    )
+  };
+  if obj.tag == JS_TAG_EXCEPTION {
+    return ptr::null();
+  }
+  intern::<SharedArrayBuffer>(obj)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__SharedArrayBuffer__NewBackingStore__with_byte_length(
+  isolate: *mut RealIsolate,
+  byte_length: usize,
+) -> *mut BackingStore {
+  let _ = isolate;
+  BsInner::new_allocated(byte_length, true) as *mut BackingStore
 }
