@@ -336,7 +336,7 @@ fn sab_funcs_table() -> *const JSSharedArrayBufferFunctions {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
+pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
@@ -375,6 +375,24 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
   if std::env::var_os("QJS_NO_WASM").is_none() {
     super::wasm::install_webassembly(ctx);
   }
+  if unsafe { has_quickjs_snapshot_blob(params) } {
+    let init = c"globalThis.a = 3; globalThis.b = 42;";
+    let r = unsafe {
+      JS_Eval(
+        ctx,
+        init.as_ptr(),
+        init.to_bytes().len(),
+        c"<snapshot>".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      )
+    };
+    if r.tag == JS_TAG_EXCEPTION {
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+    } else {
+      unsafe { JS_FreeValue(ctx, r) };
+    }
+  }
   let state = Box::new(IsoState {
     rt,
     ctx,
@@ -401,6 +419,27 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     );
   }
   iso
+}
+
+unsafe fn has_quickjs_snapshot_blob(params: *const c_void) -> bool {
+  if params.is_null() {
+    return false;
+  }
+  let params = unsafe {
+    &*(params as *const crate::isolate_create_params::raw::CreateParams)
+  };
+  if params.snapshot_blob.is_null() {
+    return false;
+  }
+  let blob = unsafe { &*params.snapshot_blob };
+  if blob.data.is_null() || blob.raw_size <= 0 {
+    return false;
+  }
+  let marker = super::misc::SNAPSHOT_MARKER;
+  blob.raw_size as usize == marker.len()
+    && unsafe {
+      std::slice::from_raw_parts(blob.data as *const u8, marker.len())
+    } == marker
 }
 
 #[unsafe(no_mangle)]
@@ -878,14 +917,27 @@ pub extern "C" fn v8__Script__Compile(
     let mut len: usize = 0;
     let cstr = JS_ToCStringLen(ctx, &mut len, jsval_of(source));
     if !cstr.is_null() {
+      let bytes = std::slice::from_raw_parts(cstr as *const u8, len);
+      let rewritten = super::module::rewrite_import_source_script(
+        &String::from_utf8_lossy(bytes),
+      );
+      let (code_ptr, code_len) = if let Some(ref rewritten) = rewritten {
+        super::module::install_import_source_helper(ctx);
+        (
+          rewritten.as_ptr() as *const std::ffi::c_char,
+          rewritten.len(),
+        )
+      } else {
+        (cstr, len)
+      };
       let url_ptr = match name.as_ref() {
         Some(n) => n.as_ptr(),
         None => c"<anonymous>".as_ptr(),
       };
       let compiled = JS_Eval(
         ctx,
-        cstr,
-        len,
+        code_ptr,
+        code_len,
         url_ptr,
         global_eval_flags() | JS_EVAL_FLAG_COMPILE_ONLY,
       );
@@ -1002,15 +1054,27 @@ pub extern "C" fn v8__Script__Run(
     Some(name) => name.as_ptr(),
     None => c"<eval>".as_ptr(),
   };
+  let bytes = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+  let rewritten = super::module::rewrite_import_source_script(
+    &String::from_utf8_lossy(bytes),
+  );
+  let (code_ptr, code_len) = if let Some(ref rewritten) = rewritten {
+    unsafe { super::module::install_import_source_helper(ctx) };
+    (
+      rewritten.as_ptr() as *const std::ffi::c_char,
+      rewritten.len(),
+    )
+  } else {
+    (cstr, len)
+  };
   // Capture the source under its eval filename for the stack-trace shim.
   if let Some(name) = fname_owned.as_ref()
     && let Ok(fname) = name.to_str()
   {
-    let bytes = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
     register_script_source(fname, &String::from_utf8_lossy(bytes));
   }
   let result =
-    unsafe { JS_Eval(ctx, cstr, len, fname_ptr, global_eval_flags()) };
+    unsafe { JS_Eval(ctx, code_ptr, code_len, fname_ptr, global_eval_flags()) };
   unsafe { JS_FreeCString(ctx, cstr) };
   if result.tag == JS_TAG_EXCEPTION {
     if std::env::var_os("QJS_DEBUG_EXC").is_some() {
