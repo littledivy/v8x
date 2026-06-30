@@ -1,6 +1,6 @@
 {
-  "generated": "2026-06-29T17:49:19.654Z",
-  "commit": "24aa891bfe83629fd6f1ccd884846e60965c2351",
+  "generated": "2026-06-30T07:13:34.827Z",
+  "commit": "f676bad0d3db13d53739583fa1291ce4e3a830f5",
   "backends": [
     {
       "id": "jsc",
@@ -71,7 +71,7 @@
       "rusty_v8": {
         "pass": 48,
         "total": 267,
-        "baseline": 48,
+        "baseline": 74,
         "fail": 219,
         "tier": "build",
         "fresh": true
