@@ -945,20 +945,38 @@ pub extern "C" fn v8__AllowJavascriptExecutionScope__DESTRUCT(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__AddGCPrologueCallback(
-  _isolate: *mut RealIsolate,
-  _callback: *const c_void,
-  _data: *mut c_void,
-  _gc_type_filter: i32,
+  isolate: *mut RealIsolate,
+  callback: crate::isolate::GcCallbackWithData,
+  data: *mut c_void,
+  gc_type_filter: crate::gc::GCType,
 ) {
+  if !isolate.is_null() {
+    crate::jsc::core::iso_state(isolate)
+      .gc_prologue_callbacks
+      .push(crate::jsc::core::GcCallbackEntry {
+        callback,
+        data,
+        gc_type_filter,
+      });
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__AddGCEpilogueCallback(
-  _isolate: *mut RealIsolate,
-  _callback: *const c_void,
-  _data: *mut c_void,
-  _gc_type_filter: i32,
+  isolate: *mut RealIsolate,
+  callback: crate::isolate::GcCallbackWithData,
+  data: *mut c_void,
+  gc_type_filter: crate::gc::GCType,
 ) {
+  if !isolate.is_null() {
+    crate::jsc::core::iso_state(isolate)
+      .gc_epilogue_callbacks
+      .push(crate::jsc::core::GcCallbackEntry {
+        callback,
+        data,
+        gc_type_filter,
+      });
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1139,18 +1157,34 @@ pub extern "C" fn v8__Isolate__MemoryPressureNotification(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__RemoveGCEpilogueCallback(
-  _isolate: *mut std::os::raw::c_void,
-  _callback: *const std::os::raw::c_void,
-  _data: *mut std::os::raw::c_void,
+  isolate: *mut std::os::raw::c_void,
+  callback: *const std::os::raw::c_void,
+  data: *mut std::os::raw::c_void,
 ) {
+  if !isolate.is_null() {
+    crate::jsc::core::iso_state(isolate as *mut RealIsolate)
+      .gc_epilogue_callbacks
+      .retain(|entry| {
+        entry.callback as *const std::os::raw::c_void != callback
+          || entry.data != data
+      });
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__RemoveGCPrologueCallback(
-  _isolate: *mut std::os::raw::c_void,
-  _callback: *const std::os::raw::c_void,
-  _data: *mut std::os::raw::c_void,
+  isolate: *mut std::os::raw::c_void,
+  callback: *const std::os::raw::c_void,
+  data: *mut std::os::raw::c_void,
 ) {
+  if !isolate.is_null() {
+    crate::jsc::core::iso_state(isolate as *mut RealIsolate)
+      .gc_prologue_callbacks
+      .retain(|entry| {
+        entry.callback as *const std::os::raw::c_void != callback
+          || entry.data != data
+      });
+  }
 }
 
 #[unsafe(no_mangle)]

@@ -20,6 +20,52 @@ use std::ptr;
 
 type PlatformOpaque = c_void;
 
+struct WeakCallbackInfoShim {
+  isolate: *mut crate::RealIsolate,
+  parameter: *const c_void,
+  second_pass: Option<crate::jsc::core::WeakCallback>,
+}
+
+fn collect_weak_handles(isolate: *mut crate::RealIsolate) {
+  if isolate.is_null() {
+    return;
+  }
+
+  let weak_handles = {
+    let st = crate::jsc::core::iso_state(isolate);
+    std::mem::take(&mut st.weak_handles)
+  };
+
+  for weak in weak_handles {
+    let mut info = WeakCallbackInfoShim {
+      isolate,
+      parameter: weak.parameter,
+      second_pass: None,
+    };
+    unsafe { (weak.callback)(&info as *const _ as *const c_void) };
+    if let Some(second_pass) = info.second_pass {
+      unsafe { second_pass(&info as *const _ as *const c_void) };
+    }
+  }
+}
+
+fn run_gc_callbacks(
+  isolate: *mut crate::RealIsolate,
+  callbacks: &[crate::jsc::core::GcCallbackEntry],
+) {
+  let raw = crate::isolate::UnsafeRawIsolatePtr::from_real_ptr(isolate);
+  for entry in callbacks {
+    unsafe {
+      (entry.callback)(
+        raw,
+        entry.gc_type_filter,
+        crate::gc::GCCallbackFlags(0),
+        entry.data,
+      );
+    }
+  }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__initialize_process(_platform: *mut c_void) {}
 
@@ -140,7 +186,12 @@ pub extern "C" fn v8__Isolate__RequestGarbageCollectionForTesting(
   };
   if !isolate.is_null() {
     let st = crate::jsc::core::iso_state(isolate);
+    let prologue_callbacks = st.gc_prologue_callbacks.clone();
+    run_gc_callbacks(isolate, &prologue_callbacks);
     crate::jsc::core::release_external_string_memory(st);
+    let epilogue_callbacks = st.gc_epilogue_callbacks.clone();
+    run_gc_callbacks(isolate, &epilogue_callbacks);
+    collect_weak_handles(isolate);
   }
 }
 
@@ -283,11 +334,20 @@ pub extern "C" fn v8__Global__New(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Global__NewWeak(
-  _isolate: *mut c_void,
+  isolate: *mut c_void,
   data: *const Data,
-  _parameter: *const c_void,
-  _callback: unsafe extern "C" fn(*const c_void),
+  parameter: *const c_void,
+  callback: unsafe extern "C" fn(*const c_void),
 ) -> *const Data {
+  if !data.is_null() && !isolate.is_null() {
+    crate::jsc::core::iso_state(isolate as *mut crate::RealIsolate)
+      .weak_handles
+      .push(crate::jsc::core::WeakHandle {
+        handle: data,
+        parameter,
+        callback,
+      });
+  }
   data
 }
 
@@ -295,6 +355,12 @@ pub extern "C" fn v8__Global__NewWeak(
 pub extern "C" fn v8__Global__Reset(data: *const Data) {
   if data.is_null() {
     return;
+  }
+  let iso = current_iso();
+  if !iso.is_null() {
+    crate::jsc::core::iso_state(iso)
+      .weak_handles
+      .retain(|weak| weak.handle != data);
   }
   global_unprotect(jsval(data));
 }
@@ -590,23 +656,35 @@ pub extern "C" fn v8__IdleTask__DELETE(_task: *mut c_void) {}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WeakCallbackInfo__GetIsolate(
-  _this: *const c_void,
+  this: *const c_void,
 ) -> *mut c_void {
-  current_iso() as *mut c_void
+  if this.is_null() {
+    return current_iso() as *mut c_void;
+  }
+  unsafe { (*(this as *const WeakCallbackInfoShim)).isolate as *mut c_void }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WeakCallbackInfo__GetParameter(
-  _this: *const c_void,
+  this: *const c_void,
 ) -> *mut c_void {
-  ptr::null_mut()
+  if this.is_null() {
+    return ptr::null_mut();
+  }
+  unsafe { (*(this as *const WeakCallbackInfoShim)).parameter as *mut c_void }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WeakCallbackInfo__SetSecondPassCallback(
-  _this: *const c_void,
-  _callback: unsafe extern "C" fn(*const c_void),
+  this: *const c_void,
+  callback: unsafe extern "C" fn(*const c_void),
 ) {
+  if this.is_null() {
+    return;
+  }
+  unsafe {
+    (*(this as *mut WeakCallbackInfoShim)).second_pass = Some(callback);
+  }
 }
 
 #[unsafe(no_mangle)]

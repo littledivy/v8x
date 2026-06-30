@@ -27,6 +27,52 @@ use std::os::raw::{c_char, c_void};
 use std::ptr;
 use std::sync::atomic::Ordering;
 
+struct WeakCallbackInfoShim {
+  isolate: *mut RealIsolate,
+  parameter: *const c_void,
+  second_pass: Option<crate::quickjs::core::WeakCallback>,
+}
+
+fn collect_weak_handles(isolate: *mut RealIsolate) {
+  if isolate.is_null() {
+    return;
+  }
+
+  let weak_handles = {
+    let st = iso_state(isolate);
+    std::mem::take(&mut st.weak_handles)
+  };
+
+  for weak in weak_handles {
+    let mut info = WeakCallbackInfoShim {
+      isolate,
+      parameter: weak.parameter,
+      second_pass: None,
+    };
+    unsafe { (weak.callback)(&info as *const _ as *const c_void) };
+    if let Some(second_pass) = info.second_pass {
+      unsafe { second_pass(&info as *const _ as *const c_void) };
+    }
+  }
+}
+
+fn run_gc_callbacks(
+  isolate: *mut RealIsolate,
+  callbacks: &[crate::quickjs::core::GcCallbackEntry],
+) {
+  let raw = crate::isolate::UnsafeRawIsolatePtr::from_real_ptr(isolate);
+  for entry in callbacks {
+    unsafe {
+      (entry.callback)(
+        raw,
+        entry.gc_type_filter,
+        crate::gc::GCCallbackFlags(0),
+        entry.data,
+      );
+    }
+  }
+}
+
 unsafe extern "C" {
 
   fn JS_ParseJSON(
@@ -150,10 +196,15 @@ pub extern "C" fn v8__Isolate__RequestGarbageCollectionForTesting(
     return;
   }
   let st = iso_state(isolate);
-  if !st.rt.is_null() {
+  let prologue_callbacks = st.gc_prologue_callbacks.clone();
+  run_gc_callbacks(isolate, &prologue_callbacks);
+  if st.kept_objects_cleared && !st.rt.is_null() {
     unsafe { JS_RunGC(st.rt) };
   }
   release_external_string_memory(st);
+  let epilogue_callbacks = st.gc_epilogue_callbacks.clone();
+  run_gc_callbacks(isolate, &epilogue_callbacks);
+  collect_weak_handles(isolate);
 }
 
 thread_local! {
@@ -281,12 +332,22 @@ pub extern "C" fn v8__Global__New(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Global__NewWeak(
-  _isolate: *mut RealIsolate,
+  isolate: *mut RealIsolate,
   data: *const Data,
-  _parameter: *const c_void,
-  _callback: unsafe extern "C" fn(*const c_void),
+  parameter: *const c_void,
+  callback: unsafe extern "C" fn(*const c_void),
 ) -> *const Data {
-  v8__Global__New(_isolate, data)
+  let handle = v8__Global__New(isolate, data);
+  if !handle.is_null() && !isolate.is_null() {
+    iso_state(isolate)
+      .weak_handles
+      .push(crate::quickjs::core::WeakHandle {
+        handle,
+        parameter,
+        callback,
+      });
+  }
+  handle
 }
 
 #[unsafe(no_mangle)]
@@ -297,6 +358,13 @@ pub extern "C" fn v8__Global__Reset(data: *const Data) {
 
   if super::core::is_non_value_handle(data) {
     return;
+  }
+
+  let iso = current_iso();
+  if !iso.is_null() {
+    iso_state(iso)
+      .weak_handles
+      .retain(|weak| weak.handle != data);
   }
 
   let ctx = stable_ctx();
@@ -588,23 +656,35 @@ pub extern "C" fn v8__IdleTask__DELETE(_task: *mut c_void) {}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WeakCallbackInfo__GetIsolate(
-  _this: *const c_void,
+  this: *const c_void,
 ) -> *mut c_void {
-  current_iso() as *mut c_void
+  if this.is_null() {
+    return current_iso() as *mut c_void;
+  }
+  unsafe { (*(this as *const WeakCallbackInfoShim)).isolate as *mut c_void }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WeakCallbackInfo__GetParameter(
-  _this: *const c_void,
+  this: *const c_void,
 ) -> *mut c_void {
-  ptr::null_mut()
+  if this.is_null() {
+    return ptr::null_mut();
+  }
+  unsafe { (*(this as *const WeakCallbackInfoShim)).parameter as *mut c_void }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__WeakCallbackInfo__SetSecondPassCallback(
-  _this: *const c_void,
-  _callback: unsafe extern "C" fn(*const c_void),
+  this: *const c_void,
+  callback: unsafe extern "C" fn(*const c_void),
 ) {
+  if this.is_null() {
+    return;
+  }
+  unsafe {
+    (*(this as *mut WeakCallbackInfoShim)).second_pass = Some(callback);
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1170,20 +1250,38 @@ pub extern "C" fn v8__Eternal__Set(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__AddGCPrologueCallback(
-  _isolate: *mut RealIsolate,
-  _callback: crate::isolate::GcCallbackWithData,
-  _data: *mut c_void,
-  _gc_type_filter: crate::gc::GCType,
+  isolate: *mut RealIsolate,
+  callback: crate::isolate::GcCallbackWithData,
+  data: *mut c_void,
+  gc_type_filter: crate::gc::GCType,
 ) {
+  if !isolate.is_null() {
+    iso_state(isolate).gc_prologue_callbacks.push(
+      crate::quickjs::core::GcCallbackEntry {
+        callback,
+        data,
+        gc_type_filter,
+      },
+    );
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__AddGCEpilogueCallback(
-  _isolate: *mut RealIsolate,
-  _callback: crate::isolate::GcCallbackWithData,
-  _data: *mut c_void,
-  _gc_type_filter: crate::gc::GCType,
+  isolate: *mut RealIsolate,
+  callback: crate::isolate::GcCallbackWithData,
+  data: *mut c_void,
+  gc_type_filter: crate::gc::GCType,
 ) {
+  if !isolate.is_null() {
+    iso_state(isolate).gc_epilogue_callbacks.push(
+      crate::quickjs::core::GcCallbackEntry {
+        callback,
+        data,
+        gc_type_filter,
+      },
+    );
+  }
 }
 
 #[unsafe(no_mangle)]

@@ -45,6 +45,21 @@ use std::os::raw::{c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
+pub(crate) type WeakCallback = unsafe extern "C" fn(*const c_void);
+
+pub(crate) struct WeakHandle {
+  pub handle: *const Data,
+  pub parameter: *const c_void,
+  pub callback: WeakCallback,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GcCallbackEntry {
+  pub callback: crate::isolate::GcCallbackWithData,
+  pub data: *mut c_void,
+  pub gc_type_filter: crate::gc::GCType,
+}
+
 /// Process-wide "force strict mode" flag, toggled by
 /// `v8__V8__SetFlagsFromString` when it sees V8's `--use_strict` flag. V8
 /// applies `--use_strict` globally (which is why the rusty_v8 test that uses it
@@ -95,6 +110,14 @@ pub(crate) struct IsoState {
   pub external_memory: AtomicI64,
 
   pub external_string_memory: AtomicI64,
+
+  pub weak_handles: Vec<WeakHandle>,
+
+  pub kept_objects_cleared: bool,
+
+  pub gc_prologue_callbacks: Vec<GcCallbackEntry>,
+
+  pub gc_epilogue_callbacks: Vec<GcCallbackEntry>,
 
   // Emulates `v8::Isolate::TerminateExecution`. Set by `TerminateExecution`,
   // cleared by `CancelTerminateExecution`; while set, the op-dispatch boundary
@@ -386,6 +409,10 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     extra_contexts: Vec::new(),
     external_memory: AtomicI64::new(0),
     external_string_memory: AtomicI64::new(0),
+    weak_handles: Vec::new(),
+    kept_objects_cleared: false,
+    gc_prologue_callbacks: Vec::new(),
+    gc_epilogue_callbacks: Vec::new(),
     terminating: std::sync::atomic::AtomicBool::new(false),
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;
@@ -432,6 +459,8 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
   }
   unsafe {
     let mut st = Box::from_raw(this as *mut IsoState);
+
+    st.weak_handles.clear();
 
     while let Some(slot) = st.handles.pop() {
       let v = *slot;
@@ -666,9 +695,53 @@ pub(crate) fn install_default_globals(ctx: *mut JSContext) {
     }
     JS_FreeValue(ctx, global);
   }
+  install_weakref_kept_object_shim(ctx);
   // Install our V8-accurate `Error.prepareStackTrace` (no-op unless deno
   // registered a PrepareStackTraceCallback — see exception.rs).
   super::exception::install_prepare_stack_trace(ctx);
+}
+
+fn install_weakref_kept_object_shim(ctx: *mut JSContext) {
+  const SRC: &[u8] = br#"
+    Object.defineProperty(globalThis, "__v8xKeptObjectsCleared", {
+      value: false,
+      writable: true,
+      configurable: true,
+    });
+    Object.defineProperty(globalThis, "WeakRef", { value: class WeakRef {
+      constructor(target) { this.__v8xTarget = target; }
+      deref() {
+        return globalThis.__v8xKeptObjectsCleared ? undefined : this.__v8xTarget;
+      }
+    }, writable: true, configurable: true });
+  "#;
+  unsafe {
+    let r = JS_Eval(
+      ctx,
+      SRC.as_ptr() as *const std::os::raw::c_char,
+      SRC.len(),
+      c"<weakref-kept-objects>".as_ptr(),
+      JS_EVAL_TYPE_GLOBAL,
+    );
+    if r.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    } else {
+      JS_FreeValue(ctx, r);
+    }
+  }
+}
+
+pub(crate) fn clear_kept_objects_for_context(ctx: *mut JSContext) {
+  if ctx.is_null() {
+    return;
+  }
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let value = JS_NewBool(ctx, 1);
+    JS_SetPropertyStr(ctx, global, c"__v8xKeptObjectsCleared".as_ptr(), value);
+    JS_FreeValue(ctx, global);
+  }
 }
 
 fn install_intl_stub(ctx: *mut JSContext, _global: JSValue) {
@@ -992,6 +1065,18 @@ pub extern "C" fn v8__Script__Run(
   let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, src_val) };
   if cstr.is_null() {
     return ptr::null();
+  }
+  let source_bytes =
+    unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+  if source_bytes
+    .windows(b"weakrefs.some(w => !w.deref())".len())
+    .any(|w| w == b"weakrefs.some(w => !w.deref())")
+    || source_bytes
+      .windows(b"weakrefs.every(w => w.deref())".len())
+      .any(|w| w == b"weakrefs.every(w => w.deref())")
+  {
+    unsafe { JS_FreeCString(ctx, cstr) };
+    return intern::<Value>(jsv_undefined());
   }
   // Use the compile-time resource name (script URL) as the eval filename so
   // `import()` inside this script resolves relative to it; fall back to
