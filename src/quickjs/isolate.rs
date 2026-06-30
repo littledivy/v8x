@@ -134,22 +134,41 @@ pub(crate) fn codegen_release_ctx(ctx: *mut JSContext) {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__FromSnapshot(
   isolate: *mut RealIsolate,
-  _context_snapshot_index: usize,
+  context_snapshot_index: usize,
   _global_object: *const Value,
   _microtask_queue: *mut MicrotaskQueue,
 ) -> *const Context {
   if isolate.is_null() {
     return ptr::null();
   }
-  super::core::intern_ctx(super::core::iso_state(isolate).ctx)
+  let st = super::core::iso_state(isolate);
+  let ctx = unsafe { JS_NewContext(st.rt) };
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  if std::env::var_os("QJS_NO_WASM").is_none() {
+    super::wasm::install_webassembly(ctx);
+  }
+  super::core::install_default_globals(ctx);
+  super::snapshot::mark_baseline(ctx);
+  if let Some(id) = st.snapshot_blob_id {
+    if let Some(blob) = super::snapshot::get_blob(id) {
+      if let Some(snap) = blob.contexts.get(context_snapshot_index) {
+        super::snapshot::replay_context(ctx, snap);
+        super::misc::set_snapshot_context_data(ctx, snap.context_data.clone());
+      }
+    }
+  }
+  st.extra_contexts.push(ctx);
+  super::core::intern_ctx(ctx)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetDataFromSnapshotOnce(
-  _this: *const Context,
-  _index: usize,
+  this: *const Context,
+  index: usize,
 ) -> *const Data {
-  ptr::null()
+  super::snapshot::context_data_once(this, index)
 }
 
 /// Native `getContinuationPreservedEmbedderData` for the extras binding object.
@@ -1151,10 +1170,11 @@ pub extern "C" fn v8__Isolate__GetCurrentHostDefinedOptions(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetDataFromSnapshotOnce(
-  _this: *mut std::os::raw::c_void,
-  _index: usize,
+  this: *mut std::os::raw::c_void,
+  index: usize,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  super::snapshot::isolate_data_once(this as *mut RealIsolate, index)
+    as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]

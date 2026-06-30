@@ -119,6 +119,10 @@ pub(crate) struct IsoState {
 
   pub gc_epilogue_callbacks: Vec<GcCallbackEntry>,
 
+  pub snapshot_blob_id: Option<usize>,
+
+  pub snapshot_isolate_data: Vec<Option<String>>,
+
   // Emulates `v8::Isolate::TerminateExecution`. Set by `TerminateExecution`,
   // cleared by `CancelTerminateExecution`; while set, the op-dispatch boundary
   // and the microtask/job drain refuse to run JS (matching V8, which throws an
@@ -359,7 +363,7 @@ fn sab_funcs_table() -> *const JSSharedArrayBufferFunctions {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
+pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
@@ -398,6 +402,11 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
   if std::env::var_os("QJS_NO_WASM").is_none() {
     super::wasm::install_webassembly(ctx);
   }
+  let snapshot_blob_id = super::snapshot::loaded_blob_from_params(params);
+  let snapshot_isolate_data = snapshot_blob_id
+    .and_then(super::snapshot::get_blob)
+    .map(|blob| blob.isolate_data)
+    .unwrap_or_default();
   let state = Box::new(IsoState {
     rt,
     ctx,
@@ -414,6 +423,8 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     gc_prologue_callbacks: Vec::new(),
     gc_epilogue_callbacks: Vec::new(),
     terminating: std::sync::atomic::AtomicBool::new(false),
+    snapshot_blob_id,
+    snapshot_isolate_data,
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;
   // Arm the interrupt handler so a runaway loop unwinds once
@@ -667,6 +678,16 @@ pub extern "C" fn v8__Context__New(
     c
   };
   install_default_globals(ctx);
+  super::snapshot::mark_baseline(ctx);
+  if let Some(id) = st.snapshot_blob_id {
+    if let Some(blob) = super::snapshot::get_blob(id) {
+      super::snapshot::replay_context(ctx, &blob.default_context);
+      super::misc::set_snapshot_context_data(
+        ctx,
+        blob.default_context.context_data.clone(),
+      );
+    }
+  }
 
   intern_ctx(ctx)
 }

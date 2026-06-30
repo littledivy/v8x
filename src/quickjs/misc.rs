@@ -527,88 +527,78 @@ pub extern "C" fn v8__Proxy__GetTarget(this: *const c_void) -> *const Value {
   intern::<Value>(v)
 }
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct RawStartupDataAbi {
-  data: *const c_char,
-  raw_size: std::os::raw::c_int,
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__CONSTRUCT(
   buf: *mut c_void,
-  _params: *const c_void,
+  params: *const c_void,
 ) {
-  let iso = crate::quickjs::core::v8__Isolate__New(ptr::null());
-  crate::quickjs::core::v8__Isolate__Enter(iso);
-  if !buf.is_null() {
-    unsafe { *(buf as *mut *mut RealIsolate) = iso };
-  }
+  super::snapshot::construct(buf, params);
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__SnapshotCreator__DESTRUCT(_this: *mut c_void) {}
+pub extern "C" fn v8__SnapshotCreator__DESTRUCT(this: *mut c_void) {
+  super::snapshot::destruct(this)
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__GetIsolate(
   this: *const c_void,
 ) -> *mut c_void {
-  if !this.is_null() {
-    let iso = unsafe { *(this as *const *mut RealIsolate) };
-    if !iso.is_null() {
-      return iso as *mut c_void;
-    }
+  let iso = super::snapshot::get_isolate(this);
+  if iso.is_null() {
+    current_iso() as *mut c_void
+  } else {
+    iso
   }
-  current_iso() as *mut c_void
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__CreateBlob(
   _this: *mut c_void,
   _function_code_handling: u32,
-) -> RawStartupDataAbi {
-  RawStartupDataAbi {
-    data: ptr::null(),
-    raw_size: 0,
-  }
+) -> super::snapshot::RawStartupDataAbi {
+  super::snapshot::create_blob(_this)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__SetDefaultContext(
-  _this: *mut c_void,
-  _context: *const Context,
+  this: *mut c_void,
+  context: *const Context,
 ) {
+  super::snapshot::set_default_context(this, context)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__AddContext(
-  _this: *mut c_void,
-  _context: *const Context,
+  this: *mut c_void,
+  context: *const Context,
 ) -> usize {
-  0
+  super::snapshot::add_context(this, context)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
-  _this: *mut c_void,
-  _context: *const Context,
-  _data: *const Data,
+  this: *mut c_void,
+  context: *const Context,
+  data: *const Data,
 ) -> usize {
-  0
+  super::snapshot::add_context_data(this, context, data)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StartupData__CanBeRehashed(_this: *const c_void) -> bool {
-  false
+  true
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__StartupData__IsValid(_this: *const c_void) -> bool {
-  false
+pub extern "C" fn v8__StartupData__IsValid(this: *const c_void) -> bool {
+  super::snapshot::validate_cow_startup_data(this)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__StartupData__data__DELETE(_this: *const c_char) {}
+pub extern "C" fn v8__StartupData__data__DELETE(this: *const c_char) {
+  super::snapshot::startup_data_delete(this)
+}
 
 // ICU common-data loader (vendored rusty_v8 `icu::set_common_data_77`). QuickJS
 // brings its own ICU/Intl, so we never actually *load* V8's blob — but we do
@@ -1115,6 +1105,106 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
     static SECURITY_TOKEN: std::cell::RefCell<HashMap<usize, JSValue>> =
         std::cell::RefCell::new(HashMap::new());
+    static SNAPSHOT_CONTEXT_DATA: std::cell::RefCell<HashMap<usize, Vec<Option<String>>>> =
+        std::cell::RefCell::new(HashMap::new());
+}
+
+pub(crate) fn snapshot_embedder_data(
+  ctx: *mut JSContext,
+) -> Vec<Option<String>> {
+  EMBEDDER_DATA.with(|m| {
+    m.borrow()
+      .get(&(ctx as usize))
+      .map(|slots| {
+        slots
+          .iter()
+          .map(|v| {
+            let s = unsafe {
+              JS_JSONStringify(ctx, *v, jsv_undefined(), jsv_undefined())
+            };
+            if s.tag == JS_TAG_EXCEPTION || jsv_is_undefined(&s) {
+              if s.tag == JS_TAG_EXCEPTION {
+                let exc = unsafe { JS_GetException(ctx) };
+                unsafe { JS_FreeValue(ctx, exc) };
+              }
+              return None;
+            }
+            let mut len = 0usize;
+            let cs = unsafe { JS_ToCStringLen(ctx, &mut len, s) };
+            let out = if cs.is_null() {
+              None
+            } else {
+              Some(
+                String::from_utf8_lossy(unsafe {
+                  std::slice::from_raw_parts(cs as *const u8, len)
+                })
+                .into_owned(),
+              )
+            };
+            if !cs.is_null() {
+              unsafe { JS_FreeCString(ctx, cs) };
+            }
+            unsafe { JS_FreeValue(ctx, s) };
+            out
+          })
+          .collect()
+      })
+      .unwrap_or_default()
+  })
+}
+
+pub(crate) fn restore_embedder_data(
+  ctx: *mut JSContext,
+  data: &[Option<String>],
+) {
+  if data.is_empty() {
+    return;
+  }
+  let mut slots = Vec::with_capacity(data.len());
+  for item in data {
+    if let Some(json) = item {
+      if let Ok(c) = std::ffi::CString::new(json.as_str()) {
+        let v = unsafe {
+          JS_ParseJSON(
+            ctx,
+            c.as_ptr(),
+            json.len(),
+            c"<v8x snapshot embedder>".as_ptr(),
+          )
+        };
+        if v.tag != JS_TAG_EXCEPTION {
+          slots.push(v);
+          continue;
+        }
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+      }
+    }
+    slots.push(jsv_undefined());
+  }
+  EMBEDDER_DATA.with(|m| {
+    m.borrow_mut().insert(ctx as usize, slots);
+  });
+}
+
+pub(crate) fn set_snapshot_context_data(
+  ctx: *mut JSContext,
+  data: Vec<Option<String>>,
+) {
+  SNAPSHOT_CONTEXT_DATA.with(|m| {
+    m.borrow_mut().insert(ctx as usize, data);
+  });
+}
+
+pub(crate) fn take_snapshot_context_data(
+  ctx: *mut JSContext,
+  index: usize,
+) -> Option<String> {
+  SNAPSHOT_CONTEXT_DATA.with(|m| {
+    let mut m = m.borrow_mut();
+    let slots = m.get_mut(&(ctx as usize))?;
+    slots.get_mut(index)?.take()
+  })
 }
 
 #[unsafe(no_mangle)]
@@ -1645,10 +1735,10 @@ pub extern "C" fn v8__Set__Has(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__AddData_to_isolate(
-  _this: *mut std::os::raw::c_void,
-  _data: *const std::os::raw::c_void,
+  this: *mut std::os::raw::c_void,
+  data: *const std::os::raw::c_void,
 ) -> usize {
-  0
+  super::snapshot::add_isolate_data(this, data as *const Data)
 }
 
 #[unsafe(no_mangle)]

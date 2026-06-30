@@ -24,6 +24,7 @@ mod runtime;
 mod serializer;
 mod shims;
 mod simdutf;
+mod snapshot;
 mod string;
 mod value;
 mod wasm;
