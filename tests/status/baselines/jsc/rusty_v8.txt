@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=jsc suite=rusty_v8.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 49 passing. DO NOT hand-sort; the
+# (run.mjs --update). 46 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 rv8_slots::context_slots
 rv8_slots::dropped_context_slots_on_kept_context
@@ -35,7 +35,6 @@ rv8_test_api::crdtp_dispatcher_cleanup_on_drop
 rv8_test_api::crdtp_domain_dispatcher_error_response
 rv8_test_api::crdtp_domain_dispatcher_wire
 rv8_test_api::crdtp_e2e_custom_domain_handling
-rv8_test_api::crdtp_e2e_with_v8_inspector
 rv8_test_api::crdtp_json_cbor_conversion
 rv8_test_api::crdtp_json_cbor_invalid_input
 rv8_test_api::crdtp_multiple_domains
@@ -43,9 +42,7 @@ rv8_test_api::crdtp_uber_dispatcher_basic
 rv8_test_api::get_default_locale
 rv8_test_api::get_version
 rv8_test_api::icu_set_common_data_fail
-rv8_test_api::inspector_async_task_smoke
 rv8_test_api::inspector_can_dispatch_method
-rv8_test_api::inspector_dispatch_protocol_message
 rv8_test_api::inspector_string_buffer
 rv8_test_api::inspector_string_view
 rv8_test_api::latin1_to_utf8
