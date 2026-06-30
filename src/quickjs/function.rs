@@ -121,6 +121,7 @@ struct FnTemplate {
   parent: *const FnTemplate,
 
   props: Vec<(JSValue, JSValue, u32)>,
+  accessors: Vec<TemplAccessor>,
 
   cached_proto: JSValue,
 }
@@ -144,6 +145,8 @@ struct DispatchEntry {
   callback: FunctionCallback,
 
   data: JSValue,
+
+  instance: *const ObjTemplate,
 }
 
 thread_local! {
@@ -208,17 +211,31 @@ pub(crate) mod timing {
   }
 }
 
-fn register_dispatch(callback: FunctionCallback, data: JSValue) -> c_int {
+fn register_dispatch(
+  callback: FunctionCallback,
+  data: JSValue,
+  instance: *const ObjTemplate,
+) -> c_int {
   DISPATCH.with(|t| {
     let mut t = t.borrow_mut();
     let idx = t.len() as c_int;
-    t.push(DispatchEntry { callback, data });
+    t.push(DispatchEntry {
+      callback,
+      data,
+      instance,
+    });
     idx
   })
 }
 
-fn lookup_dispatch(idx: c_int) -> Option<(FunctionCallback, JSValue)> {
-  DISPATCH.with(|t| t.borrow().get(idx as usize).map(|e| (e.callback, e.data)))
+fn lookup_dispatch(
+  idx: c_int,
+) -> Option<(FunctionCallback, JSValue, *const ObjTemplate)> {
+  DISPATCH.with(|t| {
+    t.borrow()
+      .get(idx as usize)
+      .map(|e| (e.callback, e.data, e.instance))
+  })
 }
 
 unsafe fn dispatch(
@@ -344,7 +361,7 @@ unsafe extern "C" fn fn_trampoline(
   argv: *mut JSValue,
   magic: c_int,
 ) -> JSValue {
-  let Some((callback, data)) = lookup_dispatch(magic) else {
+  let Some((callback, data, _instance)) = lookup_dispatch(magic) else {
     return jsv_undefined();
   };
   unsafe {
@@ -368,7 +385,7 @@ unsafe extern "C" fn fn_construct_trampoline(
   argv: *mut JSValue,
   magic: c_int,
 ) -> JSValue {
-  let Some((callback, data)) = lookup_dispatch(magic) else {
+  let Some((callback, data, instance)) = lookup_dispatch(magic) else {
     return unsafe { JS_NewObject(ctx) };
   };
 
@@ -409,6 +426,17 @@ unsafe extern "C" fn fn_construct_trampoline(
     }
     JS_FreeValue(ctx, proto);
   }
+
+  if !instance.is_null() {
+    let t = unsafe { &*instance };
+    super::object::set_internal_field_count_for_value(
+      this,
+      t.internal_field_count,
+    );
+    apply_props(ctx, this, &t.props);
+    apply_accessors(ctx, this, &t.accessors);
+  }
+
   let r = unsafe {
     dispatch(ctx, callback, data, this, new_target, true, argc, argv)
   };
@@ -463,12 +491,32 @@ unsafe fn make_function_len(
   length: i32,
   construct: bool,
 ) -> JSValue {
+  unsafe {
+    make_function_len_with_instance(
+      ctx,
+      callback,
+      data,
+      length,
+      construct,
+      ptr::null(),
+    )
+  }
+}
+
+unsafe fn make_function_len_with_instance(
+  ctx: *mut JSContext,
+  callback: FunctionCallback,
+  data: JSValue,
+  length: i32,
+  construct: bool,
+  instance: *const ObjTemplate,
+) -> JSValue {
   let data_owned = if jsv_is_undefined(&data) {
     jsv_undefined()
   } else {
     unsafe { JS_DupValue(ctx, data) }
   };
-  let magic = register_dispatch(callback, data_owned);
+  let magic = register_dispatch(callback, data_owned, instance);
   let cproto = if construct {
     JS_CFUNC_CONSTRUCTOR_OR_FUNC_MAGIC
   } else {
@@ -1092,6 +1140,7 @@ pub extern "C" fn v8__FunctionTemplate__New(
     instance,
     parent: ptr::null(),
     props: Vec::new(),
+    accessors: Vec::new(),
     cached_proto: jsv_undefined(),
   }));
   unsafe { (*instance).parent_fn = t };
@@ -1115,7 +1164,14 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
   let t = unsafe { &*(this as *const FnTemplate) };
 
   let f = unsafe {
-    make_function_len(ctx, t.callback, t.data, t.length, t.constructable)
+    make_function_len_with_instance(
+      ctx,
+      t.callback,
+      t.data,
+      t.length,
+      t.constructable,
+      t.instance,
+    )
   };
 
   if let Some(name) = &t.class_name {
@@ -1135,12 +1191,20 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
   }
 
   apply_props(ctx, f, &t.props);
+  apply_accessors(ctx, f, &t.accessors);
 
   let proto_obj =
     unsafe { build_prototype_object(ctx, this as *const FnTemplate) };
   let proto_dup = unsafe { JS_DupValue(ctx, proto_obj) };
   unsafe {
     JS_SetPropertyStr(ctx, f, c"prototype".as_ptr(), proto_dup);
+    JS_DefinePropertyValueStr(
+      ctx,
+      proto_obj,
+      c"constructor".as_ptr(),
+      JS_DupValue(ctx, f),
+      JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE,
+    );
   }
 
   timing::add(&timing::GETFN_N, &timing::GETFN_T, _tm);
@@ -1204,10 +1268,24 @@ fn apply_props(
     let value = materialize_template_value(ctx, value);
     let v = unsafe { JS_DupValue(ctx, value) };
     unsafe {
-      JS_DefinePropertyValue(ctx, obj, atom, v, JS_PROP_C_W_E);
+      JS_DefinePropertyValue(ctx, obj, atom, v, prop_flags_from_attr(attr));
       JS_FreeAtom(ctx, atom);
     }
   }
+}
+
+fn prop_flags_from_attr(attr: u32) -> c_int {
+  let mut flags = 0;
+  if (attr & 1) == 0 {
+    flags |= JS_PROP_WRITABLE;
+  }
+  if (attr & 2) == 0 {
+    flags |= JS_PROP_ENUMERABLE;
+  }
+  if (attr & 4) == 0 {
+    flags |= JS_PROP_CONFIGURABLE;
+  }
+  flags
 }
 
 fn materialize_template_value(ctx: *mut JSContext, value: JSValue) -> JSValue {
@@ -1296,12 +1374,12 @@ pub extern "C" fn v8__ObjectTemplate__New(
   isolate: *mut RealIsolate,
   templ: *const FunctionTemplate,
 ) -> *const ObjectTemplate {
-  let _ = (isolate, templ);
+  let _ = isolate;
   let t = Box::into_raw(Box::new(ObjTemplate {
     internal_field_count: 0,
     props: Vec::new(),
     accessors: Vec::new(),
-    parent_fn: ptr::null(),
+    parent_fn: templ as *const FnTemplate,
   }));
   register_template(t as usize, TemplKind::Obj);
   t as *const ObjectTemplate
@@ -1320,7 +1398,15 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
   let obj = unsafe { JS_NewObject(ctx) };
   if !this.is_null() {
     let t = unsafe { &*(this as *const ObjTemplate) };
+    super::object::set_internal_field_count_for_value(
+      obj,
+      t.internal_field_count,
+    );
     if !t.parent_fn.is_null() {
+      let _ = v8__FunctionTemplate__GetFunction(
+        t.parent_fn as *const FunctionTemplate,
+        context,
+      );
       let proto_obj = unsafe { build_prototype_object(ctx, t.parent_fn) };
       let dup = unsafe { JS_DupValue(ctx, proto_obj) };
       unsafe { JS_SetPrototype(ctx, obj, dup) };
@@ -1562,12 +1648,23 @@ pub extern "C" fn v8__FunctionCallbackInfo__IsConstructCall(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionTemplate__SetAccessorProperty(
-  _this: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
-  _getter: *const std::os::raw::c_void,
-  _setter: *const std::os::raw::c_void,
-  _attr: crate::PropertyAttribute,
+  this: *const std::os::raw::c_void,
+  key: *const std::os::raw::c_void,
+  getter: *const std::os::raw::c_void,
+  setter: *const std::os::raw::c_void,
+  attr: crate::PropertyAttribute,
 ) {
+  if this.is_null() {
+    return;
+  }
+  let t = unsafe { &mut *(this as *mut FnTemplate) };
+  let key_owned = own_template_value(current_ctx(), jsval_of(key));
+  t.accessors.push(TemplAccessor {
+    key: key_owned,
+    getter: getter as *const FnTemplate,
+    setter: setter as *const FnTemplate,
+    attr: attr.as_u32_lenient(),
+  });
 }
 
 #[unsafe(no_mangle)]
@@ -1607,9 +1704,13 @@ pub extern "C" fn v8__Function__ScriptId(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ObjectTemplate__InternalFieldCount(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  if this.is_null() {
+    return 0;
+  }
+  let t = unsafe { &*(this as *const ObjTemplate) };
+  t.internal_field_count
 }
 
 #[unsafe(no_mangle)]

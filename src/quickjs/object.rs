@@ -1179,11 +1179,40 @@ thread_local! {
     static WRAP_TABLE: std::cell::RefCell<
         std::collections::HashMap<(usize, u16), usize>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+
+    static INTERNAL_FIELDS: std::cell::RefCell<
+        std::collections::HashMap<usize, Vec<JSValue>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+
+    static ALIGNED_FIELDS: std::cell::RefCell<
+        std::collections::HashMap<(usize, crate::support::int, u16), usize>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
 #[inline]
 fn wrap_key(wrapper: *const Object) -> usize {
   unsafe { jsval_of(wrapper).u.ptr as usize }
+}
+
+#[inline]
+fn value_key(v: JSValue) -> usize {
+  unsafe { v.u.ptr as usize }
+}
+
+pub(crate) fn set_internal_field_count_for_value(
+  obj: JSValue,
+  count: crate::support::int,
+) {
+  if count <= 0 || !jsv_is_object(&obj) {
+    return;
+  }
+  let mut fields = Vec::with_capacity(count as usize);
+  for _ in 0..count {
+    fields.push(jsv_undefined());
+  }
+  INTERNAL_FIELDS.with(|t| {
+    t.borrow_mut().insert(value_key(obj), fields);
+  });
 }
 
 #[unsafe(no_mangle)]
@@ -1239,26 +1268,56 @@ pub extern "C" fn v8__Object__IsApiWrapper(this: *const Object) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetAlignedPointerFromInternalField(
-  _this: *const std::os::raw::c_void,
-  _index: crate::support::int,
-  _tag: u16,
+  this: *const std::os::raw::c_void,
+  index: crate::support::int,
+  tag: u16,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  if this.is_null() || index < 0 {
+    return std::ptr::null();
+  }
+  let key = value_key(jsval_of(this));
+  ALIGNED_FIELDS.with(|t| {
+    t.borrow().get(&(key, index, tag)).copied().unwrap_or(0)
+      as *const std::os::raw::c_void
+  })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetInternalField(
-  _this: *const std::os::raw::c_void,
-  _index: crate::support::int,
+  this: *const std::os::raw::c_void,
+  index: crate::support::int,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  if this.is_null() || index < 0 {
+    return std::ptr::null();
+  }
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return std::ptr::null();
+  }
+  let key = value_key(jsval_of(this));
+  INTERNAL_FIELDS.with(|t| {
+    t.borrow()
+      .get(&key)
+      .and_then(|fields| fields.get(index as usize).copied())
+      .map(|v| intern_dup::<crate::Data>(ctx, v) as *const std::os::raw::c_void)
+      .unwrap_or(std::ptr::null())
+  })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__InternalFieldCount(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  if this.is_null() {
+    return 0;
+  }
+  let key = value_key(jsval_of(this));
+  INTERNAL_FIELDS.with(|t| {
+    t.borrow()
+      .get(&key)
+      .map(|fields| fields.len() as crate::support::int)
+      .unwrap_or(0)
+  })
 }
 
 #[unsafe(no_mangle)]
@@ -1276,19 +1335,57 @@ pub extern "C" fn v8__Object__SetAccessor(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetAlignedPointerInInternalField(
-  _this: *const std::os::raw::c_void,
-  _index: crate::support::int,
-  _value: *const std::os::raw::c_void,
-  _tag: u16,
+  this: *const std::os::raw::c_void,
+  index: crate::support::int,
+  value: *const std::os::raw::c_void,
+  tag: u16,
 ) {
+  if this.is_null() || index < 0 {
+    return;
+  }
+  let key = value_key(jsval_of(this));
+  let in_range = INTERNAL_FIELDS.with(|t| {
+    t.borrow()
+      .get(&key)
+      .map(|fields| (index as usize) < fields.len())
+      .unwrap_or(false)
+  });
+  if !in_range {
+    return;
+  }
+  ALIGNED_FIELDS.with(|t| {
+    t.borrow_mut().insert((key, index, tag), value as usize);
+  });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetInternalField(
-  _this: *const std::os::raw::c_void,
-  _index: crate::support::int,
-  _data: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
+  index: crate::support::int,
+  data: *const std::os::raw::c_void,
 ) {
+  if this.is_null() || index < 0 {
+    return;
+  }
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return;
+  }
+  let key = value_key(jsval_of(this));
+  let value = unsafe { JS_DupValue(ctx, jsval_of(data)) };
+  INTERNAL_FIELDS.with(|t| {
+    let mut t = t.borrow_mut();
+    let Some(fields) = t.get_mut(&key) else {
+      unsafe { JS_FreeValue(ctx, value) };
+      return;
+    };
+    let Some(slot) = fields.get_mut(index as usize) else {
+      unsafe { JS_FreeValue(ctx, value) };
+      return;
+    };
+    let old = std::mem::replace(slot, value);
+    unsafe { JS_FreeValue(ctx, old) };
+  });
 }
 
 #[unsafe(no_mangle)]
