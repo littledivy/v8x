@@ -33,6 +33,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::mem::MaybeUninit;
+use std::os::raw::c_int;
 use std::ptr;
 
 use crate::quickjs::core::{
@@ -42,8 +43,8 @@ use crate::quickjs::core::{
 use crate::quickjs::quickjs_sys::*;
 use crate::{
   Context, Data, FixedArray, Function, Message, Module, ModuleRequest, Object,
-  RealIsolate, Script, String as V8String, UnboundModuleScript, UnboundScript,
-  Value,
+  Promise, RealIsolate, Script, String as V8String, UnboundModuleScript,
+  UnboundScript, Value,
 };
 
 use crate::isolate::ModuleImportPhase;
@@ -133,6 +134,8 @@ unsafe fn bc_write(ctx: *mut JSContext, key: u64, obj: JSValue) {
 struct ModuleState {
   status: ModuleStatus,
 
+  script_id: int,
+
   module_def: *mut JSModuleDef,
 
   bytecode: Option<JSValue>,
@@ -182,6 +185,9 @@ thread_local! {
 
     static SYNTHETIC_DEFS: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
 
+    static SYNTHETIC_ALLOWED_EXPORTS: RefCell<HashMap<usize, Vec<std::string::String>>> =
+        RefCell::new(HashMap::new());
+
     static SYNTHETIC_EVAL_STEPS: RefCell<HashMap<usize, (SyntheticModuleEvaluationSteps<'static>, JSValue)>> =
         RefCell::new(HashMap::new());
 
@@ -189,6 +195,16 @@ thread_local! {
 
     static RESOLVED_SPECIFIERS: RefCell<HashMap<(std::string::String, std::string::String), std::string::String>> =
         RefCell::new(HashMap::new());
+
+    static NEXT_SCRIPT_ID: std::cell::Cell<int> = const { std::cell::Cell::new(1) };
+}
+
+fn next_script_id() -> int {
+  NEXT_SCRIPT_ID.with(|c| {
+    let id = c.get();
+    c.set(id.saturating_add(1).max(1));
+    id
+  })
 }
 
 thread_local! {
@@ -267,6 +283,10 @@ thread_local! {
         Option<crate::isolate::RawHostImportModuleDynamicallyCallback>,
     > = const { std::cell::Cell::new(None) };
 
+    static DYN_IMPORT_PHASE_CB: std::cell::Cell<
+        Option<crate::isolate::RawHostImportModuleWithPhaseDynamicallyCallback>,
+    > = const { std::cell::Cell::new(None) };
+
     static DYN_IMPORT_CHAIN: std::cell::Cell<Option<JSValue>> =
         const { std::cell::Cell::new(None) };
 
@@ -283,6 +303,107 @@ pub(crate) fn set_dynamic_import_callback(
 ) {
   DYN_IMPORT_CB.with(|c| c.set(Some(cb)));
   unsafe { JS_SetDynamicImportHook(dynamic_import_hook) };
+}
+
+pub(crate) fn set_dynamic_import_phase_callback(
+  cb: crate::isolate::RawHostImportModuleWithPhaseDynamicallyCallback,
+) {
+  DYN_IMPORT_PHASE_CB.with(|c| c.set(Some(cb)));
+}
+
+pub(crate) fn rewrite_import_source_script(
+  source: &str,
+) -> Option<std::string::String> {
+  source
+    .contains("import.source(")
+    .then(|| source.replace("import.source(", "__v8_import_source__("))
+}
+
+unsafe extern "C" fn dynamic_import_source_fn(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  let Some(cb) = DYN_IMPORT_PHASE_CB.with(|c| c.get()) else {
+    return unsafe {
+      JS_ThrowTypeError(ctx, c"import.source: no host callback".as_ptr())
+    };
+  };
+  if argc < 1 || argv.is_null() {
+    return unsafe {
+      JS_ThrowTypeError(ctx, c"import.source: missing specifier".as_ptr())
+    };
+  }
+
+  let context = intern_ctx(ctx);
+  let host_opts = intern::<Data>(jsv_undefined());
+  let referrer = intern::<Value>(jsv_undefined());
+  let spec_handle = unsafe { intern_dup::<V8String>(ctx, *argv) };
+  let attrs_handle = intern::<FixedArray>(unsafe { JS_NewArray(ctx) });
+  let (Some(ctx_l), Some(ho_l), Some(ref_l), Some(spec_l), Some(attr_l)) = (
+    unsafe { crate::Local::from_raw(context) },
+    unsafe { crate::Local::from_raw(host_opts) },
+    unsafe { crate::Local::from_raw(referrer) },
+    unsafe { crate::Local::from_raw(spec_handle) },
+    unsafe { crate::Local::from_raw(attrs_handle) },
+  ) else {
+    return unsafe {
+      JS_ThrowTypeError(ctx, c"import.source: handle alloc failed".as_ptr())
+    };
+  };
+
+  let promise_ptr = unsafe {
+    cb(
+      ctx_l,
+      ho_l,
+      ref_l,
+      spec_l,
+      ModuleImportPhase::kSource,
+      attr_l,
+    )
+  };
+  if promise_ptr.is_null() {
+    if unsafe { JS_HasException(ctx) } {
+      return make_value(JS_TAG_EXCEPTION, JSValueUnion { int32: 0 });
+    }
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"import.source: host callback returned null".as_ptr(),
+      )
+    };
+  }
+  unsafe { JS_DupValue(ctx, jsval_of(promise_ptr as *const Promise)) }
+}
+
+pub(crate) unsafe fn install_import_source_helper(ctx: *mut JSContext) {
+  if ctx.is_null() {
+    return;
+  }
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let existing =
+    unsafe { JS_GetPropertyStr(ctx, global, c"__v8_import_source__".as_ptr()) };
+  if !jsv_is_undefined(&existing) {
+    unsafe {
+      JS_FreeValue(ctx, existing);
+      JS_FreeValue(ctx, global);
+    }
+    return;
+  }
+  unsafe { JS_FreeValue(ctx, existing) };
+  let f = unsafe {
+    JS_NewCFunction(
+      ctx,
+      dynamic_import_source_fn,
+      c"__v8_import_source__".as_ptr(),
+      1,
+    )
+  };
+  unsafe {
+    JS_SetPropertyStr(ctx, global, c"__v8_import_source__".as_ptr(), f);
+    JS_FreeValue(ctx, global);
+  }
 }
 
 // Flatten QuickJS's null-proto `with` attributes object (e.g. {type:"json"})
@@ -1272,7 +1393,7 @@ unsafe fn build_resolution_map(
   cb: ResolveModuleCallback,
   source_cb: Option<ResolveSourceCallback>,
   root: *const Module,
-) {
+) -> bool {
   use std::collections::HashSet;
   let mut visited: HashSet<usize> = HashSet::new();
   let mut stack: Vec<*const Module> = vec![root];
@@ -1280,13 +1401,18 @@ unsafe fn build_resolution_map(
     if !visited.insert(handle_key(m)) {
       continue;
     }
-    let Some((base, specs, src_imports)) = with_module_state(m, |st| {
-      (
-        st.source_name.clone(),
-        st.import_specifiers.clone(),
-        st.source_imports.clone(),
-      )
-    }) else {
+    let Some((base, specs, attrs, offsets, source_text, src_imports)) =
+      with_module_state(m, |st| {
+        (
+          st.source_name.clone(),
+          st.import_specifiers.clone(),
+          st.import_attributes.clone(),
+          st.import_offsets.clone(),
+          st.source_text.clone(),
+          st.source_imports.clone(),
+        )
+      })
+    else {
       continue;
     };
 
@@ -1295,7 +1421,7 @@ unsafe fn build_resolution_map(
         unsafe { resolve_source_import(ctx, context, scb, m, *id, spec) };
       }
     }
-    for (spec, _ty) in specs {
+    for (si, (spec, _ty)) in specs.into_iter().enumerate() {
       let Ok(cspec) = CString::new(spec.as_str()) else {
         continue;
       };
@@ -1306,7 +1432,15 @@ unsafe fn build_resolution_map(
         continue;
       }
       let spec_handle = intern::<V8String>(sval);
-      let attrs_handle = intern::<FixedArray>(unsafe { JS_NewArray(ctx) });
+      let attr_val = unsafe {
+        build_import_attributes_array(
+          ctx,
+          &source_text,
+          offsets.get(si).copied().unwrap_or(0),
+          attrs.get(si).map(Vec::as_slice).unwrap_or(&[]),
+        )
+      };
+      let attrs_handle = intern::<FixedArray>(attr_val);
       if spec_handle.is_null() || attrs_handle.is_null() {
         continue;
       }
@@ -1329,18 +1463,62 @@ unsafe fn build_resolution_map(
 
       let resolved: *const Module = unsafe { std::mem::transmute(ret) };
       if resolved.is_null() {
-        continue;
+        return false;
       }
-      if let Some(rname) =
-        with_module_state(resolved, |st| st.source_name.clone())
-      {
-        if !rname.is_empty() && rname != spec {
+      if let Some((rname, rsource)) = with_module_state(resolved, |st| {
+        (st.source_name.clone(), st.source_text.clone())
+      }) {
+        if !rsource.is_empty() {
+          // QuickJS's loader asks for a module by the import specifier. V8's
+          // callback returns a concrete Module object, so make that object's
+          // source available under the specifier to preserve callback identity
+          // even when multiple returned modules share the same ScriptOrigin.
+          register_module_source(&spec, &rsource);
+          record_resolved_specifier(&base, &spec, &rname);
+        } else if !rname.is_empty() && rname != spec {
           record_resolved_specifier(&base, &spec, &rname);
         }
         stack.push(resolved);
       }
     }
   }
+  true
+}
+
+unsafe fn build_import_attributes_array(
+  ctx: *mut JSContext,
+  source_text: &str,
+  spec_offset: i32,
+  pairs: &[(std::string::String, std::string::String)],
+) -> JSValue {
+  let arr = unsafe { JS_NewArray(ctx) };
+  if arr.tag == JS_TAG_EXCEPTION {
+    return arr;
+  }
+  let mut out = 0u32;
+  let tail_start = (spec_offset.max(0) as usize).min(source_text.len());
+  for (key, value) in pairs {
+    if let (Ok(ck), Ok(cv)) =
+      (CString::new(key.as_str()), CString::new(value.as_str()))
+    {
+      let source_offset = source_text[tail_start..]
+        .find(key)
+        .map(|rel| (tail_start + rel) as i32)
+        .unwrap_or(0);
+      unsafe {
+        JS_SetPropertyUint32(ctx, arr, out, JS_NewString(ctx, ck.as_ptr()));
+        JS_SetPropertyUint32(ctx, arr, out + 1, JS_NewString(ctx, cv.as_ptr()));
+        JS_SetPropertyUint32(
+          ctx,
+          arr,
+          out + 2,
+          JS_NewInt32(ctx, source_offset),
+        );
+      }
+      out += 3;
+    }
+  }
+  arr
 }
 
 unsafe fn resolve_source_import(
@@ -1761,6 +1939,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   let is_async = has_top_level_await(&text);
 
   register_module_source(&fname, &text);
+  super::core::register_script_source(&fname, &text);
   note_main_module(&fname);
   if std::env::var_os("QJS_DEBUG_MOD").is_some() {
     eprintln!("[QJS CompileModule] {fname} imports={import_specifiers:?}");
@@ -1785,6 +1964,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
     this,
     ModuleState {
       status: ModuleStatus::Uninstantiated,
+      script_id: next_script_id(),
       module_def: ptr::null_mut(),
       bytecode: None,
       import_specifiers,
@@ -2154,12 +2334,32 @@ pub extern "C" fn v8__Module__GetModuleRequests(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__SourceOffsetToLocation(
-  _this: *const Module,
-  _offset: int,
+  this: *const Module,
+  offset: int,
   out: *mut Location,
 ) {
   if !out.is_null() {
-    unsafe { ptr::write_bytes(out as *mut u8, 0u8, size_of::<Location>()) };
+    let (line, col) = with_module_state(this, |m| {
+      let target = offset.max(0) as usize;
+      let mut line = 0i32;
+      let mut line_start = 0usize;
+      for (idx, b) in m.source_text.as_bytes().iter().enumerate() {
+        if idx >= target {
+          break;
+        }
+        if *b == b'\n' {
+          line += 1;
+          line_start = idx + 1;
+        }
+      }
+      (line, target.saturating_sub(line_start) as i32)
+    })
+    .unwrap_or((0, 0));
+    unsafe {
+      let p = out as *mut i32;
+      *p = line;
+      *p.add(1) = col;
+    }
   }
 }
 
@@ -2390,18 +2590,14 @@ pub extern "C" fn v8__Module__InstantiateModule(
   }
   let ctx = ctx_of(context);
   if !ctx.is_null() {
-    unsafe { build_resolution_map(ctx, context, cb, source_callback, this) };
+    let resolved =
+      unsafe { build_resolution_map(ctx, context, cb, source_callback, this) };
+    if !resolved {
+      return MaybeBool::Nothing;
+    }
 
-    if let Some(scb) = source_callback {
-      let pending: Vec<_> =
-        PENDING_SOURCE_IMPORTS.with(|p| p.borrow_mut().drain(..).collect());
-      for (referrer, imports) in pending {
-        for (id, spec) in &imports {
-          unsafe {
-            resolve_source_import(ctx, context, scb, referrer, *id, spec)
-          };
-        }
-      }
+    if source_callback.is_some() {
+      PENDING_SOURCE_IMPORTS.with(|p| p.borrow_mut().clear());
     }
   }
 
@@ -2476,6 +2672,16 @@ pub extern "C" fn v8__Module__Evaluate(
   } else {
     None
   };
+
+  if with_module_state(this, |m| m.synthetic).unwrap_or(false) {
+    if let Some(def) =
+      SYNTHETIC_DEFS.with(|t| t.borrow().get(&handle_key(this)).copied())
+    {
+      unsafe { run_synthetic_eval_steps(ctx, def as *mut JSModuleDef) };
+    }
+    with_module_state(this, |m| m.status = ModuleStatus::Evaluated);
+    return make_resolved_promise(ctx);
+  }
 
   let already_evaluated = with_module_state(this, |m| {
     if !m.module_def.is_null() {
@@ -2796,6 +3002,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   if def.is_null() {
     return ptr::null();
   }
+  let mut allowed_exports = Vec::new();
   if !export_names_raw.is_null() {
     for i in 0..export_names_len {
       let n = unsafe { *export_names_raw.add(i) };
@@ -2803,8 +3010,9 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
         continue;
       }
       let s = unsafe { jsval_to_rust(ctx, jsval_of(n)) };
-      if let Ok(c) = CString::new(s) {
+      if let Ok(c) = CString::new(s.clone()) {
         unsafe { JS_AddModuleExport(ctx, def, c.as_ptr()) };
+        allowed_exports.push(s);
       }
     }
   }
@@ -2828,6 +3036,9 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   SYNTHETIC_DEFS.with(|t| {
     t.borrow_mut().insert(handle_key(this), def as usize);
   });
+  SYNTHETIC_ALLOWED_EXPORTS.with(|t| {
+    t.borrow_mut().insert(def as usize, allowed_exports);
+  });
 
   let steps: SyntheticModuleEvaluationSteps<'static> =
     unsafe { std::mem::transmute(evaluation_steps) };
@@ -2839,7 +3050,8 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   record_module_state(
     this,
     ModuleState {
-      status: ModuleStatus::Instantiated,
+      status: ModuleStatus::Uninstantiated,
+      script_id: 0,
       module_def: def,
       bytecode: None,
       import_specifiers: Vec::new(),
@@ -2936,6 +3148,22 @@ pub extern "C" fn v8__Module__SetSyntheticModuleExport(
   };
   let name = unsafe { jsval_to_rust(ctx, jsval_of(export_name)) };
 
+  let allowed = SYNTHETIC_ALLOWED_EXPORTS.with(|t| {
+    t.borrow()
+      .get(&(def as usize))
+      .map(|names| names.iter().any(|n| n == &name))
+      .unwrap_or(false)
+  });
+  if !allowed {
+    unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"synthetic module export name is not declared".as_ptr(),
+      )
+    };
+    return MaybeBool::Nothing;
+  }
+
   let val = unsafe { JS_DupValue(ctx, jsval_of(export_value)) };
   if std::env::var_os("QJS_DEBUG_MOD").is_some() {
     eprintln!("[QJS SetSyntheticExport] def={def:?} name={name}");
@@ -2972,7 +3200,7 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
   // Resolve `this` module's underlying QuickJS def. After evaluation the def is
   // recorded in ModuleState; fall back to the by-name cache for paths that only
   // populate it there.
-  let (def, source_name) = with_module_state(this, |m| {
+  let (def, source_name, source_text) = with_module_state(this, |m| {
     let def = if !m.module_def.is_null() {
       m.module_def
     } else {
@@ -2981,9 +3209,13 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
         .map(|d| d as *mut JSModuleDef)
         .unwrap_or(ptr::null_mut())
     };
-    (def, m.source_name.clone())
+    (def, m.source_name.clone(), m.source_text.clone())
   })
-  .unwrap_or((ptr::null_mut(), std::string::String::new()));
+  .unwrap_or((
+    ptr::null_mut(),
+    std::string::String::new(),
+    std::string::String::new(),
+  ));
 
   // Only a module still parked in EVALUATING_ASYNC has an unresolved top-level
   // await. A resolved TLA advances the module to EVALUATED; deno only reaches
@@ -2994,7 +3226,7 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
     return 0;
   }
 
-  let message = build_stalled_tla_message(ctx, &source_name);
+  let message = build_stalled_tla_message(ctx, &source_name, &source_text);
   if message.is_null() {
     return 0;
   }
@@ -3014,8 +3246,9 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
 fn build_stalled_tla_message(
   ctx: *mut JSContext,
   source_name: &str,
+  source_text: &str,
 ) -> *const Message {
-  let factory_src = c"(file)=>{const o={fileName:file,lineNumber:1,columnNumber:0};o.toString=()=>\"Top-level await promise never resolved\";return o;}";
+  let factory_src = c"(file,line)=>{const o={fileName:file,lineNumber:1,columnNumber:0,sourceLine:line};o.toString=()=>\"Top-level await promise never resolved\";return o;}";
   let factory = unsafe {
     JS_Eval(
       ctx,
@@ -3030,11 +3263,16 @@ fn build_stalled_tla_message(
     return ptr::null();
   }
   let file = CString::new(source_name).unwrap_or_default();
-  let mut arg = [unsafe { JS_NewString(ctx, file.as_ptr()) }];
+  let line = source_text.lines().next().unwrap_or(source_text);
+  let line = CString::new(line).unwrap_or_default();
+  let mut arg = [unsafe { JS_NewString(ctx, file.as_ptr()) }, unsafe {
+    JS_NewString(ctx, line.as_ptr())
+  }];
   let obj =
-    unsafe { JS_Call(ctx, factory, jsv_undefined(), 1, arg.as_mut_ptr()) };
+    unsafe { JS_Call(ctx, factory, jsv_undefined(), 2, arg.as_mut_ptr()) };
   unsafe {
     JS_FreeValue(ctx, arg[0]);
+    JS_FreeValue(ctx, arg[1]);
     JS_FreeValue(ctx, factory);
   }
   if obj.tag == JS_TAG_EXCEPTION {
@@ -3178,16 +3416,16 @@ pub extern "C" fn v8__ModuleRequest__GetImportAttributes(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__IsSourceTextModule(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  with_module_state(this as *const Module, |m| !m.synthetic).unwrap_or(false)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__ScriptId(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  with_module_state(this as *const Module, |m| m.script_id).unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]

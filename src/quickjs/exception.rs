@@ -846,8 +846,24 @@ pub extern "C" fn v8__Message__GetSourceLine(
   this: *const Message,
   context: *const Context,
 ) -> *const String {
-  let _ = (this, context);
-  ptr::null()
+  let ctx = ctx_of(context);
+  if ctx.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let line =
+    unsafe { JS_GetPropertyStr(ctx, jsval_of(this), c"sourceLine".as_ptr()) };
+  if line.tag == JS_TAG_EXCEPTION
+    || jsv_is_undefined(&line)
+    || jsv_is_null(&line)
+  {
+    if line.tag == JS_TAG_EXCEPTION {
+      unsafe { JS_FreeValue(ctx, JS_GetException(ctx)) };
+    } else {
+      unsafe { JS_FreeValue(ctx, line) };
+    }
+    return ptr::null();
+  }
+  intern::<String>(line)
 }
 
 #[unsafe(no_mangle)]

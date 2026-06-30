@@ -58,11 +58,13 @@ struct ModJSClassDefinition {
 struct SyntheticModule {
   ctx: JSGlobalContextRef,
   status: ModuleStatus,
+  script_id: int,
   export_names: Vec<std::string::String>,
 
   eval_steps: Option<SyntheticModuleEvaluationSteps<'static>>,
 
   source: Option<std::string::String>,
+  source_text: std::string::String,
 
   // The `//# sourceMappingURL=` magic-comment value (if any), extracted from the
   // original module source at compile. deno reads this via
@@ -356,12 +358,26 @@ thread_local! {
         Option<crate::isolate::RawHostImportModuleDynamicallyCallback>,
     > = const { std::cell::Cell::new(None) };
 
+    static DYN_IMPORT_PHASE_CB: std::cell::Cell<
+        Option<crate::isolate::RawHostImportModuleWithPhaseDynamicallyCallback>,
+    > = const { std::cell::Cell::new(None) };
+
+    static NEXT_SCRIPT_ID: std::cell::Cell<int> = const { std::cell::Cell::new(1) };
+
     // Maps a native JSC record pointer -> deno Module wrapper, so the import.meta
     // hook (moduleLoaderCreateImportMetaProperties) can find the module and route
     // to deno's import_meta_cb (url/main/resolve).
     static NATIVE_RECORD_MAP: std::cell::RefCell<
         std::collections::HashMap<usize, *const Module>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn next_script_id() -> int {
+  NEXT_SCRIPT_ID.with(|c| {
+    let id = c.get();
+    c.set(id.saturating_add(1).max(1));
+    id
+  })
 }
 
 /// `import.meta` for a native module. JSC's moduleLoaderCreateImportMetaProperties
@@ -405,6 +421,12 @@ pub(crate) fn set_dynamic_import_callback(
   cb: crate::isolate::RawHostImportModuleDynamicallyCallback,
 ) {
   DYN_IMPORT_CB.with(|c| c.set(Some(cb)));
+}
+
+pub(crate) fn set_dynamic_import_phase_callback(
+  cb: crate::isolate::RawHostImportModuleWithPhaseDynamicallyCallback,
+) {
+  DYN_IMPORT_PHASE_CB.with(|c| c.set(Some(cb)));
 }
 
 /// Called from the WebKit patch (JSAPIGlobalObject::moduleLoaderImportModule)
@@ -645,6 +667,83 @@ unsafe extern "C" fn dynamic_import_js_cb(
   )
 }
 
+unsafe extern "C" fn dynamic_import_source_js_cb(
+  ctx: JSContextRef,
+  _function: JSObjectRef,
+  _this: JSObjectRef,
+  argc: usize,
+  argv: *const JSValueRef,
+  exception: *mut JSValueRef,
+) -> JSValueRef {
+  crate::jsc::core::ffi_guard(
+    || unsafe {
+      let Some(cb) = DYN_IMPORT_PHASE_CB.with(|c| c.get()) else {
+        if !exception.is_null() {
+          *exception =
+            make_generic_error(ctx, "import.source: no host callback");
+        }
+        return JSValueMakeUndefined(ctx);
+      };
+      if argc < 1 || argv.is_null() {
+        if !exception.is_null() {
+          *exception =
+            make_generic_error(ctx, "import.source: missing specifier");
+        }
+        return JSValueMakeUndefined(ctx);
+      }
+      let spec_handle = intern_ctx::<V8String>(ctx, *argv);
+      let undef = JSValueMakeUndefined(ctx);
+      let host_opts = intern_ctx::<Data>(ctx, undef);
+      let referrer = intern_ctx::<Value>(ctx, undef);
+      let mut exc: JSValueRef = ptr::null();
+      let attrs = JSObjectMakeArray(ctx, 0, ptr::null(), &mut exc);
+      if attrs.is_null() {
+        if !exception.is_null() {
+          *exception =
+            make_generic_error(ctx, "import.source: attributes alloc failed");
+        }
+        return JSValueMakeUndefined(ctx);
+      }
+      let attrs_handle = intern_ctx::<FixedArray>(ctx, attrs as JSValueRef);
+      let Some(ctx_l) = crate::Local::from_raw(ctx as *const Context) else {
+        return JSValueMakeUndefined(ctx);
+      };
+      let Some(ho_l) = crate::Local::from_raw(host_opts) else {
+        return JSValueMakeUndefined(ctx);
+      };
+      let Some(ref_l) = crate::Local::from_raw(referrer) else {
+        return JSValueMakeUndefined(ctx);
+      };
+      let Some(spec_l) = crate::Local::from_raw(spec_handle) else {
+        return JSValueMakeUndefined(ctx);
+      };
+      let Some(attr_l) = crate::Local::from_raw(attrs_handle) else {
+        return JSValueMakeUndefined(ctx);
+      };
+      let promise = cb(
+        ctx_l,
+        ho_l,
+        ref_l,
+        spec_l,
+        ModuleImportPhase::kSource,
+        attr_l,
+      );
+      if promise.is_null() {
+        if !exception.is_null() {
+          *exception = make_generic_error(
+            ctx,
+            "import.source: host callback returned null",
+          );
+        }
+        JSValueMakeUndefined(ctx)
+      } else {
+        jsval(promise as *const Value)
+      }
+    },
+    || unsafe { JSValueMakeUndefined(ctx) },
+  )
+}
+
 /// Install `globalThis.__v82jsc_dynamicImport` on a context. Called for every
 /// context the embedder creates (see core.rs).
 pub(crate) unsafe fn install_dynamic_import_global(gctx: JSGlobalContextRef) {
@@ -668,7 +767,34 @@ pub(crate) unsafe fn install_dynamic_import_global(gctx: JSGlobalContextRef) {
       ptr::null_mut(),
     );
     JSStringRelease(name);
+
+    let source_name =
+      JSStringCreateWithUTF8CString(c"__v82jsc_importSource".as_ptr());
+    let source_f = JSObjectMakeFunctionWithCallback(
+      gctx,
+      source_name,
+      Some(dynamic_import_source_js_cb),
+    );
+    if !source_f.is_null() {
+      JSObjectSetProperty(
+        gctx,
+        global,
+        source_name,
+        source_f as JSValueRef,
+        2,
+        ptr::null_mut(),
+      );
+    }
+    JSStringRelease(source_name);
   }
+}
+
+pub(crate) fn rewrite_import_source_script(
+  source: &str,
+) -> Option<std::string::String> {
+  source
+    .contains("import.source(")
+    .then(|| source.replace("import.source(", "__v82jsc_importSource("))
 }
 
 /// Rewrite dynamic `import(` call sites to `__v82jsc_dynImport(` (a per-module
@@ -759,6 +885,30 @@ unsafe fn eval_value_as_script(
     return ptr::null();
   }
   let mut exc: JSValueRef = ptr::null();
+  let source_text = unsafe { jsstring_to_rust(ctx, source_val) };
+
+  if let Some(rewritten) = rewrite_import_source_script(&source_text) {
+    if let Ok(cstr) = std::ffi::CString::new(rewritten) {
+      let js_src = unsafe { JSStringCreateWithUTF8CString(cstr.as_ptr()) };
+      let src_url_cstr =
+        source_url.and_then(|u| std::ffi::CString::new(u).ok());
+      let src_url_js = src_url_cstr
+        .as_ref()
+        .map(|c| unsafe { JSStringCreateWithUTF8CString(c.as_ptr()) })
+        .unwrap_or(ptr::null_mut());
+      let result = unsafe {
+        JSEvaluateScript(ctx, js_src, ptr::null_mut(), src_url_js, 1, &mut exc)
+      };
+      unsafe { JSStringRelease(js_src) };
+      if !src_url_js.is_null() {
+        unsafe { JSStringRelease(src_url_js) };
+      }
+      if result.is_null() && !exc.is_null() {
+        unsafe { crate::jsc::core::record_pending_exception(ctx, exc) };
+      }
+      return result;
+    }
+  }
 
   // System JavaScriptCore has NO `moduleLoaderImportModule` hook — that is the
   // vendored-only WebKit C++ patch — so a plain-script `import()` evaluated via
@@ -777,7 +927,7 @@ unsafe fn eval_value_as_script(
   // same global context can't trip a lexical redeclaration error.
   #[cfg(not(feature = "vendor_jsc"))]
   {
-    let src = unsafe { jsstring_to_rust(ctx, source_val) };
+    let src = source_text.clone();
     let rewritten = rewrite_dynamic_import_calls(&src);
     if rewritten != src {
       let referrer = source_url.unwrap_or("");
@@ -955,7 +1105,16 @@ pub extern "C" fn v8__Script__Compile(
   let name = unsafe { origin_resource_name(ctx, origin) };
   unsafe {
     let mut exc: JSValueRef = ptr::null();
-    let src_str = JSValueToStringCopy(ctx, src_val, &mut exc);
+    let source_text = jsstring_to_rust(ctx, src_val);
+    let rewritten = rewrite_import_source_script(&source_text);
+    let src_str = if let Some(ref rewritten) = rewritten {
+      match std::ffi::CString::new(rewritten.as_str()) {
+        Ok(c) => JSStringCreateWithUTF8CString(c.as_ptr()),
+        Err(_) => ptr::null_mut(),
+      }
+    } else {
+      JSValueToStringCopy(ctx, src_val, &mut exc)
+    };
     if src_str.is_null() {
       return ptr::null();
     }
@@ -1363,9 +1522,11 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
         let state = Box::new(SyntheticModule {
           ctx: gctx,
           status: ModuleStatus::Uninstantiated,
+          script_id: next_script_id(),
           export_names: Vec::new(),
           eval_steps: None,
           source: None,
+          source_text: text.clone(),
           source_map_url: extract_source_mapping_url(&text),
           import_offsets: compute_import_offsets(&text, &specs),
           import_attributes: compute_import_attributes(&text, &specs),
@@ -1432,9 +1593,11 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
     let state = Box::new(SyntheticModule {
       ctx: gctx,
       status: ModuleStatus::Uninstantiated,
+      script_id: next_script_id(),
       export_names: rewrite.export_names,
       eval_steps: None,
       source: Some(rewrite.body),
+      source_text: text.clone(),
       source_map_url: extract_source_mapping_url(&text),
       import_offsets: compute_import_offsets(&text, &rewrite.imports),
       import_attributes: compute_import_attributes(&text, &rewrite.imports),
@@ -2653,12 +2816,33 @@ pub extern "C" fn v8__Module__GetModuleRequests(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__SourceOffsetToLocation(
-  _this: *const Module,
-  _offset: int,
+  this: *const Module,
+  offset: int,
   out: *mut Location,
 ) {
-  if !out.is_null() {
-    unsafe { ptr::write_bytes(out as *mut u8, 0u8, size_of::<Location>()) };
+  if out.is_null() {
+    return;
+  }
+  let mut line = 0i32;
+  let mut column = 0i32;
+  if let Some(m) = module_state(this) {
+    let target = offset.max(0) as usize;
+    for (i, ch) in m.source_text.char_indices() {
+      if i >= target {
+        break;
+      }
+      if ch == '\n' {
+        line += 1;
+        column = 0;
+      } else {
+        column += 1;
+      }
+    }
+  }
+  unsafe {
+    let p = out as *mut i32;
+    *p = line;
+    *p.add(1) = column;
   }
 }
 
@@ -2780,11 +2964,13 @@ pub extern "C" fn v8__Module__InstantiateModule(
   let specs = m.import_specifiers.clone();
 
   let mut deps: Vec<*const Module> = Vec::new();
+  let mut ok = true;
   for spec in &specs {
     crate::jsc::core::restore_current(iso);
     let dep = unsafe { resolve_dependency(context, cb, this, spec, 0) };
     if dep.is_null() {
-      continue;
+      ok = false;
+      break;
     }
 
     if let Some(dm) = module_state(dep) {
@@ -2798,9 +2984,23 @@ pub extern "C" fn v8__Module__InstantiateModule(
   crate::jsc::core::restore_current(iso);
   if let Some(m) = module_state(this) {
     m.dependencies = deps;
-    m.status = ModuleStatus::Instantiated;
+    m.status = if ok {
+      ModuleStatus::Instantiated
+    } else {
+      ModuleStatus::Errored
+    };
   }
-  MaybeBool::JustTrue
+  if ok {
+    MaybeBool::JustTrue
+  } else {
+    unsafe {
+      if crate::jsc::core::peek_pending_exception(current_iso()).is_null() {
+        let e = make_generic_error(ctx, "module instantiation failed");
+        crate::jsc::core::record_pending_exception(ctx, e);
+      }
+    }
+    MaybeBool::Nothing
+  }
 }
 
 unsafe fn resolve_dependency(
@@ -3453,7 +3653,9 @@ pub extern "C" fn v8__Module__IsGraphAsync(this: *const Module) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__IsSyntheticModule(this: *const Module) -> bool {
-  module_state(this).is_some()
+  module_state(this)
+    .map(|m| m.eval_steps.is_some())
+    .unwrap_or(false)
 }
 
 #[unsafe(no_mangle)]
@@ -3545,9 +3747,11 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   let state = Box::new(SyntheticModule {
     ctx: gctx,
     status: ModuleStatus::Uninstantiated,
+    script_id: 0,
     export_names: names,
     eval_steps: Some(steps),
     source: None,
+    source_text: std::string::String::new(),
     source_map_url: None,
     import_offsets: Vec::new(),
     import_attributes: Vec::new(),
@@ -3584,6 +3788,13 @@ pub extern "C" fn v8__Module__SetSyntheticModuleExport(
   if key.is_null() {
     return MaybeBool::JustFalse;
   }
+  let name_str = unsafe { jsstring_to_rust(ctx, name_v) };
+  if !m.export_names.iter().any(|n| n == &name_str) {
+    unsafe { JSStringRelease(key) };
+    let e = make_generic_error(ctx, "Synthetic module export is not declared");
+    unsafe { crate::jsc::core::record_pending_exception(ctx, e) };
+    return MaybeBool::Nothing;
+  }
   unsafe {
     JSObjectSetProperty(ctx, m.namespace, key, val, 0, &mut exc);
     JSStringRelease(key);
@@ -3593,7 +3804,6 @@ pub extern "C" fn v8__Module__SetSyntheticModuleExport(
   // environment so native ESM importers see the value (live binding).
   #[cfg(feature = "vendor_jsc")]
   if !m.native.is_null() {
-    let name_str = unsafe { jsstring_to_rust(ctx, name_v) };
     if let Ok(cname) = std::ffi::CString::new(name_str) {
       unsafe {
         v82jsc_synthetic_set_export(ctx, m.native, cname.as_ptr(), val)
@@ -3819,16 +4029,20 @@ pub extern "C" fn v8__UnboundScript__GetSourceMappingURL(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__IsSourceTextModule(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  module_state(this as *const Module)
+    .map(|m| m.eval_steps.is_none())
+    .unwrap_or(false)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__ScriptId(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  module_state(this as *const Module)
+    .map(|m| m.script_id)
+    .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]

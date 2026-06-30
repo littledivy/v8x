@@ -545,6 +545,8 @@ struct RawStartupDataAbi {
   raw_size: std::os::raw::c_int,
 }
 
+pub(crate) static SNAPSHOT_MARKER: &[u8] = b"v82jsc-jsc-snapshot\0";
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__CONSTRUCT(
   _buf: *mut c_void,
@@ -568,8 +570,8 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
   _function_code_handling: u32,
 ) -> RawStartupDataAbi {
   RawStartupDataAbi {
-    data: ptr::null(),
-    raw_size: 0,
+    data: SNAPSHOT_MARKER.as_ptr() as *const c_char,
+    raw_size: SNAPSHOT_MARKER.len() as std::os::raw::c_int,
   }
 }
 
@@ -604,7 +606,11 @@ pub extern "C" fn v8__StartupData__CanBeRehashed(_this: *const c_void) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StartupData__IsValid(_this: *const c_void) -> bool {
-  false
+  if _this.is_null() {
+    return false;
+  }
+  let data = unsafe { &*(_this as *const crate::snapshot::RawStartupData) };
+  !data.data.is_null() && data.raw_size > 0
 }
 
 #[unsafe(no_mangle)]

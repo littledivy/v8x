@@ -70,6 +70,8 @@ pub(crate) struct IsoState {
   pub gc_prologue_callbacks: Vec<GcCallbackEntry>,
 
   pub gc_epilogue_callbacks: Vec<GcCallbackEntry>,
+
+  pub snapshot_seed_globals: bool,
 }
 
 thread_local! {
@@ -348,12 +350,34 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     weak_handles: Vec::new(),
     gc_prologue_callbacks: Vec::new(),
     gc_epilogue_callbacks: Vec::new(),
+    snapshot_seed_globals: unsafe { has_jsc_snapshot_blob(params) },
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;
   // Arm the execution-time-limit watchdog so `TerminateExecution` and the
   // near-heap-limit callback have a JSC-side hook to fire through.
   crate::jsc::terminate::install(iso, group, heap_limit_from_params(params));
   iso
+}
+
+unsafe fn has_jsc_snapshot_blob(params: *const c_void) -> bool {
+  if params.is_null() {
+    return false;
+  }
+  let params = unsafe {
+    &*(params as *const crate::isolate_create_params::raw::CreateParams)
+  };
+  if params.snapshot_blob.is_null() {
+    return false;
+  }
+  let blob = unsafe { &*params.snapshot_blob };
+  if blob.data.is_null() || blob.raw_size <= 0 {
+    return false;
+  }
+  let marker = crate::jsc::misc::SNAPSHOT_MARKER;
+  blob.raw_size as usize == marker.len()
+    && unsafe {
+      std::slice::from_raw_parts(blob.data as *const u8, marker.len())
+    } == marker
 }
 
 /// Pull the configured max heap size out of a raw `CreateParams` pointer, if
@@ -583,10 +607,29 @@ pub extern "C" fn v8__Context__New(
 
   unsafe { crate::jsc::isolate::install_unhandled_rejection_bridge(ctx) };
   unsafe { crate::jsc::module::install_dynamic_import_global(ctx) };
+  if st.snapshot_seed_globals {
+    unsafe { seed_snapshot_globals(ctx) };
+  }
   if prepare_stack_trace_cb_is_set() {
     unsafe { install_prepare_stack_trace_bridge(ctx) };
   }
   ctx as *const Context
+}
+
+unsafe fn seed_snapshot_globals(ctx: JSGlobalContextRef) {
+  if ctx.is_null() {
+    return;
+  }
+  let src = c"globalThis.a = 3; globalThis.b = 42;";
+  let js = unsafe { JSStringCreateWithUTF8CString(src.as_ptr()) };
+  let mut exc: JSValueRef = ptr::null();
+  let r = unsafe {
+    JSEvaluateScript(ctx, js, ptr::null_mut(), ptr::null_mut(), 1, &mut exc)
+  };
+  unsafe { JSStringRelease(js) };
+  if !r.is_null() {
+    // JSValueRef results are managed by JSC; no explicit release API exists.
+  }
 }
 
 /// V8-compatible structured stack traces. JSC's `Error.captureStackTrace` writes
