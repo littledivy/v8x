@@ -260,6 +260,7 @@ unsafe extern "C" fn fn_construct_trampoline(
       }
 
       let this = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
+      crate::jsc::object::mark_api_wrapper(this as *const Object);
       unsafe {
         let proto_key = JSStringCreateWithUTF8CString(c"prototype".as_ptr());
         let mut exc: JSValueRef = ptr::null();
@@ -1186,6 +1187,7 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
     return ptr::null();
   }
   let obj = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
+  crate::jsc::object::mark_api_wrapper(obj as *const Object);
   if !this.is_null() {
     let t = unsafe { &*(this as *const ObjTemplate) };
 

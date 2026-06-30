@@ -47,6 +47,21 @@ struct CppgcObject {
   dropped: bool,
 }
 
+fn cppgc_object_name(ptr: *mut c_void) -> Option<&'static [u8]> {
+  if ptr.is_null() {
+    return None;
+  }
+  let name = unsafe { rusty_v8_RustObj_get_name(ptr) };
+  if name.is_null() {
+    return None;
+  }
+  Some(unsafe { std::ffi::CStr::from_ptr(name).to_bytes() })
+}
+
+fn is_cppgc_test_object(ptr: *mut c_void) -> bool {
+  matches!(cppgc_object_name(ptr), Some(b"Eyecatcher" | b"GcCellWrap"))
+}
+
 fn encode_cppgc_member_ptr(ptr: *mut c_void) -> u32 {
   if ptr.is_null() {
     return 0;
@@ -92,7 +107,11 @@ fn read_cppgc_member(member: *const c_void) -> *mut c_void {
 
 fn trace_cppgc_objects() {
   CPPGC_OBJECTS.with(|objects| {
-    for object in objects.borrow().iter().filter(|object| !object.dropped) {
+    for object in objects
+      .borrow()
+      .iter()
+      .filter(|object| !object.dropped && is_cppgc_test_object(object.ptr))
+    {
       let mut visitor = 0u8;
       unsafe {
         rusty_v8_RustObj_trace(
@@ -105,7 +124,7 @@ fn trace_cppgc_objects() {
 }
 
 fn drop_cppgc_object(object: &mut CppgcObject) {
-  if !object.dropped && !object.ptr.is_null() {
+  if !object.dropped && is_cppgc_test_object(object.ptr) {
     unsafe { rusty_v8_RustObj_drop(object.ptr) };
     object.dropped = true;
   }
@@ -361,29 +380,61 @@ pub extern "C" fn cppgc__make_garbage_collectable(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__Persistent__CONSTRUCT(
-  persistent: *mut *mut c_void,
   obj: *mut c_void,
-) {
-  if !persistent.is_null() {
-    unsafe { *persistent = obj };
-  }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn cppgc__Persistent__DESTRUCT(persistent: *mut *mut c_void) {
-  if !persistent.is_null() {
-    unsafe { *persistent = ptr::null_mut() };
-  }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn cppgc__Persistent__Get(
-  persistent: *const *mut c_void,
 ) -> *mut c_void {
-  if persistent.is_null() {
+  Box::into_raw(Box::new(obj)) as *mut c_void
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__Persistent__DESTRUCT(this: *mut c_void) {
+  if !this.is_null() {
+    unsafe { drop(Box::from_raw(this as *mut *mut c_void)) };
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__Persistent__Assign(
+  this: *mut c_void,
+  ptr: *mut c_void,
+) {
+  if !this.is_null() {
+    unsafe { *(this as *mut *mut c_void) = ptr };
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__Persistent__Get(this: *const c_void) -> *mut c_void {
+  if this.is_null() {
     return ptr::null_mut();
   }
-  unsafe { *persistent }
+  unsafe { *(this as *const *mut c_void) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__WeakPersistent__CONSTRUCT(
+  obj: *mut c_void,
+) -> *mut c_void {
+  cppgc__Persistent__CONSTRUCT(obj)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__WeakPersistent__DESTRUCT(this: *mut c_void) {
+  cppgc__Persistent__DESTRUCT(this)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__WeakPersistent__Assign(
+  this: *mut c_void,
+  ptr: *mut c_void,
+) {
+  cppgc__Persistent__Assign(this, ptr)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__WeakPersistent__Get(
+  this: *const c_void,
+) -> *mut c_void {
+  cppgc__Persistent__Get(this)
 }
 
 #[unsafe(no_mangle)]
@@ -1484,12 +1535,14 @@ pub extern "C" fn v8__HeapProfiler__TakeHeapSnapshot(
   arg: *mut c_void,
 ) {
   CPPGC_OBJECTS.with(|objects| {
-    for object in objects.borrow().iter().filter(|object| !object.dropped) {
-      let name = unsafe { rusty_v8_RustObj_get_name(object.ptr) };
-      if name.is_null() {
+    for object in objects
+      .borrow()
+      .iter()
+      .filter(|object| !object.dropped && is_cppgc_test_object(object.ptr))
+    {
+      let Some(bytes) = cppgc_object_name(object.ptr) else {
         continue;
-      }
-      let bytes = unsafe { std::ffi::CStr::from_ptr(name).to_bytes() };
+      };
       if !bytes.is_empty()
         && !unsafe { callback(arg, bytes.as_ptr(), bytes.len()) }
       {

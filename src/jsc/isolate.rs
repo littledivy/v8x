@@ -1058,9 +1058,10 @@ pub extern "C" fn v8__Isolate__SetAllowWasmCodeGenerationCallback(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__HeapProfiler__TakeHeapSnapshot(
   _isolate: *mut RealIsolate,
-  _callback: *const c_void,
-  _arg: *mut c_void,
+  callback: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> bool,
+  arg: *mut c_void,
 ) {
+  crate::jsc::misc::take_cppgc_heap_snapshot(callback, arg);
 }
 
 #[unsafe(no_mangle)]

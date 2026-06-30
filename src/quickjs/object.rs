@@ -1184,6 +1184,10 @@ thread_local! {
         std::collections::HashMap<usize, Vec<JSValue>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 
+    static API_WRAPPERS: std::cell::RefCell<
+        std::collections::HashSet<usize>,
+    > = std::cell::RefCell::new(std::collections::HashSet::new());
+
     static ALIGNED_FIELDS: std::cell::RefCell<
         std::collections::HashMap<(usize, crate::support::int, u16), usize>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -1212,6 +1216,15 @@ pub(crate) fn set_internal_field_count_for_value(
   }
   INTERNAL_FIELDS.with(|t| {
     t.borrow_mut().insert(value_key(obj), fields);
+  });
+}
+
+pub(crate) fn mark_api_wrapper_for_value(obj: JSValue) {
+  if !jsv_is_object(&obj) {
+    return;
+  }
+  API_WRAPPERS.with(|t| {
+    t.borrow_mut().insert(value_key(obj));
   });
 }
 
@@ -1251,7 +1264,10 @@ pub extern "C" fn v8__Object__Unwrap(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__IsApiWrapper(this: *const Object) -> bool {
-  !this.is_null()
+  if this.is_null() {
+    return false;
+  }
+  API_WRAPPERS.with(|t| t.borrow().contains(&wrap_key(this)))
 }
 
 // ---------------------------------------------------------------------------

@@ -433,6 +433,7 @@ unsafe extern "C" fn fn_construct_trampoline(
       this,
       t.internal_field_count,
     );
+    super::object::mark_api_wrapper_for_value(this);
     apply_props(ctx, this, &t.props);
     apply_accessors(ctx, this, &t.accessors);
   }
@@ -1402,6 +1403,7 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
       obj,
       t.internal_field_count,
     );
+    super::object::mark_api_wrapper_for_value(obj);
     if !t.parent_fn.is_null() {
       let _ = v8__FunctionTemplate__GetFunction(
         t.parent_fn as *const FunctionTemplate,

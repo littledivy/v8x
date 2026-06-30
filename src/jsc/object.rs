@@ -623,6 +623,19 @@ thread_local! {
     static WRAP_TABLE: std::cell::RefCell<
         std::collections::HashMap<(usize, u16), usize>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+
+    static API_WRAPPERS: std::cell::RefCell<
+        std::collections::HashSet<usize>,
+    > = std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
+pub(crate) fn mark_api_wrapper(wrapper: *const Object) {
+  if wrapper.is_null() {
+    return;
+  }
+  API_WRAPPERS.with(|t| {
+    t.borrow_mut().insert(wrapper as usize);
+  });
 }
 
 #[unsafe(no_mangle)]
@@ -663,10 +676,7 @@ pub extern "C" fn v8__Object__IsApiWrapper(this: *const Object) -> bool {
   if this.is_null() {
     return false;
   }
-  WRAP_TABLE.with(|t| {
-    let map = t.borrow();
-    map.keys().any(|(w, _)| *w == this as usize)
-  })
+  API_WRAPPERS.with(|t| t.borrow().contains(&(this as usize)))
 }
 
 #[unsafe(no_mangle)]
