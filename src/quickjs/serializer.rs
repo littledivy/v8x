@@ -41,6 +41,7 @@ const TAG_ARRAY: u8 = b'A';
 const TAG_LEAF: u8 = b'L';
 const TAG_HOST: u8 = b'H';
 const TAG_OBJECT: u8 = b'O';
+const TAG_SHARED_ARRAYBUFFER: u8 = b'S';
 
 #[repr(C)]
 struct JSPropertyEnum {
@@ -50,6 +51,25 @@ struct JSPropertyEnum {
 const JS_GPN_OWN_ENUM: c_int = (1 << 0) | (1 << 1) | (1 << 4); // string|symbol|enum-only
 
 unsafe extern "C" {
+  fn JS_NewArrayBuffer(
+    ctx: *mut JSContext,
+    buf: *mut u8,
+    len: usize,
+    free_func: Option<
+      unsafe extern "C" fn(
+        rt: *mut JSRuntime,
+        opaque: *mut c_void,
+        ptr: *mut c_void,
+      ),
+    >,
+    opaque: *mut c_void,
+    is_shared: bool,
+  ) -> JSValue;
+  fn JS_GetArrayBuffer(
+    ctx: *mut JSContext,
+    psize: *mut usize,
+    obj: JSValue,
+  ) -> *mut u8;
   fn JS_ValueToAtom(ctx: *mut JSContext, val: JSValue) -> JSAtom;
   fn JS_GetOwnPropertyNames(
     ctx: *mut JSContext,
@@ -80,6 +100,21 @@ unsafe extern "C" {
     delegate: *mut CxxValueDeserializerDelegate,
     isolate: *mut RealIsolate,
   ) -> *const Object;
+}
+
+unsafe extern "C" {
+  fn malloc(size: usize) -> *mut c_void;
+  fn free(ptr: *mut c_void);
+}
+
+unsafe extern "C" fn malloc_free_func(
+  _rt: *mut JSRuntime,
+  _opaque: *mut c_void,
+  ptr: *mut c_void,
+) {
+  if !ptr.is_null() {
+    unsafe { free(ptr) };
+  }
 }
 
 /// Atom for the `Symbol.for("Deno.core.hostObject")` brand deno tags transferable
@@ -116,6 +151,43 @@ fn is_host_object(ctx: *mut JSContext, v: JSValue, brand: JSAtom) -> bool {
     && unsafe { JS_HasProperty(ctx, v, brand) } > 0
 }
 
+fn class_tag_is(ctx: *mut JSContext, v: JSValue, tag: &str) -> bool {
+  if ctx.is_null() || !jsv_is_object(&v) {
+    return false;
+  }
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let obj_ctor = JS_GetPropertyStr(ctx, global, c"Object".as_ptr());
+    let proto = JS_GetPropertyStr(ctx, obj_ctor, c"prototype".as_ptr());
+    let to_string = JS_GetPropertyStr(ctx, proto, c"toString".as_ptr());
+    JS_FreeValue(ctx, global);
+    JS_FreeValue(ctx, obj_ctor);
+    JS_FreeValue(ctx, proto);
+    let mut result = false;
+    if jsv_is_object(&to_string) {
+      let r = JS_Call(ctx, to_string, v, 0, std::ptr::null_mut());
+      if !jsv_is_exception(&r) {
+        let cstr = JS_ToCString(ctx, r);
+        if !cstr.is_null() {
+          let got = std::ffi::CStr::from_ptr(cstr).to_string_lossy();
+          result = got == format!("[object {}]", tag);
+          JS_FreeCString(ctx, cstr);
+        }
+      } else {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+      }
+      JS_FreeValue(ctx, r);
+    }
+    JS_FreeValue(ctx, to_string);
+    result
+  }
+}
+
+fn is_shared_array_buffer(ctx: *mut JSContext, v: JSValue) -> bool {
+  class_tag_is(ctx, v, "SharedArrayBuffer")
+}
+
 /// Does the value graph contain a transferred ArrayBuffer or a host object?
 /// Read-only (pure QuickJS, no delegate/scope machinery), so it is safe to run on
 /// every serialize; only walks arrays (host objects nested in plain objects need
@@ -131,7 +203,10 @@ fn graph_needs_walk(
     return false;
   }
   let ptr = unsafe { v.u.ptr } as usize;
-  if st.xfer_ab.contains_key(&ptr) || is_host_object(ctx, v, brand) {
+  if st.xfer_ab.contains_key(&ptr)
+    || is_host_object(ctx, v, brand)
+    || is_shared_array_buffer(ctx, v)
+  {
     return true;
   }
   if unsafe { JS_IsArray(v) } {
@@ -426,6 +501,9 @@ fn ser_rec(
       st.buf.extend_from_slice(&id.to_le_bytes());
       return true;
     }
+    if is_shared_array_buffer(ctx, v) {
+      return ser_shared_array_buffer(st, ctx, v);
+    }
     if is_host_object(ctx, v, brand) {
       st.buf.push(TAG_HOST);
       // Hand the host object to deno's delegate, which appends its index/value
@@ -485,6 +563,27 @@ fn ser_rec(
     }
   }
   ser_blob(st, ctx, v, TAG_LEAF)
+}
+
+fn ser_shared_array_buffer(
+  st: &mut SerState,
+  ctx: *mut JSContext,
+  v: JSValue,
+) -> bool {
+  let mut len: usize = 0;
+  let data = unsafe { JS_GetArrayBuffer(ctx, &mut len, v) };
+  if data.is_null() && len > 0 {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return false;
+  }
+  st.buf.push(TAG_SHARED_ARRAYBUFFER);
+  st.buf.extend_from_slice(&(len as u32).to_le_bytes());
+  if !data.is_null() && len > 0 {
+    let bytes = unsafe { std::slice::from_raw_parts(data as *const u8, len) };
+    st.buf.extend_from_slice(bytes);
+  }
+  true
 }
 
 #[unsafe(no_mangle)]
@@ -732,6 +831,38 @@ fn de_rec(st: &mut DeState, ctx: *mut JSContext) -> JSValue {
       }
       let v = jsval_of::<Object>(obj);
       unsafe { JS_DupValue(ctx, v) }
+    }
+    Some(TAG_SHARED_ARRAYBUFFER) => {
+      let len = match read_le_u32(&st.buf, &mut st.pos) {
+        Some(l) => l as usize,
+        None => return jsv_exception(),
+      };
+      if st.pos + len > st.buf.len() {
+        return jsv_exception();
+      }
+      let data = if len == 0 {
+        std::ptr::null_mut()
+      } else {
+        let p = unsafe { malloc(len) } as *mut u8;
+        if p.is_null() {
+          return jsv_exception();
+        }
+        unsafe {
+          std::ptr::copy_nonoverlapping(st.buf.as_ptr().add(st.pos), p, len);
+        }
+        p
+      };
+      st.pos += len;
+      unsafe {
+        JS_NewArrayBuffer(
+          ctx,
+          data,
+          len,
+          Some(malloc_free_func),
+          std::ptr::null_mut(),
+          true,
+        )
+      }
     }
     Some(TAG_OBJECT) => {
       let count = match read_le_u32(&st.buf, &mut st.pos) {

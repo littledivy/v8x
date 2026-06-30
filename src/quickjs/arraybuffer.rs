@@ -28,6 +28,11 @@ fn alias_registry() -> &'static Mutex<HashMap<usize, Vec<usize>>> {
   REG.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn buffer_registry() -> &'static Mutex<HashMap<usize, usize>> {
+  static REG: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+  REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 fn registry_add(key: usize, inner: *mut BsInner) {
   if key == 0 {
     return;
@@ -136,6 +141,11 @@ struct BsInner {
 
   retained_ctx: *mut JSContext,
   retained_val: JSValue,
+}
+
+struct BufferOwner {
+  inner: *mut BsInner,
+  obj_key: usize,
 }
 
 unsafe extern "C" fn noop_deleter(
@@ -247,6 +257,17 @@ fn backing_store_for_buffer(
   ctx: *mut JSContext,
   buf: JSValue,
 ) -> SharedRef<BackingStore> {
+  if jsv_is_object(&buf) {
+    let obj_key = unsafe { buf.u.ptr } as usize;
+    if let Some(&inner) = buffer_registry().lock().unwrap().get(&obj_key) {
+      let inner = inner as *mut BsInner;
+      if !inner.is_null() {
+        unsafe { (*inner).refcount.fetch_add(1, Ordering::SeqCst) };
+        return make_shared_ref(inner);
+      }
+    }
+  }
+
   let mut len: usize = 0;
   let data = unsafe { JS_GetArrayBuffer(ctx, &mut len, buf) } as *mut c_void;
   let inner =
@@ -320,6 +341,59 @@ unsafe extern "C" fn bs_free_func(
   }
 }
 
+unsafe extern "C" fn buffer_owner_free_func(
+  _rt: *mut JSRuntime,
+  opaque: *mut c_void,
+  _ptr: *mut c_void,
+) {
+  let owner = opaque as *mut BufferOwner;
+  if owner.is_null() {
+    return;
+  }
+  let owner = unsafe { Box::from_raw(owner) };
+  if owner.obj_key != 0 {
+    buffer_registry().lock().unwrap().remove(&owner.obj_key);
+  }
+  let inner = owner.inner;
+  if inner.is_null() {
+    return;
+  }
+  if unsafe { (*inner).refcount.fetch_sub(1, Ordering::SeqCst) } == 1 {
+    unsafe { BsInner::destroy(inner) };
+  }
+}
+
+fn new_buffer_from_inner(
+  ctx: *mut JSContext,
+  inner: *mut BsInner,
+  is_shared: bool,
+) -> JSValue {
+  if inner.is_null() {
+    return jsv_exception();
+  }
+  let owner = Box::into_raw(Box::new(BufferOwner { inner, obj_key: 0 }));
+  let obj = unsafe {
+    JS_NewArrayBuffer(
+      ctx,
+      (*inner).data as *mut u8,
+      (*inner).byte_length,
+      Some(buffer_owner_free_func),
+      owner as *mut c_void,
+      is_shared,
+    )
+  };
+  if obj.tag == JS_TAG_EXCEPTION {
+    unsafe { drop(Box::from_raw(owner)) };
+    return obj;
+  }
+  if jsv_is_object(&obj) {
+    let obj_key = unsafe { obj.u.ptr } as usize;
+    unsafe { (*owner).obj_key = obj_key };
+    buffer_registry().lock().unwrap().insert(obj_key, inner as usize);
+  }
+  obj
+}
+
 unsafe extern "C" fn malloc_free_func(
   _rt: *mut JSRuntime,
   _opaque: *mut c_void,
@@ -341,22 +415,10 @@ pub extern "C" fn v8__ArrayBuffer__New__with_byte_length(
     return ptr::null();
   }
 
-  let data = if byte_length == 0 {
-    ptr::null_mut()
-  } else {
-    unsafe { calloc(byte_length, 1) as *mut u8 }
-  };
-  let obj = unsafe {
-    JS_NewArrayBuffer(
-      ctx,
-      data,
-      byte_length,
-      Some(malloc_free_func),
-      ptr::null_mut(),
-      false,
-    )
-  };
+  let inner = BsInner::new_allocated(byte_length, false);
+  let obj = new_buffer_from_inner(ctx, inner, false);
   if obj.tag == JS_TAG_EXCEPTION {
+    unsafe { BsInner::destroy(inner) };
     return ptr::null();
   }
   intern::<ArrayBuffer>(obj)
@@ -403,18 +465,9 @@ pub extern "C" fn v8__ArrayBuffer__New__with_backing_store(
   }
 
   unsafe { (*inner).refcount.fetch_add(1, Ordering::SeqCst) };
-  let obj = unsafe {
-    JS_NewArrayBuffer(
-      ctx,
-      data as *mut u8,
-      len,
-      Some(bs_free_func),
-      inner as *mut c_void,
-      false,
-    )
-  };
+  let obj = new_buffer_from_inner(ctx, inner, false);
   if obj.tag == JS_TAG_EXCEPTION {
-    unsafe { bs_free_func(ptr::null_mut(), inner as *mut c_void, data) };
+    unsafe { (*inner).refcount.fetch_sub(1, Ordering::SeqCst) };
     return ptr::null();
   }
   intern::<ArrayBuffer>(obj)
@@ -834,18 +887,9 @@ pub extern "C" fn v8__SharedArrayBuffer__New__with_backing_store(
   }
   let (data, len) = unsafe { ((*inner).data, (*inner).byte_length) };
   unsafe { (*inner).refcount.fetch_add(1, Ordering::SeqCst) };
-  let obj = unsafe {
-    JS_NewArrayBuffer(
-      ctx,
-      data as *mut u8,
-      len,
-      Some(bs_free_func),
-      inner as *mut c_void,
-      false,
-    )
-  };
+  let obj = new_buffer_from_inner(ctx, inner, true);
   if obj.tag == JS_TAG_EXCEPTION {
-    unsafe { bs_free_func(ptr::null_mut(), inner as *mut c_void, data) };
+    unsafe { (*inner).refcount.fetch_sub(1, Ordering::SeqCst) };
     return ptr::null();
   }
   intern::<SharedArrayBuffer>(obj)
@@ -1089,28 +1133,41 @@ pub extern "C" fn v8__ArrayBuffer__Allocator__NewRustAllocator(
   Box::into_raw(Box::new(0u8)) as *mut crate::array_buffer::Allocator
 }
 
-// ---------------------------------------------------------------------------
-// Link-stubs for v8 C-ABI symbols that `test_api.rs` references but this
-// backend doesn't implement yet. Each returns a benign default
-// (null / 0 / false / `Nothing`) so the target LINKS and the many tests that
-// don't touch these paths run; tests that do exercise them fail gracefully
-// without crashing. Promote individual stubs to real implementations over time.
-// ---------------------------------------------------------------------------
-
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SharedArrayBuffer__NewBackingStore__with_data(
-  _data: *mut std::os::raw::c_void,
-  _byte_length: usize,
-  _deleter: *const std::os::raw::c_void,
-  _deleter_data: *mut std::os::raw::c_void,
-) -> *mut std::os::raw::c_void {
-  std::ptr::null_mut()
+  data: *mut c_void,
+  byte_length: usize,
+  deleter: BackingStoreDeleterCallback,
+  deleter_data: *mut c_void,
+) -> *mut BackingStore {
+  BsInner::boxed(data, byte_length, true, deleter, deleter_data, false)
+    as *mut BackingStore
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SharedArrayBuffer__New__with_byte_length(
-  _isolate: *mut std::os::raw::c_void,
-  _byte_length: usize,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  isolate: *mut RealIsolate,
+  byte_length: usize,
+) -> *const SharedArrayBuffer {
+  let st = iso_state(isolate);
+  let ctx = st.contexts.last().copied().unwrap_or(st.ctx);
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  let inner = BsInner::new_allocated(byte_length, true);
+  let obj = new_buffer_from_inner(ctx, inner, true);
+  if obj.tag == JS_TAG_EXCEPTION {
+    unsafe { BsInner::destroy(inner) };
+    return ptr::null();
+  }
+  intern::<SharedArrayBuffer>(obj)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__SharedArrayBuffer__NewBackingStore__with_byte_length(
+  isolate: *mut RealIsolate,
+  byte_length: usize,
+) -> *mut BackingStore {
+  let _ = isolate;
+  BsInner::new_allocated(byte_length, true) as *mut BackingStore
 }
