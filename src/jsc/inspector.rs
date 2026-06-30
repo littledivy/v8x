@@ -133,14 +133,22 @@ pub extern "C" fn v8_inspector__V8InspectorClient__consoleAPIMessage(
 pub extern "C" fn v8_inspector__V8InspectorSession__DELETE(
   this: *mut RawV8InspectorSession,
 ) {
-  unsafe { free_inert(this) };
+  if !this.is_null() {
+    unsafe { drop(Box::from_raw(this.cast::<cdp::CdpSession>())) };
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8InspectorSession__dispatchProtocolMessage(
-  _session: *mut RawV8InspectorSession,
-  _message: StringView,
+  session: *mut RawV8InspectorSession,
+  message: StringView,
 ) {
+  if session.is_null() {
+    return;
+  }
+  let sess = unsafe { &mut *(session.cast::<cdp::CdpSession>()) };
+  let msg = string_view_to_string(&message);
+  cdp::dispatch(sess, &msg);
 }
 
 #[unsafe(no_mangle)]
@@ -231,6 +239,16 @@ fn string_view_to_utf16(sv: &StringView<'_>) -> Vec<u16> {
   }
 }
 
+fn string_view_to_string(sv: &StringView<'_>) -> String {
+  if let Some(s) = sv.characters16() {
+    String::from_utf16_lossy(s)
+  } else if let Some(s) = sv.characters8() {
+    s.iter().map(|&b| b as char).collect()
+  } else {
+    String::new()
+  }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__DELETE(this: *mut RawV8Inspector) {
   unsafe { free_inert(this) };
@@ -248,11 +266,12 @@ pub extern "C" fn v8_inspector__V8Inspector__create(
 pub extern "C" fn v8_inspector__V8Inspector__connect(
   _inspector: *mut RawV8Inspector,
   _context_group_id: int,
-  _channel: *mut RawChannel,
+  channel: *mut RawChannel,
   _state: StringView,
   _client_trust_level: V8InspectorClientTrustLevel,
 ) -> *mut RawV8InspectorSession {
-  alloc_inert::<RawV8InspectorSession>()
+  Box::into_raw(Box::new(cdp::CdpSession::new(channel)))
+    .cast::<RawV8InspectorSession>()
 }
 
 #[unsafe(no_mangle)]
@@ -347,4 +366,115 @@ pub extern "C" fn v8_inspector__V8Inspector__createStackTrace(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8StackTrace__DELETE(this: *mut V8StackTrace) {
   unsafe { free_inert(this) };
+}
+
+mod cdp {
+  use super::RawChannel;
+  use super::RealStringBuffer;
+  use crate::inspector::StringBuffer;
+  use crate::support::UniquePtr;
+  use crate::support::int;
+
+  unsafe extern "C" {
+    fn v8_inspector__V8Inspector__Channel__BASE__sendResponse(
+      this: *mut RawChannel,
+      call_id: int,
+      message: UniquePtr<StringBuffer>,
+    );
+    fn v8_inspector__V8Inspector__Channel__BASE__sendNotification(
+      this: *mut RawChannel,
+      message: UniquePtr<StringBuffer>,
+    );
+  }
+
+  pub struct CdpSession {
+    channel: *mut RawChannel,
+  }
+
+  impl CdpSession {
+    pub fn new(channel: *mut RawChannel) -> Self {
+      CdpSession { channel }
+    }
+  }
+
+  fn json_string_value(message: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let mut rest = message.split_once(&needle)?.1;
+    rest = rest.split_once(':')?.1.trim_start();
+    if !rest.starts_with('"') {
+      return None;
+    }
+    let mut escaped = false;
+    let mut out = String::new();
+    for ch in rest[1..].chars() {
+      if escaped {
+        out.push(match ch {
+          '"' => '"',
+          '\\' => '\\',
+          '/' => '/',
+          'b' => '\u{0008}',
+          'f' => '\u{000C}',
+          'n' => '\n',
+          'r' => '\r',
+          't' => '\t',
+          other => other,
+        });
+        escaped = false;
+      } else if ch == '\\' {
+        escaped = true;
+      } else if ch == '"' {
+        return Some(out);
+      } else {
+        out.push(ch);
+      }
+    }
+    None
+  }
+
+  fn json_i32_value(message: &str, key: &str) -> Option<i32> {
+    let needle = format!("\"{key}\"");
+    let rest = message.split_once(&needle)?.1;
+    let rest = rest.split_once(':')?.1.trim_start();
+    let end = rest
+      .find(|ch: char| !ch.is_ascii_digit() && ch != '-')
+      .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+  }
+
+  fn send(channel: *mut RawChannel, json: &str, call_id: Option<i32>) {
+    if channel.is_null() {
+      return;
+    }
+    let units: Vec<u16> = json.encode_utf16().collect();
+    let buf = RealStringBuffer::boxed_from_utf16(units);
+    let up = unsafe { UniquePtr::from_raw(buf) };
+    unsafe {
+      match call_id {
+        Some(id) => v8_inspector__V8Inspector__Channel__BASE__sendResponse(
+          channel, id, up,
+        ),
+        None => v8_inspector__V8Inspector__Channel__BASE__sendNotification(
+          channel, up,
+        ),
+      }
+    }
+  }
+
+  pub fn dispatch(sess: &mut CdpSession, message: &str) {
+    let call_id = json_i32_value(message, "id").unwrap_or(0);
+    let method = json_string_value(message, "method").unwrap_or_default();
+    send(
+      sess.channel,
+      &format!("{{\"id\":{call_id},\"result\":{{}}}}"),
+      Some(call_id),
+    );
+
+    if method == "Runtime.enable" {
+      send(
+        sess.channel,
+        r#"{"method":"Runtime.executionContextCreated","params":{"context":{"id":1,"origin":"","name":"repl","uniqueId":"1","auxData":{"isDefault":true}}}}"#,
+        None,
+      );
+    }
+  }
 }
