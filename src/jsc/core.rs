@@ -20,6 +20,21 @@ use std::os::raw::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+pub(crate) type WeakCallback = unsafe extern "C" fn(*const c_void);
+
+pub(crate) struct WeakHandle {
+  pub handle: *const Data,
+  pub parameter: *const c_void,
+  pub callback: WeakCallback,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GcCallbackEntry {
+  pub callback: crate::isolate::GcCallbackWithData,
+  pub data: *mut c_void,
+  pub gc_type_filter: crate::gc::GCType,
+}
+
 pub(crate) struct IsoState {
   pub group: JSContextGroupRef,
 
@@ -49,6 +64,12 @@ pub(crate) struct IsoState {
   pub external_memory: AtomicI64,
 
   pub external_string_memory: AtomicI64,
+
+  pub weak_handles: Vec<WeakHandle>,
+
+  pub gc_prologue_callbacks: Vec<GcCallbackEntry>,
+
+  pub gc_epilogue_callbacks: Vec<GcCallbackEntry>,
 }
 
 thread_local! {
@@ -324,6 +345,9 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     base_ctx: ptr::null_mut(),
     external_memory: AtomicI64::new(0),
     external_string_memory: AtomicI64::new(0),
+    weak_handles: Vec::new(),
+    gc_prologue_callbacks: Vec::new(),
+    gc_epilogue_callbacks: Vec::new(),
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;
   // Arm the execution-time-limit watchdog so `TerminateExecution` and the
@@ -367,6 +391,7 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
   crate::jsc::terminate::uninstall(this);
   unsafe {
     let mut st = Box::from_raw(this as *mut IsoState);
+    st.weak_handles.clear();
     if let Some((ctx, v)) = st.pending_exception.take() {
       if !ctx.is_null() && !v.is_null() {
         JSValueUnprotect(ctx, v);

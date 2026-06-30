@@ -1130,8 +1130,16 @@ pub extern "C" fn v8__Isolate__AddMessageListener(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__ClearKeptObjects(
-  _isolate: *mut std::os::raw::c_void,
+  isolate: *mut std::os::raw::c_void,
 ) {
+  if !isolate.is_null() {
+    let st = iso_state(isolate as *mut RealIsolate);
+    st.kept_objects_cleared = true;
+    crate::quickjs::core::clear_kept_objects_for_context(st.ctx);
+    for ctx in &st.extra_contexts {
+      crate::quickjs::core::clear_kept_objects_for_context(*ctx);
+    }
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1165,18 +1173,34 @@ pub extern "C" fn v8__Isolate__MemoryPressureNotification(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__RemoveGCEpilogueCallback(
-  _isolate: *mut std::os::raw::c_void,
-  _callback: *const std::os::raw::c_void,
-  _data: *mut std::os::raw::c_void,
+  isolate: *mut std::os::raw::c_void,
+  callback: *const std::os::raw::c_void,
+  data: *mut std::os::raw::c_void,
 ) {
+  if !isolate.is_null() {
+    iso_state(isolate as *mut RealIsolate)
+      .gc_epilogue_callbacks
+      .retain(|entry| {
+        entry.callback as *const std::os::raw::c_void != callback
+          || entry.data != data
+      });
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__RemoveGCPrologueCallback(
-  _isolate: *mut std::os::raw::c_void,
-  _callback: *const std::os::raw::c_void,
-  _data: *mut std::os::raw::c_void,
+  isolate: *mut std::os::raw::c_void,
+  callback: *const std::os::raw::c_void,
+  data: *mut std::os::raw::c_void,
 ) {
+  if !isolate.is_null() {
+    iso_state(isolate as *mut RealIsolate)
+      .gc_prologue_callbacks
+      .retain(|entry| {
+        entry.callback as *const std::os::raw::c_void != callback
+          || entry.data != data
+      });
+  }
 }
 
 #[unsafe(no_mangle)]
