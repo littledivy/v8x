@@ -315,7 +315,6 @@ pub extern "C" fn v8__ArrayBuffer__New__with_byte_length(
       ptr::null_mut(),
     )
   };
-  registry_add(data as usize, inner);
   intern_ctx::<ArrayBuffer>(ctx, obj as JSValueRef)
 }
 
@@ -361,6 +360,7 @@ pub extern "C" fn v8__ArrayBuffer__New__with_backing_store(
       ptr::null_mut(),
     )
   };
+  registry_add(data as usize, inner);
   intern_ctx::<ArrayBuffer>(ctx, obj as JSValueRef)
 }
 
