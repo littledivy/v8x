@@ -233,7 +233,11 @@ fn backing_store_for_buffer(
   let mut len: usize = 0;
   let data = unsafe { JS_GetArrayBuffer(ctx, &mut len, buf) } as *mut c_void;
   if !data.is_null() {
-    let existing = alias_registry().lock().unwrap().get(&(data as usize)).copied();
+    let existing = alias_registry()
+      .lock()
+      .unwrap()
+      .get(&(data as usize))
+      .copied();
     if let Some(existing) = existing {
       let inner = existing as *mut BsInner;
       if !inner.is_null() {

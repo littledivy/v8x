@@ -96,7 +96,10 @@ fn backing_store_registry() -> &'static Mutex<HashMap<usize, usize>> {
 
 fn registry_add(key: usize, inner: *mut BsInner) {
   if key != 0 {
-    backing_store_registry().lock().unwrap().insert(key, inner as usize);
+    backing_store_registry()
+      .lock()
+      .unwrap()
+      .insert(key, inner as usize);
   }
 }
 
@@ -244,7 +247,10 @@ fn backing_store_for_buffer(
   make_shared_ref(inner)
 }
 
-fn make_shared_array_buffer(ctx: JSContextRef, byte_length: usize) -> JSValueRef {
+fn make_shared_array_buffer(
+  ctx: JSContextRef,
+  byte_length: usize,
+) -> JSValueRef {
   if ctx.is_null() {
     return ptr::null();
   }
@@ -907,7 +913,9 @@ pub extern "C" fn v8__SharedArrayBuffer__New__with_backing_store(
       JSObjectGetArrayBufferBytesPtr(ctx, sab as JSObjectRef, ptr::null_mut())
     };
     if !dst.is_null() {
-      unsafe { ptr::copy_nonoverlapping(data as *const u8, dst as *mut u8, len) };
+      unsafe {
+        ptr::copy_nonoverlapping(data as *const u8, dst as *mut u8, len)
+      };
     }
   }
   intern_ctx::<SharedArrayBuffer>(ctx, sab)
