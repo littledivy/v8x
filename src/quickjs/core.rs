@@ -38,7 +38,8 @@
 
 use super::quickjs_sys::*;
 use crate::{
-  Context, Data, Object, Primitive, RealIsolate, String as V8String, Value,
+  Context, Data, MicrotaskQueue, Object, Primitive, RealIsolate,
+  String as V8String, Value,
 };
 use std::cell::RefCell;
 use std::os::raw::{c_int, c_void};
@@ -102,6 +103,10 @@ pub(crate) struct IsoState {
   // uncatchable termination exception on the next safe point). An `AtomicBool`
   // because V8's terminate may be requested from another thread.
   pub terminating: std::sync::atomic::AtomicBool,
+
+  pub microtasks_policy: crate::MicrotasksPolicy,
+
+  pub default_microtask_queue: *mut MicrotaskQueue,
 }
 
 impl IsoState {
@@ -275,6 +280,27 @@ pub(crate) fn intern_dup<T>(ctx: *mut JSContext, v: JSValue) -> *const T {
   intern::<T>(dup)
 }
 
+pub(crate) fn drain_jobs(rt: *mut JSRuntime) {
+  if rt.is_null() {
+    return;
+  }
+  unsafe {
+    let mut pctx: *mut JSContext = ptr::null_mut();
+    loop {
+      let r = JS_ExecutePendingJob(rt, &mut pctx);
+      if r == 0 {
+        break;
+      }
+      if r < 0 {
+        if !pctx.is_null() {
+          let exc = JS_GetException(pctx);
+          JS_FreeValue(pctx, exc);
+        }
+      }
+    }
+  }
+}
+
 // Process-global refcount table for SharedArrayBuffer memory shared across worker
 // threads. Keyed by data pointer so foreign pointers (e.g. SABs deno hands us via
 // a backing store rather than `sab_alloc`) are handled gracefully: dup/free on an
@@ -337,6 +363,7 @@ fn sab_funcs_table() -> *const JSSharedArrayBufferFunctions {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
+  super::isolate::reset_promise_hooks();
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
@@ -387,6 +414,8 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     external_memory: AtomicI64::new(0),
     external_string_memory: AtomicI64::new(0),
     terminating: std::sync::atomic::AtomicBool::new(false),
+    microtasks_policy: crate::MicrotasksPolicy::Auto,
+    default_microtask_queue: super::isolate::new_microtask_queue(),
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;
   // Arm the interrupt handler so a runaway loop unwinds once
@@ -445,8 +474,11 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
     }
     super::isolate::codegen_release_ctx(st.ctx);
     for c in st.extra_contexts.drain(..) {
+      super::isolate::context_clear_microtask_queue(c);
       JS_FreeContext(c);
     }
+    super::isolate::context_clear_microtask_queue(st.ctx);
+    super::isolate::free_microtask_queue(st.default_microtask_queue);
     JS_FreeContext(st.ctx);
     if std::env::var_os("QJS_SKIP_FREE_RT").is_none() {
       JS_FreeRuntime(st.rt);
@@ -617,7 +649,7 @@ pub extern "C" fn v8__Context__New(
   isolate: *mut RealIsolate,
   _templ: *const c_void,
   _global_object: *const c_void,
-  _microtask_queue: *mut c_void,
+  microtask_queue: *mut c_void,
 ) -> *const Context {
   if isolate.is_null() {
     return ptr::null();
@@ -638,6 +670,10 @@ pub extern "C" fn v8__Context__New(
     c
   };
   install_default_globals(ctx);
+  super::isolate::context_set_microtask_queue_raw(
+    ctx,
+    microtask_queue as *const MicrotaskQueue,
+  );
 
   intern_ctx(ctx)
 }
@@ -1041,6 +1077,11 @@ pub extern "C" fn v8__Script__Run(
     }
 
     return ptr::null();
+  }
+
+  let iso = current_iso();
+  if !iso.is_null() && super::isolate::take_needs_microtask_drain() {
+    drain_jobs(iso_state(iso).rt);
   }
 
   intern::<Value>(result)

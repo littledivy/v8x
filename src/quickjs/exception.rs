@@ -932,9 +932,13 @@ pub extern "C" fn v8__Message__IsSharedCrossOrigin(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Promise__HasHandler(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { JS_PromiseState(ctx, jsval_of(this)) != 0 }
 }
 
 #[unsafe(no_mangle)]
