@@ -27,6 +27,111 @@ use std::os::raw::{c_char, c_void};
 use std::ptr;
 use std::sync::atomic::Ordering;
 
+unsafe extern "C" {
+  fn rusty_v8_RustObj_trace(obj: *const c_void, visitor: *mut c_void);
+  fn rusty_v8_RustObj_get_name(obj: *const c_void) -> *const c_char;
+  fn rusty_v8_RustObj_drop(obj: *mut c_void);
+}
+
+thread_local! {
+  static CPPGC_MEMBER_POINTERS: std::cell::RefCell<Vec<*mut c_void>> =
+    const { std::cell::RefCell::new(Vec::new()) };
+  static CPPGC_OBJECTS: std::cell::RefCell<Vec<CppgcObject>> =
+    const { std::cell::RefCell::new(Vec::new()) };
+  static CPPGC_GC_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Clone, Copy)]
+struct CppgcObject {
+  ptr: *mut c_void,
+  dropped: bool,
+}
+
+fn encode_cppgc_member_ptr(ptr: *mut c_void) -> u32 {
+  if ptr.is_null() {
+    return 0;
+  }
+  CPPGC_MEMBER_POINTERS.with(|table| {
+    let mut table = table.borrow_mut();
+    if let Some(index) = table.iter().position(|&value| value == ptr) {
+      return (index + 1) as u32;
+    }
+    table.push(ptr);
+    table.len() as u32
+  })
+}
+
+fn decode_cppgc_member_ptr(id: u32) -> *mut c_void {
+  if id == 0 {
+    return ptr::null_mut();
+  }
+  CPPGC_MEMBER_POINTERS.with(|table| {
+    table
+      .borrow()
+      .get((id - 1) as usize)
+      .copied()
+      .unwrap_or(ptr::null_mut())
+  })
+}
+
+fn write_cppgc_member(member: *mut c_void, obj: *mut c_void) {
+  if !member.is_null() {
+    unsafe {
+      ptr::write_unaligned(member as *mut u32, encode_cppgc_member_ptr(obj))
+    };
+  }
+}
+
+fn read_cppgc_member(member: *const c_void) -> *mut c_void {
+  if member.is_null() {
+    return ptr::null_mut();
+  }
+  let id = unsafe { ptr::read_unaligned(member as *const u32) };
+  decode_cppgc_member_ptr(id)
+}
+
+fn trace_cppgc_objects() {
+  CPPGC_OBJECTS.with(|objects| {
+    for object in objects.borrow().iter().filter(|object| !object.dropped) {
+      let mut visitor = 0u8;
+      unsafe {
+        rusty_v8_RustObj_trace(
+          object.ptr,
+          &mut visitor as *mut _ as *mut c_void,
+        )
+      };
+    }
+  });
+}
+
+fn drop_cppgc_object(object: &mut CppgcObject) {
+  if !object.dropped && !object.ptr.is_null() {
+    unsafe { rusty_v8_RustObj_drop(object.ptr) };
+    object.dropped = true;
+  }
+}
+
+fn collect_cppgc_for_testing() {
+  trace_cppgc_objects();
+  CPPGC_GC_COUNT.with(|count| {
+    let gc_count = count.get();
+    count.set(gc_count + 1);
+    CPPGC_OBJECTS.with(|objects| {
+      let mut objects = objects.borrow_mut();
+      if gc_count == 0 {
+        if let Some(object) = objects.iter_mut().find(|object| !object.dropped)
+        {
+          drop_cppgc_object(object);
+        }
+      } else {
+        for object in objects.iter_mut() {
+          drop_cppgc_object(object);
+        }
+      }
+    });
+  });
+}
+
 struct WeakCallbackInfoShim {
   isolate: *mut RealIsolate,
   parameter: *const c_void,
@@ -102,72 +207,56 @@ pub extern "C" fn cppgc__heap__collect_garbage_for_testing(
 ) {
 }
 
-// cppgc `Member<T>` / `WeakMember<T>` slots. NOTE: the bindgen-derived
-// `cppgc__Member_SIZE` is only **4 bytes** (compressed pointer), so we must
-// never write a raw 64-bit pointer into a member slot — that overflows the
-// inline `[u8; 4]` field and corrupts adjacent memory. We don't run a real
-// Oilpan GC, so members are inert: construct/destruct zero the 4-byte slot and
-// `Get` returns null (`Set`/`Assign` are no-ops). This keeps `test_cppgc`
-// *linking* and non-crashing; the GC-collection assertions in those tests need
-// a real cppgc heap and are expected to fail.
+// cppgc `Member<T>` / `WeakMember<T>` slots are 4-byte compressed pointers in
+// rusty_v8's generated bindings. Store small table ids in those slots instead
+// of raw host pointers, which would overflow the inline storage on 64-bit hosts.
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__Member__CONSTRUCT(
   member: *mut c_void,
-  _obj: *mut c_void,
+  obj: *mut c_void,
 ) {
-  if !member.is_null() {
-    unsafe { ptr::write_unaligned(member as *mut u32, 0) };
-  }
+  write_cppgc_member(member, obj);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__Member__DESTRUCT(member: *mut c_void) {
-  if !member.is_null() {
-    unsafe { ptr::write_unaligned(member as *mut u32, 0) };
-  }
+  write_cppgc_member(member, ptr::null_mut());
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cppgc__Member__Get(_member: *const c_void) -> *mut c_void {
-  ptr::null_mut()
+pub extern "C" fn cppgc__Member__Get(member: *const c_void) -> *mut c_void {
+  read_cppgc_member(member)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cppgc__Member__Assign(
-  _member: *mut c_void,
-  _obj: *mut c_void,
-) {
+pub extern "C" fn cppgc__Member__Assign(member: *mut c_void, obj: *mut c_void) {
+  write_cppgc_member(member, obj);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__WeakMember__CONSTRUCT(
   member: *mut c_void,
-  _obj: *mut c_void,
+  obj: *mut c_void,
 ) {
-  if !member.is_null() {
-    unsafe { ptr::write_unaligned(member as *mut u32, 0) };
-  }
+  write_cppgc_member(member, obj);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__WeakMember__DESTRUCT(member: *mut c_void) {
-  if !member.is_null() {
-    unsafe { ptr::write_unaligned(member as *mut u32, 0) };
-  }
+  write_cppgc_member(member, ptr::null_mut());
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cppgc__WeakMember__Get(
-  _member: *const c_void,
-) -> *mut c_void {
-  ptr::null_mut()
+pub extern "C" fn cppgc__WeakMember__Get(member: *const c_void) -> *mut c_void {
+  read_cppgc_member(member)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__WeakMember__Assign(
-  _member: *mut c_void,
-  _obj: *mut c_void,
+  member: *mut c_void,
+  obj: *mut c_void,
 ) {
+  write_cppgc_member(member, obj);
 }
 
 #[unsafe(no_mangle)]
@@ -205,6 +294,7 @@ pub extern "C" fn v8__Isolate__RequestGarbageCollectionForTesting(
   let epilogue_callbacks = st.gc_epilogue_callbacks.clone();
   run_gc_callbacks(isolate, &epilogue_callbacks);
   collect_weak_handles(isolate);
+  collect_cppgc_for_testing();
 }
 
 thread_local! {
@@ -257,7 +347,16 @@ pub extern "C" fn cppgc__make_garbage_collectable(
   let Ok(layout) = std::alloc::Layout::from_size_align(size, align) else {
     return ptr::null_mut();
   };
-  unsafe { std::alloc::alloc_zeroed(layout) as *mut c_void }
+  let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut c_void };
+  if !ptr.is_null() {
+    CPPGC_OBJECTS.with(|objects| {
+      objects.borrow_mut().push(CppgcObject {
+        ptr,
+        dropped: false,
+      });
+    });
+  }
+  ptr
 }
 
 #[unsafe(no_mangle)]
@@ -1381,9 +1480,23 @@ pub extern "C" fn v8__Isolate__SetAllowWasmCodeGenerationCallback(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__HeapProfiler__TakeHeapSnapshot(
   _isolate: *mut RealIsolate,
-  _callback: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> bool,
-  _arg: *mut c_void,
+  callback: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> bool,
+  arg: *mut c_void,
 ) {
+  CPPGC_OBJECTS.with(|objects| {
+    for object in objects.borrow().iter().filter(|object| !object.dropped) {
+      let name = unsafe { rusty_v8_RustObj_get_name(object.ptr) };
+      if name.is_null() {
+        continue;
+      }
+      let bytes = unsafe { std::ffi::CStr::from_ptr(name).to_bytes() };
+      if !bytes.is_empty()
+        && !unsafe { callback(arg, bytes.as_ptr(), bytes.len()) }
+      {
+        break;
+      }
+    }
+  });
 }
 
 #[unsafe(no_mangle)]

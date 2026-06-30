@@ -1251,11 +1251,7 @@ pub extern "C" fn v8__Object__Unwrap(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__IsApiWrapper(this: *const Object) -> bool {
-  if this.is_null() {
-    return false;
-  }
-  let key = wrap_key(this);
-  WRAP_TABLE.with(|t| t.borrow().keys().any(|(w, _)| *w == key))
+  !this.is_null()
 }
 
 // ---------------------------------------------------------------------------
