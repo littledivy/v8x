@@ -329,8 +329,12 @@ fn parse_qjs_backtrace(raw: &str) -> Vec<QjsStackFrame> {
         }
       }
     };
-    let (url, line_no, col_no) = parse_loc(loc);
+    let (url, line_no, mut col_no) = parse_loc(loc);
     let has_url = !url.is_empty() && url != "<anonymous>";
+    if let Some(src) = super::core::script_source_line(url, line_no) {
+      col_no = v8_new_expr_column(&src, col_no);
+      col_no = v8_await_expr_column(&src, col_no);
+    }
     frames.push(QjsStackFrame {
       line: line_no,
       col: col_no,
@@ -340,6 +344,52 @@ fn parse_qjs_backtrace(raw: &str) -> Vec<QjsStackFrame> {
     });
   }
   frames
+}
+
+pub(crate) fn normalize_stack_string(raw: &str) -> Option<std::string::String> {
+  let mut changed = false;
+  let mut out = std::string::String::with_capacity(raw.len());
+  for (i, line) in raw.lines().enumerate() {
+    if i > 0 {
+      out.push('\n');
+    }
+    let Some((line_no, col_no, new_col)) = normalized_line_column(line) else {
+      out.push_str(line);
+      continue;
+    };
+    if new_col == col_no {
+      out.push_str(line);
+      continue;
+    }
+    let suffix = format!(":{line_no}:{col_no}");
+    if let Some(pos) = line.rfind(&suffix) {
+      out.push_str(&line[..pos]);
+      out.push_str(&format!(":{line_no}:{new_col}"));
+      out.push_str(&line[pos + suffix.len()..]);
+      changed = true;
+    } else {
+      out.push_str(line);
+    }
+  }
+  changed.then_some(out)
+}
+
+fn normalized_line_column(line: &str) -> Option<(i32, i32, i32)> {
+  let mut rest = line.trim_start();
+  rest = rest.strip_prefix("at ").unwrap_or(rest);
+  rest = rest.strip_prefix("async ").unwrap_or(rest);
+  let loc = match (rest.find('('), rest.strip_suffix(')')) {
+    (Some(p), Some(_)) => &rest[p + 1..rest.len() - 1],
+    _ => rest,
+  };
+  let (url, line_no, col_no) = parse_loc(loc.trim());
+  if url.is_empty() || line_no <= 0 || col_no <= 0 {
+    return None;
+  }
+  let src = super::core::script_source_line(url, line_no)?;
+  let mut new_col = v8_new_expr_column(&src, col_no);
+  new_col = v8_await_expr_column(&src, new_col);
+  Some((line_no, col_no, new_col))
 }
 
 /// Split `<file>:<line>:<col>` / `<file>:<line>` into (file, line, col),
@@ -1241,6 +1291,39 @@ fn v8_new_expr_column(line: &str, col: i32) -> i32 {
   }
 }
 
+/// V8 reports async stack frames at the `await` keyword; QuickJS can report the
+/// awaited callee/expression instead. If `col` falls inside an awaited expression
+/// on this source line, return the column of `await`.
+fn v8_await_expr_column(line: &str, col: i32) -> i32 {
+  if col <= 1 {
+    return col;
+  }
+  let end = (col as usize - 1).min(line.len());
+  let Some(prefix) = line.get(..end) else {
+    return col;
+  };
+  let Some(idx) = prefix.rfind("await") else {
+    return col;
+  };
+
+  let before = line[..idx].chars().next_back();
+  let after = line[idx + "await".len()..].chars().next();
+  let is_ident = |c: char| c == '_' || c == '$' || c.is_ascii_alphanumeric();
+  if before.is_some_and(is_ident) || after.is_some_and(is_ident) {
+    return col;
+  }
+
+  let expr = &line[idx + "await".len()..end];
+  if expr
+    .chars()
+    .any(|c| c == ';' || c == ',' || c == ')' || c == '}')
+  {
+    return col;
+  }
+
+  idx as i32 + 1
+}
+
 /// `Error.prepareStackTrace(error, callSites)` — see the module note above.
 unsafe extern "C" fn qjs_prepare_stack_trace(
   ctx: *mut JSContext,
@@ -1315,6 +1398,7 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     // Recover V8's `new`-keyword column for `new X()` frames.
     if let Some(src) = super::core::script_source_line(&file, line) {
       col = v8_new_expr_column(&src, col);
+      col = v8_await_expr_column(&src, col);
     }
 
     // quickjs names top-level script frames `global code` / `<eval>`; V8

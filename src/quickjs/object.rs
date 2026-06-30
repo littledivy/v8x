@@ -104,6 +104,47 @@ fn key_atom<T>(ctx: *mut JSContext, key: *const T) -> JSAtom {
   unsafe { JS_ValueToAtom(ctx, jsval_of(key)) }
 }
 
+unsafe fn atom_string(
+  ctx: *mut JSContext,
+  atom: JSAtom,
+) -> Option<std::string::String> {
+  let s = unsafe { JS_AtomToString(ctx, atom) };
+  if s.tag == JS_TAG_EXCEPTION {
+    return None;
+  }
+  let mut len = 0usize;
+  let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, s) };
+  let out = if cstr.is_null() {
+    None
+  } else {
+    let bytes = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+    let out = std::string::String::from_utf8_lossy(bytes).into_owned();
+    unsafe { JS_FreeCString(ctx, cstr) };
+    Some(out)
+  };
+  unsafe { JS_FreeValue(ctx, s) };
+  out
+}
+
+unsafe fn normalize_stack_value(ctx: *mut JSContext, v: JSValue) -> JSValue {
+  let mut len = 0usize;
+  let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, v) };
+  if cstr.is_null() {
+    return v;
+  }
+  let bytes = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+  let raw = std::string::String::from_utf8_lossy(bytes);
+  let normalized = super::exception::normalize_stack_string(&raw);
+  unsafe { JS_FreeCString(ctx, cstr) };
+  let Some(normalized) = normalized else {
+    return v;
+  };
+  unsafe { JS_FreeValue(ctx, v) };
+  unsafe {
+    JS_NewStringLen(ctx, normalized.as_ptr() as *const c_char, normalized.len())
+  }
+}
+
 #[inline]
 fn attr_to_jsprop(attr: u32) -> c_int {
   let mut flags = JS_PROP_HAS_VALUE
@@ -199,11 +240,17 @@ pub extern "C" fn v8__Object__Get(
   if atom == 0 {
     return ptr::null();
   }
+  let is_stack = unsafe { atom_string(ctx, atom).as_deref() == Some("stack") };
   let v = unsafe { JS_GetProperty(ctx, jsval_of(this), atom) };
   unsafe { JS_FreeAtom(ctx, atom) };
   if v.tag == JS_TAG_EXCEPTION {
     return ptr::null();
   }
+  let v = if is_stack && jsv_is_string(&v) {
+    unsafe { normalize_stack_value(ctx, v) }
+  } else {
+    v
+  };
 
   intern::<Value>(v)
 }

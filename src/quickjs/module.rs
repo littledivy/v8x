@@ -1172,6 +1172,7 @@ pub(crate) fn register_module_source(name: &str, source: &str) {
   if name.is_empty() {
     return;
   }
+  super::core::register_script_source(name, source);
   MODULE_SOURCES_BY_NAME.with(|t| {
     t.borrow_mut().insert(name.to_string(), source.to_string());
   });
