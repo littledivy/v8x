@@ -396,7 +396,13 @@ unsafe extern "C" fn promise_hook_trampoline(
     let promise_h = intern_dup::<crate::Promise>(ctx, promise);
     let parent_h = intern_dup::<Value>(ctx, parent);
     if !promise_h.is_null() && !parent_h.is_null() {
-      unsafe { hook(v8_ty, std::mem::transmute(promise_h), std::mem::transmute(parent_h)) };
+      unsafe {
+        hook(
+          v8_ty,
+          std::mem::transmute(promise_h),
+          std::mem::transmute(parent_h),
+        )
+      };
     }
   }
   let idx = v8_hook_index(v8_ty);
@@ -407,9 +413,7 @@ unsafe extern "C" fn promise_hook_trampoline(
   }
   if v8_ty == crate::PromiseHookType::Before {
     let key = promise_key(promise);
-    if key != 0
-      && SUPPRESS_BEFORE_HOOKS.with(|s| s.borrow_mut().remove(&key))
-    {
+    if key != 0 && SUPPRESS_BEFORE_HOOKS.with(|s| s.borrow_mut().remove(&key)) {
       PROMISE_HOOK_BUSY.with(|b| b.set(false));
       return;
     }
@@ -694,7 +698,11 @@ pub extern "C" fn v8__Isolate__SetMicrotasksPolicy(
   isolate: *mut RealIsolate,
   policy: MicrotasksPolicy,
 ) {
-  let iso = if isolate.is_null() { current_iso() } else { isolate };
+  let iso = if isolate.is_null() {
+    current_iso()
+  } else {
+    isolate
+  };
   if !iso.is_null() {
     iso_state(iso).microtasks_policy = policy;
   }
@@ -1212,7 +1220,10 @@ pub(crate) fn context_get_microtask_queue_raw(
     return ptr::null();
   }
   CONTEXT_MICROTASK_QUEUES.with(|m| {
-    m.borrow().get(&(ctx as usize)).copied().unwrap_or(ptr::null())
+    m.borrow()
+      .get(&(ctx as usize))
+      .copied()
+      .unwrap_or(ptr::null())
   })
 }
 
