@@ -453,8 +453,12 @@ pub extern "C" fn v8__Object__Delete(
   if atom == 0 {
     return MaybeBool::Nothing;
   }
-  let r =
-    unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, JS_PROP_THROW) };
+  // flags=0, NOT JS_PROP_THROW: V8's `Object::Delete` reports an
+  // unconfigurable property as `false` without throwing (sloppy-mode delete
+  // semantics). JS_PROP_THROW would leave a pending exception the embedder
+  // never expects (deno_core deletes init-only props and ignores the result;
+  // the stale exception then aborts the next unrelated eval).
+  let r = unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, 0) };
   unsafe { JS_FreeAtom(ctx, atom) };
   if r < 0 {
     return MaybeBool::Nothing;
@@ -797,8 +801,12 @@ pub extern "C" fn v8__Object__DeleteIndex(
   if atom == 0 {
     return MaybeBool::Nothing;
   }
-  let r =
-    unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, JS_PROP_THROW) };
+  // flags=0, NOT JS_PROP_THROW: V8's `Object::Delete` reports an
+  // unconfigurable property as `false` without throwing (sloppy-mode delete
+  // semantics). JS_PROP_THROW would leave a pending exception the embedder
+  // never expects (deno_core deletes init-only props and ignores the result;
+  // the stale exception then aborts the next unrelated eval).
+  let r = unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, 0) };
   unsafe { JS_FreeAtom(ctx, atom) };
   if r < 0 {
     return MaybeBool::Nothing;
@@ -842,8 +850,12 @@ pub extern "C" fn v8__Object__DeletePrivate(
   if atom == 0 {
     return MaybeBool::Nothing;
   }
-  let r =
-    unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, JS_PROP_THROW) };
+  // flags=0, NOT JS_PROP_THROW: V8's `Object::Delete` reports an
+  // unconfigurable property as `false` without throwing (sloppy-mode delete
+  // semantics). JS_PROP_THROW would leave a pending exception the embedder
+  // never expects (deno_core deletes init-only props and ignores the result;
+  // the stale exception then aborts the next unrelated eval).
+  let r = unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, 0) };
   unsafe { JS_FreeAtom(ctx, atom) };
   if r < 0 {
     return MaybeBool::Nothing;

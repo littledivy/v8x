@@ -851,6 +851,21 @@ fn install_intl_stub(ctx: *mut JSContext, _global: JSValue) {
   }
 }
 
+/// Snapshot replay support: enter/exit `ctx` on the isolate's context stack
+/// (same effect as `v8__Context__Enter/Exit`) so ops invoked by replayed
+/// scripts resolve the right current context (and its embedder state slots).
+pub(crate) fn push_entered_ctx(iso: *mut RealIsolate, ctx: *mut JSContext) {
+  let st = iso_state(iso);
+  st.contexts.push(ctx);
+  refresh_current_ctx(st);
+}
+
+pub(crate) fn pop_entered_ctx(iso: *mut RealIsolate) {
+  let st = iso_state(iso);
+  st.contexts.pop();
+  refresh_current_ctx(st);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__Enter(this: *const Context) {
   let iso = current_iso();

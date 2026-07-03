@@ -173,7 +173,7 @@ pub(crate) fn init_boundary(iso: *mut crate::RealIsolate) {
   };
   for (ctx_key, tape) in pending {
     let ctx = ctx_key as *mut JSContext;
-    replay_tape(ctx, &tape);
+    replay_tape(iso, ctx, &tape);
     // Chained creator: the replayed user entries belong to the NEW blob's
     // user tape (recording during replay is suppressed by REPLAYING).
     if let Some(snap) = iso_state(iso).snap.as_deref_mut() {
@@ -209,8 +209,16 @@ pub(crate) fn deserialize_value(ctx: *mut JSContext, bytes: &[u8]) -> JSValue {
 }
 
 /// Replay one tape into `ctx`. Returns false if any entry threw.
-fn replay_tape(ctx: *mut JSContext, tape: &[TapeEntry]) -> bool {
+fn replay_tape(
+  iso: *mut crate::RealIsolate,
+  ctx: *mut JSContext,
+  tape: &[TapeEntry],
+) -> bool {
   REPLAYING.with(|r| r.set(r.get() + 1));
+  // Enter `ctx` for the duration: replayed scripts can call ops, and ops
+  // resolve the current context (and its embedder state slot) through the
+  // entered-context stack.
+  super::core::push_entered_ctx(iso, ctx);
   let mut ok = true;
   for entry in tape {
     match entry {
@@ -229,7 +237,8 @@ fn replay_tape(ctx: *mut JSContext, tape: &[TapeEntry]) -> bool {
           )
         };
         if v.tag == JS_TAG_EXCEPTION {
-          report_replay_exception(ctx, "<script>");
+          let head: String = source.chars().take(80).collect();
+          report_replay_exception(ctx, &format!("<script> {head:?}"));
           ok = false;
         } else {
           unsafe { JS_FreeValue(ctx, v) };
@@ -267,6 +276,7 @@ fn replay_tape(ctx: *mut JSContext, tape: &[TapeEntry]) -> bool {
       }
     }
   }
+  super::core::pop_entered_ctx(iso);
   REPLAYING.with(|r| r.set(r.get() - 1));
   ok
 }
@@ -290,8 +300,8 @@ pub(crate) fn replay_into(
 
   let mut ok = true;
   if !managed {
-    ok &= replay_tape(ctx, &image.init_tape);
-    ok &= replay_tape(ctx, &image.user_tape);
+    ok &= replay_tape(iso, ctx, &image.init_tape);
+    ok &= replay_tape(iso, ctx, &image.user_tape);
   }
 
   // Restore embedder-data value slots.
@@ -354,6 +364,15 @@ fn report_replay_exception(ctx: *mut JSContext, what: &str) {
           String::from_utf8_lossy(bytes)
         );
         JS_FreeCString(ctx, s);
+        let stk = JS_GetPropertyStr(ctx, exc, c"stack".as_ptr());
+        let mut sl = 0usize;
+        let ss = JS_ToCStringLen(ctx, &mut sl, stk);
+        if !ss.is_null() {
+          let sb = std::slice::from_raw_parts(ss as *const u8, sl);
+          eprintln!("[qjs snapshot] stack:\n{}", String::from_utf8_lossy(sb));
+          JS_FreeCString(ctx, ss);
+        }
+        JS_FreeValue(ctx, stk);
       }
     }
     JS_FreeValue(ctx, exc);

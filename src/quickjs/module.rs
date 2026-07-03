@@ -565,9 +565,31 @@ fn lookup_resolved_specifier_any(spec: &str) -> Option<std::string::String> {
 }
 
 fn mark_all_modules_evaluated() {
+  // Evaluating a root pulls its whole dependency graph, so its deps flip to
+  // Evaluated together — but ONLY those. Query quickjs per-def instead of
+  // sweeping every registered module: a compiled-but-never-evaluated module
+  // (e.g. an extension entry point awaiting its own mod_evaluate) must stay
+  // Instantiated, or deno_core's "already evaluated" early-return skips it.
+  let evaluated_names: std::collections::HashSet<std::string::String> =
+    MODULE_DEF_CACHE.with(|c| {
+      c.borrow()
+        .iter()
+        .filter(|(_, d)| unsafe {
+          v82jsc_module_is_evaluated(**d as *mut JSModuleDef) != 0
+        })
+        .map(|(n, _)| n.clone())
+        .collect()
+    });
   MODULE_STATE.with(|t| {
     for m in t.borrow_mut().values_mut() {
-      m.status = ModuleStatus::Evaluated;
+      if m.status == ModuleStatus::Evaluated {
+        continue;
+      }
+      let def_evaluated = !m.module_def.is_null()
+        && unsafe { v82jsc_module_is_evaluated(m.module_def) != 0 };
+      if def_evaluated || evaluated_names.contains(&m.source_name) {
+        m.status = ModuleStatus::Evaluated;
+      }
     }
   });
   AFTER_FIRST_EVAL.with(|f| f.set(true));

@@ -161,7 +161,9 @@ pub extern "C" fn v8__Context__FromSnapshot(
   }
   st.extra_contexts.push(ctx);
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
-    eprintln!("[qjs snapshot] Context__FromSnapshot idx={context_snapshot_index} ctx={ctx:?}");
+    eprintln!(
+      "[qjs snapshot] Context__FromSnapshot idx={context_snapshot_index} ctx={ctx:?}"
+    );
   }
   super::core::install_default_globals(ctx);
   super::snapshot::replay_into(isolate, ctx, &image);
