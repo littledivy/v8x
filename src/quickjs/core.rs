@@ -509,6 +509,11 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
       JS_FreeRuntime(st.rt);
     }
   }
+  // The module registries are thread-locals keyed by NAME or by pointers into
+  // the runtime that was just freed. A later isolate on this thread (e.g. a
+  // runtime restored from the snapshot this isolate just created) would
+  // resolve its ext: modules to this isolate's dangling defs. Drop them all.
+  super::module::clear_thread_module_caches();
   set_current(ptr::null_mut());
   clear_last_iso(this);
 }
@@ -698,6 +703,9 @@ pub extern "C" fn v8__Context__New(
 
   // Snapshot restore: every plain Context::New on a snapshot-backed isolate
   // materializes the snapshot's default context (matches V8 semantics).
+  if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
+    eprintln!("[qjs snapshot] Context__New ctx={ctx:?}");
+  }
   if let Some(restored) = st.restored.as_deref() {
     let image = restored.default_image.clone();
     super::snapshot::replay_into(isolate, ctx, &image);
@@ -1095,6 +1103,22 @@ pub extern "C" fn v8__Script__Run(
     return ptr::null();
   }
   let src_val = jsval_of(script);
+  if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
+    let mut l = 0usize;
+    let s = unsafe { JS_ToCStringLen(ctx, &mut l, src_val) };
+    let head = if s.is_null() {
+      String::new()
+    } else {
+      let b = unsafe { std::slice::from_raw_parts(s as *const u8, l.min(60)) };
+      let h = String::from_utf8_lossy(b).replace('\n', "\\n");
+      unsafe { JS_FreeCString(ctx, s) };
+      h
+    };
+    eprintln!(
+      "[qjs snapshot] Script__Run ctx={ctx:?} cur={:?} src={head}",
+      current_ctx()
+    );
+  }
 
   let mut len: usize = 0;
   let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, src_val) };
@@ -1131,6 +1155,9 @@ pub extern "C" fn v8__Script__Run(
   }
   let result =
     unsafe { JS_Eval(ctx, cstr, len, fname_ptr, global_eval_flags()) };
+  if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
+    eprintln!("[qjs snapshot]   -> result.tag={}", result.tag);
+  }
   if result.tag != JS_TAG_EXCEPTION {
     // Snapshot recording: remember successfully-run scripts for replay.
     let src_bytes =

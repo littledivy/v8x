@@ -283,6 +283,44 @@ pub use support::MapFnTo;
 pub const TYPED_ARRAY_MAX_SIZE_IN_HEAP: usize =
   binding::v8__TYPED_ARRAY_MAX_SIZE_IN_HEAP as _;
 
+/// Always true in this crate: identifies the v8x compatibility layer (any
+/// engine backend) to embedders that must branch on engine semantics — e.g.
+/// deno_core's snapshot path, where v8x restores by re-initializing + replay
+/// instead of deserializing a V8 heap. The real `v8` crate has no such item,
+/// so code referencing it only compiles against v8x (integration patches).
+pub const IS_V8X: bool = true;
+
+/// The engine backend this build of the shim runs on.
+pub const V8X_ENGINE: &str = if cfg!(feature = "engine_quickjs") {
+  "quickjs"
+} else if cfg!(feature = "vendor_jsc") {
+  "jsc"
+} else {
+  "system-jsc"
+};
+
+/// v8x extension: marks the end of embedder runtime initialization for
+/// replay-based snapshots.
+///
+/// v8x has no heap serializer; a snapshot is a replay tape split into an
+/// *init* phase (heap state the embedder rebuilds natively on every start —
+/// bindings, extension JS) and a *user* phase (state only the tape carries).
+/// The embedder calls this exactly when its native init completes, on BOTH
+/// sides: on a `SnapshotCreator` isolate it flips recording to the user
+/// phase; on an isolate restored from an embedder-managed blob it replays the
+/// pending user tape (the heap now matches what the creator's did at the same
+/// point). Embedders that never call it get whole-tape eager replay at
+/// `Context::New` (plain rusty_v8 semantics). No-op on real V8 and on
+/// backends without replay snapshots.
+pub fn v8x_snapshot_init_boundary(isolate: &mut Isolate) {
+  #[cfg(feature = "engine_quickjs")]
+  quickjs::snapshot::init_boundary(isolate.as_real_ptr());
+  #[cfg(not(feature = "engine_quickjs"))]
+  {
+    let _ = isolate;
+  }
+}
+
 #[cfg(test)]
 #[allow(unused)]
 pub(crate) fn initialize_v8() {

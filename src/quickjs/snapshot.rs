@@ -9,6 +9,23 @@
 //! `Context::New` (and the indexed tapes for `Context::FromSnapshot`), which
 //! recreates the same JS heap state the creator observed. Deterministic init
 //! code — the only thing snapshots are used for in practice — replays exactly.
+//!
+//! ## Init/user phase split (embedder-managed restores)
+//!
+//! Some embedders (deno_core) build part of the snapshot heap with *Rust*
+//! C-API calls (`Deno.core` bindings, primordials, op functions) that a JS
+//! tape cannot capture, then run init scripts that DEPEND on that state.
+//! Replaying such a tape at `Context::New` throws (`Deno.core` is undefined).
+//! Signal: those embedders call `Isolate::SetData(slot 0, state)` when their
+//! init completes. So the tape is split at the creator's first `SetData(0)`
+//! into an *init* tape and a *user* tape, and the blob is marked
+//! "embedder-managed". Restoring a managed blob: the init tape is DROPPED
+//! (the embedder re-runs its native init from scratch — v8x-patched deno_core
+//! takes the InitMode::New path even with a snapshot), and the user tape is
+//! replayed when the restoring runtime performs its own `SetData(0)` —
+//! i.e. exactly when its heap reaches the state the creator's had. Blobs from
+//! creators that never call `SetData(0)` (the vendored rusty_v8 tests) keep
+//! the old semantics: the whole tape replays eagerly at `Context::New`.
 
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -18,7 +35,7 @@ use super::core::current_iso;
 use super::core::iso_state;
 use super::quickjs_sys::*;
 
-pub(crate) const SNAP_MAGIC: &[u8; 8] = b"V8XSNAP1";
+pub(crate) const SNAP_MAGIC: &[u8; 8] = b"V8XSNAP2";
 
 #[derive(Clone, Debug)]
 pub(crate) enum TapeEntry {
@@ -30,11 +47,13 @@ pub(crate) enum TapeEntry {
   ModuleEval { name: String },
 }
 
-/// One context's worth of snapshot: its replay tape, its `AddData` values and
-/// its embedder-data slots (captured at `CreateBlob` time).
+/// One context's worth of snapshot: its replay tapes (split at the creator's
+/// first `SetData(0)`), its `AddData` values and its embedder-data slots
+/// (captured at `CreateBlob` time).
 #[derive(Clone, Default, Debug)]
 pub(crate) struct ContextImage {
-  pub tape: Vec<TapeEntry>,
+  pub init_tape: Vec<TapeEntry>,
+  pub user_tape: Vec<TapeEntry>,
   pub ctx_data: Vec<Vec<u8>>,
   pub embedder: Vec<Option<Vec<u8>>>,
 }
@@ -42,8 +61,13 @@ pub(crate) struct ContextImage {
 /// Recording side: lives on the isolate created by `SnapshotCreator`.
 #[derive(Default)]
 pub(crate) struct SnapState {
-  /// Tape per live JSContext (keyed by pointer value).
+  /// Init-phase tape per live JSContext (keyed by pointer value).
   pub tapes: HashMap<usize, Vec<TapeEntry>>,
+  /// User-phase tape (entries recorded after the first `SetData(0)`).
+  pub user_tapes: HashMap<usize, Vec<TapeEntry>>,
+  /// Set once the embedder calls `SetData(0)`: subsequent recordings are
+  /// user-phase, and the blob is marked embedder-managed.
+  pub user_phase: bool,
   /// `AddData(context, ..)` values per context, serialized eagerly.
   pub ctx_data: HashMap<usize, Vec<Vec<u8>>>,
   /// `AddData(isolate-level)` values, serialized eagerly.
@@ -54,10 +78,25 @@ pub(crate) struct SnapState {
   pub added: Vec<usize>,
 }
 
+impl SnapState {
+  fn tape_for(&mut self, ctx: usize) -> &mut Vec<TapeEntry> {
+    if self.user_phase {
+      self.user_tapes.entry(ctx).or_default()
+    } else {
+      self.tapes.entry(ctx).or_default()
+    }
+  }
+}
+
 /// Restore side: parsed blob + once-consumable data slots.
 pub(crate) struct RestoredSnap {
   pub default_image: ContextImage,
   pub indexed: Vec<ContextImage>,
+  /// Whether the creator called `SetData(0)` (see module docs): init tapes are
+  /// dropped and user tapes replay at the restoring runtime's `SetData(0)`.
+  pub embedder_managed: bool,
+  /// Managed mode: user tapes waiting for the embedder's `SetData(0)`.
+  pub pending_user: Vec<(usize, Vec<TapeEntry>)>,
   /// Isolate-level AddData values; `None` once consumed.
   pub iso_data: Vec<Option<Vec<u8>>>,
   /// Armed per live context at replay time; `None` once consumed.
@@ -83,13 +122,9 @@ fn snap_of_current() -> Option<&'static mut SnapState> {
 
 pub(crate) fn record_script(ctx: *mut JSContext, source: &str) {
   if let Some(snap) = snap_of_current() {
-    snap
-      .tapes
-      .entry(ctx as usize)
-      .or_default()
-      .push(TapeEntry::Script {
-        source: source.to_string(),
-      });
+    snap.tape_for(ctx as usize).push(TapeEntry::Script {
+      source: source.to_string(),
+    });
   }
 }
 
@@ -102,14 +137,10 @@ pub(crate) fn record_module_source(
     return;
   }
   if let Some(snap) = snap_of_current() {
-    snap
-      .tapes
-      .entry(ctx as usize)
-      .or_default()
-      .push(TapeEntry::ModuleSource {
-        name: name.to_string(),
-        source: source.to_string(),
-      });
+    snap.tape_for(ctx as usize).push(TapeEntry::ModuleSource {
+      name: name.to_string(),
+      source: source.to_string(),
+    });
   }
 }
 
@@ -118,13 +149,40 @@ pub(crate) fn record_module_eval(ctx: *mut JSContext, name: &str) {
     return;
   }
   if let Some(snap) = snap_of_current() {
-    snap
-      .tapes
-      .entry(ctx as usize)
-      .or_default()
-      .push(TapeEntry::ModuleEval {
-        name: name.to_string(),
-      });
+    snap.tape_for(ctx as usize).push(TapeEntry::ModuleEval {
+      name: name.to_string(),
+    });
+  }
+}
+
+/// Explicit init/user phase boundary (see module docs), reached via the
+/// public `v8::v8x_snapshot_init_boundary` API. The embedder calls it exactly
+/// when its native runtime init is complete. On a creator: flip recording to
+/// the user phase. On a restored embedder-managed isolate: the embedder's
+/// native init just finished — replay the pending user tapes.
+pub(crate) fn init_boundary(iso: *mut crate::RealIsolate) {
+  if iso.is_null() {
+    return;
+  }
+  if let Some(snap) = iso_state(iso).snap.as_deref_mut() {
+    snap.user_phase = true;
+  }
+  let pending = match iso_state(iso).restored.as_deref_mut() {
+    Some(r) if r.embedder_managed => std::mem::take(&mut r.pending_user),
+    _ => return,
+  };
+  for (ctx_key, tape) in pending {
+    let ctx = ctx_key as *mut JSContext;
+    replay_tape(ctx, &tape);
+    // Chained creator: the replayed user entries belong to the NEW blob's
+    // user tape (recording during replay is suppressed by REPLAYING).
+    if let Some(snap) = iso_state(iso).snap.as_deref_mut() {
+      snap
+        .user_tapes
+        .entry(ctx_key)
+        .or_default()
+        .extend(tape.iter().cloned());
+    }
   }
 }
 
@@ -150,15 +208,11 @@ pub(crate) fn deserialize_value(ctx: *mut JSContext, bytes: &[u8]) -> JSValue {
   unsafe { JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), 0) }
 }
 
-/// Replay one context image into `ctx`. Returns false if any entry threw.
-pub(crate) fn replay_into(
-  iso: *mut crate::RealIsolate,
-  ctx: *mut JSContext,
-  image: &ContextImage,
-) -> bool {
+/// Replay one tape into `ctx`. Returns false if any entry threw.
+fn replay_tape(ctx: *mut JSContext, tape: &[TapeEntry]) -> bool {
   REPLAYING.with(|r| r.set(r.get() + 1));
   let mut ok = true;
-  for entry in &image.tape {
+  for entry in tape {
     match entry {
       TapeEntry::Script { source } => {
         let Ok(csrc) = CString::new(source.as_str()) else {
@@ -213,7 +267,35 @@ pub(crate) fn replay_into(
       }
     }
   }
+  REPLAYING.with(|r| r.set(r.get() - 1));
+  ok
+}
+
+/// Materialize one context image into `ctx` at context-creation time.
+///
+/// Always: restore embedder-data slots and arm the once-consumable AddData
+/// slots. Tape: eager (init + user, old semantics) unless the blob is
+/// embedder-managed — then the init tape is dropped and the user tape parks in
+/// `pending_user` until `SetData(0)` (see module docs).
+pub(crate) fn replay_into(
+  iso: *mut crate::RealIsolate,
+  ctx: *mut JSContext,
+  image: &ContextImage,
+) -> bool {
+  let managed = iso_state(iso)
+    .restored
+    .as_deref()
+    .map(|r| r.embedder_managed)
+    .unwrap_or(false);
+
+  let mut ok = true;
+  if !managed {
+    ok &= replay_tape(ctx, &image.init_tape);
+    ok &= replay_tape(ctx, &image.user_tape);
+  }
+
   // Restore embedder-data value slots.
+  REPLAYING.with(|r| r.set(r.get() + 1));
   for (idx, slot) in image.embedder.iter().enumerate() {
     if let Some(bytes) = slot {
       let v = deserialize_value(ctx, bytes);
@@ -226,21 +308,35 @@ pub(crate) fn replay_into(
   REPLAYING.with(|r| r.set(r.get() - 1));
 
   let st = iso_state(iso);
-  // Arm this context's once-consumable AddData slots.
+  // Arm this context's once-consumable AddData slots (+ park the user tape in
+  // managed mode).
   if let Some(restored) = st.restored.as_deref_mut() {
     restored.ctx_data.insert(
       ctx as usize,
       image.ctx_data.iter().map(|b| Some(b.clone())).collect(),
     );
+    if managed && !image.user_tape.is_empty() {
+      restored
+        .pending_user
+        .push((ctx as usize, image.user_tape.clone()));
+    }
   }
   // Chained creator (`snapshot_creator_from_existing_snapshot`): seed the new
-  // tape with the replayed one so the next CreateBlob emits old + new.
+  // tapes with the replayed ones so the next CreateBlob emits old + new.
+  // (Managed user tapes are seeded when they replay, in on_isolate_set_data.)
   if let Some(snap) = st.snap.as_deref_mut() {
-    snap
-      .tapes
-      .entry(ctx as usize)
-      .or_default()
-      .extend(image.tape.iter().cloned());
+    if !managed {
+      snap
+        .tapes
+        .entry(ctx as usize)
+        .or_default()
+        .extend(image.init_tape.iter().cloned());
+      snap
+        .user_tapes
+        .entry(ctx as usize)
+        .or_default()
+        .extend(image.user_tape.iter().cloned());
+    }
   }
   ok
 }
@@ -266,10 +362,10 @@ fn report_replay_exception(ctx: *mut JSContext, what: &str) {
 
 // ---------------------------------------------------------------------------
 // Blob wire format (little-endian, length-prefixed):
-//   magic[8]
+//   magic[8] | u8 embedder_managed
 //   default_image | u32 n_indexed | indexed images
 //   u32 n_iso_data | (u32 len, bytes)*
-// image := u32 n_tape | tape entries
+// image := u32 n_init_tape | entries | u32 n_user_tape | entries
 //          u32 n_ctx_data | (u32 len, bytes)*
 //          u32 n_embedder | (u8 present, [u32 len, bytes])*
 // tape entry := u8 kind | fields (strings as u32 len + utf8)
@@ -313,9 +409,9 @@ impl<'a> Reader<'a> {
   }
 }
 
-fn write_image(out: &mut Vec<u8>, image: &ContextImage) {
-  put_u32(out, image.tape.len() as u32);
-  for e in &image.tape {
+fn write_tape(out: &mut Vec<u8>, tape: &[TapeEntry]) {
+  put_u32(out, tape.len() as u32);
+  for e in tape {
     match e {
       TapeEntry::Script { source } => {
         out.push(0);
@@ -332,6 +428,31 @@ fn write_image(out: &mut Vec<u8>, image: &ContextImage) {
       }
     }
   }
+}
+
+fn read_tape(r: &mut Reader) -> Option<Vec<TapeEntry>> {
+  let n = r.u32()?;
+  let mut tape = Vec::with_capacity(n as usize);
+  for _ in 0..n {
+    let entry = match r.u8()? {
+      0 => TapeEntry::Script {
+        source: r.string()?,
+      },
+      1 => TapeEntry::ModuleSource {
+        name: r.string()?,
+        source: r.string()?,
+      },
+      2 => TapeEntry::ModuleEval { name: r.string()? },
+      _ => return None,
+    };
+    tape.push(entry);
+  }
+  Some(tape)
+}
+
+fn write_image(out: &mut Vec<u8>, image: &ContextImage) {
+  write_tape(out, &image.init_tape);
+  write_tape(out, &image.user_tape);
   put_u32(out, image.ctx_data.len() as u32);
   for d in &image.ctx_data {
     put_bytes(out, d);
@@ -349,22 +470,8 @@ fn write_image(out: &mut Vec<u8>, image: &ContextImage) {
 }
 
 fn read_image(r: &mut Reader) -> Option<ContextImage> {
-  let n_tape = r.u32()?;
-  let mut tape = Vec::with_capacity(n_tape as usize);
-  for _ in 0..n_tape {
-    let entry = match r.u8()? {
-      0 => TapeEntry::Script {
-        source: r.string()?,
-      },
-      1 => TapeEntry::ModuleSource {
-        name: r.string()?,
-        source: r.string()?,
-      },
-      2 => TapeEntry::ModuleEval { name: r.string()? },
-      _ => return None,
-    };
-    tape.push(entry);
-  }
+  let init_tape = read_tape(r)?;
+  let user_tape = read_tape(r)?;
   let n_data = r.u32()?;
   let mut ctx_data = Vec::with_capacity(n_data as usize);
   for _ in 0..n_data {
@@ -379,7 +486,8 @@ fn read_image(r: &mut Reader) -> Option<ContextImage> {
     });
   }
   Some(ContextImage {
-    tape,
+    init_tape,
+    user_tape,
     ctx_data,
     embedder,
   })
@@ -399,7 +507,8 @@ pub(crate) fn create_blob(snap: &SnapState) -> Vec<u8> {
         .collect()
     };
     ContextImage {
-      tape: snap.tapes.get(&ctx_key).cloned().unwrap_or_default(),
+      init_tape: snap.tapes.get(&ctx_key).cloned().unwrap_or_default(),
+      user_tape: snap.user_tapes.get(&ctx_key).cloned().unwrap_or_default(),
       ctx_data: snap.ctx_data.get(&ctx_key).cloned().unwrap_or_default(),
       embedder,
     }
@@ -407,6 +516,7 @@ pub(crate) fn create_blob(snap: &SnapState) -> Vec<u8> {
 
   let mut out = Vec::new();
   out.extend_from_slice(SNAP_MAGIC);
+  out.push(snap.user_phase as u8);
   write_image(&mut out, &image_for(snap.default_ctx));
   put_u32(&mut out, snap.added.len() as u32);
   for &ctx_key in &snap.added {
@@ -424,6 +534,7 @@ pub(crate) fn parse_blob(bytes: &[u8]) -> Option<RestoredSnap> {
     return None;
   }
   let mut r = Reader { buf: bytes, pos: 8 };
+  let embedder_managed = r.u8()? != 0;
   let default_image = read_image(&mut r)?;
   let n_indexed = r.u32()?;
   let mut indexed = Vec::with_capacity(n_indexed as usize);
@@ -438,6 +549,8 @@ pub(crate) fn parse_blob(bytes: &[u8]) -> Option<RestoredSnap> {
   Some(RestoredSnap {
     default_image,
     indexed,
+    embedder_managed,
+    pending_user: Vec::new(),
     iso_data,
     ctx_data: HashMap::new(),
   })

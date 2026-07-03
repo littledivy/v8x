@@ -1186,6 +1186,27 @@ pub(crate) fn lookup_module_source(name: &str) -> Option<std::string::String> {
   lookup_module_source_by_name(name)
 }
 
+/// Reset every module registry on this thread. Called from
+/// `v8__Isolate__Dispose`: these thread-locals are keyed by module NAME or by
+/// pointers into the disposed runtime, so a later isolate on the same thread
+/// (e.g. a runtime restored from a snapshot the disposed isolate created)
+/// would otherwise resolve its modules to dangling defs from the old runtime.
+/// Values are dropped WITHOUT JS_FreeValue — their runtime is already gone.
+pub(crate) fn clear_thread_module_caches() {
+  MODULE_STATE.with(|c| c.borrow_mut().clear());
+  MODULE_SOURCES_BY_NAME.with(|c| c.borrow_mut().clear());
+  MODULE_DEF_CACHE.with(|c| c.borrow_mut().clear());
+  SYNTHETIC_EXPORTS.with(|c| c.borrow_mut().clear());
+  SYNTHETIC_NS_EXPORTS.with(|c| c.borrow_mut().clear());
+  SYNTHETIC_DEFS.with(|c| c.borrow_mut().clear());
+  SYNTHETIC_EVAL_STEPS.with(|c| c.borrow_mut().clear());
+  AFTER_FIRST_EVAL.with(|c| c.set(false));
+  RESOLVED_SPECIFIERS.with(|c| c.borrow_mut().clear());
+  MODULE_WRAPPER_BY_NAME.with(|c| c.borrow_mut().clear());
+  MAIN_MODULE_URL.with(|c| c.borrow_mut().take());
+  PENDING_SOURCE_IMPORTS.with(|c| c.borrow_mut().clear());
+}
+
 pub(crate) unsafe extern "C" fn module_normalize_callback(
   ctx: *mut JSContext,
   module_base_name: *const std::os::raw::c_char,
