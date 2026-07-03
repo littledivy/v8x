@@ -310,11 +310,20 @@ async function rescueHiddenPasses(bin, cwd, batchOutput) {
   let out = "";
   let rescued = 0;
   for (const name of failed) {
-    const r = await streamWithWatchdog(
-      bin,
-      [name, "--exact", "--test-threads", "1", "--color", "never"],
-      cwd,
-    );
+    // On Linux, cap each solo run's address space at 8 GiB: a test that
+    // allocates unboundedly (heap_limits-class) must die with its own OOM
+    // instead of taking down the CI runner VM. macOS has no working
+    // `ulimit -v`, so the plain spawn is used there (dev machines have swap;
+    // the output-silence watchdog still bounds wall clock).
+    const args = [name, "--exact", "--test-threads", "1", "--color", "never"];
+    const r =
+      os.platform() === "linux"
+        ? await streamWithWatchdog(
+            "/bin/sh",
+            ["-c", `ulimit -v 8388608; exec "$0" "$@"`, bin, ...args],
+            cwd,
+          )
+        : await streamWithWatchdog(bin, args, cwd);
     if (/^test result: ok\. 1 passed/m.test(r.output)) {
       out += `test ${name} ... ok\n`;
       rescued++;
