@@ -207,10 +207,54 @@ index aafac6d..c240a69 100644
  }
  
 diff --git a/libs/core/runtime/jsruntime.rs b/libs/core/runtime/jsruntime.rs
-index 6f1ce4d..84ff9d4 100644
+index 6f1ce4d..8084711 100644
 --- a/libs/core/runtime/jsruntime.rs
 +++ b/libs/core/runtime/jsruntime.rs
-@@ -1566,12 +1566,24 @@ impl JsRuntime {
+@@ -315,6 +315,14 @@ pub(crate) enum InitMode {
+ 
+ impl InitMode {
+   fn from_options(options: &RuntimeOptions) -> Self {
++    // v8x: the backend has no V8 heap snapshots — a startup blob is a replay
++    // tape the backend itself materializes (embedder-managed: user-phase
++    // entries replay when we store the state pointer via SetData(0)). All of
++    // deno_core's own heap state (Deno.core, primordials, op bindings,
++    // extension JS) must therefore be rebuilt exactly as in a fresh runtime.
++    if v8::IS_V8X {
++      return Self::New;
++    }
+     match options.startup_snapshot {
+       None => Self::New,
+       Some(_) => Self::FromSnapshot {
+@@ -811,6 +819,14 @@ impl JsRuntime {
+       .take()
+       .map(snapshot::deconstruct)
+       .unzip();
++    // v8x: the raw blob must still reach v8::CreateParams (the backend arms
++    // its replay tape from it), but the sidecar describes V8 heap objects
++    // (module handles, function templates) that a replay-based restore does
++    // not preserve — this runtime re-initializes as InitMode::New instead
++    // (see InitMode::from_options), so drop the sidecar wholesale.
++    if v8::IS_V8X {
++      sidecar_data = None;
++    }
+     startup_phase_end(_phase, "snapshot::deconstruct");
+ 
+     let _phase = startup_phase_begin();
+@@ -1318,6 +1334,13 @@ impl JsRuntime {
+         .put(uv_compat::AsyncId::default());
+     }
+ 
++    // v8x: runtime init is complete — everything past this point is user
++    // state. On a snapshot creator this flips tape recording to the user
++    // phase; on a runtime restored from a v8x blob it replays the user tape
++    // now (our heap just reached the same state the creator's had here).
++    // No-op unless the backend does replay-based snapshots.
++    v8::v8x_snapshot_init_boundary(js_runtime.v8_isolate());
++
+     // ...and we've made it; `JsRuntime` is ready to execute user code.
+     Ok(js_runtime)
+   }
+@@ -1566,12 +1589,24 @@ impl JsRuntime {
        Rc::new(ExtModuleLoader::new(sources, ext_code_cache.clone()));
      *module_map.loader.borrow_mut() = ext_loader.clone();
  
@@ -240,7 +284,7 @@ index 6f1ce4d..84ff9d4 100644
      }
  
      // Execute extension scripts
-@@ -1602,34 +1614,54 @@ impl JsRuntime {
+@@ -1602,34 +1637,54 @@ impl JsRuntime {
        }
      }
  

@@ -202,8 +202,13 @@ function streamWithWatchdog(bin, args, cwd) {
       // `(?: - should panic)?` strips libtest's display annotation so the name
       // is the bare test PATH `--skip` expects (the panic suffix is not part of
       // the filter name).
+      // The dangling line is not always CLEAN: the crashing test's stderr can
+      // interleave onto it before any newline (`test X ... thread 'X' has
+      // overflowed its stack`), so require only that the suffix is NOT a
+      // libtest result — not that the line ends after `... `.
       let inFlight = null;
-      const startRe = /^test (.+?)(?: - should panic)? \.\.\. *$/gm;
+      const startRe =
+        /^test (.+?)(?: - should panic)? \.\.\. (?!ok\b|FAILED\b|ignored\b)[^\n]*$/gm;
       for (let m; (m = startRe.exec(output)) !== null; ) inFlight = m[1];
       resolve({ output, killed, code, signal, inFlight });
     });
