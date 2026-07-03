@@ -757,12 +757,16 @@ fn install_weakref_kept_object_shim(ctx: *mut JSContext) {
         return globalThis.__v8xKeptObjectsCleared ? undefined : this.__v8xTarget;
       }
     }, writable: true, configurable: true });
-  \0"#;
+  "#;
+  // QuickJS's parser needs a NUL sentinel at buf[len]; a raw string can't
+  // embed one (`\0` inside r#""# is a literal backslash + zero — that typo
+  // broke every Context::New on CI), so copy into a NUL-terminated CString.
+  let csrc = std::ffi::CString::new(SRC).unwrap();
   unsafe {
     let r = JS_Eval(
       ctx,
-      SRC.as_ptr() as *const std::os::raw::c_char,
-      SRC.len() - 1,
+      csrc.as_ptr(),
+      SRC.len(),
       c"<weakref-kept-objects>".as_ptr(),
       JS_EVAL_TYPE_GLOBAL,
     );
