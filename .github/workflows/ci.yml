@@ -148,6 +148,12 @@ jobs:
             git submodule update --init --depth 1 vendor/rusty_v8 vendor/quickjs-ng vendor/wamr
           fi
       - uses: dtolnay/rust-toolchain@stable
+      # deno_core::tests::test_rebuild_async_stubs shells out to a stock
+      # `deno` CLI (and panics rather than skipping when it's absent); the
+      # macos-15 image stopped shipping one.
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
       - name: Install ninja (WebKit build)
         if: matrix.ninja
         run: brew install ninja
