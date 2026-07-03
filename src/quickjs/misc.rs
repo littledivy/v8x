@@ -658,8 +658,31 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
     return 0;
   }
   let ctx = ctx_of(context);
-  let bytes =
-    super::snapshot::serialize_value(ctx, jsval_of(data)).unwrap_or_default();
+  let val = jsval_of(data);
+  let bytes = super::snapshot::serialize_value(ctx, val);
+  if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
+    let preview = unsafe {
+      let mut l = 0usize;
+      let s = JS_ToCStringLen(ctx, &mut l, val);
+      let out = if s.is_null() {
+        "<unstringifiable>".to_string()
+      } else {
+        let b = std::slice::from_raw_parts(s as *const u8, l.min(80));
+        let c = String::from_utf8_lossy(b).into_owned();
+        JS_FreeCString(ctx, s);
+        c
+      };
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      out
+    };
+    eprintln!(
+      "[qjs snapshot] AddData_to_context tag={} ser={} preview={preview}",
+      val.tag,
+      bytes.is_some(),
+    );
+  }
+  let bytes = bytes.unwrap_or_default();
   if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut() {
     let v = snap.ctx_data.entry(ctx as usize).or_default();
     v.push(bytes);

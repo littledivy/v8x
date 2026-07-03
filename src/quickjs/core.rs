@@ -749,12 +749,12 @@ fn install_weakref_kept_object_shim(ctx: *mut JSContext) {
         return globalThis.__v8xKeptObjectsCleared ? undefined : this.__v8xTarget;
       }
     }, writable: true, configurable: true });
-  "#;
+  \0"#;
   unsafe {
     let r = JS_Eval(
       ctx,
       SRC.as_ptr() as *const std::os::raw::c_char,
-      SRC.len(),
+      SRC.len() - 1,
       c"<weakref-kept-objects>".as_ptr(),
       JS_EVAL_TYPE_GLOBAL,
     );
