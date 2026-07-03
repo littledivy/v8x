@@ -301,7 +301,12 @@ async function runBins(bins, cwd) {
 async function rescueHiddenPasses(bin, cwd, batchOutput) {
   const failed = [];
   const re = /^test (.+?)(?: - should panic)? \.\.\. FAILED\b/gm;
-  for (let m; (m = re.exec(batchOutput)) !== null; ) failed.push(m[1]);
+  for (let m; (m = re.exec(batchOutput)) !== null; ) {
+    // Never solo-run a quarantined test: IGNORE holds tests that hang, crash,
+    // or OOM the machine (e.g. heap_limits) — a solo rerun re-triggers exactly
+    // that (killed our CI runner twice before this check).
+    if (!IGNORE.has(m[1])) failed.push(m[1]);
+  }
   let out = "";
   let rescued = 0;
   for (const name of failed) {
