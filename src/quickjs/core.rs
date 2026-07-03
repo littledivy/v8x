@@ -370,8 +370,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   let restored = if params.is_null() {
     None
   } else {
-    let raw =
-      params as *const crate::isolate_create_params::raw::CreateParams;
+    let raw = params as *const crate::isolate_create_params::raw::CreateParams;
     let blob = unsafe { (*raw).snapshot_blob };
     if blob.is_null() {
       None
@@ -380,8 +379,9 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
       if data.is_null() || len <= 0 {
         None
       } else {
-        let bytes =
-          unsafe { std::slice::from_raw_parts(data as *const u8, len as usize) };
+        let bytes = unsafe {
+          std::slice::from_raw_parts(data as *const u8, len as usize)
+        };
         super::snapshot::parse_blob(bytes).map(Box::new)
       }
     }

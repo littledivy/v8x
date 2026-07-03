@@ -83,11 +83,13 @@ fn snap_of_current() -> Option<&'static mut SnapState> {
 
 pub(crate) fn record_script(ctx: *mut JSContext, source: &str) {
   if let Some(snap) = snap_of_current() {
-    snap.tapes.entry(ctx as usize).or_default().push(
-      TapeEntry::Script {
+    snap
+      .tapes
+      .entry(ctx as usize)
+      .or_default()
+      .push(TapeEntry::Script {
         source: source.to_string(),
-      },
-    );
+      });
   }
 }
 
@@ -100,12 +102,14 @@ pub(crate) fn record_module_source(
     return;
   }
   if let Some(snap) = snap_of_current() {
-    snap.tapes.entry(ctx as usize).or_default().push(
-      TapeEntry::ModuleSource {
+    snap
+      .tapes
+      .entry(ctx as usize)
+      .or_default()
+      .push(TapeEntry::ModuleSource {
         name: name.to_string(),
         source: source.to_string(),
-      },
-    );
+      });
   }
 }
 

@@ -607,8 +607,7 @@ pub extern "C" fn v8__SnapshotCreator__SetDefaultContext(
   if iso.is_null() {
     return;
   }
-  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut()
-  {
+  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut() {
     snap.default_ctx = ctx_of(context) as usize;
   }
 }
@@ -622,8 +621,7 @@ pub extern "C" fn v8__SnapshotCreator__AddContext(
   if iso.is_null() {
     return 0;
   }
-  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut()
-  {
+  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut() {
     snap.added.push(ctx_of(context) as usize);
     return snap.added.len() - 1;
   }
@@ -642,8 +640,7 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_isolate(
   let ctx = current_ctx();
   let bytes =
     super::snapshot::serialize_value(ctx, jsval_of(data)).unwrap_or_default();
-  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut()
-  {
+  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut() {
     snap.iso_data.push(bytes);
     return snap.iso_data.len() - 1;
   }
@@ -663,8 +660,7 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
   let ctx = ctx_of(context);
   let bytes =
     super::snapshot::serialize_value(ctx, jsval_of(data)).unwrap_or_default();
-  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut()
-  {
+  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut() {
     let v = snap.ctx_data.entry(ctx as usize).or_default();
     v.push(bytes);
     return v.len() - 1;
