@@ -537,10 +537,14 @@ pub(crate) struct RawStartupDataAbi {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__CONSTRUCT(
   buf: *mut c_void,
-  _params: *const c_void,
+  params: *const c_void,
 ) {
-  let iso = crate::quickjs::core::v8__Isolate__New(ptr::null());
+  // Params may carry an existing snapshot blob (creator-from-existing):
+  // Isolate__New parses it, and each new context replays + re-records it.
+  let iso = crate::quickjs::core::v8__Isolate__New(params);
   crate::quickjs::core::v8__Isolate__Enter(iso);
+  crate::quickjs::core::iso_state(iso).snap =
+    Some(Box::new(super::snapshot::SnapState::default()));
   if !buf.is_null() {
     unsafe { *(buf as *mut *mut RealIsolate) = iso };
   }
@@ -562,11 +566,32 @@ pub extern "C" fn v8__SnapshotCreator__GetIsolate(
   current_iso() as *mut c_void
 }
 
+fn creator_iso(this: *const c_void) -> *mut RealIsolate {
+  if !this.is_null() {
+    let iso = unsafe { *(this as *const *mut RealIsolate) };
+    if !iso.is_null() {
+      return iso;
+    }
+  }
+  current_iso()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__CreateBlob(
-  _this: *mut c_void,
+  this: *mut c_void,
   _function_code_handling: u32,
 ) -> RawStartupDataAbi {
+  let iso = creator_iso(this);
+  if !iso.is_null() {
+    if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref() {
+      let bytes = super::snapshot::create_blob(snap);
+      let (data, len) = super::snapshot::leak_blob(bytes);
+      return RawStartupDataAbi {
+        data: data as *const c_char,
+        raw_size: len as std::os::raw::c_int,
+      };
+    }
+  }
   RawStartupDataAbi {
     data: ptr::null(),
     raw_size: 0,
@@ -575,25 +600,75 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__SetDefaultContext(
-  _this: *mut c_void,
-  _context: *const Context,
+  this: *mut c_void,
+  context: *const Context,
 ) {
+  let iso = creator_iso(this);
+  if iso.is_null() {
+    return;
+  }
+  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut()
+  {
+    snap.default_ctx = ctx_of(context) as usize;
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__AddContext(
-  _this: *mut c_void,
-  _context: *const Context,
+  this: *mut c_void,
+  context: *const Context,
 ) -> usize {
+  let iso = creator_iso(this);
+  if iso.is_null() {
+    return 0;
+  }
+  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut()
+  {
+    snap.added.push(ctx_of(context) as usize);
+    return snap.added.len() - 1;
+  }
+  0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__SnapshotCreator__AddData_to_isolate(
+  this: *mut c_void,
+  data: *const Data,
+) -> usize {
+  let iso = creator_iso(this);
+  if iso.is_null() || data.is_null() {
+    return 0;
+  }
+  let ctx = current_ctx();
+  let bytes =
+    super::snapshot::serialize_value(ctx, jsval_of(data)).unwrap_or_default();
+  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut()
+  {
+    snap.iso_data.push(bytes);
+    return snap.iso_data.len() - 1;
+  }
   0
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
-  _this: *mut c_void,
-  _context: *const Context,
-  _data: *const Data,
+  this: *mut c_void,
+  context: *const Context,
+  data: *const Data,
 ) -> usize {
+  let iso = creator_iso(this);
+  if iso.is_null() || data.is_null() {
+    return 0;
+  }
+  let ctx = ctx_of(context);
+  let bytes =
+    super::snapshot::serialize_value(ctx, jsval_of(data)).unwrap_or_default();
+  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut()
+  {
+    let v = snap.ctx_data.entry(ctx as usize).or_default();
+    v.push(bytes);
+    return v.len() - 1;
+  }
   0
 }
 
@@ -603,12 +678,22 @@ pub extern "C" fn v8__StartupData__CanBeRehashed(_this: *const c_void) -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__StartupData__IsValid(_this: *const c_void) -> bool {
-  false
+pub extern "C" fn v8__StartupData__IsValid(this: *const c_void) -> bool {
+  if this.is_null() {
+    return false;
+  }
+  let raw = unsafe { &*(this as *const RawStartupDataAbi) };
+  if raw.data.is_null() || raw.raw_size < 8 {
+    return false;
+  }
+  let head = unsafe { std::slice::from_raw_parts(raw.data as *const u8, 8) };
+  head == super::snapshot::SNAP_MAGIC
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__StartupData__data__DELETE(_this: *const c_char) {}
+pub extern "C" fn v8__StartupData__data__DELETE(this: *const c_char) {
+  super::snapshot::free_blob(this as *const u8);
+}
 
 // ICU common-data loader (vendored rusty_v8 `icu::set_common_data_77`). QuickJS
 // brings its own ICU/Intl, so we never actually *load* V8's blob — but we do
@@ -1143,6 +1228,46 @@ pub extern "C" fn v8__Context__SetEmbedderData(
   });
 }
 
+/// Snapshot support: borrow every embedder-data value slot of `ctx`.
+/// `None` marks unset (undefined) slots.
+pub(crate) fn embedder_data_snapshot(
+  ctx: *mut JSContext,
+) -> Vec<Option<JSValue>> {
+  EMBEDDER_DATA.with(|m| {
+    m.borrow()
+      .get(&(ctx as usize))
+      .map(|slots| {
+        slots
+          .iter()
+          .map(|v| if jsv_is_undefined(v) { None } else { Some(*v) })
+          .collect()
+      })
+      .unwrap_or_default()
+  })
+}
+
+/// Snapshot support: install a replayed value into an embedder-data slot.
+/// Dups `value` (caller keeps its refcount).
+pub(crate) fn set_embedder_data_raw(
+  ctx: *mut JSContext,
+  index: usize,
+  value: JSValue,
+) {
+  let owned = unsafe { JS_DupValue(ctx, value) };
+  EMBEDDER_DATA.with(|m| {
+    let mut map = m.borrow_mut();
+    let slots = map.entry(ctx as usize).or_default();
+    while slots.len() <= index {
+      slots.push(jsv_undefined());
+    }
+    let old = slots[index];
+    if old.tag < 0 {
+      unsafe { JS_FreeValue(ctx, old) };
+    }
+    slots[index] = owned;
+  });
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetEmbedderData(
   this: *const Context,
@@ -1641,14 +1766,6 @@ pub extern "C" fn v8__Set__Has(
     JS_FreeValue(ctx, r);
     mb(b)
   }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__SnapshotCreator__AddData_to_isolate(
-  _this: *mut std::os::raw::c_void,
-  _data: *const std::os::raw::c_void,
-) -> usize {
-  0
 }
 
 #[unsafe(no_mangle)]

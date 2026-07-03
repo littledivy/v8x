@@ -279,7 +279,44 @@ async function runBins(bins, cwd) {
     codesign(bin);
     // Print the path so parseLibtest can attribute tests to a binary.
     out += `Running ${bin}\n`;
-    out += (await runOneBin(bin, cwd, ["--test-threads", "1", "--color", "never"])) + "\n";
+    const batch = await runOneBin(bin, cwd, ["--test-threads", "1", "--color", "never"]);
+    out += batch + "\n";
+    if (flag("rescue")) out += await rescueHiddenPasses(bin, cwd, batch);
+  }
+  return out;
+}
+
+// --rescue: solo-rerun every batch-FAILED test, and count a solo pass.
+//
+// runOneBin's recovery handles tests that HANG or CRASH the process — but not
+// the third failure mode: a test that panics while holding the vendored
+// suite's shared PROCESS_LOCK *write* guard POISONS the lock. Every later test
+// in the same process then fails inside setup() (`RwLock::read().unwrap()`)
+// while the process runs on, so nothing dangles and no recovery triggers —
+// dozens of genuinely-passing tests report FAILED. That's a batch artifact,
+// not a backend failure: each FAILED test gets one solo `--exact` rerun (own
+// process, fresh lock) and a solo "ok" supersedes the batch FAILED in
+// parseLibtest. Opt-in per CI cell: a cell that turns --rescue on must refresh
+// its baseline in the same PR (rescue surfaces passes --check would flag).
+async function rescueHiddenPasses(bin, cwd, batchOutput) {
+  const failed = [];
+  const re = /^test (.+?)(?: - should panic)? \.\.\. FAILED\b/gm;
+  for (let m; (m = re.exec(batchOutput)) !== null; ) failed.push(m[1]);
+  let out = "";
+  let rescued = 0;
+  for (const name of failed) {
+    const r = await streamWithWatchdog(
+      bin,
+      [name, "--exact", "--test-threads", "1", "--color", "never"],
+      cwd,
+    );
+    if (/^test result: ok\. 1 passed/m.test(r.output)) {
+      out += `test ${name} ... ok\n`;
+      rescued++;
+    }
+  }
+  if (failed.length) {
+    console.error(`  [rescue] ${rescued}/${failed.length} batch-FAILED tests pass solo`);
   }
   return out;
 }

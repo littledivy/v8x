@@ -92,10 +92,15 @@ jobs:
           node-version: 22
       - name: rusty_v8 suite (${{ matrix.backend }})
         run: |
+          # --rescue solo-reruns batch-FAILED tests (poisoned PROCESS_LOCK
+          # fallout — see run.mjs rescueHiddenPasses). Opt-in per cell: a cell
+          # turning it on must refresh its baseline in the same PR.
+          RESCUE=""
+          if [ "${{ matrix.backend }}" = "quickjs" ]; then RESCUE="--rescue"; fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            node tests/harness/run.mjs rusty_v8 ${{ matrix.backend }} --check
+            node tests/harness/run.mjs rusty_v8 ${{ matrix.backend }} --check $RESCUE
           else
-            node tests/harness/run.mjs rusty_v8 ${{ matrix.backend }}
+            node tests/harness/run.mjs rusty_v8 ${{ matrix.backend }} $RESCUE
           fi
       - name: Upload run results
         if: always()

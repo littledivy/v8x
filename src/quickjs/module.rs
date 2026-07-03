@@ -1181,6 +1181,11 @@ fn lookup_module_source_by_name(name: &str) -> Option<std::string::String> {
   MODULE_SOURCES_BY_NAME.with(|t| t.borrow().get(name).cloned())
 }
 
+/// Snapshot replay: fetch a registered module source by exact name.
+pub(crate) fn lookup_module_source(name: &str) -> Option<std::string::String> {
+  lookup_module_source_by_name(name)
+}
+
 pub(crate) unsafe extern "C" fn module_normalize_callback(
   ctx: *mut JSContext,
   module_base_name: *const std::os::raw::c_char,
@@ -1762,6 +1767,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
 
   register_module_source(&fname, &text);
   note_main_module(&fname);
+  super::snapshot::record_module_source(ctx, &fname, &text);
   if std::env::var_os("QJS_DEBUG_MOD").is_some() {
     eprintln!("[QJS CompileModule] {fname} imports={import_specifiers:?}");
   }
@@ -2500,6 +2506,10 @@ pub extern "C" fn v8__Module__Evaluate(
   })
   .unwrap_or((None, std::string::String::new(), std::string::String::new()));
   let source_name_dbg = source_name.clone();
+  // Snapshot recording: modules evaluated on a creator isolate replay via
+  // JS_Eval(TYPE_MODULE) of their registered source (deps come from the
+  // ModuleSource tape entries recorded at compile time).
+  super::snapshot::record_module_eval(ctx, &source_name);
 
   if !source_name.is_empty() {
     let cached =
@@ -3178,16 +3188,19 @@ pub extern "C" fn v8__ModuleRequest__GetImportAttributes(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__IsSourceTextModule(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  let this = this as *const Module;
+  with_module_state(this, |m| !m.synthetic).unwrap_or(false)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__ScriptId(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  // V8 script ids are small ints; any per-module stable value works. Derive
+  // one from the handle-state key so it survives instantiate/evaluate.
+  ((this as usize >> 4) & 0x3fff_ffff) as crate::support::int
 }
 
 #[unsafe(no_mangle)]

@@ -134,22 +134,66 @@ pub(crate) fn codegen_release_ctx(ctx: *mut JSContext) {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__FromSnapshot(
   isolate: *mut RealIsolate,
-  _context_snapshot_index: usize,
+  context_snapshot_index: usize,
   _global_object: *const Value,
   _microtask_queue: *mut MicrotaskQueue,
 ) -> *const Context {
   if isolate.is_null() {
     return ptr::null();
   }
-  super::core::intern_ctx(super::core::iso_state(isolate).ctx)
+  let st = super::core::iso_state(isolate);
+  // Materialize the indexed snapshot context into a fresh JSContext (its own
+  // global object, like V8's AddContext'd contexts).
+  let Some(image) = st
+    .restored
+    .as_deref()
+    .and_then(|r| r.indexed.get(context_snapshot_index))
+    .cloned()
+  else {
+    return ptr::null();
+  };
+  let ctx = unsafe { JS_NewContext(st.rt) };
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  if std::env::var_os("QJS_NO_WASM").is_none() {
+    super::wasm::install_webassembly(ctx);
+  }
+  st.extra_contexts.push(ctx);
+  super::core::install_default_globals(ctx);
+  super::snapshot::replay_into(isolate, ctx, &image);
+  super::core::intern_ctx(ctx)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetDataFromSnapshotOnce(
-  _this: *const Context,
-  _index: usize,
+  this: *const Context,
+  index: usize,
 ) -> *const Data {
-  ptr::null()
+  let ctx = super::core::ctx_of(this);
+  let iso = super::core::current_iso();
+  if ctx.is_null() || iso.is_null() {
+    return ptr::null();
+  }
+  let st = super::core::iso_state(iso);
+  let Some(restored) = st.restored.as_deref_mut() else {
+    return ptr::null();
+  };
+  let Some(bytes) = restored
+    .ctx_data
+    .get_mut(&(ctx as usize))
+    .and_then(|slots| slots.get_mut(index))
+    .and_then(|slot| slot.take())
+  else {
+    return ptr::null();
+  };
+  let v = super::snapshot::deserialize_value(ctx, &bytes);
+  if v.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return ptr::null();
+  }
+  super::core::intern::<Data>(v)
 }
 
 /// Native `getContinuationPreservedEmbedderData` for the extras binding object.
@@ -1151,10 +1195,33 @@ pub extern "C" fn v8__Isolate__GetCurrentHostDefinedOptions(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetDataFromSnapshotOnce(
-  _this: *mut std::os::raw::c_void,
-  _index: usize,
+  this: *mut std::os::raw::c_void,
+  index: usize,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let iso = this as *mut RealIsolate;
+  if iso.is_null() {
+    return ptr::null();
+  }
+  let st = super::core::iso_state(iso);
+  let ctx = super::core::current_ctx();
+  let Some(restored) = st.restored.as_deref_mut() else {
+    return ptr::null();
+  };
+  let Some(bytes) = restored
+    .iso_data
+    .get_mut(index)
+    .and_then(|slot| slot.take())
+  else {
+    return ptr::null();
+  };
+  let ctx = if ctx.is_null() { st.ctx } else { ctx };
+  let v = super::snapshot::deserialize_value(ctx, &bytes);
+  if v.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return ptr::null();
+  }
+  super::core::intern::<Data>(v) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]

@@ -107,6 +107,11 @@ pub(crate) struct IsoState {
 
   pub extra_contexts: Vec<*mut JSContext>,
 
+  // Snapshot support (see snapshot.rs). `snap` records on SnapshotCreator
+  // isolates; `restored` holds a parsed blob to replay into new contexts.
+  pub snap: Option<Box<super::snapshot::SnapState>>,
+  pub restored: Option<Box<super::snapshot::RestoredSnap>>,
+
   pub external_memory: AtomicI64,
 
   pub external_string_memory: AtomicI64,
@@ -359,7 +364,28 @@ fn sab_funcs_table() -> *const JSSharedArrayBufferFunctions {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
+pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
+  // If CreateParams carries a snapshot blob (our replay format), parse it so
+  // new contexts on this isolate replay the recorded boot tape.
+  let restored = if params.is_null() {
+    None
+  } else {
+    let raw =
+      params as *const crate::isolate_create_params::raw::CreateParams;
+    let blob = unsafe { (*raw).snapshot_blob };
+    if blob.is_null() {
+      None
+    } else {
+      let (data, len) = unsafe { ((*blob).data, (*blob).raw_size) };
+      if data.is_null() || len <= 0 {
+        None
+      } else {
+        let bytes =
+          unsafe { std::slice::from_raw_parts(data as *const u8, len as usize) };
+        super::snapshot::parse_blob(bytes).map(Box::new)
+      }
+    }
+  };
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
@@ -407,6 +433,8 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     ext_class_id,
     main_ctx_claimed: false,
     extra_contexts: Vec::new(),
+    snap: None,
+    restored,
     external_memory: AtomicI64::new(0),
     external_string_memory: AtomicI64::new(0),
     weak_handles: Vec::new(),
@@ -667,6 +695,13 @@ pub extern "C" fn v8__Context__New(
     c
   };
   install_default_globals(ctx);
+
+  // Snapshot restore: every plain Context::New on a snapshot-backed isolate
+  // materializes the snapshot's default context (matches V8 semantics).
+  if let Some(restored) = st.restored.as_deref() {
+    let image = restored.default_image.clone();
+    super::snapshot::replay_into(isolate, ctx, &image);
+  }
 
   intern_ctx(ctx)
 }
@@ -1096,6 +1131,14 @@ pub extern "C" fn v8__Script__Run(
   }
   let result =
     unsafe { JS_Eval(ctx, cstr, len, fname_ptr, global_eval_flags()) };
+  if result.tag != JS_TAG_EXCEPTION {
+    // Snapshot recording: remember successfully-run scripts for replay.
+    let src_bytes =
+      unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+    if let Ok(src) = std::str::from_utf8(src_bytes) {
+      super::snapshot::record_script(ctx, src);
+    }
+  }
   unsafe { JS_FreeCString(ctx, cstr) };
   if result.tag == JS_TAG_EXCEPTION {
     if std::env::var_os("QJS_DEBUG_EXC").is_some() {
