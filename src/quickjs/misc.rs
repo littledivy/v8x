@@ -613,9 +613,7 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
 ) -> RawStartupDataAbi {
   let iso = creator_iso(this);
   if !iso.is_null() {
-    // C-API record/replay tape is the DEFAULT blob format; V8X_TAPE_V1
-    // falls back to the legacy JS-source tape while it is being retired.
-    if std::env::var_os("V8X_TAPE_V1").is_none() {
+    {
       if let Some(rec) =
         crate::quickjs::core::iso_state(iso).tape_rec.as_deref()
       {
