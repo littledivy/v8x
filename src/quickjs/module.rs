@@ -84,20 +84,32 @@ fn bc_cache_dir() -> Option<std::path::PathBuf> {
     .clone()
 }
 
-fn bc_key(source: &str) -> u64 {
-  use std::hash::{Hash, Hasher};
-  let mut h = std::collections::hash_map::DefaultHasher::new();
-  BC_MAGIC.hash(&mut h);
-  source.len().hash(&mut h);
-  source.hash(&mut h);
-  h.finish()
+/// FNV-1a over 8-byte lanes. Cache keys hash multiple MB of extension source
+/// on EVERY boot (each module eval + each transpile lookup); SipHash
+/// (DefaultHasher) was a measurable slice of denort startup. Collision
+/// resistance only needs to beat accidental edits, not adversaries.
+pub(crate) fn fast_content_hash(seed: u64, bytes: &[u8]) -> u64 {
+  const PRIME: u64 = 0x0000_0100_0000_01B3;
+  let mut h = 0xcbf2_9ce4_8422_2325u64 ^ seed;
+  let mut chunks = bytes.chunks_exact(8);
+  for c in &mut chunks {
+    h = (h ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(PRIME);
+  }
+  for &b in chunks.remainder() {
+    h = (h ^ b as u64).wrapping_mul(PRIME);
+  }
+  h ^ (bytes.len() as u64)
+}
+
+pub(crate) fn bc_key(source: &str) -> u64 {
+  fast_content_hash(BC_MAGIC as u64, source.as_bytes())
 }
 
 fn bc_path(key: u64) -> Option<std::path::PathBuf> {
   Some(bc_cache_dir()?.join(format!("{key:016x}.qbc")))
 }
 
-fn bc_load(key: u64) -> Option<Vec<u8>> {
+pub(crate) fn bc_load(key: u64) -> Option<Vec<u8>> {
   let p = bc_path(key)?;
   std::fs::read(p).ok().filter(|b| !b.is_empty())
 }
@@ -114,7 +126,7 @@ fn bc_store(key: u64, bytes: &[u8]) {
   }
 }
 
-unsafe fn bc_write(ctx: *mut JSContext, key: u64, obj: JSValue) {
+pub(crate) unsafe fn bc_write(ctx: *mut JSContext, key: u64, obj: JSValue) {
   if bc_cache_dir().is_none() {
     return;
   }

@@ -1172,8 +1172,55 @@ pub extern "C" fn v8__Script__Run(
     let bytes = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
     register_script_source(fname, &String::from_utf8_lossy(bytes));
   }
-  let result =
-    unsafe { JS_Eval(ctx, cstr, len, fname_ptr, global_eval_flags()) };
+  // Script bytecode cache: parse once per (source, flags), then boot from
+  // JS_ReadObject + JS_EvalFunction — same pattern as the module path. The
+  // eval flags participate via the seed so a `--use_strict` run never reuses
+  // sloppy-mode bytecode.
+  let eval_flags = global_eval_flags();
+  let src_str = std::str::from_utf8(source_bytes).ok();
+  let bc_key = src_str.map(|s| {
+    super::module::fast_content_hash(
+      0x5343_5249 ^ eval_flags as u64,
+      s.as_bytes(),
+    )
+  });
+  let mut result = JSValue {
+    u: JSValueUnion { int32: 0 },
+    tag: JS_TAG_UNINITIALIZED,
+  };
+  if let Some(key) = bc_key
+    && let Some(bytes) = super::module::bc_load(key)
+  {
+    let obj = unsafe {
+      JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), 1 /* BYTECODE */)
+    };
+    if obj.tag == JS_TAG_EXCEPTION {
+      // Stale/corrupt cache entry: clear the error, fall through to a parse.
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+    } else {
+      result = unsafe { JS_EvalFunction(ctx, obj) };
+    }
+  }
+  if result.tag == JS_TAG_UNINITIALIZED {
+    let compiled = unsafe {
+      JS_Eval(
+        ctx,
+        cstr,
+        len,
+        fname_ptr,
+        eval_flags | JS_EVAL_FLAG_COMPILE_ONLY,
+      )
+    };
+    if compiled.tag == JS_TAG_EXCEPTION {
+      result = compiled;
+    } else {
+      if let Some(key) = bc_key {
+        unsafe { super::module::bc_write(ctx, key, compiled) };
+      }
+      result = unsafe { JS_EvalFunction(ctx, compiled) };
+    }
+  }
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
     eprintln!("[qjs snapshot]   -> result.tag={}", result.tag);
   }

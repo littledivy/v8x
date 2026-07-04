@@ -7,6 +7,7 @@
 
 mod allocator;
 mod arraybuffer;
+mod capi_tape;
 mod cli_extra;
 mod core;
 mod exception;
