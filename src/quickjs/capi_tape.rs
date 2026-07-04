@@ -219,6 +219,41 @@ pub(crate) enum TapeOp {
     ctx: HandleId,
     index: u32,
   },
+  /// Rust-driven JS call during embedder init (e.g. deno_core invoking its
+  /// setUpAsyncStub JS helper per async op). Replay re-invokes it.
+  FunctionCall {
+    result: HandleId,
+    ctx: HandleId,
+    callee: HandleId,
+    recv: HandleId,
+    args: Vec<HandleId>,
+  },
+  /// Module wrapper handle from ScriptCompiler::CompileModule (the module's
+  /// side-table state is reconstructed by name; sources ride ModuleSource).
+  ModuleCompile {
+    id: HandleId,
+    ctx: HandleId,
+    name: Vec<u8>,
+  },
+  /// Context::GetExtrasBindingObject result.
+  ExtrasBinding {
+    id: HandleId,
+    ctx: HandleId,
+  },
+  /// FunctionTemplate::New — template handles are shim-side structs, not JS
+  /// values; they carry an id so template context data survives a restore.
+  TemplateNew {
+    id: HandleId,
+    cb_ext_ref: u32,
+    data_ext: Option<u32>,
+    length: i32,
+    constructable: bool,
+  },
+  /// Positional marker: the creator stored its per-runtime state here
+  /// (Isolate::SetData slot ≥ 1). Everything before it demonstrably ran
+  /// WITHOUT embedder state on the creator, so it replays eagerly; JS after
+  /// it waits for the restoring runtime's own SetData.
+  StateReady,
 }
 
 // ---------------------------------------------------------------------------
@@ -308,12 +343,19 @@ impl Recorder {
     match self.ptr_ids.get(&(ptr as usize)) {
       Some(&id) => id,
       None => {
+        // Read the handle's JSValue tag for diagnosis (arena slot layout).
+        let tag = unsafe { (*(ptr as *const JSValue)).tag };
         self
           .incomplete
-          .push(format!("arg without id: {what} ({ptr:?})"));
+          .push(format!("arg without id: {what} tag={tag} ({ptr:?})"));
         u32::MAX
       }
     }
+  }
+
+  /// Non-fatal arg lookup (reads): None when the value was never recorded.
+  pub fn try_arg(&mut self, ptr: *const std::ffi::c_void) -> Option<HandleId> {
+    self.ptr_ids.get(&(ptr as usize)).copied()
   }
 
   pub fn ctx_id(&mut self, ctx: *mut JSContext) -> HandleId {
@@ -388,6 +430,34 @@ impl Recorder {
 
 pub(crate) const TAPE_MAGIC: &[u8; 8] = b"V8XTAPE1";
 
+/// The ids an op PRODUCES (results only) — taint sources for the deferred
+/// replay phase.
+fn op_result_ids(op: &TapeOp) -> Vec<HandleId> {
+  use TapeOp::*;
+  match op {
+    ContextNew { id }
+    | ContextGlobal { id, .. }
+    | StringNew { id, .. }
+    | NumberNew { id, .. }
+    | BoolNew { id, .. }
+    | UndefinedNew { id }
+    | NullNew { id }
+    | ObjectNew { id }
+    | ArrayNew { id, .. }
+    | ExternalNew { id, .. }
+    | FunctionNew { id, .. }
+    | GetProp { id, .. }
+    | GetEmbedderData { id, .. }
+    | ModuleCompile { id, .. }
+    | ExtrasBinding { id, .. }
+    | TemplateNew { id, .. } => vec![*id],
+    ScriptRun { result, .. }
+    | ModuleEval { result, .. }
+    | FunctionCall { result, .. } => vec![*result],
+    _ => vec![],
+  }
+}
+
 /// Every id an op mentions (result + argument ids) — used to advance a
 /// chained creator's id counter past the seeded range.
 fn op_ids(op: &TapeOp) -> Vec<HandleId> {
@@ -442,6 +512,21 @@ fn op_ids(op: &TapeOp) -> Vec<HandleId> {
     SetDefaultContext { ctx } | AddContext { ctx } => vec![*ctx],
     SetEmbedderData { ctx, value, .. } => vec![*ctx, *value],
     GetEmbedderData { id, ctx, .. } => vec![*id, *ctx],
+    FunctionCall {
+      result,
+      ctx,
+      callee,
+      recv,
+      args,
+    } => {
+      let mut v = vec![*result, *ctx, *callee, *recv];
+      v.extend_from_slice(args);
+      v
+    }
+    ModuleCompile { id, ctx, .. } => vec![*id, *ctx],
+    ExtrasBinding { id, ctx } => vec![*id, *ctx],
+    TemplateNew { id, .. } => vec![*id],
+    StateReady => vec![],
   }
 }
 
@@ -641,6 +726,49 @@ pub(crate) fn serialize(ops: &[TapeOp]) -> Vec<u8> {
         put_u32(&mut out, *ctx);
         put_u32(&mut out, *index);
       }
+      TapeOp::FunctionCall {
+        result,
+        ctx,
+        callee,
+        recv,
+        args,
+      } => {
+        out.push(24);
+        put_u32(&mut out, *result);
+        put_u32(&mut out, *ctx);
+        put_u32(&mut out, *callee);
+        put_u32(&mut out, *recv);
+        put_u32(&mut out, args.len() as u32);
+        for a in args {
+          put_u32(&mut out, *a);
+        }
+      }
+      TapeOp::ModuleCompile { id, ctx, name } => {
+        out.push(25);
+        put_u32(&mut out, *id);
+        put_u32(&mut out, *ctx);
+        put_bytes(&mut out, name);
+      }
+      TapeOp::ExtrasBinding { id, ctx } => {
+        out.push(26);
+        put_u32(&mut out, *id);
+        put_u32(&mut out, *ctx);
+      }
+      TapeOp::TemplateNew {
+        id,
+        cb_ext_ref,
+        data_ext,
+        length,
+        constructable,
+      } => {
+        out.push(27);
+        put_u32(&mut out, *id);
+        put_u32(&mut out, *cb_ext_ref);
+        put_opt(&mut out, *data_ext);
+        put_i32(&mut out, *length);
+        out.push(*constructable as u8);
+      }
+      TapeOp::StateReady => out.push(28),
     }
   }
   out
@@ -790,6 +918,41 @@ pub(crate) fn deserialize(bytes: &[u8]) -> Option<Vec<TapeOp>> {
         ctx: r.u32()?,
         index: r.u32()?,
       },
+      24 => {
+        let result = r.u32()?;
+        let ctx = r.u32()?;
+        let callee = r.u32()?;
+        let recv = r.u32()?;
+        let n = r.u32()?;
+        let mut args = Vec::with_capacity(n as usize);
+        for _ in 0..n {
+          args.push(r.u32()?);
+        }
+        TapeOp::FunctionCall {
+          result,
+          ctx,
+          callee,
+          recv,
+          args,
+        }
+      }
+      25 => TapeOp::ModuleCompile {
+        id: r.u32()?,
+        ctx: r.u32()?,
+        name: r.bytes()?,
+      },
+      26 => TapeOp::ExtrasBinding {
+        id: r.u32()?,
+        ctx: r.u32()?,
+      },
+      27 => TapeOp::TemplateNew {
+        id: r.u32()?,
+        cb_ext_ref: r.u32()?,
+        data_ext: r.opt()?,
+        length: r.i32()?,
+        constructable: r.u8()? != 0,
+      },
+      28 => TapeOp::StateReady,
       _ => return None,
     };
     ops.push(op);
@@ -843,6 +1006,12 @@ pub(crate) struct TapeRestore {
   pub ops: Vec<TapeOp>,
   /// Copy kept after replay for chained-creator seeding.
   pub seeded_ops: Vec<TapeOp>,
+  /// JS-executing entries (and everything data-dependent on their results),
+  /// deferred until the embedder stores its state pointer (SetData): ops
+  /// fired by replayed extension code read that state, and real V8 executes
+  /// nothing at restore so embedders never guard for it.
+  pub deferred: Vec<TapeOp>,
+  pub deferred_done: bool,
   pub replayed: bool,
   /// id → owned (+1) JSValue. Everything stays alive until isolate dispose:
   /// GetDataFromSnapshotOnce may be called long after replay.
@@ -855,6 +1024,12 @@ pub(crate) struct TapeRestore {
   pub iso_data: Vec<Option<HandleId>>,
   /// Restore-process external-reference table (index → pointer).
   pub ext_table: Vec<usize>,
+  /// Tape id → module WRAPPER handle pointer (module identity in deno_core's
+  /// side tables is the handle pointer itself, so GetDataFromSnapshotOnce
+  /// must return the exact wrapper, not a re-interned copy).
+  pub module_handles: HashMap<HandleId, usize>,
+  /// Tape id → replayed FunctionTemplate handle pointer (shim-side struct).
+  pub template_handles: HashMap<HandleId, usize>,
 }
 
 impl TapeRestore {
@@ -877,6 +1052,10 @@ impl TapeRestore {
     TapeRestore {
       seeded_ops: ops.clone(),
       ops,
+      deferred: Vec::new(),
+      deferred_done: false,
+      module_handles: HashMap::new(),
+      template_handles: HashMap::new(),
       replayed: false,
       handles: HashMap::new(),
       contexts: HashMap::new(),
@@ -910,7 +1089,60 @@ pub(crate) fn replay(iso: *mut crate::RealIsolate) {
     return;
   }
   restore.replayed = true;
-  let ops = std::mem::take(&mut restore.ops);
+  let all_ops = std::mem::take(&mut restore.ops);
+  // Positional split at the StateReady marker (see the op's docs): before it
+  // everything replays eagerly, after it JS-executing entries wait for the
+  // restoring runtime's own state install. Pure C ops and data-slot
+  // registration always run eagerly — the latter keeps AddData indices in
+  // tape order; reads of not-yet-materialized values get placeholders.
+  let mut ops = Vec::new();
+  let mut deferred = Vec::new();
+  let mut after_marker = false;
+  for op in all_ops {
+    if matches!(op, TapeOp::StateReady) {
+      after_marker = true;
+      continue;
+    }
+    let is_js = matches!(
+      op,
+      TapeOp::ScriptRun { .. }
+        | TapeOp::ModuleEval { .. }
+        | TapeOp::FunctionCall { .. }
+    );
+    if after_marker && is_js {
+      deferred.push(op);
+    } else if after_marker
+      && !matches!(
+        op,
+        TapeOp::AddContextData { .. }
+          | TapeOp::AddIsolateData { .. }
+          | TapeOp::SetDefaultContext { .. }
+          | TapeOp::AddContext { .. }
+          | TapeOp::ContextNew { .. }
+          | TapeOp::ContextGlobal { .. }
+          | TapeOp::ObjectNew { .. }
+          | TapeOp::ArrayNew { .. }
+          | TapeOp::FunctionNew { .. }
+          | TapeOp::ExtrasBinding { .. }
+          | TapeOp::ModuleSource { .. }
+          | TapeOp::ModuleCompile { .. }
+          | TapeOp::TemplateNew { .. }
+          | TapeOp::StringNew { .. }
+          | TapeOp::NumberNew { .. }
+          | TapeOp::BoolNew { .. }
+          | TapeOp::UndefinedNew { .. }
+          | TapeOp::NullNew { .. }
+          | TapeOp::ExternalNew { .. }
+      )
+    {
+      // Post-marker mutations/reads may reference post-marker JS results:
+      // keep them ordered WITH the JS.
+      deferred.push(op);
+    } else {
+      ops.push(op);
+    }
+  }
+  restore.deferred = deferred;
   let rt = st.rt;
 
   let mut first_ctx = true;
@@ -962,6 +1194,44 @@ unsafe fn atom_of(
   match handles.get(&key) {
     Some((v, _)) => unsafe { JS_ValueToAtom(ctx, *v) },
     None => 0,
+  }
+}
+
+/// Run the deferred (JS-executing) phase. Triggered by the embedder's first
+/// meaningful Isolate::SetData — deno_core stores its JsRuntimeState right
+/// after context/bindings setup and before any code could need it.
+/// True when a restored isolate still has JS-executing tape entries pending.
+pub(crate) fn has_pending_deferred(iso: *mut crate::RealIsolate) -> bool {
+  if iso.is_null() {
+    return false;
+  }
+  iso_state(iso)
+    .tape_restore
+    .as_deref()
+    .map(|r| r.replayed && !r.deferred_done)
+    .unwrap_or(false)
+}
+
+pub(crate) fn replay_deferred(iso: *mut crate::RealIsolate) {
+  let st = iso_state(iso);
+  let Some(restore) = st.tape_restore.as_deref_mut() else {
+    return;
+  };
+  if !restore.replayed || restore.deferred_done {
+    return;
+  }
+  restore.deferred_done = true;
+  let rt = st.rt;
+  let ops = std::mem::take(&mut restore.deferred);
+  for op in &ops {
+    if matches!(op, TapeOp::ContextNew { .. }) {
+      continue;
+    }
+    let restore = iso_state(iso).tape_restore.as_deref_mut().unwrap();
+    replay_one(rt, restore, op);
+  }
+  if dbg_on() {
+    eprintln!("[qjs tape] deferred phase done ({} ops)", ops.len());
   }
 }
 
@@ -1313,6 +1583,94 @@ fn replay_one(rt: *mut JSRuntime, r: &mut TapeRestore, op: &TapeOp) {
         .unwrap_or(jsv_undefined());
       let dup = unsafe { JS_DupValue(c, v) };
       r.handles.insert(*id, (dup, c));
+    }
+    TapeOp::FunctionCall {
+      result,
+      ctx,
+      callee,
+      recv,
+      args,
+    } => {
+      let c = ctxof!(ctx);
+      let f = val!(callee);
+      let this = val!(recv);
+      let mut argv: Vec<JSValue> = Vec::with_capacity(args.len());
+      for a in args {
+        argv.push(val!(a));
+      }
+      super::core::push_entered_ctx(current_iso(), c);
+      let v =
+        unsafe { JS_Call(c, f, this, argv.len() as i32, argv.as_mut_ptr()) };
+      super::core::pop_entered_ctx(current_iso());
+      if v.tag == JS_TAG_EXCEPTION {
+        if dbg_on() {
+          let e = unsafe { JS_GetException(c) };
+          let mut l = 0usize;
+          let cs = unsafe { JS_ToCStringLen(c, &mut l, e) };
+          if !cs.is_null() {
+            let b = unsafe { std::slice::from_raw_parts(cs as *const u8, l) };
+            eprintln!(
+              "[qjs tape] FunctionCall threw: {}",
+              String::from_utf8_lossy(b)
+            );
+            unsafe { JS_FreeCString(c, cs) };
+          }
+          unsafe { JS_FreeValue(c, e) };
+        } else {
+          let e = unsafe { JS_GetException(c) };
+          unsafe { JS_FreeValue(c, e) };
+        }
+        return;
+      }
+      r.handles.insert(*result, (v, c));
+    }
+    TapeOp::ModuleCompile { id, ctx, name } => {
+      let c = ctxof!(ctx);
+      let n = String::from_utf8_lossy(name).into_owned();
+      let h = super::module::tape_make_module_handle(c, &n);
+      if !h.is_null() {
+        // The wrapper handle IS the identity deno_core keeps; hold a dup of
+        // its JSValue so the id resolves like any other.
+        let v = unsafe { JS_DupValue(c, super::core::jsval_of(h)) };
+        r.handles.insert(*id, (v, c));
+        r.module_handles.insert(*id, h as usize);
+      }
+    }
+    TapeOp::ExtrasBinding { id, ctx } => {
+      let c = ctxof!(ctx);
+      let h = super::isolate::extras_binding_for_ctx(c);
+      if !h.is_null() {
+        let v = unsafe { JS_DupValue(c, super::core::jsval_of(h)) };
+        r.handles.insert(*id, (v, c));
+      }
+    }
+    TapeOp::StateReady => {}
+    TapeOp::TemplateNew {
+      id,
+      cb_ext_ref,
+      data_ext,
+      length,
+      constructable,
+    } => {
+      let cb_ptr = r.ext_ptr(*cb_ext_ref);
+      if cb_ptr.is_null() {
+        if dbg_on() {
+          eprintln!("[qjs tape] TemplateNew: unresolved ext ref {cb_ext_ref}");
+        }
+        return;
+      }
+      let data_ptr = data_ext.map(|e| r.ext_ptr(e));
+      let h = super::function::tape_make_template(
+        unsafe {
+          std::mem::transmute::<*mut std::ffi::c_void, crate::FunctionCallback>(
+            cb_ptr,
+          )
+        },
+        data_ptr,
+        *length,
+        *constructable,
+      );
+      r.template_handles.insert(*id, h as usize);
     }
   }
 }

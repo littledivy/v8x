@@ -212,8 +212,19 @@ pub extern "C" fn v8__Context__GetDataFromSnapshotOnce(
     let Some(hid) = taken else {
       return ptr::null();
     };
+    if let Some(&wrapper) = restore.module_handles.get(&hid) {
+      // Module identity IS the wrapper pointer (side tables key on it).
+      return wrapper as *const Data;
+    }
+    if let Some(&tmpl) = restore.template_handles.get(&hid) {
+      return tmpl as *const Data;
+    }
     let Some(&(v, vctx)) = restore.handles.get(&hid) else {
-      return ptr::null();
+      // Produced by a deferred (JS-executing) tape entry that has not run
+      // yet: hand back undefined instead of failing the whole load. (Real
+      // V8 would have the value; the affected slots are script-result
+      // caches, which our model re-derives by re-running the scripts.)
+      return super::core::intern::<Data>(jsv_undefined());
     };
     let _ = vctx;
     let h = super::core::intern_dup::<Data>(ctx, v);
@@ -277,6 +288,15 @@ unsafe extern "C" fn extras_set_cped(
   jsv_undefined()
 }
 
+/// Tape replay entry to the extras binding object (same shim object the
+/// C-ABI fn returns, minus the handle-arg plumbing).
+pub(crate) fn extras_binding_for_ctx(ctx: *mut JSContext) -> *const Object {
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  extras_binding_impl(ctx)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetExtrasBindingObject(
   this: *const Context,
@@ -285,6 +305,17 @@ pub extern "C" fn v8__Context__GetExtrasBindingObject(
   if ctx.is_null() {
     return ptr::null();
   }
+  let h = extras_binding_impl(ctx);
+  crate::quickjs::capi_tape::rec(|r| {
+    let cid = r.ctx_id(ctx);
+    let id = r.produced(h as *const _);
+    r.ops
+      .push(crate::quickjs::capi_tape::TapeOp::ExtrasBinding { id, ctx: cid });
+  });
+  return h;
+}
+
+fn extras_binding_impl(ctx: *mut JSContext) -> *const Object {
   unsafe {
     let o = JS_NewObject(ctx);
     let console = JS_NewObject(ctx);
@@ -375,6 +406,15 @@ pub extern "C" fn v8__Context__SetAlignedPointerInEmbedderData(
   embedder_slots_with(this, Some(idx + 1), |v| {
     v[idx] = value;
   });
+  // Tape restore: the embedder just installed its per-context state (deno's
+  // CONTEXT_STATE_SLOT is an aligned slot ≥ 1) — the earliest point at which
+  // ops fired by deferred JS tape entries can resolve their state.
+  if index >= 1 && !value.is_null() {
+    let iso = super::core::current_iso();
+    if !iso.is_null() {
+      super::capi_tape::replay_deferred(iso);
+    }
+  }
 }
 
 type JSPromiseHookType = i32;
@@ -1257,7 +1297,7 @@ pub extern "C" fn v8__Isolate__GetDataFromSnapshotOnce(
       return ptr::null();
     };
     let Some(&(v, vctx)) = restore.handles.get(&hid) else {
-      return ptr::null();
+      return std::ptr::null();
     };
     let target = if ctx.is_null() { vctx } else { ctx };
     let h = super::core::intern_dup::<Data>(target, v);

@@ -141,6 +141,18 @@ struct ObjTemplate {
   parent_fn: *const FnTemplate,
 }
 
+impl ObjTemplate {
+  /// Bare template for tape replay.
+  fn default_for_tape() -> ObjTemplate {
+    ObjTemplate {
+      internal_field_count: 0,
+      props: Vec::new(),
+      accessors: Vec::new(),
+      parent_fn: std::ptr::null(),
+    }
+  }
+}
+
 struct DispatchEntry {
   callback: FunctionCallback,
 
@@ -733,6 +745,43 @@ pub extern "C" fn v8__Function__Call(
   if ctx.is_null() || this.is_null() {
     return ptr::null();
   }
+  // Rust-driven call on a recording creator: tape it (the JS it runs is
+  // otherwise invisible to a restore). Argument/result ids resolved OUTSIDE
+  // the depth guard; the call body itself must not re-record.
+  let tape_ids = if crate::quickjs::capi_tape::recording() {
+    let mut out = None;
+    crate::quickjs::capi_tape::rec(|r| {
+      // A Rust-driven call whose callee or arguments the tape cannot
+      // represent (e.g. deno_core passing TypedArray views over
+      // process-local ContextState buffers to __setTickInfo) is per-process
+      // wiring: the embedder re-issues it on every start — including after a
+      // restore — so it must NOT be replayed. Skip silently.
+      let Some(fid) = r.try_arg(this as *const _) else {
+        return;
+      };
+      let rid = if recv.is_null() {
+        None
+      } else {
+        match r.try_arg(recv as *const _) {
+          Some(id) => Some(id),
+          None => return,
+        }
+      };
+      let mut aids = Vec::new();
+      for i in 0..argc.max(0) as usize {
+        let ap = unsafe { *argv.add(i) };
+        match r.try_arg(ap as *const _) {
+          Some(id) => aids.push(id),
+          None => return,
+        }
+      }
+      let cid = r.ctx_id(ctx);
+      out = Some((cid, fid, rid.unwrap_or(u32::MAX), aids));
+    });
+    out
+  } else {
+    None
+  };
   let _jsg = crate::quickjs::capi_tape::JsDepthGuard::enter();
   let func = jsval_of(this);
   let recv_v = if recv.is_null() {
@@ -766,7 +815,32 @@ pub extern "C" fn v8__Function__Call(
     return ptr::null();
   }
 
-  intern::<Value>(r)
+  let h = intern::<Value>(r);
+  if let Some((cid, fid, rid, aids)) = tape_ids {
+    drop(_jsg);
+    crate::quickjs::capi_tape::rec(|rr| {
+      let result = rr.produced(h as *const _);
+      // recv id u32::MAX encodes "undefined receiver" — replay maps it to a
+      // fresh UndefinedNew entry instead of a missing handle.
+      let recv_id = if rid == u32::MAX {
+        let id = rr.produced(std::ptr::null());
+        rr.ops
+          .push(crate::quickjs::capi_tape::TapeOp::UndefinedNew { id });
+        id
+      } else {
+        rid
+      };
+      rr.ops
+        .push(crate::quickjs::capi_tape::TapeOp::FunctionCall {
+          result,
+          ctx: cid,
+          callee: fid,
+          recv: recv_id,
+          args: aids,
+        });
+    });
+  }
+  h
 }
 
 #[unsafe(no_mangle)]
@@ -1172,6 +1246,67 @@ pub extern "C" fn v8__FunctionTemplate__New(
     accessors: Vec::new(),
     parent_fn: ptr::null(),
   }));
+  register_template(proto as usize, TemplKind::Obj);
+  register_template(instance as usize, TemplKind::Obj);
+  let t = Box::into_raw(Box::new(FnTemplate {
+    callback,
+    data,
+    constructable,
+    length,
+    class_name: None,
+    proto,
+    instance,
+    parent: ptr::null(),
+    props: Vec::new(),
+    accessors: Vec::new(),
+    cached_proto: jsv_undefined(),
+  }));
+  unsafe { (*instance).parent_fn = t };
+  register_template(t as usize, TemplKind::Func);
+  crate::quickjs::capi_tape::rec(|r| {
+    let data_ext = {
+      let d = unsafe { (*t).data };
+      let opaque = unsafe { JS_GetOpaque(d, ext_class_id_current()) };
+      if opaque.is_null() {
+        if !jsv_is_undefined(&d) {
+          r.incomplete
+            .push("FunctionTemplate__New data is not an External".into());
+        }
+        None
+      } else {
+        Some(r.ext_ref(opaque as usize, "FunctionTemplate__New data"))
+      }
+    };
+    let cb_ref = r.ext_ref(callback as usize, "FunctionTemplate__New cb");
+    let id = r.produced(t as *const _);
+    r.ops.push(crate::quickjs::capi_tape::TapeOp::TemplateNew {
+      id,
+      cb_ext_ref: cb_ref,
+      data_ext,
+      length,
+      constructable,
+    });
+  });
+  t as *const FunctionTemplate
+}
+
+/// Tape replay: reconstruct a FunctionTemplate (same struct the C-ABI ctor
+/// builds) with a remapped callback/data pointer.
+pub(crate) fn tape_make_template(
+  callback: FunctionCallback,
+  data_ptr: Option<*mut c_void>,
+  length: i32,
+  constructable: bool,
+) -> *const FunctionTemplate {
+  let ctx = crate::quickjs::core::current_ctx();
+  let data = match data_ptr {
+    Some(p) if !p.is_null() && !ctx.is_null() => {
+      make_external_jsvalue(crate::quickjs::core::current_iso(), ctx, p)
+    }
+    _ => jsv_undefined(),
+  };
+  let proto = Box::into_raw(Box::new(ObjTemplate::default_for_tape()));
+  let instance = Box::into_raw(Box::new(ObjTemplate::default_for_tape()));
   register_template(proto as usize, TemplKind::Obj);
   register_template(instance as usize, TemplKind::Obj);
   let t = Box::into_raw(Box::new(FnTemplate {

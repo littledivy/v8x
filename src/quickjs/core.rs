@@ -593,6 +593,22 @@ pub extern "C" fn v8__Isolate__SetData(
   if let Some(s) = st.data_slots.get_mut(slot as usize) {
     *s = data;
   }
+  // Tape restore: the embedder just stored its per-runtime state (rusty_v8
+  // reserves raw slot 0; embedder slots start at 1). Ops fired by the
+  // deferred JS entries can now resolve it.
+  if slot >= 1 && !data.is_null() {
+    super::capi_tape::replay_deferred(isolate as *mut RealIsolate);
+    // Creator side: mark the point where embedder state came alive.
+    super::capi_tape::rec(|r| {
+      if !r
+        .ops
+        .iter()
+        .any(|o| matches!(o, super::capi_tape::TapeOp::StateReady))
+      {
+        r.ops.push(super::capi_tape::TapeOp::StateReady);
+      }
+    });
+  }
 }
 
 #[unsafe(no_mangle)]

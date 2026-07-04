@@ -213,10 +213,17 @@ pub extern "C" fn v8__Object__Get(
 
   let h = intern::<Value>(v);
   crate::quickjs::capi_tape::rec(|r| {
-    let cid = r.ctx_id(ctx);
-    let oid = r.arg(this as *const _, "Object__Get this");
+    // Reads on values the tape has never seen (e.g. `.message` of a caught
+    // init-time exception) are transient Rust-side inspections: skip them —
+    // the result cannot become load-bearing heap state, and only writes and
+    // calls mutate. If a skipped read's result IS referenced later, the
+    // later op reports the missing id.
+    let Some(oid) = r.try_arg(this as *const _) else {
+      return;
+    };
     let kid = r.arg(key as *const _, "Object__Get key");
     let id = r.produced(h as *const _);
+    let cid = r.ctx_id(ctx);
     r.ops.push(crate::quickjs::capi_tape::TapeOp::GetProp {
       id,
       ctx: cid,
@@ -289,7 +296,20 @@ pub extern "C" fn v8__Object__Set(
     let cid = rr.ctx_id(ctx);
     let oid = rr.arg(this as *const _, "Object__Set this");
     let kid = rr.arg(key as *const _, "Object__Set key");
-    let vid = rr.arg(value as *const _, "Object__Set value");
+    let key_preview = unsafe {
+      let cs = JS_ToCString(ctx, jsval_of(key));
+      if cs.is_null() {
+        std::string::String::new()
+      } else {
+        let out = std::ffi::CStr::from_ptr(cs).to_string_lossy().into_owned();
+        JS_FreeCString(ctx, cs);
+        out
+      }
+    };
+    let vid = rr.arg(
+      value as *const _,
+      &format!("Object__Set value key={key_preview}"),
+    );
     rr.ops.push(crate::quickjs::capi_tape::TapeOp::SetProp {
       ctx: cid,
       obj: oid,

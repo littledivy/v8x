@@ -157,7 +157,15 @@ pub extern "C" fn v8__String__NewFromTwoByte(
   if v.tag == JS_TAG_EXCEPTION {
     return ptr::null();
   }
-  intern::<V8String>(v)
+  let h = intern::<V8String>(v);
+  crate::quickjs::capi_tape::rec(|r| {
+    let id = r.produced(h as *const _);
+    r.ops.push(crate::quickjs::capi_tape::TapeOp::StringNew {
+      id,
+      utf8: utf8.as_bytes().to_vec(),
+    });
+  });
+  h
 }
 
 #[unsafe(no_mangle)]
@@ -186,6 +194,13 @@ pub extern "C" fn v8__String__NewExternalOneByteConst(
   }
   let handle = intern::<V8String>(v);
   remember_external_onebyte(handle, bytes.to_vec().into_boxed_slice());
+  crate::quickjs::capi_tape::rec(|r| {
+    let id = r.produced(handle as *const _);
+    r.ops.push(crate::quickjs::capi_tape::TapeOp::StringNew {
+      id,
+      utf8: bytes.to_vec(),
+    });
+  });
   handle
 }
 
@@ -216,6 +231,13 @@ pub extern "C" fn v8__String__NewExternalOneByteStatic(
   }
   let handle = intern::<V8String>(v);
   remember_external_onebyte(handle, bytes.to_vec().into_boxed_slice());
+  crate::quickjs::capi_tape::rec(|r| {
+    let id = r.produced(handle as *const _);
+    r.ops.push(crate::quickjs::capi_tape::TapeOp::StringNew {
+      id,
+      utf8: utf8.as_bytes().to_vec(),
+    });
+  });
   handle
 }
 
@@ -642,7 +664,15 @@ pub extern "C" fn v8__String__NewFromOneByte(
   if v.tag == JS_TAG_EXCEPTION {
     return ptr::null();
   }
-  intern::<V8String>(v)
+  let h = intern::<V8String>(v);
+  crate::quickjs::capi_tape::rec(|r| {
+    let id = r.produced(h as *const _);
+    r.ops.push(crate::quickjs::capi_tape::TapeOp::StringNew {
+      id,
+      utf8: utf8.as_bytes().to_vec(),
+    });
+  });
+  h
 }
 
 #[unsafe(no_mangle)]

@@ -614,10 +614,18 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
       {
         if !rec.incomplete.is_empty() {
           eprintln!(
-            "[qjs tape] blob INCOMPLETE ({} gaps); first: {}",
-            rec.incomplete.len(),
-            rec.incomplete[0]
+            "[qjs tape] blob INCOMPLETE ({} gaps)",
+            rec.incomplete.len()
           );
+          let mut uniq: std::collections::BTreeMap<&str, u32> =
+            Default::default();
+          for g in &rec.incomplete {
+            let key = g.split(" (0x").next().unwrap_or(g);
+            *uniq.entry(key).or_default() += 1;
+          }
+          for (k, n) in uniq {
+            eprintln!("[qjs tape]   {n:5}x {k}");
+          }
         }
         let bytes = super::capi_tape::serialize(&rec.ops);
         let (data, len) = super::snapshot::leak_blob(bytes);
@@ -745,7 +753,24 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
   let bytes = bytes.unwrap_or_default();
   super::capi_tape::rec(|r| {
     let cid = r.ctx_id(ctx);
-    let vid = r.arg(data as *const _, "AddData_to_context value");
+    let preview = unsafe {
+      let cs = JS_ToCString(ctx, jsval_of(data));
+      if cs.is_null() {
+        std::string::String::new()
+      } else {
+        let out = std::ffi::CStr::from_ptr(cs)
+          .to_string_lossy()
+          .chars()
+          .take(40)
+          .collect();
+        JS_FreeCString(ctx, cs);
+        out
+      }
+    };
+    let vid = r.arg(
+      data as *const _,
+      &format!("AddData_to_context value={preview}"),
+    );
     r.ops.push(super::capi_tape::TapeOp::AddContextData {
       ctx: cid,
       value: vid,

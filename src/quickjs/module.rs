@@ -1221,6 +1221,56 @@ pub(crate) fn lookup_module_source(name: &str) -> Option<std::string::String> {
   lookup_module_source_by_name(name)
 }
 
+/// Tape replay: recreate a module WRAPPER handle for `name`. The wrapper is
+/// deno_core's module identity (Global<Module> in its map); its side-table
+/// state carries just enough for post-restore queries — status comes from
+/// the def cache once the ModuleEval tape entry has run, the namespace path
+/// falls back to the def cache by name.
+pub(crate) fn tape_make_module_handle(
+  ctx: *mut JSContext,
+  name: &str,
+) -> *const Module {
+  let handle_val = unsafe { JS_NewObject(ctx) };
+  if handle_val.tag == JS_TAG_EXCEPTION {
+    let e = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, e) };
+    return std::ptr::null();
+  }
+  let this = intern::<Module>(handle_val);
+  if this.is_null() {
+    return this;
+  }
+  let source = lookup_module_source_by_name(name).unwrap_or_default();
+  let def = MODULE_DEF_CACHE
+    .with(|c| c.borrow().get(name).copied())
+    .unwrap_or(0) as *mut JSModuleDef;
+  let evaluated =
+    !def.is_null() && unsafe { v82jsc_module_is_evaluated(def) != 0 };
+  record_module_state(
+    this,
+    ModuleState {
+      status: if evaluated {
+        ModuleStatus::Evaluated
+      } else {
+        ModuleStatus::Instantiated
+      },
+      module_def: def,
+      bytecode: None,
+      import_specifiers: parse_import_specifiers(&source),
+      import_offsets: Vec::new(),
+      import_attributes: Vec::new(),
+      source_imports: Vec::new(),
+      synthetic: false,
+      is_async: has_top_level_await(&source),
+      source_text: source.clone(),
+      source_name: name.to_string(),
+      source_map_url: None,
+    },
+  );
+  record_module_wrapper(name, this);
+  this
+}
+
 /// Reset every module registry on this thread. Called from
 /// `v8__Isolate__Dispose`: these thread-locals are keyed by module NAME or by
 /// pointers into the disposed runtime, so a later isolate on the same thread
@@ -1844,6 +1894,15 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   if this.is_null() {
     return ptr::null();
   }
+  super::capi_tape::rec(|r| {
+    let cid = r.ctx_id(ctx);
+    let id = r.produced(this as *const _);
+    r.ops.push(super::capi_tape::TapeOp::ModuleCompile {
+      id,
+      ctx: cid,
+      name: fname.as_bytes().to_vec(),
+    });
+  });
   if !source_imports.is_empty() {
     PENDING_SOURCE_IMPORTS.with(|p| {
       p.borrow_mut().push((this, source_imports.clone()));
