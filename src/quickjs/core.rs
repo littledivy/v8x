@@ -41,6 +41,7 @@ use crate::{
   Context, Data, Object, Primitive, RealIsolate, String as V8String, Value,
 };
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::os::raw::{c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -109,8 +110,11 @@ pub(crate) struct IsoState {
 
   // Snapshot support (see snapshot.rs). `snap` records on SnapshotCreator
   // isolates; `restored` holds a parsed blob to replay into new contexts.
-  pub snap: Option<Box<super::snapshot::SnapState>>,
-  pub restored: Option<Box<super::snapshot::RestoredSnap>>,
+  /// Per-context AddData slot counters (SnapshotCreator::AddData returns the
+  /// data index; the tape replays slots in call order).
+  pub ctx_data_counts: HashMap<usize, usize>,
+  pub iso_data_count: usize,
+  pub iso_added_contexts: usize,
 
   // C-API tape (capi_tape.rs, "tape v2" — the stock-deno_core path).
   pub tape_rec: Option<Box<super::capi_tape::Recorder>>,
@@ -369,29 +373,8 @@ fn sab_funcs_table() -> *const JSSharedArrayBufferFunctions {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
-  // If CreateParams carries a snapshot blob (our replay format), parse it so
-  // new contexts on this isolate replay the recorded boot tape.
-  let restored = if params.is_null() {
-    None
-  } else {
-    let raw = params as *const crate::isolate_create_params::raw::CreateParams;
-    let blob = unsafe { (*raw).snapshot_blob };
-    if blob.is_null() {
-      None
-    } else {
-      let (data, len) = unsafe { ((*blob).data, (*blob).raw_size) };
-      if data.is_null() || len <= 0 {
-        None
-      } else {
-        let bytes = unsafe {
-          std::slice::from_raw_parts(data as *const u8, len as usize)
-        };
-        super::snapshot::parse_blob(bytes).map(Box::new)
-      }
-    }
-  };
-  // Tape-v2 blob? (magic-dispatched; the raw params also carry the
-  // external-reference table the tape's ext-ref indices resolve through.)
+  // C-API tape blob? (the raw params also carry the external-reference
+  // table the tape's ext-ref indices resolve through.)
   let tape_restore = if params.is_null() {
     None
   } else {
@@ -462,8 +445,9 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     ext_class_id,
     main_ctx_claimed: false,
     extra_contexts: Vec::new(),
-    snap: None,
-    restored,
+    ctx_data_counts: HashMap::new(),
+    iso_data_count: 0,
+    iso_added_contexts: 0,
     tape_rec: None,
     tape_restore,
     external_memory: AtomicI64::new(0),
@@ -776,10 +760,6 @@ pub extern "C" fn v8__Context__New(
   // materializes the snapshot's default context (matches V8 semantics).
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
     eprintln!("[qjs snapshot] Context__New ctx={ctx:?}");
-  }
-  if let Some(restored) = st.restored.as_deref() {
-    let image = restored.default_image.clone();
-    super::snapshot::replay_into(isolate, ctx, &image);
   }
 
   intern_ctx(ctx)
@@ -1335,12 +1315,8 @@ pub extern "C" fn v8__Script__Run(
     eprintln!("[qjs snapshot]   -> result.tag={}", result.tag);
   }
   if result.tag != JS_TAG_EXCEPTION {
-    // Snapshot recording: remember successfully-run scripts for replay.
     let src_bytes =
       unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
-    if let Ok(src) = std::str::from_utf8(src_bytes) {
-      super::snapshot::record_script(ctx, src);
-    }
     let h_result = intern::<Value>(unsafe { JS_DupValue(ctx, result) });
     super::capi_tape::rec(|r| {
       let cid = r.ctx_id(ctx);

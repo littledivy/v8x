@@ -100,7 +100,7 @@ rv8_test_api::inspector_string_view
 rv8_test_api::instance_of
 rv8_test_api::instance_template_with_internal_field
 rv8_test_api::isolate_data_slots
-rv8_test_api::isolate_drop_order
+rv8_test_api::isolate_drop_order - should panic
 rv8_test_api::isolate_slot_drop_can_access_annex_during_teardown
 rv8_test_api::isolate_termination_methods
 rv8_test_api::json

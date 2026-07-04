@@ -39,7 +39,6 @@
 #![allow(dead_code)]
 
 use std::cell::Cell;
-use std::cell::RefCell;
 use std::collections::HashMap;
 
 use super::quickjs_sys::*;

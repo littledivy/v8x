@@ -116,7 +116,7 @@ index 1514e9b..9d66bfe 100644
  name = "which"
  version = "8.0.0"
 diff --git a/Cargo.toml b/Cargo.toml
-index 51bfbf1..1b03de1 100644
+index 51bfbf1..2e1102f 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -105,7 +105,7 @@ deno_task_shell = "=0.33.0"
@@ -186,75 +186,11 @@ index ff6044d..4cb0afa 100755
    }
  
    function createLazyLoader(specifier) {
-diff --git a/libs/core/error.rs b/libs/core/error.rs
-index aafac6d..c240a69 100644
---- a/libs/core/error.rs
-+++ b/libs/core/error.rs
-@@ -2086,6 +2086,15 @@ pub fn prepare_stack_trace_callback<'s, 'i>(
-   error: v8::Local<'s, v8::Value>,
-   callsites: v8::Local<'s, v8::Array>,
- ) -> v8::Local<'s, v8::Value> {
-+  // v82jsc: QuickJS computes `error.stack` EAGERLY at throw time (V8 defers
-+  // to the first `.stack` access), so an exception thrown while the runtime
-+  // is still initializing reaches this callback before `set_data` stored the
-+  // JsRuntimeState pointer — `state_from` would then Rc::from_raw(null).
-+  // Return undefined in that window; the backend falls back to its own
-+  // V8-shaped stack string.
-+  if scope.get_data(0).is_null() {
-+    return v8::undefined(scope).into();
-+  }
-   prepare_stack_trace_inner::<true>(scope, error, callsites)
- }
- 
 diff --git a/libs/core/runtime/jsruntime.rs b/libs/core/runtime/jsruntime.rs
-index 6f1ce4d..8084711 100644
+index 6f1ce4d..84ff9d4 100644
 --- a/libs/core/runtime/jsruntime.rs
 +++ b/libs/core/runtime/jsruntime.rs
-@@ -315,6 +315,14 @@ pub(crate) enum InitMode {
- 
- impl InitMode {
-   fn from_options(options: &RuntimeOptions) -> Self {
-+    // v8x: the backend has no V8 heap snapshots — a startup blob is a replay
-+    // tape the backend itself materializes (embedder-managed: user-phase
-+    // entries replay when we store the state pointer via SetData(0)). All of
-+    // deno_core's own heap state (Deno.core, primordials, op bindings,
-+    // extension JS) must therefore be rebuilt exactly as in a fresh runtime.
-+    if v8::IS_V8X {
-+      return Self::New;
-+    }
-     match options.startup_snapshot {
-       None => Self::New,
-       Some(_) => Self::FromSnapshot {
-@@ -811,6 +819,14 @@ impl JsRuntime {
-       .take()
-       .map(snapshot::deconstruct)
-       .unzip();
-+    // v8x: the raw blob must still reach v8::CreateParams (the backend arms
-+    // its replay tape from it), but the sidecar describes V8 heap objects
-+    // (module handles, function templates) that a replay-based restore does
-+    // not preserve — this runtime re-initializes as InitMode::New instead
-+    // (see InitMode::from_options), so drop the sidecar wholesale.
-+    if v8::IS_V8X {
-+      sidecar_data = None;
-+    }
-     startup_phase_end(_phase, "snapshot::deconstruct");
- 
-     let _phase = startup_phase_begin();
-@@ -1318,6 +1334,13 @@ impl JsRuntime {
-         .put(uv_compat::AsyncId::default());
-     }
- 
-+    // v8x: runtime init is complete — everything past this point is user
-+    // state. On a snapshot creator this flips tape recording to the user
-+    // phase; on a runtime restored from a v8x blob it replays the user tape
-+    // now (our heap just reached the same state the creator's had here).
-+    // No-op unless the backend does replay-based snapshots.
-+    v8::v8x_snapshot_init_boundary(js_runtime.v8_isolate());
-+
-     // ...and we've made it; `JsRuntime` is ready to execute user code.
-     Ok(js_runtime)
-   }
-@@ -1566,12 +1589,24 @@ impl JsRuntime {
+@@ -1566,12 +1566,24 @@ impl JsRuntime {
        Rc::new(ExtModuleLoader::new(sources, ext_code_cache.clone()));
      *module_map.loader.borrow_mut() = ext_loader.clone();
  
@@ -284,7 +220,7 @@ index 6f1ce4d..8084711 100644
      }
  
      // Execute extension scripts
-@@ -1602,34 +1637,54 @@ impl JsRuntime {
+@@ -1602,34 +1614,54 @@ impl JsRuntime {
        }
      }
  

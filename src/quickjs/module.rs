@@ -1974,7 +1974,6 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
 
   register_module_source(&fname, &text);
   note_main_module(&fname);
-  super::snapshot::record_module_source(ctx, &fname, &text);
   super::capi_tape::rec(|r| {
     r.ops.push(super::capi_tape::TapeOp::ModuleSource {
       name: fname.as_bytes().to_vec(),
@@ -2732,7 +2731,6 @@ pub extern "C" fn v8__Module__Evaluate(
   // Snapshot recording: modules evaluated on a creator isolate replay via
   // JS_Eval(TYPE_MODULE) of their registered source (deps come from the
   // ModuleSource tape entries recorded at compile time).
-  super::snapshot::record_module_eval(ctx, &source_name);
   if super::capi_tape::recording() && !source_name.is_empty() {
     let tape_bc = lookup_module_source(&source_name)
       .map(|src| bc_key(&src))

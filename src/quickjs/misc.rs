@@ -554,10 +554,6 @@ pub extern "C" fn v8__SnapshotCreator__CONSTRUCT(
   // Isolate__New parses it, and each new context replays + re-records it.
   let iso = crate::quickjs::core::v8__Isolate__New(params);
   crate::quickjs::core::v8__Isolate__Enter(iso);
-  crate::quickjs::core::iso_state(iso).snap =
-    Some(Box::new(super::snapshot::SnapState::default()));
-  // Tape v2 records in parallel with the v1 JS tape; CreateBlob picks the
-  // format (V8X_TAPE=1 while tape coverage is being ground to parity).
   let ext_refs = if params.is_null() {
     std::ptr::null()
   } else {
@@ -617,7 +613,9 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
 ) -> RawStartupDataAbi {
   let iso = creator_iso(this);
   if !iso.is_null() {
-    if std::env::var_os("V8X_TAPE").is_some() {
+    // C-API record/replay tape is the DEFAULT blob format; V8X_TAPE_V1
+    // falls back to the legacy JS-source tape while it is being retired.
+    if std::env::var_os("V8X_TAPE_V1").is_none() {
       if let Some(rec) =
         crate::quickjs::core::iso_state(iso).tape_rec.as_deref()
       {
@@ -708,14 +706,6 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
         };
       }
     }
-    if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref() {
-      let bytes = super::snapshot::create_blob(snap);
-      let (data, len) = super::snapshot::leak_blob(bytes);
-      return RawStartupDataAbi {
-        data: data as *const c_char,
-        raw_size: len as std::os::raw::c_int,
-      };
-    }
   }
   RawStartupDataAbi {
     data: ptr::null(),
@@ -731,9 +721,6 @@ pub extern "C" fn v8__SnapshotCreator__SetDefaultContext(
   let iso = creator_iso(this);
   if iso.is_null() {
     return;
-  }
-  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut() {
-    snap.default_ctx = ctx_of(context) as usize;
   }
   let qctx = ctx_of(context);
   super::capi_tape::rec(|r| {
@@ -757,11 +744,10 @@ pub extern "C" fn v8__SnapshotCreator__AddContext(
     let id = r.ctx_id(qctx);
     r.ops.push(super::capi_tape::TapeOp::AddContext { ctx: id });
   });
-  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut() {
-    snap.added.push(ctx_of(context) as usize);
-    return snap.added.len() - 1;
-  }
-  0
+  let st = crate::quickjs::core::iso_state(iso);
+  let n = st.iso_added_contexts;
+  st.iso_added_contexts += 1;
+  n
 }
 
 #[unsafe(no_mangle)]
@@ -802,11 +788,10 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_isolate(
     r.ops
       .push(super::capi_tape::TapeOp::AddIsolateData { value: vid });
   });
-  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut() {
-    snap.iso_data.push(bytes);
-    return snap.iso_data.len() - 1;
-  }
-  0
+  let st = crate::quickjs::core::iso_state(iso);
+  let n = st.iso_data_count;
+  st.iso_data_count += 1;
+  n
 }
 
 #[unsafe(no_mangle)]
@@ -898,12 +883,11 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
       value: vid,
     });
   });
-  if let Some(snap) = crate::quickjs::core::iso_state(iso).snap.as_deref_mut() {
-    let v = snap.ctx_data.entry(ctx as usize).or_default();
-    v.push(bytes);
-    return v.len() - 1;
-  }
-  0
+  let st = crate::quickjs::core::iso_state(iso);
+  let n = st.ctx_data_counts.entry(ctx as usize).or_insert(0);
+  let idx = *n;
+  *n += 1;
+  idx
 }
 
 #[unsafe(no_mangle)]
@@ -921,7 +905,7 @@ pub extern "C" fn v8__StartupData__IsValid(this: *const c_void) -> bool {
     return false;
   }
   let head = unsafe { std::slice::from_raw_parts(raw.data as *const u8, 8) };
-  head == super::snapshot::SNAP_MAGIC
+  head == super::capi_tape::TAPE_MAGIC
 }
 
 #[unsafe(no_mangle)]

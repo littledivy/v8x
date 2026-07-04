@@ -160,33 +160,7 @@ pub extern "C" fn v8__Context__FromSnapshot(
     }
     return super::core::intern_ctx(ctx);
   }
-  let st = super::core::iso_state(isolate);
-  // Materialize the indexed snapshot context into a fresh JSContext (its own
-  // global object, like V8's AddContext'd contexts).
-  let Some(image) = st
-    .restored
-    .as_deref()
-    .and_then(|r| r.indexed.get(context_snapshot_index))
-    .cloned()
-  else {
-    return ptr::null();
-  };
-  let ctx = unsafe { JS_NewContext(st.rt) };
-  if ctx.is_null() {
-    return ptr::null();
-  }
-  if std::env::var_os("QJS_NO_WASM").is_none() {
-    super::wasm::install_webassembly(ctx);
-  }
-  st.extra_contexts.push(ctx);
-  if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
-    eprintln!(
-      "[qjs snapshot] Context__FromSnapshot idx={context_snapshot_index} ctx={ctx:?}"
-    );
-  }
-  super::core::install_default_globals(ctx);
-  super::snapshot::replay_into(isolate, ctx, &image);
-  super::core::intern_ctx(ctx)
+  ptr::null()
 }
 
 #[unsafe(no_mangle)]
@@ -250,24 +224,7 @@ pub extern "C" fn v8__Context__GetDataFromSnapshotOnce(
     super::capi_tape::rec(|r| r.bind(h as *const _, hid));
     return h;
   }
-  let Some(restored) = st.restored.as_deref_mut() else {
-    return ptr::null();
-  };
-  let Some(bytes) = restored
-    .ctx_data
-    .get_mut(&(ctx as usize))
-    .and_then(|slots| slots.get_mut(index))
-    .and_then(|slot| slot.take())
-  else {
-    return ptr::null();
-  };
-  let v = super::snapshot::deserialize_value(ctx, &bytes);
-  if v.tag == JS_TAG_EXCEPTION {
-    let exc = unsafe { JS_GetException(ctx) };
-    unsafe { JS_FreeValue(ctx, exc) };
-    return ptr::null();
-  }
-  super::core::intern::<Data>(v)
+  ptr::null()
 }
 
 /// Native `getContinuationPreservedEmbedderData` for the extras binding object.
@@ -1314,24 +1271,7 @@ pub extern "C" fn v8__Isolate__GetDataFromSnapshotOnce(
     super::capi_tape::rec(|r| r.bind(h as *const _, hid));
     return h as *const std::os::raw::c_void;
   }
-  let Some(restored) = st.restored.as_deref_mut() else {
-    return ptr::null();
-  };
-  let Some(bytes) = restored
-    .iso_data
-    .get_mut(index)
-    .and_then(|slot| slot.take())
-  else {
-    return ptr::null();
-  };
-  let ctx = if ctx.is_null() { st.ctx } else { ctx };
-  let v = super::snapshot::deserialize_value(ctx, &bytes);
-  if v.tag == JS_TAG_EXCEPTION {
-    let exc = unsafe { JS_GetException(ctx) };
-    unsafe { JS_FreeValue(ctx, exc) };
-    return ptr::null();
-  }
-  super::core::intern::<Data>(v) as *const std::os::raw::c_void
+  ptr::null()
 }
 
 #[unsafe(no_mangle)]
