@@ -757,6 +757,7 @@ pub extern "C" fn v8__Function__Call(
       // wiring: the embedder re-issues it on every start — including after a
       // restore — so it must NOT be replayed. Skip silently.
       let Some(fid) = r.try_arg(this as *const _) else {
+        r.ops.push(crate::quickjs::capi_tape::TapeOp::WiringCall);
         return;
       };
       let rid = if recv.is_null() {
@@ -764,16 +765,27 @@ pub extern "C" fn v8__Function__Call(
       } else {
         match r.try_arg(recv as *const _) {
           Some(id) => Some(id),
-          None => return,
+          None => {
+            r.ops.push(crate::quickjs::capi_tape::TapeOp::WiringCall);
+            return;
+          }
         }
       };
       let mut aids = Vec::new();
+      let mut ok = true;
       for i in 0..argc.max(0) as usize {
         let ap = unsafe { *argv.add(i) };
         match r.try_arg(ap as *const _) {
           Some(id) => aids.push(id),
-          None => return,
+          None => {
+            ok = false;
+            break;
+          }
         }
+      }
+      if !ok {
+        r.ops.push(crate::quickjs::capi_tape::TapeOp::WiringCall);
+        return;
       }
       let cid = r.ctx_id(ctx);
       out = Some((cid, fid, rid.unwrap_or(u32::MAX), aids));
@@ -816,6 +828,12 @@ pub extern "C" fn v8__Function__Call(
   }
 
   let h = intern::<Value>(r);
+  {
+    let iso_now = crate::quickjs::core::current_iso();
+    if !iso_now.is_null() {
+      crate::quickjs::capi_tape::on_wiring_call_done(iso_now);
+    }
+  }
   if let Some((cid, fid, rid, aids)) = tape_ids {
     drop(_jsg);
     crate::quickjs::capi_tape::rec(|rr| {

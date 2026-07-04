@@ -256,6 +256,12 @@ pub(crate) enum TapeOp {
     id: HandleId,
     bytes: Vec<u8>,
   },
+  /// Positional marker: the creator SKIPPED a per-process wiring call here
+  /// (a Rust-driven Function::Call with untapeable args, e.g. __setTickInfo
+  /// with a TypedArray over a process-local buffer). The restoring embedder
+  /// re-issues those calls live; tape entries recorded after the last one
+  /// (user-phase JS) wait until the restore has completed as many.
+  WiringCall,
   /// Positional marker: the creator stored its per-runtime state here
   /// (Isolate::SetData slot ≥ 1). Everything before it demonstrably ran
   /// WITHOUT embedder state on the creator, so it replays eagerly; JS after
@@ -412,7 +418,12 @@ impl Recorder {
       }
     }
     self.next_id = self.next_id.max(max_id);
-    self.ops.extend(ops.iter().cloned());
+    // Drop stale WiringCall markers: they described the live wiring calls of
+    // THIS process's restore (already done). Only the markers this recorder
+    // emits itself describe the wiring the next restore will perform.
+    self
+      .ops
+      .extend(ops.iter().filter(|op| !matches!(op, TapeOp::WiringCall)).cloned());
     for (&id, &ctx) in contexts {
       self.ctx_ids.insert(ctx as usize, id);
     }
@@ -533,7 +544,7 @@ fn op_ids(op: &TapeOp) -> Vec<HandleId> {
     ModuleCompile { id, ctx, .. } => vec![*id, *ctx],
     ExtrasBinding { id, ctx } => vec![*id, *ctx],
     TemplateNew { id, .. } => vec![*id],
-    StateReady => vec![],
+    StateReady | WiringCall => vec![],
     ClonedValue { id, .. } => vec![*id],
   }
 }
@@ -777,6 +788,7 @@ pub(crate) fn serialize(ops: &[TapeOp]) -> Vec<u8> {
         out.push(*constructable as u8);
       }
       TapeOp::StateReady => out.push(28),
+      TapeOp::WiringCall => out.push(30),
       TapeOp::ClonedValue { id, bytes } => {
         out.push(29);
         put_u32(&mut out, *id);
@@ -966,6 +978,7 @@ pub(crate) fn deserialize(bytes: &[u8]) -> Option<Vec<TapeOp>> {
         constructable: r.u8()? != 0,
       },
       28 => TapeOp::StateReady,
+      30 => TapeOp::WiringCall,
       29 => TapeOp::ClonedValue {
         id: r.u32()?,
         bytes: r.bytes()?,
@@ -1029,6 +1042,11 @@ pub(crate) struct TapeRestore {
   /// nothing at restore so embedders never guard for it.
   pub deferred: Vec<TapeOp>,
   pub deferred_done: bool,
+  /// User-phase entries (after the creator's last WiringCall) + how many
+  /// live wiring calls must complete first.
+  pub deferred_user: Vec<TapeOp>,
+  pub wiring_pending: u32,
+  pub user_done: bool,
   pub replayed: bool,
   /// id → owned (+1) JSValue. Everything stays alive until isolate dispose:
   /// GetDataFromSnapshotOnce may be called long after replay.
@@ -1085,6 +1103,9 @@ impl TapeRestore {
       ops,
       deferred: Vec::new(),
       deferred_done: false,
+      deferred_user: Vec::new(),
+      wiring_pending: 0,
+      user_done: false,
       module_handles: HashMap::new(),
       template_handles: HashMap::new(),
       primary_ctx: std::ptr::null_mut(),
@@ -1177,6 +1198,19 @@ pub(crate) fn replay(iso: *mut crate::RealIsolate) {
       ops.push(op);
     }
   }
+  // P1/P2 split: user-phase entries follow the creator's last WiringCall.
+  let wiring_total =
+    deferred.iter().filter(|o| matches!(o, TapeOp::WiringCall)).count() as u32;
+  let mut deferred_user = Vec::new();
+  if wiring_total > 0 {
+    let last_wiring = deferred
+      .iter()
+      .rposition(|o| matches!(o, TapeOp::WiringCall))
+      .unwrap();
+    deferred_user = deferred.split_off(last_wiring + 1);
+  }
+  restore.wiring_pending = wiring_total;
+  restore.deferred_user = deferred_user;
   restore.deferred = deferred;
   let rt = st.rt;
 
@@ -1343,6 +1377,40 @@ pub(crate) fn replay_deferred(iso: *mut crate::RealIsolate) {
     let restore = iso_state(iso).tape_restore.as_deref_mut().unwrap();
     replay_one(rt, restore, op);
   }
+  finish_phase(iso);
+  if dbg_on() {
+    eprintln!("[qjs tape] deferred phase done ({} ops)", ops.len());
+  }
+  // No per-process wiring recorded: the user phase has nothing to wait for.
+  let st = iso_state(iso);
+  if let Some(r) = st.tape_restore.as_deref_mut() {
+    if r.wiring_pending == 0 && !r.user_done {
+      r.user_done = true;
+      let user_ops = std::mem::take(&mut r.deferred_user);
+      if dbg_on() {
+        eprintln!("[qjs tape] user phase (tail) START ({} ops)", user_ops.len());
+      }
+      for (i, op) in user_ops.iter().enumerate() {
+        if matches!(op, TapeOp::ContextNew { .. }) {
+          continue;
+        }
+        if dbg_on() {
+          let kind = format!("{op:?}");
+          eprintln!("[qjs tape] user[{i}] {}", &kind[..kind.len().min(90)]);
+        }
+        let restore = iso_state(iso).tape_restore.as_deref_mut().unwrap();
+        replay_one(rt, restore, op);
+      }
+      finish_phase(iso);
+    }
+  }
+}
+
+/// Post-phase bookkeeping, run after BOTH the deferred (P1) and user (P2)
+/// phases: lift module wrapper defs/statuses to engine truth and patch any
+/// placeholder cells whose values have materialized. Fixups whose values are
+/// still pending stay queued for the next phase.
+fn finish_phase(iso: *mut crate::RealIsolate) {
   // Module wrappers were created before their ModuleEval entries ran: pull
   // their defs/status up to engine truth.
   {
@@ -1362,10 +1430,11 @@ pub(crate) fn replay_deferred(iso: *mut crate::RealIsolate) {
       super::module::refresh_tape_module_state(ctx0, w as *const crate::Module);
     }
   }
-  // Patch every placeholder cell now that its value exists.
+  // Patch every placeholder cell whose value now exists.
   let st = iso_state(iso);
   if let Some(restore) = st.tape_restore.as_deref_mut() {
     let fixups = std::mem::take(&mut restore.fixups);
+    let mut kept = Vec::new();
     let mut patched = 0usize;
     for (hid, cell, expected_obj) in fixups {
       if let Some(&(v, vctx)) = restore.handles.get(&hid) {
@@ -1381,15 +1450,54 @@ pub(crate) fn replay_deferred(iso: *mut crate::RealIsolate) {
           JS_FreeValue(vctx, old);
         }
         patched += 1;
+      } else {
+        kept.push((hid, cell, expected_obj));
       }
     }
+    restore.fixups = kept;
     if dbg_on() && patched > 0 {
       eprintln!("[qjs tape] patched {patched} placeholder cells");
     }
   }
-  if dbg_on() {
-    eprintln!("[qjs tape] deferred phase done ({} ops)", ops.len());
+}
+
+/// A live Rust-driven Function::Call completed on a tape-restored isolate:
+/// count down the creator's recorded wiring calls; at zero, the heap has all
+/// per-process buffers wired and the user-phase tape can run.
+pub(crate) fn on_wiring_call_done(iso: *mut crate::RealIsolate) {
+  let st = iso_state(iso);
+  let Some(restore) = st.tape_restore.as_deref_mut() else {
+    return;
+  };
+  if !restore.deferred_done || restore.user_done {
+    return;
   }
+  if restore.wiring_pending > 0 {
+    restore.wiring_pending -= 1;
+  }
+  if restore.wiring_pending > 0 {
+    return;
+  }
+  restore.user_done = true;
+  let rt = st.rt;
+  let ops = std::mem::take(
+    &mut iso_state(iso).tape_restore.as_deref_mut().unwrap().deferred_user,
+  );
+  if dbg_on() {
+    eprintln!("[qjs tape] user phase START ({} ops)", ops.len());
+  }
+  for (i, op) in ops.iter().enumerate() {
+    if matches!(op, TapeOp::ContextNew { .. }) {
+      continue;
+    }
+    if dbg_on() {
+      let kind = format!("{op:?}");
+      eprintln!("[qjs tape] user[{i}] {}", &kind[..kind.len().min(90)]);
+    }
+    let restore = iso_state(iso).tape_restore.as_deref_mut().unwrap();
+    replay_one(rt, restore, op);
+  }
+  finish_phase(iso);
 }
 
 fn replay_one(rt: *mut JSRuntime, r: &mut TapeRestore, op: &TapeOp) {
@@ -1815,6 +1923,7 @@ fn replay_one(rt: *mut JSRuntime, r: &mut TapeRestore, op: &TapeOp) {
       }
     }
     TapeOp::StateReady => {}
+    TapeOp::WiringCall => {}
     TapeOp::ClonedValue { id, bytes } => {
       let c = r.primary_ctx;
       if c.is_null() {
