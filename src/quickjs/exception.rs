@@ -1510,6 +1510,26 @@ unsafe fn source_mapped_stack(
   if ctx.is_null() {
     return None;
   }
+  // QuickJS builds `.stack` EAGERLY at throw time; V8 defers to the first
+  // `.stack` read. An exception thrown while the embedder is still
+  // initializing would reach its callback before any state pointer exists
+  // (deno_core's prepare_stack_trace_callback does Rc::from_raw on embedder
+  // slot 0 unconditionally). V8 can't call the callback in that window —
+  // match it: decline until the embedder stores something in slot 0
+  // (raw slot 1; slot 0 is the rusty_v8 annex).
+  {
+    let iso = super::core::current_iso();
+    if iso.is_null()
+      || super::core::iso_state(iso)
+        .data_slots
+        .get(1)
+        .copied()
+        .unwrap_or(std::ptr::null_mut())
+        .is_null()
+    {
+      return None;
+    }
+  }
   let sites = unsafe { build_callsites(ctx, frames) }?;
 
   let (error_obj, saved) = unsafe { take_prepare_stack_trace(ctx) };
