@@ -141,6 +141,19 @@ pub extern "C" fn v8__Context__FromSnapshot(
   if isolate.is_null() {
     return ptr::null();
   }
+  // Tape v2: materialize the tape and resolve the AddContext'd entry.
+  if super::core::iso_state(isolate).tape_restore.is_some() {
+    super::capi_tape::replay(isolate);
+    let st = super::core::iso_state(isolate);
+    let restore = st.tape_restore.as_deref().unwrap();
+    let Some(&cid) = restore.added.get(context_snapshot_index) else {
+      return ptr::null();
+    };
+    let Some(&ctx) = restore.contexts.get(&cid) else {
+      return ptr::null();
+    };
+    return super::core::intern_ctx(ctx);
+  }
   let st = super::core::iso_state(isolate);
   // Materialize the indexed snapshot context into a fresh JSContext (its own
   // global object, like V8's AddContext'd contexts).
@@ -181,6 +194,32 @@ pub extern "C" fn v8__Context__GetDataFromSnapshotOnce(
     return ptr::null();
   }
   let st = super::core::iso_state(iso);
+  // Tape v2: hand back the recorded AddData handle for this context.
+  if let Some(restore) = st.tape_restore.as_deref_mut() {
+    let cid = restore
+      .contexts
+      .iter()
+      .find(|(_, c)| **c == ctx)
+      .map(|(&id, _)| id);
+    let Some(cid) = cid else {
+      return ptr::null();
+    };
+    let taken = restore
+      .ctx_data
+      .get_mut(&cid)
+      .and_then(|slots| slots.get_mut(index))
+      .and_then(|slot| slot.take());
+    let Some(hid) = taken else {
+      return ptr::null();
+    };
+    let Some(&(v, vctx)) = restore.handles.get(&hid) else {
+      return ptr::null();
+    };
+    let _ = vctx;
+    let h = super::core::intern_dup::<Data>(ctx, v);
+    super::capi_tape::rec(|r| r.bind(h as *const _, hid));
+    return h;
+  }
   let Some(restored) = st.restored.as_deref_mut() else {
     return ptr::null();
   };
@@ -657,6 +696,7 @@ pub extern "C" fn v8__Isolate__SetMicrotasksPolicy(
 }
 
 fn drain_jobs(rt: *mut JSRuntime) {
+  let _jsg = crate::quickjs::capi_tape::JsDepthGuard::enter();
   if rt.is_null() {
     return;
   }
@@ -1209,6 +1249,21 @@ pub extern "C" fn v8__Isolate__GetDataFromSnapshotOnce(
   }
   let st = super::core::iso_state(iso);
   let ctx = super::core::current_ctx();
+  // Tape v2: hand back the recorded isolate-level AddData handle.
+  if let Some(restore) = st.tape_restore.as_deref_mut() {
+    let Some(hid) =
+      restore.iso_data.get_mut(index).and_then(|slot| slot.take())
+    else {
+      return ptr::null();
+    };
+    let Some(&(v, vctx)) = restore.handles.get(&hid) else {
+      return ptr::null();
+    };
+    let target = if ctx.is_null() { vctx } else { ctx };
+    let h = super::core::intern_dup::<Data>(target, v);
+    super::capi_tape::rec(|r| r.bind(h as *const _, hid));
+    return h as *const std::os::raw::c_void;
+  }
   let Some(restored) = st.restored.as_deref_mut() else {
     return ptr::null();
   };

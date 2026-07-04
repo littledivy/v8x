@@ -97,7 +97,7 @@ fn just_bool(b: bool) -> MaybeBool {
 }
 
 #[inline]
-fn key_atom<T>(ctx: *mut JSContext, key: *const T) -> JSAtom {
+pub(crate) fn key_atom<T>(ctx: *mut JSContext, key: *const T) -> JSAtom {
   if key.is_null() {
     return 0;
   }
@@ -143,7 +143,13 @@ pub extern "C" fn v8__Object__New(isolate: *mut RealIsolate) -> *const Object {
   if o.tag == JS_TAG_EXCEPTION {
     return ptr::null();
   }
-  intern::<Object>(o)
+  let h = intern::<Object>(o);
+  crate::quickjs::capi_tape::rec(|r| {
+    let id = r.produced(h as *const _);
+    r.ops
+      .push(crate::quickjs::capi_tape::TapeOp::ObjectNew { id });
+  });
+  h
 }
 
 #[unsafe(no_mangle)]
@@ -205,7 +211,20 @@ pub extern "C" fn v8__Object__Get(
     return ptr::null();
   }
 
-  intern::<Value>(v)
+  let h = intern::<Value>(v);
+  crate::quickjs::capi_tape::rec(|r| {
+    let cid = r.ctx_id(ctx);
+    let oid = r.arg(this as *const _, "Object__Get this");
+    let kid = r.arg(key as *const _, "Object__Get key");
+    let id = r.produced(h as *const _);
+    r.ops.push(crate::quickjs::capi_tape::TapeOp::GetProp {
+      id,
+      ctx: cid,
+      obj: oid,
+      key: kid,
+    });
+  });
+  h
 }
 
 #[unsafe(no_mangle)]
@@ -266,6 +285,18 @@ pub extern "C" fn v8__Object__Set(
     }
     return MaybeBool::Nothing;
   }
+  crate::quickjs::capi_tape::rec(|rr| {
+    let cid = rr.ctx_id(ctx);
+    let oid = rr.arg(this as *const _, "Object__Set this");
+    let kid = rr.arg(key as *const _, "Object__Set key");
+    let vid = rr.arg(value as *const _, "Object__Set value");
+    rr.ops.push(crate::quickjs::capi_tape::TapeOp::SetProp {
+      ctx: cid,
+      obj: oid,
+      key: kid,
+      value: vid,
+    });
+  });
   just_bool(r != 0)
 }
 
@@ -330,6 +361,17 @@ pub extern "C" fn v8__Object__SetPrototype(
   if r < 0 {
     return MaybeBool::Nothing;
   }
+  crate::quickjs::capi_tape::rec(|rr| {
+    let cid = rr.ctx_id(ctx);
+    let oid = rr.arg(this as *const _, "SetPrototype this");
+    let pid = rr.arg(prototype as *const _, "SetPrototype proto");
+    rr.ops
+      .push(crate::quickjs::capi_tape::TapeOp::SetPrototype {
+        ctx: cid,
+        obj: oid,
+        proto: pid,
+      });
+  });
   just_bool(r != 0)
 }
 
@@ -357,6 +399,18 @@ pub extern "C" fn v8__Object__CreateDataProperty(
   if r < 0 {
     return MaybeBool::Nothing;
   }
+  crate::quickjs::capi_tape::rec(|rr| {
+    let cid = rr.ctx_id(ctx);
+    let oid = rr.arg(this as *const _, "CreateDataProperty this");
+    let kid = rr.arg(key as *const _, "CreateDataProperty key");
+    let vid = rr.arg(value as *const _, "CreateDataProperty value");
+    rr.ops.push(crate::quickjs::capi_tape::TapeOp::SetProp {
+      ctx: cid,
+      obj: oid,
+      key: kid,
+      value: vid,
+    });
+  });
   just_bool(r != 0)
 }
 
@@ -384,6 +438,20 @@ pub extern "C" fn v8__Object__DefineOwnProperty(
   if r < 0 {
     return MaybeBool::Nothing;
   }
+  let raw_attr = read_attr(&attr);
+  crate::quickjs::capi_tape::rec(|rr| {
+    let cid = rr.ctx_id(ctx);
+    let oid = rr.arg(this as *const _, "DefineOwnProperty this");
+    let kid = rr.arg(key as *const _, "DefineOwnProperty key");
+    let vid = rr.arg(value as *const _, "DefineOwnProperty value");
+    rr.ops.push(crate::quickjs::capi_tape::TapeOp::DefineProp {
+      ctx: cid,
+      obj: oid,
+      key: kid,
+      value: vid,
+      attrs: raw_attr as u32,
+    });
+  });
   just_bool(r != 0)
 }
 

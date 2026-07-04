@@ -44,6 +44,33 @@ use std::collections::HashMap;
 
 use super::quickjs_sys::*;
 
+unsafe extern "C" {
+  fn JS_ValueToAtom(ctx: *mut JSContext, val: JSValue) -> JSAtom;
+  fn JS_SetProperty(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: JSAtom,
+    val: JSValue,
+  ) -> std::os::raw::c_int;
+  fn JS_DefinePropertyValue(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: JSAtom,
+    val: JSValue,
+    flags: std::os::raw::c_int,
+  ) -> std::os::raw::c_int;
+  fn JS_GetProperty(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: JSAtom,
+  ) -> JSValue;
+  fn JS_SetPrototype(
+    ctx: *mut JSContext,
+    obj: JSValue,
+    proto_val: JSValue,
+  ) -> std::os::raw::c_int;
+}
+
 // ---------------------------------------------------------------------------
 // Tape operations
 // ---------------------------------------------------------------------------
@@ -102,6 +129,9 @@ pub(crate) enum TapeOp {
     ctx: HandleId,
     cb_ext_ref: u32,
     data: Option<HandleId>,
+    /// Template-path data: an External whose pointer lives in the ext-ref
+    /// table (op ctx) — used when the data value was never a recorded handle.
+    data_ext: Option<u32>,
     name: Option<HandleId>,
     length: i32,
   },
@@ -182,6 +212,12 @@ pub(crate) enum TapeOp {
     ctx: HandleId,
     index: u32,
     value: HandleId,
+  },
+  /// Read of an embedder-data value slot that produced a referenced handle.
+  GetEmbedderData {
+    id: HandleId,
+    ctx: HandleId,
+    index: u32,
   },
 }
 
@@ -292,6 +328,47 @@ impl Recorder {
     }
   }
 
+  /// Bind an existing tape id to a live pointer (chained creators: values
+  /// handed out by GetDataFromSnapshotOnce keep their original ids).
+  pub fn bind(&mut self, ptr: *const std::ffi::c_void, id: HandleId) {
+    self.ptr_ids.insert(ptr as usize, id);
+  }
+
+  /// Handle copy (Local::New / escape / Global::New): the new pointer names
+  /// the same recorded value — propagate its id. No tape op is emitted.
+  pub fn alias(
+    &mut self,
+    from: *const std::ffi::c_void,
+    to: *const std::ffi::c_void,
+  ) {
+    if let Some(&id) = self.ptr_ids.get(&(from as usize)) {
+      self.ptr_ids.insert(to as usize, id);
+    }
+  }
+
+  /// Seed a chained creator from the blob it was constructed on top of: the
+  /// old ops replay first at restore, so they PREFIX the new tape; fresh ids
+  /// continue after the old range and the replayed contexts keep their ids.
+  pub fn seed_from(
+    &mut self,
+    ops: &[TapeOp],
+    contexts: &HashMap<HandleId, *mut JSContext>,
+  ) {
+    let mut max_id = 0u32;
+    for op in ops {
+      for id in op_ids(op) {
+        if id != u32::MAX {
+          max_id = max_id.max(id.saturating_add(1));
+        }
+      }
+    }
+    self.next_id = self.next_id.max(max_id);
+    self.ops.extend(ops.iter().cloned());
+    for (&id, &ctx) in contexts {
+      self.ctx_ids.insert(ctx as usize, id);
+    }
+  }
+
   pub fn ext_ref(&mut self, ptr: usize, what: &str) -> u32 {
     match self.ext_refs.get(&ptr) {
       Some(&i) => i,
@@ -310,6 +387,63 @@ impl Recorder {
 // ---------------------------------------------------------------------------
 
 pub(crate) const TAPE_MAGIC: &[u8; 8] = b"V8XTAPE1";
+
+/// Every id an op mentions (result + argument ids) — used to advance a
+/// chained creator's id counter past the seeded range.
+fn op_ids(op: &TapeOp) -> Vec<HandleId> {
+  use TapeOp::*;
+  match op {
+    ContextNew { id }
+    | UndefinedNew { id }
+    | NullNew { id }
+    | ObjectNew { id } => vec![*id],
+    ContextGlobal { id, ctx } => vec![*id, *ctx],
+    StringNew { id, .. }
+    | NumberNew { id, .. }
+    | BoolNew { id, .. }
+    | ArrayNew { id, .. }
+    | ExternalNew { id, .. } => vec![*id],
+    FunctionNew {
+      id,
+      ctx,
+      data,
+      name,
+      ..
+    } => {
+      let mut v = vec![*id, *ctx];
+      if let Some(d) = data {
+        v.push(*d);
+      }
+      if let Some(n) = name {
+        v.push(*n);
+      }
+      v
+    }
+    SetProp {
+      ctx,
+      obj,
+      key,
+      value,
+    } => vec![*ctx, *obj, *key, *value],
+    DefineProp {
+      ctx,
+      obj,
+      key,
+      value,
+      ..
+    } => vec![*ctx, *obj, *key, *value],
+    GetProp { id, ctx, obj, key } => vec![*id, *ctx, *obj, *key],
+    SetPrototype { ctx, obj, proto } => vec![*ctx, *obj, *proto],
+    ScriptRun { result, ctx, .. } => vec![*result, *ctx],
+    ModuleSource { .. } => vec![],
+    ModuleEval { result, ctx, .. } => vec![*result, *ctx],
+    AddContextData { ctx, value } => vec![*ctx, *value],
+    AddIsolateData { value } => vec![*value],
+    SetDefaultContext { ctx } | AddContext { ctx } => vec![*ctx],
+    SetEmbedderData { ctx, value, .. } => vec![*ctx, *value],
+    GetEmbedderData { id, ctx, .. } => vec![*id, *ctx],
+  }
+}
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
   out.extend_from_slice(&v.to_le_bytes());
@@ -391,6 +525,7 @@ pub(crate) fn serialize(ops: &[TapeOp]) -> Vec<u8> {
         ctx,
         cb_ext_ref,
         data,
+        data_ext,
         name,
         length,
       } => {
@@ -399,6 +534,7 @@ pub(crate) fn serialize(ops: &[TapeOp]) -> Vec<u8> {
         put_u32(&mut out, *ctx);
         put_u32(&mut out, *cb_ext_ref);
         put_opt(&mut out, *data);
+        put_opt(&mut out, *data_ext);
         put_opt(&mut out, *name);
         put_i32(&mut out, *length);
       }
@@ -499,6 +635,12 @@ pub(crate) fn serialize(ops: &[TapeOp]) -> Vec<u8> {
         put_u32(&mut out, *index);
         put_u32(&mut out, *value);
       }
+      TapeOp::GetEmbedderData { id, ctx, index } => {
+        out.push(23);
+        put_u32(&mut out, *id);
+        put_u32(&mut out, *ctx);
+        put_u32(&mut out, *index);
+      }
     }
   }
   out
@@ -584,6 +726,7 @@ pub(crate) fn deserialize(bytes: &[u8]) -> Option<Vec<TapeOp>> {
         ctx: r.u32()?,
         cb_ext_ref: r.u32()?,
         data: r.opt()?,
+        data_ext: r.opt()?,
         name: r.opt()?,
         length: r.i32()?,
       },
@@ -642,9 +785,534 @@ pub(crate) fn deserialize(bytes: &[u8]) -> Option<Vec<TapeOp>> {
         index: r.u32()?,
         value: r.u32()?,
       },
+      23 => TapeOp::GetEmbedderData {
+        id: r.u32()?,
+        ctx: r.u32()?,
+        index: r.u32()?,
+      },
       _ => return None,
     };
     ops.push(op);
   }
   Some(ops)
+}
+
+// ---------------------------------------------------------------------------
+// Recording plumbing used by the shim hooks
+// ---------------------------------------------------------------------------
+
+use super::core::current_iso;
+use super::core::iso_state;
+
+/// Run `f` against the current isolate's tape recorder, if recording is
+/// active and control is outside JS. One-liner hook helper:
+/// `capi_tape::rec(|r| { ... });`
+#[inline]
+pub(crate) fn rec<F: FnOnce(&mut Recorder)>(f: F) {
+  if in_js() {
+    return;
+  }
+  let iso = current_iso();
+  if iso.is_null() {
+    return;
+  }
+  if let Some(r) = iso_state(iso).tape_rec.as_deref_mut() {
+    f(r);
+  }
+}
+
+/// True when the current isolate records a tape (and we are outside JS) —
+/// for hooks that must compute extra data (e.g. bytecode) only when needed.
+#[inline]
+pub(crate) fn recording() -> bool {
+  if in_js() {
+    return false;
+  }
+  let iso = current_iso();
+  !iso.is_null() && iso_state(iso).tape_rec.is_some()
+}
+
+// ---------------------------------------------------------------------------
+// Replay
+// ---------------------------------------------------------------------------
+
+/// Restore-side state: parsed tape + materialized handles. Lives on the
+/// isolate; the tape replays once, when the embedder asks for the first
+/// context (`Context::new` or `Context::from_snapshot`).
+pub(crate) struct TapeRestore {
+  pub ops: Vec<TapeOp>,
+  /// Copy kept after replay for chained-creator seeding.
+  pub seeded_ops: Vec<TapeOp>,
+  pub replayed: bool,
+  /// id → owned (+1) JSValue. Everything stays alive until isolate dispose:
+  /// GetDataFromSnapshotOnce may be called long after replay.
+  pub handles: HashMap<HandleId, (JSValue, *mut JSContext)>,
+  pub contexts: HashMap<HandleId, *mut JSContext>,
+  pub default_ctx: Option<HandleId>,
+  pub added: Vec<HandleId>,
+  /// Once-consumable AddData values, in AddData order.
+  pub ctx_data: HashMap<HandleId, Vec<Option<HandleId>>>,
+  pub iso_data: Vec<Option<HandleId>>,
+  /// Restore-process external-reference table (index → pointer).
+  pub ext_table: Vec<usize>,
+}
+
+impl TapeRestore {
+  pub fn new(ops: Vec<TapeOp>, external_references: *const isize) -> Self {
+    let mut ext_table = Vec::new();
+    if !external_references.is_null() {
+      let mut i = 0usize;
+      loop {
+        let p = unsafe { *external_references.add(i) };
+        if p == 0 {
+          break;
+        }
+        ext_table.push(p as usize);
+        i += 1;
+        if i > 1_000_000 {
+          break;
+        }
+      }
+    }
+    TapeRestore {
+      seeded_ops: ops.clone(),
+      ops,
+      replayed: false,
+      handles: HashMap::new(),
+      contexts: HashMap::new(),
+      default_ctx: None,
+      added: Vec::new(),
+      ctx_data: HashMap::new(),
+      iso_data: Vec::new(),
+      ext_table,
+    }
+  }
+
+  fn ext_ptr(&self, idx: u32) -> *mut std::ffi::c_void {
+    self.ext_table.get(idx as usize).copied().unwrap_or(0)
+      as *mut std::ffi::c_void
+  }
+}
+
+fn dbg_on() -> bool {
+  std::env::var_os("QJS_DEBUG_TAPE").is_some()
+}
+
+/// Materialize the whole tape against `iso`. The FIRST ContextNew claims the
+/// isolate's bootstrap context (mirrors `v8__Context__New` semantics); later
+/// ones get fresh JSContexts.
+pub(crate) fn replay(iso: *mut crate::RealIsolate) {
+  let st = iso_state(iso);
+  let Some(restore) = st.tape_restore.as_deref_mut() else {
+    return;
+  };
+  if restore.replayed {
+    return;
+  }
+  restore.replayed = true;
+  let ops = std::mem::take(&mut restore.ops);
+  let rt = st.rt;
+
+  let mut first_ctx = true;
+  for (i, op) in ops.iter().enumerate() {
+    let _ = i;
+    match op {
+      TapeOp::ContextNew { id } => {
+        let ctx = if first_ctx && !st.main_ctx_claimed {
+          st.main_ctx_claimed = true;
+          st.ctx
+        } else {
+          let c = unsafe { JS_NewContext(rt) };
+          if std::env::var_os("QJS_NO_WASM").is_none() {
+            super::wasm::install_webassembly(c);
+          }
+          st.extra_contexts.push(c);
+          super::core::install_default_globals(c);
+          c
+        };
+        first_ctx = false;
+        let restore = st.tape_restore.as_deref_mut().unwrap();
+        restore.contexts.insert(*id, ctx);
+      }
+      _ => {
+        // All other ops need the restore struct; split borrow.
+        let restore = st.tape_restore.as_deref_mut().unwrap();
+        replay_one(rt, restore, op);
+      }
+    }
+  }
+  if dbg_on() {
+    let restore = st.tape_restore.as_deref_mut().unwrap();
+    eprintln!(
+      "[qjs tape] replayed: {} handles, {} contexts, default={:?}, added={}",
+      restore.handles.len(),
+      restore.contexts.len(),
+      restore.default_ctx,
+      restore.added.len()
+    );
+  }
+}
+
+/// Key handle → property atom (symbol/int keys round-trip via JS_ValueToAtom).
+unsafe fn atom_of(
+  ctx: *mut JSContext,
+  handles: &HashMap<HandleId, (JSValue, *mut JSContext)>,
+  key: HandleId,
+) -> JSAtom {
+  match handles.get(&key) {
+    Some((v, _)) => unsafe { JS_ValueToAtom(ctx, *v) },
+    None => 0,
+  }
+}
+
+fn replay_one(rt: *mut JSRuntime, r: &mut TapeRestore, op: &TapeOp) {
+  let _ = rt;
+  // Resolve a context id (fallback: default context).
+  macro_rules! ctxof {
+    ($id:expr) => {
+      match r.contexts.get($id) {
+        Some(&c) => c,
+        None => {
+          if dbg_on() {
+            eprintln!("[qjs tape] missing ctx id {}", $id);
+          }
+          return;
+        }
+      }
+    };
+  }
+  macro_rules! val {
+    ($id:expr) => {
+      match r.handles.get($id) {
+        Some(&(v, _)) => v,
+        None => {
+          if dbg_on() {
+            eprintln!("[qjs tape] missing handle id {}", $id);
+          }
+          return;
+        }
+      }
+    };
+  }
+
+  match op {
+    TapeOp::ContextNew { .. } => unreachable!("handled by replay()"),
+    TapeOp::ContextGlobal { id, ctx } => {
+      let c = ctxof!(ctx);
+      let g = unsafe { JS_GetGlobalObject(c) };
+      r.handles.insert(*id, (g, c));
+    }
+    TapeOp::StringNew { id, utf8 } => {
+      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      if c.is_null() {
+        return;
+      }
+      let v = unsafe {
+        JS_NewStringLen(
+          c,
+          utf8.as_ptr() as *const std::os::raw::c_char,
+          utf8.len(),
+        )
+      };
+      r.handles.insert(*id, (v, c));
+    }
+    TapeOp::NumberNew { id, value } => {
+      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      let v = unsafe { JS_NewFloat64(c, *value) };
+      r.handles.insert(*id, (v, c));
+    }
+    TapeOp::BoolNew { id, value } => {
+      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      let v = unsafe { JS_NewBool(c, *value as i32) };
+      r.handles.insert(*id, (v, c));
+    }
+    TapeOp::UndefinedNew { id } => {
+      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      r.handles.insert(*id, (jsv_undefined(), c));
+    }
+    TapeOp::NullNew { id } => {
+      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      r.handles.insert(*id, (jsv_null(), c));
+    }
+    TapeOp::ObjectNew { id } => {
+      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      let v = unsafe { JS_NewObject(c) };
+      r.handles.insert(*id, (v, c));
+    }
+    TapeOp::ArrayNew { id, length } => {
+      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      let v = unsafe { JS_NewArray(c) };
+      if *length > 0 {
+        let lv = unsafe { JS_NewFloat64(c, *length as f64) };
+        let atom = unsafe { JS_NewAtom(c, c"length".as_ptr()) };
+        unsafe { JS_SetProperty(c, v, atom, lv) };
+        unsafe { JS_FreeAtom(c, atom) };
+      }
+      r.handles.insert(*id, (v, c));
+    }
+    TapeOp::ExternalNew { id, ext_ref } => {
+      let ptr = r.ext_ptr(*ext_ref);
+      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      let v = super::function::make_external_jsvalue(current_iso(), c, ptr);
+      r.handles.insert(*id, (v, c));
+    }
+    TapeOp::FunctionNew {
+      id,
+      ctx,
+      cb_ext_ref,
+      data,
+      data_ext,
+      name,
+      length,
+    } => {
+      let c = ctxof!(ctx);
+      let cb_ptr = r.ext_ptr(*cb_ext_ref);
+      if cb_ptr.is_null() {
+        if dbg_on() {
+          eprintln!("[qjs tape] FunctionNew: unresolved ext ref {cb_ext_ref}");
+        }
+        return;
+      }
+      let cb: crate::FunctionCallback = unsafe { std::mem::transmute(cb_ptr) };
+      let data_v = match (data, data_ext) {
+        (Some(d), _) => val!(d),
+        (None, Some(e)) => super::function::make_external_jsvalue(
+          current_iso(),
+          c,
+          r.ext_ptr(*e),
+        ),
+        (None, None) => jsv_undefined(),
+      };
+      let f = unsafe {
+        super::function::make_function_len(c, cb, data_v, *length, true)
+      };
+      if let Some(n) = name {
+        let nv = val!(n);
+        let atom = unsafe { JS_NewAtom(c, c"name".as_ptr()) };
+        let dup = unsafe { JS_DupValue(c, nv) };
+        unsafe {
+          JS_DefinePropertyValue(
+            c, f, atom, dup, 0, /* not writable/enum */
+          )
+        };
+        unsafe { JS_FreeAtom(c, atom) };
+      }
+      r.handles.insert(*id, (f, c));
+    }
+    TapeOp::SetProp {
+      ctx,
+      obj,
+      key,
+      value,
+    } => {
+      let c = ctxof!(ctx);
+      let o = val!(obj);
+      let v = val!(value);
+      let atom = unsafe { atom_of(c, &r.handles, *key) };
+      if atom != 0 {
+        let dup = unsafe { JS_DupValue(c, v) };
+        unsafe { JS_SetProperty(c, o, atom, dup) };
+        unsafe { JS_FreeAtom(c, atom) };
+      }
+    }
+    TapeOp::DefineProp {
+      ctx,
+      obj,
+      key,
+      value,
+      attrs,
+    } => {
+      let c = ctxof!(ctx);
+      let o = val!(obj);
+      let v = val!(value);
+      let atom = unsafe { atom_of(c, &r.handles, *key) };
+      if atom != 0 {
+        // v8::PropertyAttribute: 1=ReadOnly, 2=DontEnum, 4=DontDelete.
+        let mut flags = 0;
+        if attrs & 1 == 0 {
+          flags |= JS_PROP_WRITABLE;
+        }
+        if attrs & 2 == 0 {
+          flags |= JS_PROP_ENUMERABLE;
+        }
+        if attrs & 4 == 0 {
+          flags |= JS_PROP_CONFIGURABLE;
+        }
+        let dup = unsafe { JS_DupValue(c, v) };
+        unsafe { JS_DefinePropertyValue(c, o, atom, dup, flags) };
+        unsafe { JS_FreeAtom(c, atom) };
+      }
+    }
+    TapeOp::GetProp { id, ctx, obj, key } => {
+      let c = ctxof!(ctx);
+      let o = val!(obj);
+      let atom = unsafe { atom_of(c, &r.handles, *key) };
+      if atom != 0 {
+        let v = unsafe { JS_GetProperty(c, o, atom) };
+        unsafe { JS_FreeAtom(c, atom) };
+        r.handles.insert(*id, (v, c));
+      }
+    }
+    TapeOp::SetPrototype { ctx, obj, proto } => {
+      let c = ctxof!(ctx);
+      let o = val!(obj);
+      let p = val!(proto);
+      unsafe { JS_SetPrototype(c, o, p) };
+    }
+    TapeOp::ScriptRun {
+      result,
+      ctx,
+      bytecode,
+      source,
+      filename,
+      eval_flags,
+    } => {
+      let c = ctxof!(ctx);
+      super::core::push_entered_ctx(current_iso(), c);
+      let mut v = JSValue {
+        u: JSValueUnion { int32: 0 },
+        tag: JS_TAG_UNINITIALIZED,
+      };
+      if !bytecode.is_empty() {
+        let obj =
+          unsafe { JS_ReadObject(c, bytecode.as_ptr(), bytecode.len(), 1) };
+        if obj.tag == JS_TAG_EXCEPTION {
+          let e = unsafe { JS_GetException(c) };
+          unsafe { JS_FreeValue(c, e) };
+        } else {
+          v = unsafe { JS_EvalFunction(c, obj) };
+        }
+      }
+      if v.tag == JS_TAG_UNINITIALIZED {
+        // Bytecode-version mismatch fallback: parse the kept source.
+        let mut src = source.clone();
+        src.push(0);
+        let mut fname = filename.clone();
+        fname.push(0);
+        v = unsafe {
+          JS_Eval(
+            c,
+            src.as_ptr() as *const std::os::raw::c_char,
+            src.len() - 1,
+            fname.as_ptr() as *const std::os::raw::c_char,
+            *eval_flags,
+          )
+        };
+      }
+      super::core::pop_entered_ctx(current_iso());
+      if v.tag == JS_TAG_EXCEPTION {
+        if dbg_on() {
+          let e = unsafe { JS_GetException(c) };
+          let mut l = 0usize;
+          let s = unsafe { JS_ToCStringLen(c, &mut l, e) };
+          if !s.is_null() {
+            let b = unsafe { std::slice::from_raw_parts(s as *const u8, l) };
+            eprintln!(
+              "[qjs tape] ScriptRun threw: {}",
+              String::from_utf8_lossy(b)
+            );
+            unsafe { JS_FreeCString(c, s) };
+          }
+          unsafe { JS_FreeValue(c, e) };
+        } else {
+          let e = unsafe { JS_GetException(c) };
+          unsafe { JS_FreeValue(c, e) };
+        }
+        return;
+      }
+      r.handles.insert(*result, (v, c));
+    }
+    TapeOp::ModuleSource { name, source } => {
+      let n = String::from_utf8_lossy(name);
+      let s = String::from_utf8_lossy(source);
+      super::module::register_module_source(&n, &s);
+    }
+    TapeOp::ModuleEval {
+      result,
+      ctx,
+      name,
+      bytecode,
+      source,
+    } => {
+      let c = ctxof!(ctx);
+      super::core::push_entered_ctx(current_iso(), c);
+      let mut v = JSValue {
+        u: JSValueUnion { int32: 0 },
+        tag: JS_TAG_UNINITIALIZED,
+      };
+      if !bytecode.is_empty() {
+        let obj =
+          unsafe { JS_ReadObject(c, bytecode.as_ptr(), bytecode.len(), 1) };
+        if obj.tag == JS_TAG_EXCEPTION {
+          let e = unsafe { JS_GetException(c) };
+          unsafe { JS_FreeValue(c, e) };
+        } else {
+          v = unsafe { JS_EvalFunction(c, obj) };
+        }
+      }
+      if v.tag == JS_TAG_UNINITIALIZED {
+        let mut src = source.to_vec();
+        src.push(0);
+        let mut fname = name.to_vec();
+        fname.push(0);
+        v = unsafe {
+          JS_Eval(
+            c,
+            src.as_ptr() as *const std::os::raw::c_char,
+            src.len() - 1,
+            fname.as_ptr() as *const std::os::raw::c_char,
+            JS_EVAL_TYPE_MODULE,
+          )
+        };
+      }
+      super::core::pop_entered_ctx(current_iso());
+      if v.tag == JS_TAG_EXCEPTION {
+        let e = unsafe { JS_GetException(c) };
+        if dbg_on() {
+          let mut l = 0usize;
+          let s = unsafe { JS_ToCStringLen(c, &mut l, e) };
+          if !s.is_null() {
+            let b = unsafe { std::slice::from_raw_parts(s as *const u8, l) };
+            eprintln!(
+              "[qjs tape] ModuleEval {} threw: {}",
+              String::from_utf8_lossy(name),
+              String::from_utf8_lossy(b)
+            );
+            unsafe { JS_FreeCString(c, s) };
+          }
+        }
+        unsafe { JS_FreeValue(c, e) };
+        return;
+      }
+      r.handles.insert(*result, (v, c));
+    }
+    TapeOp::AddContextData { ctx, value } => {
+      r.ctx_data.entry(*ctx).or_default().push(Some(*value));
+    }
+    TapeOp::AddIsolateData { value } => {
+      r.iso_data.push(Some(*value));
+    }
+    TapeOp::SetDefaultContext { ctx } => {
+      r.default_ctx = Some(*ctx);
+    }
+    TapeOp::AddContext { ctx } => {
+      r.added.push(*ctx);
+    }
+    TapeOp::SetEmbedderData { ctx, index, value } => {
+      let c = ctxof!(ctx);
+      let v = val!(value);
+      super::misc::set_embedder_data_raw(c, *index as usize, v);
+    }
+    TapeOp::GetEmbedderData { id, ctx, index } => {
+      let c = ctxof!(ctx);
+      let slots = super::misc::embedder_data_snapshot(c);
+      let v = slots
+        .get(*index as usize)
+        .copied()
+        .flatten()
+        .unwrap_or(jsv_undefined());
+      let dup = unsafe { JS_DupValue(c, v) };
+      r.handles.insert(*id, (dup, c));
+    }
+  }
 }

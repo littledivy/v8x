@@ -112,6 +112,10 @@ pub(crate) struct IsoState {
   pub snap: Option<Box<super::snapshot::SnapState>>,
   pub restored: Option<Box<super::snapshot::RestoredSnap>>,
 
+  // C-API tape (capi_tape.rs, "tape v2" — the stock-deno_core path).
+  pub tape_rec: Option<Box<super::capi_tape::Recorder>>,
+  pub tape_restore: Option<Box<super::capi_tape::TapeRestore>>,
+
   pub external_memory: AtomicI64,
 
   pub external_string_memory: AtomicI64,
@@ -386,6 +390,31 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
       }
     }
   };
+  // Tape-v2 blob? (magic-dispatched; the raw params also carry the
+  // external-reference table the tape's ext-ref indices resolve through.)
+  let tape_restore = if params.is_null() {
+    None
+  } else {
+    let raw = params as *const crate::isolate_create_params::raw::CreateParams;
+    let blob = unsafe { (*raw).snapshot_blob };
+    if blob.is_null() {
+      None
+    } else {
+      let (data, len) = unsafe { ((*blob).data, (*blob).raw_size) };
+      if data.is_null() || len <= 0 {
+        None
+      } else {
+        let bytes = unsafe {
+          std::slice::from_raw_parts(data as *const u8, len as usize)
+        };
+        super::capi_tape::deserialize(bytes).map(|ops| {
+          Box::new(super::capi_tape::TapeRestore::new(ops, unsafe {
+            (*raw).external_references
+          }))
+        })
+      }
+    }
+  };
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
@@ -435,6 +464,8 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     extra_contexts: Vec::new(),
     snap: None,
     restored,
+    tape_rec: None,
+    tape_restore,
     external_memory: AtomicI64::new(0),
     external_string_memory: AtomicI64::new(0),
     weak_handles: Vec::new(),
@@ -643,6 +674,9 @@ pub extern "C" fn v8__EscapeSlot__escape(
     *slot = new_val;
     JS_FreeValue(ctx, old);
   }
+  super::capi_tape::rec(|r| {
+    r.alias(value as *const _, slot as *const _);
+  });
   slot as *const Data
 }
 
@@ -665,13 +699,20 @@ pub extern "C" fn v8__Local__New(
     let st = iso_state(isolate);
     st.contexts.last().copied().unwrap_or(st.ctx)
   };
-  intern_dup::<Data>(ctx, jsval_of(other))
+  let h = intern_dup::<Data>(ctx, jsval_of(other));
+  super::capi_tape::rec(|r| r.alias(other as *const _, h as *const _));
+  h
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Undefined(isolate: *mut RealIsolate) -> *const Primitive {
   let _ = isolate;
-  intern::<Primitive>(jsv_undefined())
+  let h = intern::<Primitive>(jsv_undefined());
+  super::capi_tape::rec(|r| {
+    let id = r.produced(h as *const _);
+    r.ops.push(super::capi_tape::TapeOp::UndefinedNew { id });
+  });
+  h
 }
 
 #[unsafe(no_mangle)]
@@ -683,6 +724,9 @@ pub extern "C" fn v8__Context__New(
 ) -> *const Context {
   if isolate.is_null() {
     return ptr::null();
+  }
+  if let Some(c) = tape_context_new(isolate) {
+    return c;
   }
   let st = iso_state(isolate);
   // First Context::New hands out the bootstrapped context; later ones get a
@@ -700,6 +744,9 @@ pub extern "C" fn v8__Context__New(
     c
   };
   install_default_globals(ctx);
+  super::capi_tape::rec(|r| {
+    let _ = r.ctx_id(ctx); // emits ContextNew on first sight
+  });
 
   // Snapshot restore: every plain Context::New on a snapshot-backed isolate
   // materializes the snapshot's default context (matches V8 semantics).
@@ -712,6 +759,21 @@ pub extern "C" fn v8__Context__New(
   }
 
   intern_ctx(ctx)
+}
+
+/// Tape-v2 aware Context::New half: when the isolate was restored from a
+/// C-API tape, materialize the tape (once) and hand back its DEFAULT context
+/// instead of a fresh one.
+fn tape_context_new(isolate: *mut RealIsolate) -> Option<*const Context> {
+  iso_state(isolate).tape_restore.as_deref()?;
+  super::capi_tape::replay(isolate);
+  let restore = iso_state(isolate).tape_restore.as_deref()?;
+  let id = restore
+    .default_ctx
+    .or_else(|| restore.contexts.keys().min().copied())?;
+  let ctx = *restore.contexts.get(&id)?;
+  refresh_current_ctx(iso_state(isolate));
+  Some(intern_ctx(ctx))
 }
 
 pub(crate) fn install_default_globals(ctx: *mut JSContext) {
@@ -900,7 +962,14 @@ pub extern "C" fn v8__Context__Global(this: *const Context) -> *const Object {
   }
 
   let g = unsafe { JS_GetGlobalObject(ctx) };
-  intern::<Object>(g)
+  let h = intern::<Object>(g);
+  super::capi_tape::rec(|r| {
+    let cid = r.ctx_id(ctx);
+    let id = r.produced(h as *const _);
+    r.ops
+      .push(super::capi_tape::TapeOp::ContextGlobal { id, ctx: cid });
+  });
+  h
 }
 
 thread_local! {
@@ -1188,9 +1257,14 @@ pub extern "C" fn v8__Script__Run(
     u: JSValueUnion { int32: 0 },
     tag: JS_TAG_UNINITIALIZED,
   };
+  let mut tape_bc: Vec<u8> = Vec::new();
+  let want_tape = super::capi_tape::recording();
   if let Some(key) = bc_key
     && let Some(bytes) = super::module::bc_load(key)
   {
+    if want_tape {
+      tape_bc = bytes.clone();
+    }
     let obj = unsafe {
       JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), 1 /* BYTECODE */)
     };
@@ -1199,6 +1273,7 @@ pub extern "C" fn v8__Script__Run(
       let exc = unsafe { JS_GetException(ctx) };
       unsafe { JS_FreeValue(ctx, exc) };
     } else {
+      let _g = super::capi_tape::JsDepthGuard::enter();
       result = unsafe { JS_EvalFunction(ctx, obj) };
     }
   }
@@ -1218,6 +1293,17 @@ pub extern "C" fn v8__Script__Run(
       if let Some(key) = bc_key {
         unsafe { super::module::bc_write(ctx, key, compiled) };
       }
+      if want_tape {
+        let mut size: usize = 0;
+        let buf = unsafe {
+          JS_WriteObject(ctx, &mut size, compiled, 1 /* BYTECODE */)
+        };
+        if !buf.is_null() {
+          tape_bc = unsafe { std::slice::from_raw_parts(buf, size) }.to_vec();
+          unsafe { js_free(ctx, buf as *mut c_void) };
+        }
+      }
+      let _g = super::capi_tape::JsDepthGuard::enter();
       result = unsafe { JS_EvalFunction(ctx, compiled) };
     }
   }
@@ -1231,6 +1317,30 @@ pub extern "C" fn v8__Script__Run(
     if let Ok(src) = std::str::from_utf8(src_bytes) {
       super::snapshot::record_script(ctx, src);
     }
+    let h_result = intern::<Value>(unsafe { JS_DupValue(ctx, result) });
+    super::capi_tape::rec(|r| {
+      let cid = r.ctx_id(ctx);
+      let rid = r.produced(h_result as *const _);
+      let fname_bytes = match fname_owned.as_ref() {
+        Some(n) => n.to_bytes().to_vec(),
+        None => b"<eval>".to_vec(),
+      };
+      r.ops.push(super::capi_tape::TapeOp::ScriptRun {
+        result: rid,
+        ctx: cid,
+        bytecode: std::mem::take(&mut tape_bc),
+        source: src_bytes.to_vec(),
+        filename: fname_bytes,
+        eval_flags,
+      });
+    });
+    // Return the SAME handle the tape knows about, so later C-API calls that
+    // reference the result resolve to a recorded id.
+    unsafe { JS_FreeCString(ctx, cstr) };
+    if result.tag != JS_TAG_EXCEPTION {
+      unsafe { JS_FreeValue(ctx, result) };
+    }
+    return h_result;
   }
   unsafe { JS_FreeCString(ctx, cstr) };
   if result.tag == JS_TAG_EXCEPTION {
