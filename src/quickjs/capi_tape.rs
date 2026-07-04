@@ -496,9 +496,10 @@ impl Recorder {
       // JS object pointer, so chained creators resolve them without relying
       // on arena-box aliasing.
       self.bind(wrapper as *const std::ffi::c_void, hid);
-      self
-        .module_obj_ids
-        .insert(super::module::module_obj_key(wrapper as *const crate::Module), hid);
+      self.module_obj_ids.insert(
+        super::module::module_obj_key(wrapper as *const crate::Module),
+        hid,
+      );
     }
   }
 
@@ -1435,8 +1436,10 @@ pub(crate) fn replay(iso: *mut crate::RealIsolate) {
     }
   }
   // P1/P2 split: user-phase entries follow the creator's last WiringCall.
-  let wiring_total =
-    deferred.iter().filter(|o| matches!(o, TapeOp::WiringCall)).count() as u32;
+  let wiring_total = deferred
+    .iter()
+    .filter(|o| matches!(o, TapeOp::WiringCall))
+    .count() as u32;
   let mut deferred_user = Vec::new();
   if wiring_total > 0 {
     let last_wiring = deferred
@@ -1628,7 +1631,10 @@ pub(crate) fn replay_deferred(iso: *mut crate::RealIsolate) {
       r.user_done = true;
       let user_ops = std::mem::take(&mut r.deferred_user);
       if dbg_on() {
-        eprintln!("[qjs tape] user phase (tail) START ({} ops)", user_ops.len());
+        eprintln!(
+          "[qjs tape] user phase (tail) START ({} ops)",
+          user_ops.len()
+        );
       }
       for (i, op) in user_ops.iter().enumerate() {
         if matches!(op, TapeOp::ContextNew { .. }) {
@@ -1709,8 +1715,7 @@ pub(crate) fn on_wiring_call_done(iso: *mut crate::RealIsolate) {
   let Some(restore) = st.tape_restore.as_deref_mut() else {
     return;
   };
-  if !restore.deferred_done || restore.deferred_running || restore.user_done
-  {
+  if !restore.deferred_done || restore.deferred_running || restore.user_done {
     return;
   }
   if restore.wiring_pending > 0 {
@@ -1722,7 +1727,11 @@ pub(crate) fn on_wiring_call_done(iso: *mut crate::RealIsolate) {
   restore.user_done = true;
   let rt = st.rt;
   let ops = std::mem::take(
-    &mut iso_state(iso).tape_restore.as_deref_mut().unwrap().deferred_user,
+    &mut iso_state(iso)
+      .tape_restore
+      .as_deref_mut()
+      .unwrap()
+      .deferred_user,
   );
   if dbg_on() {
     eprintln!("[qjs tape] user phase START ({} ops)", ops.len());

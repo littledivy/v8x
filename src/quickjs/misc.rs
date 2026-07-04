@@ -570,7 +570,11 @@ pub extern "C" fn v8__SnapshotCreator__CONSTRUCT(
       super::capi_tape::replay(iso);
       let st = crate::quickjs::core::iso_state(iso);
       if let Some(restore) = st.tape_restore.as_deref() {
-        rec.seed_from(&restore.seeded_ops, &restore.contexts, &restore.module_handles);
+        rec.seed_from(
+          &restore.seeded_ops,
+          &restore.contexts,
+          &restore.module_handles,
+        );
       }
     }
     crate::quickjs::core::iso_state(iso).tape_rec = Some(rec);
@@ -645,9 +649,7 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
             if let super::capi_tape::TapeOp::AddContextData { value, .. } = op {
               let producer = ops
                 .iter()
-                .find(|c| {
-                  super::capi_tape::op_result_ids_of(c).contains(value)
-                })
+                .find(|c| super::capi_tape::op_result_ids_of(c).contains(value))
                 .map(|c| {
                   let d = format!("{c:?}");
                   d[..d.len().min(70)].to_string()
@@ -866,7 +868,9 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
         if std::env::var_os("QJS_DEBUG_TAPE").is_some() {
           eprintln!(
             "[qjs tape] AddContextData FALLBACK ClonedValue id={id} module_wrapper={} preview={preview}",
-            super::module::is_module_wrapper(data as *const std::os::raw::c_void),
+            super::module::is_module_wrapper(
+              data as *const std::os::raw::c_void
+            ),
           );
         }
         r.ops.push(super::capi_tape::TapeOp::ClonedValue {
