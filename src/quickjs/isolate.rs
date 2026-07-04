@@ -152,6 +152,12 @@ pub extern "C" fn v8__Context__FromSnapshot(
     let Some(&ctx) = restore.contexts.get(&cid) else {
       return ptr::null();
     };
+    if std::env::var_os("QJS_DEBUG_TAPE").is_some() {
+      eprintln!(
+        "[qjs tape] FromSnapshot idx={context_snapshot_index} cid={cid} ctx={ctx:?} added={:?}",
+        restore.added
+      );
+    }
     return super::core::intern_ctx(ctx);
   }
   let st = super::core::iso_state(isolate);

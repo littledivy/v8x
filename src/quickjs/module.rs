@@ -612,6 +612,11 @@ fn after_first_eval() -> bool {
   AFTER_FIRST_EVAL.with(|f| f.get())
 }
 
+/// Public key for a module wrapper: the underlying JS object pointer.
+pub(crate) fn module_obj_key(this: *const Module) -> usize {
+  handle_key(this)
+}
+
 #[inline]
 fn handle_key(this: *const Module) -> usize {
   let v = jsval_of(this);
@@ -1959,6 +1964,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   super::capi_tape::rec(|r| {
     let cid = r.ctx_id(ctx);
     let id = r.produced(this as *const _);
+    r.module_obj_ids.insert(handle_key(this), id);
     r.ops.push(super::capi_tape::TapeOp::ModuleCompile {
       id,
       ctx: cid,
@@ -3052,6 +3058,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
     super::capi_tape::rec(|r| {
       let cid = r.ctx_id(ctx);
       let id = r.produced(this as *const _);
+      r.module_obj_ids.insert(handle_key(this), id);
       r.ops.push(super::capi_tape::TapeOp::ModuleCompile {
         id,
         ctx: cid,

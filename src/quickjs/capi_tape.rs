@@ -276,13 +276,26 @@ pub(crate) enum TapeOp {
 #[derive(Default)]
 pub(crate) struct Recorder {
   pub ops: Vec<TapeOp>,
-  /// Arena pointer → last handle id bound to it (latest-wins).
-  ptr_ids: HashMap<usize, HandleId>,
+  /// VALUE-content key (tag, payload bits) → handle id. Content keys survive
+  /// arena-box recycling (the old pointer-keyed map handed out stale ids
+  /// whenever an allocator reused a freed handle box). Every refcounted
+  /// value bound here is dup'd into `held` so its address cannot be reused
+  /// while the recorder lives.
+  val_ids: HashMap<(i64, u64), HandleId>,
+  /// Refcount holds backing `val_ids` (leaked at process exit — snapshot
+  /// creators are short-lived).
+  held: Vec<JSValue>,
+  /// Runtime for JS_DupValueRT; set as soon as the creator's isolate exists.
+  pub rt: *mut JSRuntime,
   /// JSContext pointer → id of its ContextNew entry.
   ctx_ids: HashMap<usize, HandleId>,
   next_id: HandleId,
   /// External pointer → index in CreateParams.external_references.
   ext_refs: HashMap<usize, u32>,
+  /// Module wrapper's underlying JS object pointer → its ModuleCompile id.
+  /// Wrappers are immortal, so this map (unlike `ptr_ids`, keyed by arena
+  /// boxes) can never be poisoned by allocator address reuse.
+  pub module_obj_ids: HashMap<usize, HandleId>,
   /// Set when a pointer outside the ext-ref table or an argument without an
   /// id was seen: the tape cannot faithfully restore. CreateBlob fails (like
   /// V8's "Unknown external reference") instead of emitting a broken blob.
@@ -333,7 +346,31 @@ impl Recorder {
     }
     Recorder {
       ext_refs,
+      rt: std::ptr::null_mut(),
       ..Default::default()
+    }
+  }
+
+  fn val_key(ptr: *const std::ffi::c_void) -> (i64, u64) {
+    if ptr.is_null() {
+      // Sentinel key no real value produces (tag i64::MIN is not a quickjs
+      // tag): null handles never match or create a binding.
+      return (i64::MIN, 0);
+    }
+    let v = unsafe { *(ptr as *const JSValue) };
+    (v.tag, unsafe { v.u.ptr } as u64)
+  }
+
+  /// Keep the value alive for the recorder's lifetime so its content key
+  /// can never be reused by another allocation.
+  fn retain(&mut self, ptr: *const std::ffi::c_void) {
+    if self.rt.is_null() || ptr.is_null() {
+      return;
+    }
+    let v = unsafe { *(ptr as *const JSValue) };
+    if v.tag < 0 {
+      let d = unsafe { JS_DupValueRT(self.rt, v) };
+      self.held.push(d);
     }
   }
 
@@ -346,14 +383,15 @@ impl Recorder {
   /// Bind a freshly produced handle pointer to a new id.
   pub fn produced(&mut self, ptr: *const std::ffi::c_void) -> HandleId {
     let id = self.fresh_id();
-    self.ptr_ids.insert(ptr as usize, id);
+    self.val_ids.insert(Self::val_key(ptr), id);
+    self.retain(ptr);
     id
   }
 
   /// Resolve an argument handle to its id; marks the tape incomplete when the
   /// value was produced by an unrecorded call.
   pub fn arg(&mut self, ptr: *const std::ffi::c_void, what: &str) -> HandleId {
-    match self.ptr_ids.get(&(ptr as usize)) {
+    match self.val_ids.get(&Self::val_key(ptr)) {
       Some(&id) => id,
       None => {
         // Read the handle's JSValue tag for diagnosis (arena slot layout).
@@ -368,7 +406,7 @@ impl Recorder {
 
   /// Non-fatal arg lookup (reads): None when the value was never recorded.
   pub fn try_arg(&mut self, ptr: *const std::ffi::c_void) -> Option<HandleId> {
-    self.ptr_ids.get(&(ptr as usize)).copied()
+    self.val_ids.get(&Self::val_key(ptr)).copied()
   }
 
   pub fn ctx_id(&mut self, ctx: *mut JSContext) -> HandleId {
@@ -386,7 +424,8 @@ impl Recorder {
   /// Bind an existing tape id to a live pointer (chained creators: values
   /// handed out by GetDataFromSnapshotOnce keep their original ids).
   pub fn bind(&mut self, ptr: *const std::ffi::c_void, id: HandleId) {
-    self.ptr_ids.insert(ptr as usize, id);
+    self.val_ids.insert(Self::val_key(ptr), id);
+    self.retain(ptr);
   }
 
   /// Handle copy (Local::New / escape / Global::New): the new pointer names
@@ -396,8 +435,11 @@ impl Recorder {
     from: *const std::ffi::c_void,
     to: *const std::ffi::c_void,
   ) {
-    if let Some(&id) = self.ptr_ids.get(&(from as usize)) {
-      self.ptr_ids.insert(to as usize, id);
+    // Content-keyed map: a handle copy usually shares the key, so this is a
+    // no-op unless the copy boxes a different-but-equal payload.
+    if let Some(&id) = self.val_ids.get(&Self::val_key(from)) {
+      self.val_ids.insert(Self::val_key(to), id);
+      self.retain(to);
     }
   }
 
@@ -408,6 +450,7 @@ impl Recorder {
     &mut self,
     ops: &[TapeOp],
     contexts: &HashMap<HandleId, *mut JSContext>,
+    module_handles: &HashMap<HandleId, usize>,
   ) {
     let mut max_id = 0u32;
     for op in ops {
@@ -418,14 +461,45 @@ impl Recorder {
       }
     }
     self.next_id = self.next_id.max(max_id);
-    // Drop stale WiringCall markers: they described the live wiring calls of
-    // THIS process's restore (already done). Only the markers this recorder
-    // emits itself describe the wiring the next restore will perform.
-    self
-      .ops
-      .extend(ops.iter().filter(|op| !matches!(op, TapeOp::WiringCall)).cloned());
+    // Drop ops that belong to the PREVIOUS blob's restore protocol, not the
+    // chained blob we are recording:
+    // - WiringCall markers described the live wiring calls of THIS process's
+    //   restore (already done); only markers this recorder emits itself
+    //   describe the next restore's wiring.
+    // - AddContextData/AddIsolateData/SetDefaultContext/AddContext were the
+    //   previous creator's data registrations. The new creator re-registers
+    //   everything itself at snapshot time; keeping the old ones would shift
+    //   every data index the embedder's sidecar refers to.
+    self.ops.extend(
+      ops
+        .iter()
+        .filter(|op| {
+          if std::env::var_os("QJS_SEED_KEEP_ADDS").is_some() {
+            !matches!(op, TapeOp::WiringCall)
+          } else {
+            !matches!(
+              op,
+              TapeOp::WiringCall
+                | TapeOp::AddContextData { .. }
+                | TapeOp::AddIsolateData { .. }
+                | TapeOp::SetDefaultContext { .. }
+                | TapeOp::AddContext { .. }
+            )
+          }
+        })
+        .cloned(),
+    );
     for (&id, &ctx) in contexts {
       self.ctx_ids.insert(ctx as usize, id);
+    }
+    for (&hid, &wrapper) in module_handles {
+      // Bind restored module wrappers by value content and by the underlying
+      // JS object pointer, so chained creators resolve them without relying
+      // on arena-box aliasing.
+      self.bind(wrapper as *const std::ffi::c_void, hid);
+      self
+        .module_obj_ids
+        .insert(super::module::module_obj_key(wrapper as *const crate::Module), hid);
     }
   }
 
@@ -478,6 +552,14 @@ fn op_result_ids(op: &TapeOp) -> Vec<HandleId> {
 
 /// Every id an op mentions (result + argument ids) — used to advance a
 /// chained creator's id counter past the seeded range.
+pub(crate) fn op_ids_of(op: &TapeOp) -> Vec<HandleId> {
+  op_ids(op)
+}
+
+pub(crate) fn op_result_ids_of(op: &TapeOp) -> Vec<HandleId> {
+  op_result_ids(op)
+}
+
 fn op_ids(op: &TapeOp) -> Vec<HandleId> {
   use TapeOp::*;
   match op {
@@ -547,6 +629,142 @@ fn op_ids(op: &TapeOp) -> Vec<HandleId> {
     StateReady | WiringCall => vec![],
     ClonedValue { id, .. } => vec![*id],
   }
+}
+
+/// Dead-op elimination before serialization. Creators record every C-ABI
+/// call, including short-lived values (per-module promise closures,
+/// Externals) that are garbage by snapshot time. Real V8 never serializes
+/// those (unreachable from roots); we drop them the same way so their
+/// unresolvable external-reference gaps don't poison the blob.
+///
+/// An op is kept if it is a side-effectful root, or (for pure producers) if
+/// its result id is consumed by a kept op, or (for SetProp-family mutations)
+/// if its target object is live. Fixpoint iteration handles chains in either
+/// direction.
+pub(crate) fn prune_dead_ops(ops: &[TapeOp]) -> Vec<TapeOp> {
+  use TapeOp::*;
+  let unconditional = |op: &TapeOp| {
+    matches!(
+      op,
+      ContextNew { .. }
+        | ContextGlobal { .. }
+        | ScriptRun { .. }
+        | ModuleSource { .. }
+        | ModuleEval { .. }
+        | AddContextData { .. }
+        | AddIsolateData { .. }
+        | SetDefaultContext { .. }
+        | AddContext { .. }
+        | SetEmbedderData { .. }
+        | GetEmbedderData { .. }
+        | FunctionCall { .. }
+        | ModuleCompile { .. }
+        | ExtrasBinding { .. }
+        | TemplateNew { .. }
+        | StateReady
+        | WiringCall
+        | ClonedValue { .. }
+    )
+  };
+  // Ids produced by ops that can never replay faithfully (dynamic closures /
+  // embedder pointers outside the external-reference table). A FunctionCall
+  // touching one of these is creator-side wiring on garbage — dropping it
+  // (and thus the garbage) mirrors real V8, where none of it is reachable.
+  let mut poisoned: std::collections::HashSet<HandleId> = Default::default();
+  for op in ops {
+    match op {
+      ExternalNew { id, ext_ref } if *ext_ref == u32::MAX => {
+        poisoned.insert(*id);
+      }
+      FunctionNew {
+        id,
+        cb_ext_ref,
+        data,
+        ..
+      } if *cb_ext_ref == u32::MAX
+        || data.map(|d| poisoned.contains(&d)).unwrap_or(false) =>
+      {
+        poisoned.insert(*id);
+      }
+      _ => {}
+    }
+  }
+  let mut live: std::collections::HashSet<HandleId> = Default::default();
+  let mut keep = vec![false; ops.len()];
+  for (i, op) in ops.iter().enumerate() {
+    if let FunctionCall { callee, args, .. } = op {
+      if poisoned.contains(callee) || args.iter().any(|a| poisoned.contains(a))
+      {
+        continue;
+      }
+    }
+    if unconditional(op) {
+      keep[i] = true;
+      for id in op_ids(op) {
+        live.insert(id);
+      }
+    }
+  }
+  loop {
+    let mut changed = false;
+    for (i, op) in ops.iter().enumerate().rev() {
+      if keep[i] {
+        continue;
+      }
+      if let FunctionCall { callee, args, .. } = op {
+        if poisoned.contains(callee)
+          || args.iter().any(|a| poisoned.contains(a))
+        {
+          continue;
+        }
+      }
+      let hit = match op {
+        SetProp { obj, .. }
+        | DefineProp { obj, .. }
+        | SetPrototype { obj, .. } => live.contains(obj),
+        // A read off a live object is kept even before its result is known
+        // to be consumed: mutations (SetProp on the read's result) only hit
+        // once the result id is live, and reads are side-effect-free.
+        GetProp { id, obj, .. } => live.contains(id) || live.contains(obj),
+        _ => op_result_ids(op).iter().any(|id| live.contains(id)),
+      };
+      if hit {
+        keep[i] = true;
+        for id in op_ids(op) {
+          changed |= live.insert(id);
+        }
+        changed = true;
+      }
+    }
+    if !changed {
+      break;
+    }
+  }
+  ops
+    .iter()
+    .zip(&keep)
+    .filter(|(_, k)| **k)
+    .map(|(op, _)| op.clone())
+    .collect()
+}
+
+/// External-reference gaps present in a (pruned) op list — a blob is only
+/// truly incomplete if a LIVE op references a pointer outside the
+/// external-reference table.
+pub(crate) fn live_ext_ref_gaps(ops: &[TapeOp]) -> usize {
+  use TapeOp::*;
+  ops
+    .iter()
+    .filter(|op| match op {
+      ExternalNew { ext_ref, .. } => *ext_ref == u32::MAX,
+      FunctionNew {
+        cb_ext_ref,
+        data_ext,
+        ..
+      } => *cb_ext_ref == u32::MAX || *data_ext == Some(u32::MAX),
+      _ => false,
+    })
+    .count()
 }
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
@@ -1046,6 +1264,10 @@ pub(crate) struct TapeRestore {
   /// live wiring calls must complete first.
   pub deferred_user: Vec<TapeOp>,
   pub wiring_pending: u32,
+  /// True while the deferred (P1) replay loop is executing: live
+  /// Function::Calls made by ops fired from replayed JS must NOT count
+  /// toward the wiring total, and the user phase must not start mid-loop.
+  pub deferred_running: bool,
   pub user_done: bool,
   pub replayed: bool,
   /// id → owned (+1) JSValue. Everything stays alive until isolate dispose:
@@ -1110,6 +1332,7 @@ impl TapeRestore {
       template_handles: HashMap::new(),
       primary_ctx: std::ptr::null_mut(),
       fixups: Vec::new(),
+      deferred_running: false,
       fixup_cells: HashMap::new(),
       replayed: false,
       handles: HashMap::new(),
@@ -1145,6 +1368,20 @@ pub(crate) fn replay(iso: *mut crate::RealIsolate) {
   }
   restore.replayed = true;
   let all_ops = std::mem::take(&mut restore.ops);
+  if let Some(path) = std::env::var_os("QJS_DUMP_TAPE") {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+      .create(true)
+      .append(true)
+      .open(&path)
+    {
+      let _ = writeln!(f, "==== tape ({} ops) ====", all_ops.len());
+      for (i, op) in all_ops.iter().enumerate() {
+        let d = format!("{op:?}");
+        let _ = writeln!(f, "[{i}] {}", &d[..d.len().min(160)]);
+      }
+    }
+  }
   // Positional split at the StateReady marker (see the op's docs): before it
   // everything replays eagerly, after it JS-executing entries wait for the
   // restoring runtime's own state install. Pure C ops and data-slot
@@ -1357,6 +1594,7 @@ pub(crate) fn replay_deferred(iso: *mut crate::RealIsolate) {
     return;
   }
   restore.deferred_done = true;
+  restore.deferred_running = true;
   let rt = st.rt;
   let ops = std::mem::take(&mut restore.deferred);
   if dbg_on() {
@@ -1380,6 +1618,9 @@ pub(crate) fn replay_deferred(iso: *mut crate::RealIsolate) {
   finish_phase(iso);
   if dbg_on() {
     eprintln!("[qjs tape] deferred phase done ({} ops)", ops.len());
+  }
+  if let Some(r) = iso_state(iso).tape_restore.as_deref_mut() {
+    r.deferred_running = false;
   }
   // No per-process wiring recorded: the user phase has nothing to wait for.
   let st = iso_state(iso);
@@ -1469,7 +1710,8 @@ pub(crate) fn on_wiring_call_done(iso: *mut crate::RealIsolate) {
   let Some(restore) = st.tape_restore.as_deref_mut() else {
     return;
   };
-  if !restore.deferred_done || restore.user_done {
+  if !restore.deferred_done || restore.deferred_running || restore.user_done
+  {
     return;
   }
   if restore.wiring_pending > 0 {
