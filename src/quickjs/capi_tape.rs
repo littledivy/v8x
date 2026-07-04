@@ -2030,6 +2030,11 @@ fn replay_one(rt: *mut JSRuntime, r: &mut TapeRestore, op: &TapeOp) {
         u: JSValueUnion { int32: 0 },
         tag: JS_TAG_UNINITIALIZED,
       };
+      // The def pointer of the root module: bytecode reads and COMPILE_ONLY
+      // evals hand it back before evaluation. Cached under the tape name so
+      // refresh_tape_module_state can lift the wrapper's status — the engine
+      // registry never sees replay-born defs.
+      let mut def_ptr: usize = 0;
       if !bytecode.is_empty() {
         let obj =
           unsafe { JS_ReadObject(c, bytecode.as_ptr(), bytecode.len(), 1) };
@@ -2037,6 +2042,14 @@ fn replay_one(rt: *mut JSRuntime, r: &mut TapeRestore, op: &TapeOp) {
           let e = unsafe { JS_GetException(c) };
           unsafe { JS_FreeValue(c, e) };
         } else {
+          if obj.tag == JS_TAG_MODULE {
+            def_ptr = unsafe { obj.u.ptr } as usize;
+            super::module::populate_import_meta_for_replay(
+              c,
+              def_ptr,
+              &String::from_utf8_lossy(name),
+            );
+          }
           v = unsafe { JS_EvalFunction(c, obj) };
         }
       }
@@ -2045,15 +2058,32 @@ fn replay_one(rt: *mut JSRuntime, r: &mut TapeRestore, op: &TapeOp) {
         src.push(0);
         let mut fname = name.to_vec();
         fname.push(0);
-        v = unsafe {
+        let compiled = unsafe {
           JS_Eval(
             c,
             src.as_ptr() as *const std::os::raw::c_char,
             src.len() - 1,
             fname.as_ptr() as *const std::os::raw::c_char,
-            JS_EVAL_TYPE_MODULE,
+            JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
           )
         };
+        if compiled.tag == JS_TAG_MODULE {
+          def_ptr = unsafe { compiled.u.ptr } as usize;
+          super::module::populate_import_meta_for_replay(
+            c,
+            def_ptr,
+            &String::from_utf8_lossy(name),
+          );
+          v = unsafe { JS_EvalFunction(c, compiled) };
+        } else {
+          v = compiled;
+        }
+      }
+      if def_ptr != 0 && v.tag != JS_TAG_EXCEPTION {
+        super::module::cache_module_def(
+          &String::from_utf8_lossy(name),
+          def_ptr,
+        );
       }
       super::core::pop_entered_ctx(current_iso());
       if v.tag == JS_TAG_EXCEPTION {

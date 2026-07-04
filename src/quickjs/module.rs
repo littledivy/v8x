@@ -359,7 +359,16 @@ unsafe extern "C" fn dynamic_import_hook(
 
   let context = intern_ctx(ctx);
   let host_opts = intern::<Data>(jsv_undefined());
-  let referrer = intern_dup::<Value>(ctx, basename);
+  // Scripts compiled without a resource name run under our synthetic
+  // "<eval>"/"<anonymous>" filenames; V8 reports an EMPTY referrer for
+  // those (deno prints "(no referrer)").
+  let base_str = unsafe { jsval_to_rust(ctx, basename) };
+  let referrer = if base_str == "<eval>" || base_str == "<anonymous>" {
+    let empty = unsafe { JS_NewString(ctx, c"".as_ptr()) };
+    intern::<Value>(empty)
+  } else {
+    intern_dup::<Value>(ctx, basename)
+  };
   let spec_handle = intern_dup::<V8String>(ctx, specifier);
   let attrs_handle =
     intern::<FixedArray>(unsafe { build_dyn_attrs(ctx, attributes) });
@@ -415,6 +424,16 @@ unsafe extern "C" fn dynamic_import_hook(
   let mut args = [d, resolve, reject];
   let r = unsafe { JS_Call(ctx, chain, jsv_undefined(), 3, args.as_mut_ptr()) };
   unsafe { JS_FreeValue(ctx, r) };
+}
+
+/// Tape replay: bytecode-born module defs bypass the loader, so their
+/// `import.meta` must be populated explicitly before evaluation.
+pub(crate) fn populate_import_meta_for_replay(
+  ctx: *mut JSContext,
+  def: usize,
+  name: &str,
+) {
+  unsafe { populate_import_meta(ctx, def as *mut JSModuleDef, name) }
 }
 
 unsafe fn populate_import_meta(
@@ -1236,6 +1255,15 @@ fn intern_module(v: JSValue) -> *const Module {
 
 /// Tape replay: after the deferred ModuleEval entries ran, resolve each
 /// tape wrapper's def by name and lift its status to match the engine.
+/// Register a module def under a name in the def cache (tape replay: defs
+/// born from bytecode reads are invisible to the engine's loaded-module
+/// registry).
+pub(crate) fn cache_module_def(name: &str, def: usize) {
+  MODULE_DEF_CACHE.with(|c| {
+    c.borrow_mut().insert(name.to_string(), def);
+  });
+}
+
 pub(crate) fn refresh_tape_module_state(
   ctx: *mut JSContext,
   wrapper: *const Module,
@@ -1255,6 +1283,12 @@ pub(crate) fn refresh_tape_module_state(
       def = unsafe { v82jsc_get_loaded_module(ctx, cn.as_ptr()) }
         as *mut JSModuleDef;
     }
+  }
+  if std::env::var_os("QJS_DEBUG_TAPE").is_some() {
+    eprintln!(
+      "[qjs tape] refresh module {name}: def={def:?} src_known={}",
+      lookup_module_source_by_name(&name).is_some()
+    );
   }
   if !def.is_null() {
     let evaluated = unsafe { v82jsc_module_is_evaluated(def) != 0 }
