@@ -330,6 +330,14 @@ pub extern "C" fn v8__Global__New(
   super::capi_tape::rec(|r| {
     r.alias(data as *const _, cell as *const _);
   });
+  let iso_now = current_iso();
+  if !iso_now.is_null() {
+    super::capi_tape::propagate_fixup(
+      iso_now,
+      data as *const _,
+      cell as *const _,
+    );
+  }
   cell as *const Data
 }
 
@@ -704,7 +712,18 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_isolate(
   let bytes =
     super::snapshot::serialize_value(ctx, jsval_of(data)).unwrap_or_default();
   super::capi_tape::rec(|r| {
-    let vid = r.arg(data as *const _, "AddData_to_isolate value");
+    let vid = match r.try_arg(data as *const _) {
+      Some(id) => id,
+      None => {
+        let cloned = super::snapshot::serialize_value(ctx, jsval_of(data));
+        let id = r.produced(data as *const _);
+        r.ops.push(super::capi_tape::TapeOp::ClonedValue {
+          id,
+          bytes: cloned.unwrap_or_default(),
+        });
+        id
+      }
+    };
     r.ops
       .push(super::capi_tape::TapeOp::AddIsolateData { value: vid });
   });
@@ -767,10 +786,22 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
         out
       }
     };
-    let vid = r.arg(
-      data as *const _,
-      &format!("AddData_to_context value={preview}"),
-    );
+    let _ = preview;
+    let vid = match r.try_arg(data as *const _) {
+      Some(id) => id,
+      None => {
+        // JS-born value (created inside an op, invisible to the tape).
+        // Structured-clone it when possible; otherwise a plain object
+        // placeholder — restore re-derives the content by re-running init.
+        let cloned = super::snapshot::serialize_value(ctx, jsval_of(data));
+        let id = r.produced(data as *const _);
+        r.ops.push(super::capi_tape::TapeOp::ClonedValue {
+          id,
+          bytes: cloned.unwrap_or_default(),
+        });
+        id
+      }
+    };
     r.ops.push(super::capi_tape::TapeOp::AddContextData {
       ctx: cid,
       value: vid,

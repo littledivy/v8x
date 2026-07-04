@@ -1221,6 +1221,68 @@ pub(crate) fn lookup_module_source(name: &str) -> Option<std::string::String> {
   lookup_module_source_by_name(name)
 }
 
+/// Intern a module WRAPPER handle into an immortal slot. Wrapper pointers ARE
+/// module identity (every side table + the embedder's Globals key on them),
+/// so they must never be recycled by handle-scope pops the way arena slots
+/// are. Owns the +1 JSValue; reclaimed only at registry teardown.
+fn intern_module(v: JSValue) -> *const Module {
+  Box::into_raw(Box::new(v)) as *const Module
+}
+
+/// Tape replay: after the deferred ModuleEval entries ran, resolve each
+/// tape wrapper's def by name and lift its status to match the engine.
+pub(crate) fn refresh_tape_module_state(
+  ctx: *mut JSContext,
+  wrapper: *const Module,
+) {
+  let Some(name) =
+    with_module_state(wrapper as *const Module, |m| m.source_name.clone())
+  else {
+    return;
+  };
+  let mut def = MODULE_DEF_CACHE
+    .with(|c| c.borrow().get(&name).copied())
+    .unwrap_or(0) as *mut JSModuleDef;
+  if def.is_null() && !ctx.is_null() {
+    // ModuleEval replays through raw JS_Eval, which registers the def in the
+    // ENGINE registry, not our cache — look it up there.
+    if let Ok(cn) = CString::new(name.clone()) {
+      def = unsafe { v82jsc_get_loaded_module(ctx, cn.as_ptr()) }
+        as *mut JSModuleDef;
+    }
+  }
+  if !def.is_null() {
+    let evaluated = unsafe { v82jsc_module_is_evaluated(def) != 0 }
+      || unsafe { v82jsc_module_eval_started(def) != 0 };
+    with_module_state(wrapper as *const Module, |m| {
+      m.module_def = def;
+      if evaluated {
+        m.status = ModuleStatus::Evaluated;
+      }
+    });
+    return;
+  }
+  // No def and no source: a synthetic module (e.g. deno's virtual ops
+  // module). It WAS evaluated on the creator — reflect that; the restoring
+  // embedder rebuilt its exports natively (ops re-binding), and nothing
+  // imports the def through the engine after restore.
+  if lookup_module_source_by_name(&name).is_none() {
+    with_module_state(wrapper as *const Module, |m| {
+      m.status = ModuleStatus::Evaluated;
+    });
+  }
+}
+
+/// True when `p` is a registered module WRAPPER handle. Module identity in
+/// every side table is the wrapper pointer itself, so handle copies
+/// (Global/Local) must preserve it — see `core::is_non_value_handle`.
+pub(crate) fn is_module_wrapper(p: *const std::os::raw::c_void) -> bool {
+  // Module identity keys on the wrapped JS OBJECT pointer (handle_key), so
+  // any handle copy of a wrapper matches.
+  MODULE_STATE
+    .with(|t| t.borrow().contains_key(&handle_key(p as *const Module)))
+}
+
 /// Tape replay: recreate a module WRAPPER handle for `name`. The wrapper is
 /// deno_core's module identity (Global<Module> in its map); its side-table
 /// state carries just enough for post-restore queries — status comes from
@@ -1236,7 +1298,7 @@ pub(crate) fn tape_make_module_handle(
     unsafe { JS_FreeValue(ctx, e) };
     return std::ptr::null();
   }
-  let this = intern::<Module>(handle_val);
+  let this = intern_module(handle_val);
   if this.is_null() {
     return this;
   }
@@ -1890,7 +1952,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
     unsafe { JS_FreeValue(ctx, exc) };
     return ptr::null();
   }
-  let this = intern::<Module>(handle_val);
+  let this = intern_module(handle_val);
   if this.is_null() {
     return ptr::null();
   }
@@ -2972,7 +3034,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
     unsafe { JS_FreeValue(ctx, exc) };
     return ptr::null();
   }
-  let this = intern::<Module>(handle_val);
+  let this = intern_module(handle_val);
   if this.is_null() {
     return ptr::null();
   }
@@ -2985,6 +3047,18 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   SYNTHETIC_DEFS.with(|t| {
     t.borrow_mut().insert(handle_key(this), def as usize);
   });
+  {
+    let nm = unsafe { jsval_to_rust(ctx, jsval_of(module_name)) };
+    super::capi_tape::rec(|r| {
+      let cid = r.ctx_id(ctx);
+      let id = r.produced(this as *const _);
+      r.ops.push(super::capi_tape::TapeOp::ModuleCompile {
+        id,
+        ctx: cid,
+        name: nm.as_bytes().to_vec(),
+      });
+    });
+  }
 
   let steps: SyntheticModuleEvaluationSteps<'static> =
     unsafe { std::mem::transmute(evaluation_steps) };

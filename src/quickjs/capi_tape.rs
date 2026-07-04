@@ -249,6 +249,13 @@ pub(crate) enum TapeOp {
     length: i32,
     constructable: bool,
   },
+  /// Structured-clone bytes of a JS-born value (AddData fallback: the value
+  /// was created inside an op, invisible to the tape). Empty bytes = plain
+  /// object placeholder; the restoring runtime's re-run init refills it.
+  ClonedValue {
+    id: HandleId,
+    bytes: Vec<u8>,
+  },
   /// Positional marker: the creator stored its per-runtime state here
   /// (Isolate::SetData slot ≥ 1). Everything before it demonstrably ran
   /// WITHOUT embedder state on the creator, so it replays eagerly; JS after
@@ -527,6 +534,7 @@ fn op_ids(op: &TapeOp) -> Vec<HandleId> {
     ExtrasBinding { id, ctx } => vec![*id, *ctx],
     TemplateNew { id, .. } => vec![*id],
     StateReady => vec![],
+    ClonedValue { id, .. } => vec![*id],
   }
 }
 
@@ -769,6 +777,11 @@ pub(crate) fn serialize(ops: &[TapeOp]) -> Vec<u8> {
         out.push(*constructable as u8);
       }
       TapeOp::StateReady => out.push(28),
+      TapeOp::ClonedValue { id, bytes } => {
+        out.push(29);
+        put_u32(&mut out, *id);
+        put_bytes(&mut out, bytes);
+      }
     }
   }
   out
@@ -953,6 +966,10 @@ pub(crate) fn deserialize(bytes: &[u8]) -> Option<Vec<TapeOp>> {
         constructable: r.u8()? != 0,
       },
       28 => TapeOp::StateReady,
+      29 => TapeOp::ClonedValue {
+        id: r.u32()?,
+        bytes: r.bytes()?,
+      },
       _ => return None,
     };
     ops.push(op);
@@ -1030,6 +1047,20 @@ pub(crate) struct TapeRestore {
   pub module_handles: HashMap<HandleId, usize>,
   /// Tape id → replayed FunctionTemplate handle pointer (shim-side struct).
   pub template_handles: HashMap<HandleId, usize>,
+  /// First materialized tape context — deterministic home for value
+  /// creation and by-name module lookups (HashMap order is random).
+  pub primary_ctx: *mut JSContext,
+  /// Placeholder fixups: cells (arena handles / Global boxes — both are
+  /// Box<JSValue>) handed out for values whose producing tape entry is still
+  /// deferred. When the deferred phase materializes the value, every
+  /// registered cell is patched in place, so Globals the embedder took early
+  /// see the real value by the time it types-checks them.
+  /// (pending id, cell ptr, placeholder object ptr). The object ptr guards
+  /// against patching an arena slot that was popped and RECYCLED before the
+  /// deferred phase ran — only cells still holding the placeholder patch.
+  pub fixups: Vec<(HandleId, usize, usize)>,
+  /// Cell → (pending id, placeholder object ptr).
+  pub fixup_cells: HashMap<usize, (HandleId, usize)>,
 }
 
 impl TapeRestore {
@@ -1056,6 +1087,9 @@ impl TapeRestore {
       deferred_done: false,
       module_handles: HashMap::new(),
       template_handles: HashMap::new(),
+      primary_ctx: std::ptr::null_mut(),
+      fixups: Vec::new(),
+      fixup_cells: HashMap::new(),
       replayed: false,
       handles: HashMap::new(),
       contexts: HashMap::new(),
@@ -1133,6 +1167,7 @@ pub(crate) fn replay(iso: *mut crate::RealIsolate) {
           | TapeOp::UndefinedNew { .. }
           | TapeOp::NullNew { .. }
           | TapeOp::ExternalNew { .. }
+          | TapeOp::ClonedValue { .. }
       )
     {
       // Post-marker mutations/reads may reference post-marker JS results:
@@ -1152,6 +1187,7 @@ pub(crate) fn replay(iso: *mut crate::RealIsolate) {
       TapeOp::ContextNew { id } => {
         let ctx = if first_ctx && !st.main_ctx_claimed {
           st.main_ctx_claimed = true;
+          super::core::install_default_globals(st.ctx);
           st.ctx
         } else {
           let c = unsafe { JS_NewContext(rt) };
@@ -1164,6 +1200,9 @@ pub(crate) fn replay(iso: *mut crate::RealIsolate) {
         };
         first_ctx = false;
         let restore = st.tape_restore.as_deref_mut().unwrap();
+        if restore.primary_ctx.is_null() {
+          restore.primary_ctx = ctx;
+        }
         restore.contexts.insert(*id, ctx);
       }
       _ => {
@@ -1175,12 +1214,43 @@ pub(crate) fn replay(iso: *mut crate::RealIsolate) {
   }
   if dbg_on() {
     let restore = st.tape_restore.as_deref_mut().unwrap();
+    for (id, &c) in &restore.contexts {
+      let probe =
+        c"[typeof globalThis.__bootstrap, typeof globalThis.Deno].join()";
+      let v = unsafe {
+        JS_Eval(
+          c,
+          probe.as_ptr(),
+          62,
+          c"<probe>".as_ptr(),
+          JS_EVAL_TYPE_GLOBAL,
+        )
+      };
+      let mut l = 0usize;
+      let cs = unsafe { JS_ToCStringLen(c, &mut l, v) };
+      if !cs.is_null() {
+        let b = unsafe { std::slice::from_raw_parts(cs as *const u8, l) };
+        eprintln!(
+          "[qjs tape] eager probe ctx id={id} ptr={c:?}: {}",
+          String::from_utf8_lossy(b)
+        );
+        unsafe { JS_FreeCString(c, cs) };
+      }
+      unsafe { JS_FreeValue(c, v) };
+    }
     eprintln!(
-      "[qjs tape] replayed: {} handles, {} contexts, default={:?}, added={}",
+      "[qjs tape] replayed: {} handles, {} ctx, default={:?}, added={}, modules={}, tmpls={}, ctx_data={:?}",
       restore.handles.len(),
       restore.contexts.len(),
       restore.default_ctx,
-      restore.added.len()
+      restore.added.len(),
+      restore.module_handles.len(),
+      restore.template_handles.len(),
+      restore
+        .ctx_data
+        .iter()
+        .map(|(k, v)| (*k, v.len()))
+        .collect::<Vec<_>>()
     );
   }
 }
@@ -1212,6 +1282,38 @@ pub(crate) fn has_pending_deferred(iso: *mut crate::RealIsolate) -> bool {
     .unwrap_or(false)
 }
 
+/// Register a placeholder cell for a not-yet-materialized tape value.
+pub(crate) fn register_fixup(
+  iso: *mut crate::RealIsolate,
+  hid: HandleId,
+  cell: *const std::ffi::c_void,
+) {
+  let obj_ptr = unsafe { (*(cell as *const JSValue)).u.ptr } as usize;
+  if let Some(r) = iso_state(iso).tape_restore.as_deref_mut() {
+    r.fixups.push((hid, cell as usize, obj_ptr));
+    r.fixup_cells.insert(cell as usize, (hid, obj_ptr));
+  }
+}
+
+/// A handle copy (Local::New / Global::New) of a placeholder must be patched
+/// too — chain the new cell onto the same pending id.
+pub(crate) fn propagate_fixup(
+  iso: *mut crate::RealIsolate,
+  from: *const std::ffi::c_void,
+  to: *const std::ffi::c_void,
+) {
+  if iso.is_null() {
+    return;
+  }
+  let Some(r) = iso_state(iso).tape_restore.as_deref_mut() else {
+    return;
+  };
+  if let Some(&(hid, obj)) = r.fixup_cells.get(&(from as usize)) {
+    r.fixups.push((hid, to as usize, obj));
+    r.fixup_cells.insert(to as usize, (hid, obj));
+  }
+}
+
 pub(crate) fn replay_deferred(iso: *mut crate::RealIsolate) {
   let st = iso_state(iso);
   let Some(restore) = st.tape_restore.as_deref_mut() else {
@@ -1223,12 +1325,67 @@ pub(crate) fn replay_deferred(iso: *mut crate::RealIsolate) {
   restore.deferred_done = true;
   let rt = st.rt;
   let ops = std::mem::take(&mut restore.deferred);
-  for op in &ops {
+  if dbg_on() {
+    eprintln!(
+      "[qjs tape] deferred phase START ({} ops), backtrace:\n{}",
+      ops.len(),
+      std::backtrace::Backtrace::force_capture()
+    );
+  }
+  for (i, op) in ops.iter().enumerate() {
     if matches!(op, TapeOp::ContextNew { .. }) {
       continue;
     }
+    if dbg_on() {
+      let kind = format!("{op:?}");
+      eprintln!("[qjs tape] deferred[{i}] {}", &kind[..kind.len().min(90)]);
+    }
     let restore = iso_state(iso).tape_restore.as_deref_mut().unwrap();
     replay_one(rt, restore, op);
+  }
+  // Module wrappers were created before their ModuleEval entries ran: pull
+  // their defs/status up to engine truth.
+  {
+    let st0 = iso_state(iso);
+    let ctx0 = st0
+      .tape_restore
+      .as_deref()
+      .map(|r| r.primary_ctx)
+      .filter(|c| !c.is_null())
+      .unwrap_or(st0.ctx);
+    let wrappers: Vec<usize> = iso_state(iso)
+      .tape_restore
+      .as_deref()
+      .map(|r| r.module_handles.values().copied().collect())
+      .unwrap_or_default();
+    for w in wrappers {
+      super::module::refresh_tape_module_state(ctx0, w as *const crate::Module);
+    }
+  }
+  // Patch every placeholder cell now that its value exists.
+  let st = iso_state(iso);
+  if let Some(restore) = st.tape_restore.as_deref_mut() {
+    let fixups = std::mem::take(&mut restore.fixups);
+    let mut patched = 0usize;
+    for (hid, cell, expected_obj) in fixups {
+      if let Some(&(v, vctx)) = restore.handles.get(&hid) {
+        unsafe {
+          let slot = cell as *mut JSValue;
+          // Skip recycled cells: only patch if the slot still holds OUR
+          // placeholder object.
+          if ((*slot).u.ptr as usize) != expected_obj {
+            continue;
+          }
+          let old = *slot;
+          *slot = JS_DupValue(vctx, v);
+          JS_FreeValue(vctx, old);
+        }
+        patched += 1;
+      }
+    }
+    if dbg_on() && patched > 0 {
+      eprintln!("[qjs tape] patched {patched} placeholder cells");
+    }
   }
   if dbg_on() {
     eprintln!("[qjs tape] deferred phase done ({} ops)", ops.len());
@@ -1273,7 +1430,7 @@ fn replay_one(rt: *mut JSRuntime, r: &mut TapeRestore, op: &TapeOp) {
       r.handles.insert(*id, (g, c));
     }
     TapeOp::StringNew { id, utf8 } => {
-      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      let c = r.primary_ctx;
       if c.is_null() {
         return;
       }
@@ -1287,30 +1444,30 @@ fn replay_one(rt: *mut JSRuntime, r: &mut TapeRestore, op: &TapeOp) {
       r.handles.insert(*id, (v, c));
     }
     TapeOp::NumberNew { id, value } => {
-      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      let c = r.primary_ctx;
       let v = unsafe { JS_NewFloat64(c, *value) };
       r.handles.insert(*id, (v, c));
     }
     TapeOp::BoolNew { id, value } => {
-      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      let c = r.primary_ctx;
       let v = unsafe { JS_NewBool(c, *value as i32) };
       r.handles.insert(*id, (v, c));
     }
     TapeOp::UndefinedNew { id } => {
-      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      let c = r.primary_ctx;
       r.handles.insert(*id, (jsv_undefined(), c));
     }
     TapeOp::NullNew { id } => {
-      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      let c = r.primary_ctx;
       r.handles.insert(*id, (jsv_null(), c));
     }
     TapeOp::ObjectNew { id } => {
-      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      let c = r.primary_ctx;
       let v = unsafe { JS_NewObject(c) };
       r.handles.insert(*id, (v, c));
     }
     TapeOp::ArrayNew { id, length } => {
-      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      let c = r.primary_ctx;
       let v = unsafe { JS_NewArray(c) };
       if *length > 0 {
         let lv = unsafe { JS_NewFloat64(c, *length as f64) };
@@ -1322,7 +1479,7 @@ fn replay_one(rt: *mut JSRuntime, r: &mut TapeRestore, op: &TapeOp) {
     }
     TapeOp::ExternalNew { id, ext_ref } => {
       let ptr = r.ext_ptr(*ext_ref);
-      let c = *r.contexts.values().next().unwrap_or(&std::ptr::null_mut());
+      let c = r.primary_ctx;
       let v = super::function::make_external_jsvalue(current_iso(), c, ptr);
       r.handles.insert(*id, (v, c));
     }
@@ -1477,10 +1634,23 @@ fn replay_one(rt: *mut JSRuntime, r: &mut TapeRestore, op: &TapeOp) {
           let s = unsafe { JS_ToCStringLen(c, &mut l, e) };
           if !s.is_null() {
             let b = unsafe { std::slice::from_raw_parts(s as *const u8, l) };
+            let head: String =
+              String::from_utf8_lossy(source).chars().take(120).collect();
             eprintln!(
-              "[qjs tape] ScriptRun threw: {}",
+              "[qjs tape] ScriptRun(ctx={ctx} c={c:?}) threw: {} :: src={head:?}",
               String::from_utf8_lossy(b)
             );
+            unsafe {
+              let stk = JS_GetPropertyStr(c, e, c"stack".as_ptr());
+              let mut sl = 0usize;
+              let ss = JS_ToCStringLen(c, &mut sl, stk);
+              if !ss.is_null() {
+                let sb = std::slice::from_raw_parts(ss as *const u8, sl);
+                eprintln!("[qjs tape] stack: {}", String::from_utf8_lossy(sb));
+                JS_FreeCString(c, ss);
+              }
+              JS_FreeValue(c, stk);
+            }
             unsafe { JS_FreeCString(c, s) };
           }
           unsafe { JS_FreeValue(c, e) };
@@ -1645,6 +1815,25 @@ fn replay_one(rt: *mut JSRuntime, r: &mut TapeRestore, op: &TapeOp) {
       }
     }
     TapeOp::StateReady => {}
+    TapeOp::ClonedValue { id, bytes } => {
+      let c = r.primary_ctx;
+      if c.is_null() {
+        return;
+      }
+      let v = if bytes.is_empty() {
+        unsafe { JS_NewObject(c) }
+      } else {
+        let read = unsafe { JS_ReadObject(c, bytes.as_ptr(), bytes.len(), 0) };
+        if read.tag == JS_TAG_EXCEPTION {
+          let e = unsafe { JS_GetException(c) };
+          unsafe { JS_FreeValue(c, e) };
+          unsafe { JS_NewObject(c) }
+        } else {
+          read
+        }
+      };
+      r.handles.insert(*id, (v, c));
+    }
     TapeOp::TemplateNew {
       id,
       cb_ext_ref,

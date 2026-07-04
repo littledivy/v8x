@@ -737,7 +737,18 @@ pub extern "C" fn v8__Data__IsModule(this: *const Data) -> bool {
   if this.is_null() {
     return false;
   }
-  jsval_of(this).tag == JS_TAG_MODULE
+  // Module WRAPPER handles are plain objects tag-wise; identity lives in the
+  // module side tables (snapshot restores hand these back through
+  // GetDataFromSnapshotOnce and rusty_v8 type-checks them).
+  let r = jsval_of(this).tag == JS_TAG_MODULE
+    || crate::quickjs::module::is_module_wrapper(this as *const _);
+  if !r && std::env::var_os("QJS_DEBUG_TAPE").is_some() {
+    eprintln!(
+      "[qjs tape] IsModule=false ptr={this:?} tag={}",
+      jsval_of(this).tag
+    );
+  }
+  r
 }
 
 #[unsafe(no_mangle)]

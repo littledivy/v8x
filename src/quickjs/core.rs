@@ -717,6 +717,14 @@ pub extern "C" fn v8__Local__New(
   };
   let h = intern_dup::<Data>(ctx, jsval_of(other));
   super::capi_tape::rec(|r| r.alias(other as *const _, h as *const _));
+  let iso_now = current_iso();
+  if !iso_now.is_null() {
+    super::capi_tape::propagate_fixup(
+      iso_now,
+      other as *const _,
+      h as *const _,
+    );
+  }
   h
 }
 
