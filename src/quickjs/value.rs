@@ -21,7 +21,9 @@
 
 #![allow(non_snake_case)]
 
-use crate::quickjs::core::{ctx_of, current_ctx, intern, intern_dup, jsval_of};
+use crate::quickjs::core::{
+  ctx_of, current_ctx, intern, intern_dup, is_interned_handle, jsval_of,
+};
 use crate::quickjs::quickjs_sys::*;
 use crate::support::Maybe;
 use crate::{
@@ -543,7 +545,29 @@ pub extern "C" fn v8__Value__StrictEquals(
   if c.is_null() || this.is_null() || that.is_null() {
     return false;
   }
-  unsafe { JS_IsStrictEqual(c, jsval_of(this), jsval_of(that)) }
+  let this_smi_zero = is_smi_zero(this);
+  let that_smi_zero = is_smi_zero(that);
+  if this_smi_zero || that_smi_zero {
+    if this_smi_zero && that_smi_zero {
+      return true;
+    }
+    let other = if this_smi_zero { that } else { this };
+    let other = jsval_of(other);
+    return jsv_is_number(&other) && num_of(&other) == 0.0;
+  }
+  let a = jsval_of(this);
+  let b = jsval_of(that);
+  if jsv_is_number(&a) && jsv_is_number(&b) {
+    let na = num_of(&a);
+    let nb = num_of(&b);
+    return !na.is_nan() && !nb.is_nan() && na == nb;
+  }
+  unsafe { JS_IsStrictEqual(c, a, b) }
+}
+
+#[inline]
+fn is_smi_zero<T>(p: *const T) -> bool {
+  !p.is_null() && !is_interned_handle(p) && unsafe { *(p as *const usize) == 0 }
 }
 
 #[unsafe(no_mangle)]

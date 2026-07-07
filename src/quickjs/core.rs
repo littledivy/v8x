@@ -256,6 +256,16 @@ pub(crate) fn is_non_value_handle<T>(p: *const T) -> bool {
 }
 
 #[inline(always)]
+pub(crate) fn is_interned_handle<T>(p: *const T) -> bool {
+  let iso = current_iso();
+  !iso.is_null()
+    && iso_state(iso)
+      .handles
+      .iter()
+      .any(|&h| std::ptr::addr_eq(h, p as *const JSValue))
+}
+
+#[inline(always)]
 pub(crate) fn ctx_of(c: *const Context) -> *mut JSContext {
   if c.is_null() {
     return ptr::null_mut();
