@@ -127,6 +127,10 @@ export function run(cmd, args, opts = {}) {
 // --- libtest (cargo) output parser ------------------------------------------
 // Handles many test binaries in one stream; prefixes each test with its binary
 // name so identical test fn names across binaries don't collide.
+function normalizeLibtestName(name) {
+  return name.replace(/ - should panic$/, "");
+}
+
 export function parseLibtest(output) {
   const pass = new Set();
   const fail = new Set();
@@ -142,7 +146,8 @@ export function parseLibtest(output) {
     }
     const m = line.match(/^test (.+?) \.\.\. (ok|FAILED|ignored)\b/);
     if (!m) continue;
-    const name = bin ? `${bin}::${m[1]}` : m[1];
+    const testName = normalizeLibtestName(m[1]);
+    const name = bin ? `${bin}::${testName}` : testName;
     if (m[2] === "ok") {
       pass.add(name);
       // A later solo-rerun "ok" (run.mjs --rescue) supersedes an earlier

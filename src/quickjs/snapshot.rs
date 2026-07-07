@@ -38,6 +38,15 @@ thread_local! {
     Default::default();
 }
 
+pub(crate) fn leak_blob(bytes: Box<[u8]>) -> (*const u8, i32) {
+  let data = bytes.as_ptr();
+  let raw_size = bytes.len().min(i32::MAX as usize) as i32;
+  BLOBS.with(|b| {
+    b.borrow_mut().insert(data as usize, bytes);
+  });
+  (data, raw_size)
+}
+
 pub(crate) fn free_blob(ptr: *const u8) {
   if ptr.is_null() {
     return;

@@ -580,11 +580,13 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
   this: *mut c_void,
   _function_code_handling: u32,
 ) -> RawStartupDataAbi {
-  // No snapshot support on quickjs: hand back an empty blob.
+  // No snapshot support on quickjs: hand back an inert non-null blob so
+  // rusty_v8 can distinguish successful creation from "no blob".
   let _ = this;
+  let (data, raw_size) = super::snapshot::leak_blob(Box::new([0]));
   RawStartupDataAbi {
-    data: ptr::null(),
-    raw_size: 0,
+    data: data as *const c_char,
+    raw_size,
   }
 }
 

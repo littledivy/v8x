@@ -718,12 +718,33 @@ pub(crate) fn install_default_globals(ctx: *mut JSContext) {
     if intl_absent {
       install_intl_stub(ctx, global);
     }
+
+    let gc = JS_GetPropertyStr(ctx, global, c"gc".as_ptr());
+    let gc_absent = jsv_is_undefined(&gc) || gc.tag == JS_TAG_NULL;
+    JS_FreeValue(ctx, gc);
+    if gc_absent {
+      let gc_fn = JS_NewCFunction(ctx, qjs_gc, c"gc".as_ptr(), 0);
+      JS_SetPropertyStr(ctx, global, c"gc".as_ptr(), gc_fn);
+    }
     JS_FreeValue(ctx, global);
   }
   install_weakref_kept_object_shim(ctx);
   // Install our V8-accurate `Error.prepareStackTrace` (no-op unless deno
   // registered a PrepareStackTraceCallback — see exception.rs).
   super::exception::install_prepare_stack_trace(ctx);
+}
+
+unsafe extern "C" fn qjs_gc(
+  _ctx: *mut JSContext,
+  _this_val: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
+  let isolate = current_iso();
+  if !isolate.is_null() {
+    super::misc::v8__Isolate__RequestGarbageCollectionForTesting(isolate, 0);
+  }
+  jsv_undefined()
 }
 
 fn install_weakref_kept_object_shim(ctx: *mut JSContext) {
