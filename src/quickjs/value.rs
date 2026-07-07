@@ -46,6 +46,8 @@ unsafe extern "C" {
   ) -> std::os::raw::c_int;
 
   fn JS_GetTypedArrayType(obj: JSValue) -> std::os::raw::c_int;
+
+  fn JS_IsError(val: JSValue) -> bool;
 }
 
 const JS_TYPED_ARRAY_UINT8C: i32 = 0;
@@ -60,6 +62,10 @@ const JS_TYPED_ARRAY_BIG_UINT64: i32 = 8;
 const JS_TYPED_ARRAY_FLOAT16: i32 = 9;
 const JS_TYPED_ARRAY_FLOAT32: i32 = 10;
 const JS_TYPED_ARRAY_FLOAT64: i32 = 11;
+const QUICKJS_ATOMICS_WAIT_ERROR: &[u8] =
+  b"TypeError: cannot block in this thread";
+const V8_ATOMICS_WAIT_ERROR: &[u8] =
+  b"TypeError: Atomics.wait cannot be called in this context";
 
 #[repr(C)]
 struct MaybeMirror<T> {
@@ -898,7 +904,18 @@ pub extern "C" fn v8__Value__ToString(
     unsafe { JS_FreeValue(ctx, exc) };
     return ptr::null();
   }
-  let s = unsafe { JS_NewStringLen(ctx, cstr, len) };
+  let text = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+  let s = if unsafe { JS_IsError(v) } && text == QUICKJS_ATOMICS_WAIT_ERROR {
+    unsafe {
+      JS_NewStringLen(
+        ctx,
+        V8_ATOMICS_WAIT_ERROR.as_ptr() as *const c_char,
+        V8_ATOMICS_WAIT_ERROR.len(),
+      )
+    }
+  } else {
+    unsafe { JS_NewStringLen(ctx, cstr, len) }
+  };
   unsafe { JS_FreeCString(ctx, cstr) };
   if s.tag == JS_TAG_EXCEPTION {
     return ptr::null();

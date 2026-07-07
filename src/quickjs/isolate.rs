@@ -1264,9 +1264,14 @@ pub extern "C" fn v8__Isolate__RemoveGCPrologueCallback(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetAllowAtomicsWait(
-  _isolate: *mut std::os::raw::c_void,
-  _allow: bool,
+  isolate: *mut std::os::raw::c_void,
+  allow: bool,
 ) {
+  if isolate.is_null() {
+    return;
+  }
+  let rt = iso_state(isolate as *mut RealIsolate).rt;
+  unsafe { JS_SetCanBlock(rt, allow) };
 }
 
 #[unsafe(no_mangle)]
