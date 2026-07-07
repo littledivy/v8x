@@ -84,11 +84,6 @@ pub extern "C" fn v8__Number__New(
   }
   let v = unsafe { JS_NewFloat64(ctx, value) };
   let h = intern::<Number>(v);
-  crate::quickjs::capi_tape::rec(|r| {
-    let id = r.produced(h as *const _);
-    r.ops
-      .push(crate::quickjs::capi_tape::TapeOp::NumberNew { id, value });
-  });
   h
 }
 
@@ -119,13 +114,6 @@ pub extern "C" fn v8__Integer__New(
   }
   let v = unsafe { JS_NewInt32(ctx, value) };
   let h = intern::<Integer>(v);
-  crate::quickjs::capi_tape::rec(|r| {
-    let id = r.produced(h as *const _);
-    r.ops.push(crate::quickjs::capi_tape::TapeOp::NumberNew {
-      id,
-      value: value as f64,
-    });
-  });
   h
 }
 
@@ -141,13 +129,6 @@ pub extern "C" fn v8__Integer__NewFromUnsigned(
 
   let v = unsafe { JS_NewUint32(ctx, value) };
   let h = intern::<Integer>(v);
-  crate::quickjs::capi_tape::rec(|r| {
-    let id = r.produced(h as *const _);
-    r.ops.push(crate::quickjs::capi_tape::TapeOp::NumberNew {
-      id,
-      value: value as f64,
-    });
-  });
   h
 }
 
@@ -221,11 +202,6 @@ pub extern "C" fn v8__Boolean__New(
   }
   let v = unsafe { JS_NewBool(ctx, value as std::os::raw::c_int) };
   let h = intern::<Boolean>(v);
-  crate::quickjs::capi_tape::rec(|r| {
-    let id = r.produced(h as *const _);
-    r.ops
-      .push(crate::quickjs::capi_tape::TapeOp::BoolNew { id, value });
-  });
   h
 }
 
@@ -234,11 +210,6 @@ pub extern "C" fn v8__Null(isolate: *mut RealIsolate) -> *const Primitive {
   let _ = isolate;
 
   let h = intern::<Primitive>(jsv_null());
-  crate::quickjs::capi_tape::rec(|r| {
-    let id = r.produced(h as *const _);
-    r.ops
-      .push(crate::quickjs::capi_tape::TapeOp::NullNew { id });
-  });
   h
 }
 

@@ -138,28 +138,11 @@ pub extern "C" fn v8__Context__FromSnapshot(
   _global_object: *const Value,
   _microtask_queue: *mut MicrotaskQueue,
 ) -> *const Context {
+  let _ = context_snapshot_index;
   if isolate.is_null() {
     return ptr::null();
   }
-  // Tape v2: materialize the tape and resolve the AddContext'd entry.
-  if super::core::iso_state(isolate).tape_restore.is_some() {
-    super::capi_tape::replay(isolate);
-    let st = super::core::iso_state(isolate);
-    let restore = st.tape_restore.as_deref().unwrap();
-    let Some(&cid) = restore.added.get(context_snapshot_index) else {
-      return ptr::null();
-    };
-    let Some(&ctx) = restore.contexts.get(&cid) else {
-      return ptr::null();
-    };
-    if std::env::var_os("QJS_DEBUG_TAPE").is_some() {
-      eprintln!(
-        "[qjs tape] FromSnapshot idx={context_snapshot_index} cid={cid} ctx={ctx:?} added={:?}",
-        restore.added
-      );
-    }
-    return super::core::intern_ctx(ctx);
-  }
+  // No snapshot support on quickjs: the embedder falls back to New-init.
   ptr::null()
 }
 
@@ -168,62 +151,13 @@ pub extern "C" fn v8__Context__GetDataFromSnapshotOnce(
   this: *const Context,
   index: usize,
 ) -> *const Data {
+  let _ = index;
   let ctx = super::core::ctx_of(this);
   let iso = super::core::current_iso();
   if ctx.is_null() || iso.is_null() {
     return ptr::null();
   }
-  let st = super::core::iso_state(iso);
-  // Tape v2: hand back the recorded AddData handle for this context.
-  if let Some(restore) = st.tape_restore.as_deref_mut() {
-    let cid = restore
-      .contexts
-      .iter()
-      .find(|(_, c)| **c == ctx)
-      .map(|(&id, _)| id);
-    let Some(cid) = cid else {
-      return ptr::null();
-    };
-    let taken = restore
-      .ctx_data
-      .get_mut(&cid)
-      .and_then(|slots| slots.get_mut(index))
-      .and_then(|slot| slot.take());
-    let Some(hid) = taken else {
-      return ptr::null();
-    };
-    if std::env::var_os("QJS_DEBUG_TAPE").is_some() {
-      eprintln!(
-        "[qjs tape] GetCtxData idx={index} hid={hid} module={} tmpl={} handle={}",
-        restore.module_handles.contains_key(&hid),
-        restore.template_handles.contains_key(&hid),
-        restore.handles.contains_key(&hid)
-      );
-    }
-    if let Some(&wrapper) = restore.module_handles.get(&hid) {
-      // Module identity IS the wrapper pointer (side tables key on it).
-      return wrapper as *const Data;
-    }
-    if let Some(&tmpl) = restore.template_handles.get(&hid) {
-      return tmpl as *const Data;
-    }
-    let Some(&(v, vctx)) = restore.handles.get(&hid) else {
-      // Produced by a deferred (JS-executing) tape entry that has not run
-      // yet: hand back a PLACEHOLDER handle and register it for in-place
-      // patching once the deferred phase materializes the value (copies the
-      // embedder takes — Globals, Locals — chain via propagate_fixup). An
-      // empty OBJECT, not undefined: embedders type-check some data slots
-      // (Local::<Object>::try_from) before the deferred phase can run.
-      let ph = unsafe { JS_NewObject(ctx) };
-      let h = super::core::intern::<Data>(ph);
-      super::capi_tape::register_fixup(iso, hid, h as *const _);
-      return h;
-    };
-    let _ = vctx;
-    let h = super::core::intern_dup::<Data>(ctx, v);
-    super::capi_tape::rec(|r| r.bind(h as *const _, hid));
-    return h;
-  }
+  // No snapshot support on quickjs.
   ptr::null()
 }
 
@@ -282,12 +216,6 @@ pub extern "C" fn v8__Context__GetExtrasBindingObject(
     return ptr::null();
   }
   let h = extras_binding_impl(ctx);
-  crate::quickjs::capi_tape::rec(|r| {
-    let cid = r.ctx_id(ctx);
-    let id = r.produced(h as *const _);
-    r.ops
-      .push(crate::quickjs::capi_tape::TapeOp::ExtrasBinding { id, ctx: cid });
-  });
   return h;
 }
 
@@ -703,7 +631,6 @@ pub extern "C" fn v8__Isolate__SetMicrotasksPolicy(
 }
 
 fn drain_jobs(rt: *mut JSRuntime) {
-  let _jsg = crate::quickjs::capi_tape::JsDepthGuard::enter();
   if rt.is_null() {
     return;
   }
@@ -1254,23 +1181,8 @@ pub extern "C" fn v8__Isolate__GetDataFromSnapshotOnce(
   if iso.is_null() {
     return ptr::null();
   }
-  let st = super::core::iso_state(iso);
-  let ctx = super::core::current_ctx();
-  // Tape v2: hand back the recorded isolate-level AddData handle.
-  if let Some(restore) = st.tape_restore.as_deref_mut() {
-    let Some(hid) =
-      restore.iso_data.get_mut(index).and_then(|slot| slot.take())
-    else {
-      return ptr::null();
-    };
-    let Some(&(v, vctx)) = restore.handles.get(&hid) else {
-      return std::ptr::null();
-    };
-    let target = if ctx.is_null() { vctx } else { ctx };
-    let h = super::core::intern_dup::<Data>(target, v);
-    super::capi_tape::rec(|r| r.bind(h as *const _, hid));
-    return h as *const std::os::raw::c_void;
-  }
+  let _ = index;
+  // No snapshot support on quickjs.
   ptr::null()
 }
 

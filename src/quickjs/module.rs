@@ -1243,7 +1243,6 @@ thread_local! {
 }
 
 unsafe fn drain_jobs(rt: *mut JSRuntime) {
-  let _jsg = crate::quickjs::capi_tape::JsDepthGuard::enter();
   if rt.is_null() {
     return;
   }
@@ -2011,12 +2010,6 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
 
   register_module_source(&fname, &text);
   note_main_module(&fname);
-  super::capi_tape::rec(|r| {
-    r.ops.push(super::capi_tape::TapeOp::ModuleSource {
-      name: fname.as_bytes().to_vec(),
-      source: text.as_bytes().to_vec(),
-    });
-  });
   if std::env::var_os("QJS_DEBUG_MOD").is_some() {
     eprintln!("[QJS CompileModule] {fname} imports={import_specifiers:?}");
   }
@@ -2031,16 +2024,6 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   if this.is_null() {
     return ptr::null();
   }
-  super::capi_tape::rec(|r| {
-    let cid = r.ctx_id(ctx);
-    let id = r.produced(this as *const _);
-    r.module_obj_ids.insert(handle_key(this), id);
-    r.ops.push(super::capi_tape::TapeOp::ModuleCompile {
-      id,
-      ctx: cid,
-      name: fname.as_bytes().to_vec(),
-    });
-  });
   if !source_imports.is_empty() {
     PENDING_SOURCE_IMPORTS.with(|p| {
       p.borrow_mut().push((this, source_imports.clone()));
@@ -2765,36 +2748,6 @@ pub extern "C" fn v8__Module__Evaluate(
   })
   .unwrap_or((None, std::string::String::new(), std::string::String::new()));
   let source_name_dbg = source_name.clone();
-  // Snapshot recording: modules evaluated on a creator isolate replay via
-  // JS_Eval(TYPE_MODULE) of their registered source (deps come from the
-  // ModuleSource tape entries recorded at compile time).
-  if super::capi_tape::recording() && !source_name.is_empty() {
-    let tape_bc = lookup_module_source(&source_name)
-      .map(|src| bc_key(&src))
-      .and_then(bc_load)
-      .unwrap_or_default();
-    let src_bytes = lookup_module_source(&source_name)
-      .map(|s| s.into_bytes())
-      .unwrap_or_default();
-    // Result handle: the promise this Evaluate returns is created further
-    // down on several paths; the tape binds a fresh placeholder id instead
-    // (nothing dereferences a module-eval completion value via C).
-    super::capi_tape::rec(|r| {
-      let cid = r.ctx_id(ctx);
-      let rid = r.produced(std::ptr::null());
-      r.ops.push(super::capi_tape::TapeOp::ModuleEval {
-        result: rid,
-        ctx: cid,
-        name: source_name.as_bytes().to_vec(),
-        bytecode: tape_bc.clone(),
-        source: src_bytes.clone(),
-      });
-    });
-  }
-  // Everything below runs module bodies; C-API calls fired by ops inside them
-  // must not re-record (the ModuleEval entry above reproduces them).
-  let _jsg = super::capi_tape::JsDepthGuard::enter();
-
   if !source_name.is_empty() {
     let cached =
       MODULE_DEF_CACHE.with(|c| c.borrow().get(&source_name).copied());
@@ -3124,16 +3077,6 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   });
   {
     let nm = unsafe { jsval_to_rust(ctx, jsval_of(module_name)) };
-    super::capi_tape::rec(|r| {
-      let cid = r.ctx_id(ctx);
-      let id = r.produced(this as *const _);
-      r.module_obj_ids.insert(handle_key(this), id);
-      r.ops.push(super::capi_tape::TapeOp::ModuleCompile {
-        id,
-        ctx: cid,
-        name: nm.as_bytes().to_vec(),
-      });
-    });
   }
 
   let steps: SyntheticModuleEvaluationSteps<'static> =

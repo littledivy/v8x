@@ -33,21 +33,9 @@ pub(crate) fn serialize_value(
   Some(out)
 }
 
-pub(crate) fn deserialize_value(ctx: *mut JSContext, bytes: &[u8]) -> JSValue {
-  unsafe { JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), 0) }
-}
-
 thread_local! {
   static BLOBS: std::cell::RefCell<HashMap<usize, Box<[u8]>>> =
     Default::default();
-}
-
-pub(crate) fn leak_blob(bytes: Vec<u8>) -> (*const u8, usize) {
-  let boxed: Box<[u8]> = bytes.into_boxed_slice();
-  let len = boxed.len();
-  let ptr = boxed.as_ptr();
-  BLOBS.with(|b| b.borrow_mut().insert(ptr as usize, boxed));
-  (ptr, len)
 }
 
 pub(crate) fn free_blob(ptr: *const u8) {

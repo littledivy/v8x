@@ -327,17 +327,6 @@ pub extern "C" fn v8__Global__New(
   let v = jsval_of(data);
   let dup = unsafe { JS_DupValue(ctx, v) };
   let cell = Box::into_raw(Box::new(dup));
-  super::capi_tape::rec(|r| {
-    r.alias(data as *const _, cell as *const _);
-  });
-  let iso_now = current_iso();
-  if !iso_now.is_null() {
-    super::capi_tape::propagate_fixup(
-      iso_now,
-      data as *const _,
-      cell as *const _,
-    );
-  }
   cell as *const Data
 }
 
@@ -550,35 +539,11 @@ pub extern "C" fn v8__SnapshotCreator__CONSTRUCT(
   buf: *mut c_void,
   params: *const c_void,
 ) {
-  // Params may carry an existing snapshot blob (creator-from-existing):
-  // Isolate__New parses it, and each new context replays + re-records it.
+  // Snapshots are unsupported on quickjs (no heap serializer); the creator is
+  // just a plain isolate. CreateBlob returns an empty blob and the embedder
+  // falls back to New-init.
   let iso = crate::quickjs::core::v8__Isolate__New(params);
   crate::quickjs::core::v8__Isolate__Enter(iso);
-  let ext_refs = if params.is_null() {
-    std::ptr::null()
-  } else {
-    let raw = params as *const crate::isolate_create_params::raw::CreateParams;
-    unsafe { (*raw).external_references }
-  };
-  {
-    let mut rec = Box::new(super::capi_tape::Recorder::new(ext_refs));
-    rec.rt = crate::quickjs::core::iso_state(iso).rt;
-    // Chained creator: materialize the existing blob NOW and seed the new
-    // tape with it, so CreateBlob emits old + new and replayed contexts
-    // keep their recorded ids.
-    if crate::quickjs::core::iso_state(iso).tape_restore.is_some() {
-      super::capi_tape::replay(iso);
-      let st = crate::quickjs::core::iso_state(iso);
-      if let Some(restore) = st.tape_restore.as_deref() {
-        rec.seed_from(
-          &restore.seeded_ops,
-          &restore.contexts,
-          &restore.module_handles,
-        );
-      }
-    }
-    crate::quickjs::core::iso_state(iso).tape_rec = Some(rec);
-  }
   if !buf.is_null() {
     unsafe { *(buf as *mut *mut RealIsolate) = iso };
   }
@@ -615,98 +580,8 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
   this: *mut c_void,
   _function_code_handling: u32,
 ) -> RawStartupDataAbi {
-  let iso = creator_iso(this);
-  if !iso.is_null() {
-    {
-      if let Some(rec) =
-        crate::quickjs::core::iso_state(iso).tape_rec.as_deref()
-      {
-        if let Some(path) = std::env::var_os("QJS_DUMP_TAPE_RAW") {
-          use std::io::Write;
-          if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-          {
-            let _ =
-              writeln!(f, "==== raw creator tape ({} ops) ====", rec.ops.len());
-            for (i, op) in rec.ops.iter().enumerate() {
-              let d = format!("{op:?}");
-              let _ = writeln!(f, "[{i}] {}", &d[..d.len().min(160)]);
-            }
-            let _ = writeln!(f, "== incomplete: {:?}", rec.incomplete);
-          }
-        }
-        let ops = if std::env::var_os("QJS_NO_PRUNE").is_some() {
-          rec.ops.clone()
-        } else {
-          super::capi_tape::prune_dead_ops(&rec.ops)
-        };
-        let live_gaps = super::capi_tape::live_ext_ref_gaps(&ops);
-        if std::env::var_os("QJS_DEBUG_TAPE").is_some() {
-          let mut adds = 0usize;
-          for op in ops.iter() {
-            if let super::capi_tape::TapeOp::AddContextData { value, .. } = op {
-              let producer = ops
-                .iter()
-                .find(|c| super::capi_tape::op_result_ids_of(c).contains(value))
-                .map(|c| {
-                  let d = format!("{c:?}");
-                  d[..d.len().min(70)].to_string()
-                })
-                .unwrap_or_else(|| "<none>".into());
-              eprintln!(
-                "[qjs tape] AddCtxData[{adds}] value={value} producer={producer}"
-              );
-              adds += 1;
-            }
-          }
-        }
-        if live_gaps > 0 {
-          eprintln!(
-            "[qjs tape] blob INCOMPLETE ({live_gaps} live gaps, {} recorded; {} of {} ops pruned)",
-            rec.incomplete.len(),
-            rec.ops.len() - ops.len(),
-            rec.ops.len(),
-          );
-          let mut uniq: std::collections::BTreeMap<&str, u32> =
-            Default::default();
-          for g in &rec.incomplete {
-            let key = g.split(" (0x").next().unwrap_or(g);
-            *uniq.entry(key).or_default() += 1;
-          }
-          for (k, n) in uniq {
-            eprintln!("[qjs tape]   {n:5}x {k}");
-          }
-          if std::env::var_os("QJS_DEBUG_TAPE").is_some() {
-            for (i, op) in ops.iter().enumerate() {
-              let gap = super::capi_tape::live_ext_ref_gaps(&ops[i..i + 1]);
-              if gap > 0 {
-                eprintln!("[qjs tape]   live gap op[{i}]: {op:?}");
-                for id in super::capi_tape::op_ids_of(op) {
-                  for (j, c) in ops.iter().enumerate() {
-                    if j != i && super::capi_tape::op_ids_of(c).contains(&id) {
-                      let d = format!("{c:?}");
-                      eprintln!(
-                        "[qjs tape]     consumer[{j}] of {id}: {}",
-                        &d[..d.len().min(110)]
-                      );
-                    }
-                  }
-                }
-              }
-            }
-          }
-        }
-        let bytes = super::capi_tape::serialize(&ops);
-        let (data, len) = super::snapshot::leak_blob(bytes);
-        return RawStartupDataAbi {
-          data: data as *const c_char,
-          raw_size: len as std::os::raw::c_int,
-        };
-      }
-    }
-  }
+  // No snapshot support on quickjs: hand back an empty blob.
+  let _ = this;
   RawStartupDataAbi {
     data: ptr::null(),
     raw_size: 0,
@@ -723,11 +598,6 @@ pub extern "C" fn v8__SnapshotCreator__SetDefaultContext(
     return;
   }
   let qctx = ctx_of(context);
-  super::capi_tape::rec(|r| {
-    let id = r.ctx_id(qctx);
-    r.ops
-      .push(super::capi_tape::TapeOp::SetDefaultContext { ctx: id });
-  });
 }
 
 #[unsafe(no_mangle)]
@@ -740,10 +610,6 @@ pub extern "C" fn v8__SnapshotCreator__AddContext(
     return 0;
   }
   let qctx = ctx_of(context);
-  super::capi_tape::rec(|r| {
-    let id = r.ctx_id(qctx);
-    r.ops.push(super::capi_tape::TapeOp::AddContext { ctx: id });
-  });
   let st = crate::quickjs::core::iso_state(iso);
   let n = st.iso_added_contexts;
   st.iso_added_contexts += 1;
@@ -762,32 +628,6 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_isolate(
   let ctx = current_ctx();
   let bytes =
     super::snapshot::serialize_value(ctx, jsval_of(data)).unwrap_or_default();
-  super::capi_tape::rec(|r| {
-    let module_id = if std::env::var_os("QJS_NO_MODKEY").is_some() {
-      None
-    } else {
-      r.module_obj_ids
-        .get(&super::module::module_obj_key(data as *const crate::Module))
-        .copied()
-        .filter(|_| {
-          super::module::is_module_wrapper(data as *const std::os::raw::c_void)
-        })
-    };
-    let vid = match module_id.or_else(|| r.try_arg(data as *const _)) {
-      Some(id) => id,
-      None => {
-        let cloned = super::snapshot::serialize_value(ctx, jsval_of(data));
-        let id = r.produced(data as *const _);
-        r.ops.push(super::capi_tape::TapeOp::ClonedValue {
-          id,
-          bytes: cloned.unwrap_or_default(),
-        });
-        id
-      }
-    };
-    r.ops
-      .push(super::capi_tape::TapeOp::AddIsolateData { value: vid });
-  });
   let st = crate::quickjs::core::iso_state(iso);
   let n = st.iso_data_count;
   st.iso_data_count += 1;
@@ -830,61 +670,6 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
     );
   }
   let bytes = bytes.unwrap_or_default();
-  super::capi_tape::rec(|r| {
-    let cid = r.ctx_id(ctx);
-    let preview = unsafe {
-      let cs = JS_ToCString(ctx, jsval_of(data));
-      if cs.is_null() {
-        std::string::String::new()
-      } else {
-        let out = std::ffi::CStr::from_ptr(cs)
-          .to_string_lossy()
-          .chars()
-          .take(40)
-          .collect();
-        JS_FreeCString(ctx, cs);
-        out
-      }
-    };
-    let _ = preview;
-    let module_id = if std::env::var_os("QJS_NO_MODKEY").is_some() {
-      None
-    } else {
-      r.module_obj_ids
-        .get(&super::module::module_obj_key(data as *const crate::Module))
-        .copied()
-        .filter(|_| {
-          super::module::is_module_wrapper(data as *const std::os::raw::c_void)
-        })
-    };
-    let vid = match module_id.or_else(|| r.try_arg(data as *const _)) {
-      Some(id) => id,
-      None => {
-        // JS-born value (created inside an op, invisible to the tape).
-        // Structured-clone it when possible; otherwise a plain object
-        // placeholder — restore re-derives the content by re-running init.
-        let cloned = super::snapshot::serialize_value(ctx, jsval_of(data));
-        let id = r.produced(data as *const _);
-        if std::env::var_os("QJS_DEBUG_TAPE").is_some() {
-          eprintln!(
-            "[qjs tape] AddContextData FALLBACK ClonedValue id={id} module_wrapper={} preview={preview}",
-            super::module::is_module_wrapper(
-              data as *const std::os::raw::c_void
-            ),
-          );
-        }
-        r.ops.push(super::capi_tape::TapeOp::ClonedValue {
-          id,
-          bytes: cloned.unwrap_or_default(),
-        });
-        id
-      }
-    };
-    r.ops.push(super::capi_tape::TapeOp::AddContextData {
-      ctx: cid,
-      value: vid,
-    });
-  });
   let st = crate::quickjs::core::iso_state(iso);
   let n = st.ctx_data_counts.entry(ctx as usize).or_insert(0);
   let idx = *n;
@@ -898,16 +683,9 @@ pub extern "C" fn v8__StartupData__CanBeRehashed(_this: *const c_void) -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__StartupData__IsValid(this: *const c_void) -> bool {
-  if this.is_null() {
-    return false;
-  }
-  let raw = unsafe { &*(this as *const RawStartupDataAbi) };
-  if raw.data.is_null() || raw.raw_size < 8 {
-    return false;
-  }
-  let head = unsafe { std::slice::from_raw_parts(raw.data as *const u8, 8) };
-  head == super::capi_tape::TAPE_MAGIC
+pub extern "C" fn v8__StartupData__IsValid(_this: *const c_void) -> bool {
+  // No snapshot support on quickjs: never a valid startup blob.
+  false
 }
 
 #[unsafe(no_mangle)]
@@ -1446,15 +1224,6 @@ pub extern "C" fn v8__Context__SetEmbedderData(
     }
     slots[idx] = owned;
   });
-  super::capi_tape::rec(|r| {
-    let cid = r.ctx_id(ctx);
-    let vid = r.arg(value as *const _, "SetEmbedderData value");
-    r.ops.push(super::capi_tape::TapeOp::SetEmbedderData {
-      ctx: cid,
-      index: index as u32,
-      value: vid,
-    });
-  });
 }
 
 /// Snapshot support: borrow every embedder-data value slot of `ctx`.
@@ -1515,15 +1284,6 @@ pub extern "C" fn v8__Context__GetEmbedderData(
     Some(v) => intern_dup::<Value>(ctx, v),
     None => intern::<Value>(jsv_undefined()),
   };
-  super::capi_tape::rec(|r| {
-    let cid = r.ctx_id(ctx);
-    let id = r.produced(h as *const _);
-    r.ops.push(super::capi_tape::TapeOp::GetEmbedderData {
-      id,
-      ctx: cid,
-      index: index as u32,
-    });
-  });
   h
 }
 
