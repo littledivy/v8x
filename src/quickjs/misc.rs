@@ -327,6 +327,11 @@ pub extern "C" fn v8__Global__New(
   let v = jsval_of(data);
   let dup = unsafe { JS_DupValue(ctx, v) };
   let cell = Box::into_raw(Box::new(dup));
+  if !_isolate.is_null() {
+    iso_state(_isolate)
+      .global_handles
+      .fetch_add(1, Ordering::SeqCst);
+  }
   cell as *const Data
 }
 
@@ -362,9 +367,11 @@ pub extern "C" fn v8__Global__Reset(data: *const Data) {
 
   let iso = current_iso();
   if !iso.is_null() {
-    iso_state(iso)
-      .weak_handles
-      .retain(|weak| weak.handle != data);
+    let st = iso_state(iso);
+    st.weak_handles.retain(|weak| weak.handle != data);
+    if st.global_handles.load(Ordering::SeqCst) > 0 {
+      st.global_handles.fetch_sub(1, Ordering::SeqCst);
+    }
   }
 
   let ctx = stable_ctx();

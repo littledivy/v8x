@@ -585,10 +585,40 @@ pub extern "C" fn v8__Isolate__GetHeapStatistics(
         std::mem::size_of::<crate::binding::v8__HeapStatistics>(),
       );
       if !this.is_null() {
-        (*s).external_memory_ = iso_state(this)
-          .external_memory
-          .load(Ordering::SeqCst)
-          .max(0) as usize;
+        let st = iso_state(this);
+        let mut usage = JSMemoryUsage::default();
+        if !st.rt.is_null() {
+          JS_ComputeMemoryUsage(st.rt, &mut usage);
+        }
+        let malloc_size = usage.malloc_size.max(0) as usize;
+        let memory_used_size = usage.memory_used_size.max(0) as usize;
+        let malloc_limit = usage.malloc_limit.max(0) as usize;
+        let total_heap_size = malloc_size.max(memory_used_size).max(1);
+        let heap_size_limit = if malloc_limit > total_heap_size {
+          malloc_limit
+        } else {
+          total_heap_size.saturating_add(1)
+        };
+        let global_handle_count =
+          st.global_handles.load(Ordering::SeqCst).max(0) as usize;
+        let global_handle_bytes =
+          global_handle_count.saturating_mul(std::mem::size_of::<JSValue>());
+
+        (*s).total_heap_size_ = total_heap_size;
+        (*s).total_physical_size_ = total_heap_size;
+        (*s).total_available_size_ =
+          heap_size_limit.saturating_sub(total_heap_size);
+        (*s).used_heap_size_ = memory_used_size.max(1).min(total_heap_size);
+        (*s).heap_size_limit_ = heap_size_limit;
+        (*s).malloced_memory_ = malloc_size.max(1);
+        (*s).peak_malloced_memory_ = malloc_size.max(1);
+        (*s).external_memory_ =
+          st.external_memory.load(Ordering::SeqCst).max(0) as usize;
+        (*s).number_of_native_contexts_ =
+          usize::from(st.main_ctx_claimed) + st.extra_contexts.len();
+        (*s).total_global_handles_size_ = global_handle_bytes;
+        (*s).used_global_handles_size_ = global_handle_bytes;
+        (*s).total_allocated_bytes_ = total_heap_size as u64;
       }
     }
   }

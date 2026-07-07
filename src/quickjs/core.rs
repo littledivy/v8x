@@ -120,6 +120,8 @@ pub(crate) struct IsoState {
 
   pub external_string_memory: AtomicI64,
 
+  pub global_handles: AtomicI64,
+
   pub weak_handles: Vec<WeakHandle>,
 
   pub kept_objects_cleared: bool,
@@ -431,6 +433,7 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     iso_added_contexts: 0,
     external_memory: AtomicI64::new(0),
     external_string_memory: AtomicI64::new(0),
+    global_handles: AtomicI64::new(0),
     weak_handles: Vec::new(),
     kept_objects_cleared: false,
     gc_prologue_callbacks: Vec::new(),
