@@ -1290,7 +1290,11 @@ pub extern "C" fn v8__Isolate__SetPromiseHook(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetUseCounterCallback(
-  _isolate: *mut std::os::raw::c_void,
-  _callback: *const std::os::raw::c_void,
+  isolate: *mut RealIsolate,
+  callback: crate::isolate::UseCounterCallback,
 ) {
+  if isolate.is_null() {
+    return;
+  }
+  iso_state(isolate).use_counter_callback = Some(callback);
 }

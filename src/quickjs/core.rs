@@ -79,6 +79,68 @@ pub(crate) fn global_eval_flags() -> c_int {
   flags
 }
 
+fn skip_js_space_and_comments(mut bytes: &[u8]) -> &[u8] {
+  loop {
+    bytes = bytes.trim_ascii_start();
+    if let Some(rest) = bytes.strip_prefix(b"//") {
+      bytes = match rest.iter().position(|b| *b == b'\n' || *b == b'\r') {
+        Some(pos) => &rest[pos + 1..],
+        None => &[],
+      };
+      continue;
+    }
+    if let Some(rest) = bytes.strip_prefix(b"/*") {
+      bytes = match rest.windows(2).position(|w| w == b"*/") {
+        Some(pos) => &rest[pos + 2..],
+        None => &[],
+      };
+      continue;
+    }
+    return bytes;
+  }
+}
+
+fn starts_with_strict_directive(source: &[u8]) -> bool {
+  let source = skip_js_space_and_comments(source);
+  let Some((&quote, rest)) = source.split_first() else {
+    return false;
+  };
+  if quote != b'\'' && quote != b'"' {
+    return false;
+  }
+  let Some(after_literal) = rest.strip_prefix(b"use strict") else {
+    return false;
+  };
+  let Some((&end_quote, after_quote)) = after_literal.split_first() else {
+    return false;
+  };
+  if end_quote != quote {
+    return false;
+  }
+  after_quote
+    .first()
+    .is_none_or(|b| b.is_ascii_whitespace() || *b == b';')
+}
+
+fn maybe_report_strict_mode_use(source: &[u8]) {
+  if !starts_with_strict_directive(source) {
+    return;
+  }
+  let iso = current_iso();
+  if iso.is_null() {
+    return;
+  }
+  let callback = iso_state(iso).use_counter_callback;
+  if let Some(callback) = callback {
+    let mut isolate = unsafe {
+      crate::Isolate::from_raw_isolate_ptr(
+        crate::UnsafeRawIsolatePtr::from_real_ptr(iso),
+      )
+    };
+    unsafe { callback(&mut isolate, crate::UseCounterFeature::kStrictMode) };
+  }
+}
+
 pub(crate) struct IsoState {
   pub rt: *mut JSRuntime,
 
@@ -133,6 +195,8 @@ pub(crate) struct IsoState {
   pub gc_prologue_callbacks: Vec<GcCallbackEntry>,
 
   pub gc_epilogue_callbacks: Vec<GcCallbackEntry>,
+
+  pub use_counter_callback: Option<crate::UseCounterCallback>,
 
   // Emulates `v8::Isolate::TerminateExecution`. Set by `TerminateExecution`,
   // cleared by `CancelTerminateExecution`; while set, the op-dispatch boundary
@@ -446,6 +510,7 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     kept_objects_cleared: false,
     gc_prologue_callbacks: Vec::new(),
     gc_epilogue_callbacks: Vec::new(),
+    use_counter_callback: None,
     terminating: std::sync::atomic::AtomicBool::new(false),
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;
@@ -1071,6 +1136,8 @@ pub extern "C" fn v8__Script__Compile(
     let mut len: usize = 0;
     let cstr = JS_ToCStringLen(ctx, &mut len, jsval_of(source));
     if !cstr.is_null() {
+      let source_bytes = std::slice::from_raw_parts(cstr as *const u8, len);
+      maybe_report_strict_mode_use(source_bytes);
       let url_ptr = match name.as_ref() {
         Some(n) => n.as_ptr(),
         None => c"<anonymous>".as_ptr(),
