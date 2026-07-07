@@ -173,7 +173,15 @@ pub extern "C" fn v8__Message__Get(this: *const Message) -> *const String {
       clear_pending(ctx);
       return ptr::null();
     }
-    let s = JS_NewStringLen(ctx, cstr, len);
+    let bytes = std::slice::from_raw_parts(cstr as *const u8, len);
+    let s = if bytes.starts_with(b"Uncaught ") {
+      JS_NewStringLen(ctx, cstr, len)
+    } else {
+      let mut message = Vec::with_capacity(b"Uncaught ".len() + len);
+      message.extend_from_slice(b"Uncaught ");
+      message.extend_from_slice(bytes);
+      JS_NewStringLen(ctx, message.as_ptr() as *const c_char, message.len())
+    };
     JS_FreeCString(ctx, cstr);
     if s.tag == JS_TAG_EXCEPTION {
       return ptr::null();
@@ -804,7 +812,9 @@ pub extern "C" fn v8__TryCatch__Reset(this: *mut TryCatch) {
     return;
   }
   unsafe {
-    *(this as *mut usize).add(1) = 0;
+    if *(this as *const usize).add(1) != 0 {
+      return;
+    }
     clear_pending(tc_ctx(this as *const TryCatch));
   }
 }
@@ -815,10 +825,12 @@ pub extern "C" fn v8__TryCatch__ReThrow(this: *mut TryCatch) -> *const Value {
     return ptr::null();
   }
   unsafe {
-    *(this as *mut usize).add(1) = 1;
     let ctx = tc_ctx(this as *const TryCatch);
     match peek_pending(ctx) {
-      Some(exc) => intern::<Value>(exc),
+      Some(exc) => {
+        *(this as *mut usize).add(1) = 1;
+        intern::<Value>(exc)
+      }
       None => ptr::null(),
     }
   }
@@ -988,10 +1000,35 @@ pub extern "C" fn v8__StackTrace__CurrentScriptNameOrSourceURL(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TryCatch__StackTrace(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  this: *const TryCatch,
+  _context: *const Context,
+) -> *const Value {
+  if this.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    let ctx = tc_ctx(this);
+    if ctx.is_null() || !JS_HasException(ctx) {
+      return ptr::null();
+    }
+
+    let exc = JS_GetException(ctx);
+    let stack = JS_GetPropertyStr(ctx, exc, c"stack".as_ptr());
+    if stack.tag == JS_TAG_EXCEPTION {
+      clear_pending(ctx);
+      JS_Throw(ctx, JS_DupValue(ctx, exc));
+      JS_FreeValue(ctx, exc);
+      return ptr::null();
+    }
+
+    JS_Throw(ctx, JS_DupValue(ctx, exc));
+    JS_FreeValue(ctx, exc);
+    if jsv_is_undefined(&stack) || jsv_is_null(&stack) {
+      JS_FreeValue(ctx, stack);
+      return ptr::null();
+    }
+    intern::<Value>(stack)
+  }
 }
 
 // ---------------------------------------------------------------------------
