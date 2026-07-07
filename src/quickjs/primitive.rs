@@ -592,16 +592,18 @@ pub extern "C" fn v8__Symbol__New(
     return ptr::null();
   }
 
-  let desc = if description.is_null() {
-    std::string::String::new()
+  let cdesc = if description.is_null() {
+    None
   } else {
-    unsafe { to_dec_string(ctx, jsval_of(description)) }
-  };
-  let Ok(cdesc) = CString::new(desc) else {
-    return ptr::null();
+    let desc = unsafe { to_dec_string(ctx, jsval_of(description)) };
+    let Ok(cdesc) = CString::new(desc) else {
+      return ptr::null();
+    };
+    Some(cdesc)
   };
 
-  let v = unsafe { JS_NewSymbol(ctx, cdesc.as_ptr(), 0) };
+  let cdesc_ptr = cdesc.as_ref().map_or(ptr::null(), |c| c.as_ptr());
+  let v = unsafe { JS_NewSymbol(ctx, cdesc_ptr, 0) };
   if v.tag == JS_TAG_EXCEPTION {
     let exc = unsafe { JS_GetException(ctx) };
     unsafe { JS_FreeValue(ctx, exc) };
