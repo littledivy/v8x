@@ -88,6 +88,8 @@ pub(crate) struct IsoState {
 
   pub handles: Vec<*mut JSValue>,
 
+  pub persistent_handles: Vec<*mut JSValue>,
+
   pub data_slots: [*mut c_void; 4],
 
   // QuickJS class id for `v8::External` objects. Registered on the runtime
@@ -260,11 +262,13 @@ pub(crate) fn is_non_value_handle<T>(p: *const T) -> bool {
 #[inline(always)]
 pub(crate) fn is_interned_handle<T>(p: *const T) -> bool {
   let iso = current_iso();
-  !iso.is_null()
-    && iso_state(iso)
-      .handles
+  !iso.is_null() && {
+    let st = iso_state(iso);
+    st.handles
       .iter()
+      .chain(st.persistent_handles.iter())
       .any(|&h| std::ptr::addr_eq(h, p as *const JSValue))
+  }
 }
 
 #[inline(always)]
@@ -424,6 +428,7 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     ctx,
     contexts: Vec::new(),
     handles: Vec::new(),
+    persistent_handles: Vec::new(),
     data_slots: [ptr::null_mut(); 4],
     ext_class_id,
     main_ctx_claimed: false,
@@ -488,6 +493,11 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
     st.weak_handles.clear();
 
     while let Some(slot) = st.handles.pop() {
+      let v = *slot;
+      JS_FreeValue(st.ctx, v);
+      drop(Box::from_raw(slot));
+    }
+    while let Some(slot) = st.persistent_handles.pop() {
       let v = *slot;
       JS_FreeValue(st.ctx, v);
       drop(Box::from_raw(slot));

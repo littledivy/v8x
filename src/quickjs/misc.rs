@@ -328,9 +328,9 @@ pub extern "C" fn v8__Global__New(
   let dup = unsafe { JS_DupValue(ctx, v) };
   let cell = Box::into_raw(Box::new(dup));
   if !_isolate.is_null() {
-    iso_state(_isolate)
-      .global_handles
-      .fetch_add(1, Ordering::SeqCst);
+    let st = iso_state(_isolate);
+    st.persistent_handles.push(cell);
+    st.global_handles.fetch_add(1, Ordering::SeqCst);
   }
   cell as *const Data
 }
@@ -369,6 +369,8 @@ pub extern "C" fn v8__Global__Reset(data: *const Data) {
   if !iso.is_null() {
     let st = iso_state(iso);
     st.weak_handles.retain(|weak| weak.handle != data);
+    st.persistent_handles
+      .retain(|&handle| !std::ptr::addr_eq(handle, data as *const JSValue));
     if st.global_handles.load(Ordering::SeqCst) > 0 {
       st.global_handles.fetch_sub(1, Ordering::SeqCst);
     }

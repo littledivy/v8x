@@ -27,8 +27,8 @@ use crate::quickjs::core::{
 use crate::quickjs::quickjs_sys::*;
 use crate::support::Maybe;
 use crate::{
-  BigInt, Boolean, Context, Integer, Number, Object, RealIsolate,
-  String as V8String, Value,
+  BigInt, Boolean, Context, Int32, Integer, Number, Object, RealIsolate,
+  String as V8String, Uint32, Value,
 };
 use std::os::raw::c_char;
 use std::ptr;
@@ -991,24 +991,44 @@ fn hash_bytes(seed: u64, bytes: &[u8]) -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToDetailString(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  this: *const Value,
+  context: *const Context,
+) -> *const V8String {
+  v8__Value__ToString(this, context)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToInt32(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  this: *const Value,
+  context: *const Context,
+) -> *const Int32 {
+  let c = ctx_of(context);
+  if c.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let mut out: i32 = 0;
+  if unsafe { JS_ToInt32(c, &mut out, jsval_of(this)) } < 0 {
+    let exc = unsafe { JS_GetException(c) };
+    unsafe { JS_FreeValue(c, exc) };
+    return ptr::null();
+  }
+  intern::<Int32>(unsafe { JS_NewInt32(c, out) })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToUint32(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  this: *const Value,
+  context: *const Context,
+) -> *const Uint32 {
+  let c = ctx_of(context);
+  if c.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let mut out: i32 = 0;
+  if unsafe { JS_ToInt32(c, &mut out, jsval_of(this)) } < 0 {
+    let exc = unsafe { JS_GetException(c) };
+    unsafe { JS_FreeValue(c, exc) };
+    return ptr::null();
+  }
+  intern::<Uint32>(unsafe { JS_NewUint32(c, out as u32) })
 }
