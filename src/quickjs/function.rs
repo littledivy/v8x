@@ -1028,8 +1028,8 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-#[derive(Clone, Copy)]
-enum TemplKind {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TemplKind {
   Func,
   Obj,
 }
@@ -1045,6 +1045,13 @@ pub(crate) fn is_template_ptr(p: *const c_void) -> bool {
     return false;
   }
   TEMPLATES.with(|t| t.borrow().contains_key(&(p as usize)))
+}
+
+pub(crate) fn template_kind(p: *const c_void) -> Option<TemplKind> {
+  if p.is_null() {
+    return None;
+  }
+  TEMPLATES.with(|t| t.borrow().get(&(p as usize)).copied())
 }
 
 fn with_template_props(

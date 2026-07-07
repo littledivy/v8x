@@ -90,6 +90,8 @@ pub(crate) struct IsoState {
 
   pub persistent_handles: Vec<*mut JSValue>,
 
+  pub private_symbols: Vec<JSValue>,
+
   pub data_slots: [*mut c_void; 4],
 
   // QuickJS class id for `v8::External` objects. Registered on the runtime
@@ -429,6 +431,7 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     contexts: Vec::new(),
     handles: Vec::new(),
     persistent_handles: Vec::new(),
+    private_symbols: Vec::new(),
     data_slots: [ptr::null_mut(); 4],
     ext_class_id,
     main_ctx_claimed: false,
@@ -501,6 +504,9 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
       let v = *slot;
       JS_FreeValue(st.ctx, v);
       drop(Box::from_raw(slot));
+    }
+    while let Some(v) = st.private_symbols.pop() {
+      JS_FreeValue(st.ctx, v);
     }
     // Release any saved eval/Function bindings a context held while code
     // generation from strings was disabled, before its JSContext is freed.
