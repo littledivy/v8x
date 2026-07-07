@@ -891,10 +891,78 @@ pub extern "C" fn v8__Value__ToString(
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__GetHash(
-  _this: *const std::os::raw::c_void,
-) -> u32 {
-  0
+pub extern "C" fn v8__Value__GetHash(this: *const Value) -> u32 {
+  if this.is_null() {
+    return 0;
+  }
+
+  let v = jsval_of(this);
+  if jsv_is_object(&v) {
+    return super::object::v8__Object__GetIdentityHash(this as *const Object)
+      as u32;
+  }
+  if jsv_is_string(&v) || jsv_is_symbol(&v) {
+    return super::object::v8__Name__GetIdentityHash(this as *const crate::Name)
+      as u32;
+  }
+  if jsv_is_number(&v) {
+    let bits = match v.tag {
+      JS_TAG_INT => unsafe { (v.u.int32 as f64).to_bits() },
+      JS_TAG_FLOAT64 => unsafe {
+        let n = v.u.float64;
+        if n == 0.0 {
+          0
+        } else if n.is_nan() {
+          f64::NAN.to_bits()
+        } else {
+          n.to_bits()
+        }
+      },
+      _ => 0,
+    };
+    return hash_payload(0x6e75_6d62_6572, bits);
+  }
+  if jsv_is_bigint(&v) {
+    let ctx = current_ctx();
+    if !ctx.is_null() {
+      let mut len = 0usize;
+      let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, v) };
+      if !cstr.is_null() {
+        let bytes =
+          unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+        let hash = hash_bytes(0x6269_6769_6e74, bytes);
+        unsafe { JS_FreeCString(ctx, cstr) };
+        return hash;
+      }
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+    }
+  }
+
+  let payload = match v.tag {
+    JS_TAG_BOOL => unsafe { v.u.int32 as u64 },
+    _ => jsv_get_ptr(&v) as u64,
+  };
+  hash_payload(v.tag as u64, payload)
+}
+
+fn hash_payload(seed: u64, payload: u64) -> u32 {
+  let mut x = payload ^ seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+  x ^= x >> 33;
+  x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+  x ^= x >> 33;
+  x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+  x ^= x >> 33;
+  x as u32
+}
+
+fn hash_bytes(seed: u64, bytes: &[u8]) -> u32 {
+  let mut h = seed ^ (bytes.len() as u64).wrapping_mul(0x9e37_79b9);
+  for &b in bytes {
+    h ^= b as u64;
+    h = h.wrapping_mul(0x100_0000_01b3);
+  }
+  hash_payload(seed, h)
 }
 
 #[unsafe(no_mangle)]

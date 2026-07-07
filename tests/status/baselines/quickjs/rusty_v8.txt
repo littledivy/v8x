@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=rusty_v8.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 156 passing. DO NOT hand-sort; the
+# (run.mjs --update). 158 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 rv8_slots::clear_all_context_slots
 rv8_slots::context_slots
@@ -80,6 +80,7 @@ rv8_test_api::function_template_prototype
 rv8_test_api::function_template_set_accessor_property
 rv8_test_api::gc_callbacks
 rv8_test_api::get_default_locale
+rv8_test_api::get_hash
 rv8_test_api::get_own_property_descriptor
 rv8_test_api::get_version
 rv8_test_api::global_handle_drop
@@ -112,6 +113,7 @@ rv8_test_api::map
 rv8_test_api::memory_pressure_notification
 rv8_test_api::no_internal_field
 rv8_test_api::no_source_map_comment
+rv8_test_api::object
 rv8_test_api::object_define_property
 rv8_test_api::object_template
 rv8_test_api::object_template_from_function_template
