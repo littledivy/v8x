@@ -203,6 +203,10 @@ pub(crate) struct IsoState {
 
   pub use_counter_callback: Option<crate::UseCounterCallback>,
 
+  pub javascript_execution_disallow_scopes: Vec<crate::scope::OnFailure>,
+
+  pub javascript_execution_allow_depth: usize,
+
   // Emulates `v8::Isolate::TerminateExecution`. Set by `TerminateExecution`,
   // cleared by `CancelTerminateExecution`; while set, the op-dispatch boundary
   // and the microtask/job drain refuse to run JS (matching V8, which throws an
@@ -215,6 +219,24 @@ impl IsoState {
   #[inline(always)]
   pub fn is_terminating(&self) -> bool {
     self.terminating.load(std::sync::atomic::Ordering::Acquire)
+  }
+}
+
+#[inline]
+pub(crate) fn javascript_execution_allowed() -> bool {
+  let iso = current_iso();
+  if iso.is_null() {
+    return true;
+  }
+  let st = iso_state(iso);
+  st.javascript_execution_allow_depth > 0
+    || st.javascript_execution_disallow_scopes.is_empty()
+}
+
+#[inline]
+unsafe fn throw_javascript_execution_disallowed(ctx: *mut JSContext) {
+  unsafe {
+    JS_ThrowTypeError(ctx, c"Javascript execution is disallowed".as_ptr());
   }
 }
 
@@ -519,6 +541,8 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     gc_prologue_callbacks: Vec::new(),
     gc_epilogue_callbacks: Vec::new(),
     use_counter_callback: None,
+    javascript_execution_disallow_scopes: Vec::new(),
+    javascript_execution_allow_depth: 0,
     terminating: std::sync::atomic::AtomicBool::new(false),
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;
@@ -1252,6 +1276,10 @@ pub extern "C" fn v8__Script__Run(
 ) -> *const Value {
   let ctx = ctx_of(context);
   if ctx.is_null() || script.is_null() {
+    return ptr::null();
+  }
+  if !javascript_execution_allowed() {
+    unsafe { throw_javascript_execution_disallowed(ctx) };
     return ptr::null();
   }
   let src_val = jsval_of(script);

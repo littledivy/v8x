@@ -1103,34 +1103,67 @@ pub extern "C" fn v8__ResourceConstraints__set_stack_limit(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__AllowJavascriptExecutionScope__CONSTRUCT(
-  _buf: *mut std::ffi::c_void,
-  _isolate: *mut RealIsolate,
+  buf: *mut std::ffi::c_void,
+  isolate: *mut RealIsolate,
 ) {
+  if !buf.is_null() {
+    unsafe {
+      ptr::write_bytes(buf as *mut u8, 0, 2 * std::mem::size_of::<usize>());
+      *(buf as *mut usize) = isolate as usize;
+    }
+  }
+  if !isolate.is_null() {
+    iso_state(isolate).javascript_execution_allow_depth += 1;
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__AllowJavascriptExecutionScope__DESTRUCT(
-  _this: *mut std::ffi::c_void,
+  this: *mut std::ffi::c_void,
 ) {
+  if this.is_null() {
+    return;
+  }
+  let isolate = unsafe { *(this as *const usize) as *mut RealIsolate };
+  if !isolate.is_null() {
+    let st = iso_state(isolate);
+    st.javascript_execution_allow_depth =
+      st.javascript_execution_allow_depth.saturating_sub(1);
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__DisallowJavascriptExecutionScope__CONSTRUCT(
   buf: *mut std::ffi::c_void,
-  _isolate: *mut RealIsolate,
-  _on_failure: crate::scope::OnFailure,
+  isolate: *mut RealIsolate,
+  on_failure: crate::scope::OnFailure,
 ) {
   if !buf.is_null() {
     unsafe {
-      ptr::write_bytes(buf as *mut u8, 0, 2 * std::mem::size_of::<usize>())
+      ptr::write_bytes(buf as *mut u8, 0, 2 * std::mem::size_of::<usize>());
+      *(buf as *mut usize) = isolate as usize;
     };
+  }
+  if !isolate.is_null() {
+    iso_state(isolate)
+      .javascript_execution_disallow_scopes
+      .push(on_failure);
   }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__DisallowJavascriptExecutionScope__DESTRUCT(
-  _this: *mut std::ffi::c_void,
+  this: *mut std::ffi::c_void,
 ) {
+  if this.is_null() {
+    return;
+  }
+  let isolate = unsafe { *(this as *const usize) as *mut RealIsolate };
+  if !isolate.is_null() {
+    iso_state(isolate)
+      .javascript_execution_disallow_scopes
+      .pop();
+  }
 }
 
 #[unsafe(no_mangle)]
