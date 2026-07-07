@@ -17,8 +17,8 @@
 #![allow(non_snake_case, unused)]
 
 use crate::quickjs::core::{
-  adjust_external_memory, ctx_of, current_ctx, current_iso, intern, intern_dup,
-  iso_state, jsval_of, release_external_string_memory,
+  PersistentHandle, adjust_external_memory, ctx_of, current_ctx, current_iso,
+  intern, intern_dup, iso_state, jsval_of, release_external_string_memory,
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::{Context, Data, Object, RealIsolate, String as V8String, Value};
@@ -33,6 +33,44 @@ struct WeakCallbackInfoShim {
   second_pass: Option<crate::quickjs::core::WeakCallback>,
 }
 
+fn same_value_identity(a: JSValue, b: JSValue) -> bool {
+  if a.tag != b.tag {
+    return false;
+  }
+  match a.tag {
+    JS_TAG_OBJECT
+    | JS_TAG_STRING
+    | JS_TAG_STRING_ROPE
+    | JS_TAG_SYMBOL
+    | JS_TAG_BIG_INT
+    | JS_TAG_MODULE
+    | JS_TAG_FUNCTION_BYTECODE => unsafe { a.u.ptr == b.u.ptr },
+    JS_TAG_FLOAT64 => unsafe { a.u.float64.to_bits() == b.u.float64.to_bits() },
+    _ => unsafe { a.u.int32 == b.u.int32 },
+  }
+}
+
+fn is_strongly_reachable_from_handles(
+  isolate: *mut RealIsolate,
+  weak_handle: *const Data,
+) -> bool {
+  if isolate.is_null() || weak_handle.is_null() {
+    return false;
+  }
+  let weak_slot = weak_handle as *const JSValue;
+  let weak_value = unsafe { *weak_slot };
+  let st = iso_state(isolate);
+  st.handles.iter().any(|&slot| {
+    !slot.is_null() && same_value_identity(unsafe { *slot }, weak_value)
+  }) || st.persistent_handles.iter().any(|handle| {
+    let slot = handle.slot;
+    !handle.is_weak
+      && !slot.is_null()
+      && !std::ptr::addr_eq(slot, weak_slot)
+      && same_value_identity(unsafe { *slot }, weak_value)
+  })
+}
+
 fn collect_weak_handles(isolate: *mut RealIsolate) {
   if isolate.is_null() {
     return;
@@ -43,7 +81,13 @@ fn collect_weak_handles(isolate: *mut RealIsolate) {
     std::mem::take(&mut st.weak_handles)
   };
 
+  let mut survivors = Vec::new();
   for weak in weak_handles {
+    if is_strongly_reachable_from_handles(isolate, weak.handle) {
+      survivors.push(weak);
+      continue;
+    }
+
     let mut info = WeakCallbackInfoShim {
       isolate,
       parameter: weak.parameter,
@@ -53,6 +97,10 @@ fn collect_weak_handles(isolate: *mut RealIsolate) {
     if let Some(second_pass) = info.second_pass {
       unsafe { second_pass(&info as *const _ as *const c_void) };
     }
+  }
+
+  if !survivors.is_empty() {
+    iso_state(isolate).weak_handles.extend(survivors);
   }
 }
 
@@ -329,7 +377,10 @@ pub extern "C" fn v8__Global__New(
   let cell = Box::into_raw(Box::new(dup));
   if !_isolate.is_null() {
     let st = iso_state(_isolate);
-    st.persistent_handles.push(cell);
+    st.persistent_handles.push(PersistentHandle {
+      slot: cell,
+      is_weak: false,
+    });
     st.global_handles.fetch_add(1, Ordering::SeqCst);
   }
   cell as *const Data
@@ -344,13 +395,19 @@ pub extern "C" fn v8__Global__NewWeak(
 ) -> *const Data {
   let handle = v8__Global__New(isolate, data);
   if !handle.is_null() && !isolate.is_null() {
-    iso_state(isolate)
-      .weak_handles
-      .push(crate::quickjs::core::WeakHandle {
-        handle,
-        parameter,
-        callback,
-      });
+    let st = iso_state(isolate);
+    if let Some(persistent) =
+      st.persistent_handles.iter_mut().find(|persistent| {
+        std::ptr::addr_eq(persistent.slot, handle as *const JSValue)
+      })
+    {
+      persistent.is_weak = true;
+    }
+    st.weak_handles.push(crate::quickjs::core::WeakHandle {
+      handle,
+      parameter,
+      callback,
+    });
   }
   handle
 }
@@ -370,7 +427,7 @@ pub extern "C" fn v8__Global__Reset(data: *const Data) {
     let st = iso_state(iso);
     st.weak_handles.retain(|weak| weak.handle != data);
     st.persistent_handles
-      .retain(|&handle| !std::ptr::addr_eq(handle, data as *const JSValue));
+      .retain(|handle| !std::ptr::addr_eq(handle.slot, data as *const JSValue));
     if st.global_handles.load(Ordering::SeqCst) > 0 {
       st.global_handles.fetch_sub(1, Ordering::SeqCst);
     }

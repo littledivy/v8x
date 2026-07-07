@@ -54,6 +54,11 @@ pub(crate) struct WeakHandle {
   pub callback: WeakCallback,
 }
 
+pub(crate) struct PersistentHandle {
+  pub slot: *mut JSValue,
+  pub is_weak: bool,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct GcCallbackEntry {
   pub callback: crate::isolate::GcCallbackWithData,
@@ -150,7 +155,7 @@ pub(crate) struct IsoState {
 
   pub handles: Vec<*mut JSValue>,
 
-  pub persistent_handles: Vec<*mut JSValue>,
+  pub persistent_handles: Vec<PersistentHandle>,
 
   pub private_symbols: Vec<(JSValue, JSValue)>,
 
@@ -332,8 +337,11 @@ pub(crate) fn is_interned_handle<T>(p: *const T) -> bool {
     let st = iso_state(iso);
     st.handles
       .iter()
-      .chain(st.persistent_handles.iter())
       .any(|&h| std::ptr::addr_eq(h, p as *const JSValue))
+      || st
+        .persistent_handles
+        .iter()
+        .any(|h| std::ptr::addr_eq(h.slot, p as *const JSValue))
   }
 }
 
@@ -566,9 +574,9 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
       drop(Box::from_raw(slot));
     }
     while let Some(slot) = st.persistent_handles.pop() {
-      let v = *slot;
+      let v = *slot.slot;
       JS_FreeValue(st.ctx, v);
-      drop(Box::from_raw(slot));
+      drop(Box::from_raw(slot.slot));
     }
     while let Some((symbol, name)) = st.private_symbols.pop() {
       JS_FreeValue(st.ctx, symbol);
