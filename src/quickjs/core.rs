@@ -726,6 +726,10 @@ pub(crate) fn install_default_globals(ctx: *mut JSContext) {
       let gc_fn = JS_NewCFunction(ctx, qjs_gc, c"gc".as_ptr(), 0);
       JS_SetPropertyStr(ctx, global, c"gc".as_ptr(), gc_fn);
     }
+
+    if super::init::has_entropy_source() {
+      install_entropy_math_random(ctx, global);
+    }
     JS_FreeValue(ctx, global);
   }
   install_weakref_kept_object_shim(ctx);
@@ -745,6 +749,41 @@ unsafe extern "C" fn qjs_gc(
     super::misc::v8__Isolate__RequestGarbageCollectionForTesting(isolate, 0);
   }
   jsv_undefined()
+}
+
+fn install_entropy_math_random(ctx: *mut JSContext, global: JSValue) {
+  unsafe {
+    let math = JS_GetPropertyStr(ctx, global, c"Math".as_ptr());
+    let math_absent = jsv_is_undefined(&math) || math.tag == JS_TAG_NULL;
+    let math_obj = if math_absent { JS_NewObject(ctx) } else { math };
+
+    let random_fn =
+      JS_NewCFunction(ctx, qjs_entropy_random, c"random".as_ptr(), 0);
+    JS_SetPropertyStr(ctx, math_obj, c"random".as_ptr(), random_fn);
+
+    if math_absent {
+      JS_SetPropertyStr(ctx, global, c"Math".as_ptr(), math_obj);
+    } else {
+      JS_FreeValue(ctx, math_obj);
+    }
+  }
+}
+
+unsafe extern "C" fn qjs_entropy_random(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
+  let mut bytes = [0u8; 8];
+  if !super::init::fill_entropy(&mut bytes) {
+    return unsafe { JS_NewFloat64(ctx, 0.0) };
+  }
+
+  // Match the usual Math.random shape: 53 random mantissa bits in [0, 1).
+  let bits = u64::from_le_bytes(bytes) >> 11;
+  let value = (bits as f64) * (1.0 / ((1u64 << 53) as f64));
+  unsafe { JS_NewFloat64(ctx, value) }
 }
 
 fn install_weakref_kept_object_shim(ctx: *mut JSContext) {

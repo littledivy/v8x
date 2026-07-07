@@ -8,6 +8,25 @@ use crate::Platform;
 use crate::support::{SharedPtrBase, UniquePtr, long};
 use std::os::raw::{c_char, c_int};
 use std::ptr;
+use std::sync::atomic::{AtomicPtr, Ordering};
+
+type RawEntropySource = unsafe extern "C" fn(*mut u8, usize) -> bool;
+
+static ENTROPY_SOURCE: AtomicPtr<std::ffi::c_void> =
+  AtomicPtr::new(ptr::null_mut());
+
+pub(crate) fn has_entropy_source() -> bool {
+  !ENTROPY_SOURCE.load(Ordering::SeqCst).is_null()
+}
+
+pub(crate) fn fill_entropy(buf: &mut [u8]) -> bool {
+  let callback = ENTROPY_SOURCE.load(Ordering::SeqCst);
+  if callback.is_null() {
+    return false;
+  }
+  let callback: RawEntropySource = unsafe { std::mem::transmute(callback) };
+  unsafe { callback(buf.as_mut_ptr(), buf.len()) }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__InitializePlatform(_platform: *mut Platform) {}
@@ -81,7 +100,8 @@ pub extern "C" fn v8__V8__SetFlagsFromString(flags: *const u8, length: usize) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__V8__SetEntropySource(_callback: *const std::ffi::c_void) {
+pub extern "C" fn v8__V8__SetEntropySource(callback: *const std::ffi::c_void) {
+  ENTROPY_SOURCE.store(callback.cast_mut(), Ordering::SeqCst);
 }
 
 #[unsafe(no_mangle)]
