@@ -450,10 +450,15 @@ pub extern "C" fn v8__Private__ForApi(
   } else {
     unsafe { to_dec_string(ctx, jsval_of(name)) }
   };
+  let name_value = if name.is_null() {
+    jsv_undefined()
+  } else {
+    jsval_of(name)
+  };
   let escaped = desc.replace('\\', "\\\\").replace('"', "\\\"");
   let v =
     unsafe { eval(ctx, &format!("Symbol.for(\"v82jsc_private:{escaped}\")")) };
-  remember_private_symbol(isolate, ctx, v);
+  remember_private_symbol(isolate, ctx, v, name_value);
   intern::<Private>(v)
 }
 
@@ -471,6 +476,11 @@ pub extern "C" fn v8__Private__New(
   } else {
     unsafe { to_dec_string(ctx, jsval_of(name)) }
   };
+  let name_value = if name.is_null() {
+    jsv_undefined()
+  } else {
+    jsval_of(name)
+  };
   let Ok(cdesc) = CString::new(desc) else {
     return ptr::null();
   };
@@ -481,7 +491,7 @@ pub extern "C" fn v8__Private__New(
     unsafe { JS_FreeValue(ctx, exc) };
     return ptr::null();
   }
-  remember_private_symbol(isolate, ctx, v);
+  remember_private_symbol(isolate, ctx, v, name_value);
   intern::<Private>(v)
 }
 
@@ -489,6 +499,7 @@ fn remember_private_symbol(
   isolate: *mut RealIsolate,
   ctx: *mut JSContext,
   value: JSValue,
+  name: JSValue,
 ) {
   let iso = if isolate.is_null() {
     crate::quickjs::core::current_iso()
@@ -499,7 +510,8 @@ fn remember_private_symbol(
     return;
   }
   let stored = unsafe { JS_DupValue(ctx, value) };
-  iso_state(iso).private_symbols.push(stored);
+  let stored_name = unsafe { JS_DupValue(ctx, name) };
+  iso_state(iso).private_symbols.push((stored, stored_name));
 }
 
 #[unsafe(no_mangle)]
@@ -810,12 +822,26 @@ pub extern "C" fn v8__Data__IsPrivate(
   iso_state(iso)
     .private_symbols
     .iter()
-    .any(|&private| unsafe { JS_IsStrictEqual(ctx, value, private) })
+    .any(|&(private, _)| unsafe { JS_IsStrictEqual(ctx, value, private) })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Private__Name(
-  _this: *const std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+pub extern "C" fn v8__Private__Name(this: *const Private) -> *const Value {
+  if this.is_null() {
+    return ptr::null();
+  }
+  let ctx = current_ctx();
+  let iso = crate::quickjs::core::current_iso();
+  if ctx.is_null() || iso.is_null() {
+    return ptr::null();
+  }
+  let value = jsval_of(this);
+  let Some((_, name)) = iso_state(iso)
+    .private_symbols
+    .iter()
+    .find(|&&(private, _)| unsafe { JS_IsStrictEqual(ctx, value, private) })
+  else {
+    return ptr::null();
+  };
+  intern::<Value>(unsafe { JS_DupValue(ctx, *name) })
 }

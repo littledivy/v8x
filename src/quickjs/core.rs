@@ -90,7 +90,7 @@ pub(crate) struct IsoState {
 
   pub persistent_handles: Vec<*mut JSValue>,
 
-  pub private_symbols: Vec<JSValue>,
+  pub private_symbols: Vec<(JSValue, JSValue)>,
 
   pub data_slots: [*mut c_void; 4],
 
@@ -505,8 +505,9 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
       JS_FreeValue(st.ctx, v);
       drop(Box::from_raw(slot));
     }
-    while let Some(v) = st.private_symbols.pop() {
-      JS_FreeValue(st.ctx, v);
+    while let Some((symbol, name)) = st.private_symbols.pop() {
+      JS_FreeValue(st.ctx, symbol);
+      JS_FreeValue(st.ctx, name);
     }
     // Release any saved eval/Function bindings a context held while code
     // generation from strings was disabled, before its JSContext is freed.
