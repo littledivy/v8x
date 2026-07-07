@@ -109,7 +109,6 @@ rv8_test_api::local_handle_deref
 rv8_test_api::low_memory_notification
 rv8_test_api::map
 rv8_test_api::memory_pressure_notification
-rv8_test_api::module_snapshot
 rv8_test_api::no_internal_field
 rv8_test_api::no_source_map_comment
 rv8_test_api::object_define_property
@@ -128,9 +127,6 @@ rv8_test_api::set_host_initialize_import_meta_object_callback
 rv8_test_api::set_idle
 rv8_test_api::set_promise_reject_callback
 rv8_test_api::shared_array_buffer_allocator
-rv8_test_api::snapshot_creator
-rv8_test_api::snapshot_creator_context_embedder_data
-rv8_test_api::snapshot_creator_multiple_contexts
 rv8_test_api::string_concat
 rv8_test_api::string_valueview
 rv8_test_api::string_valueview_as_str
