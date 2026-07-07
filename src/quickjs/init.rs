@@ -58,15 +58,56 @@ pub extern "C" fn v8__V8__GetVersion() -> *const c_char {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__SetFlagsFromCommandLine(
   argc: *mut c_int,
-  _argv: *mut *mut c_char,
+  argv: *mut *mut c_char,
   _usage: *const c_char,
 ) {
-  if !argc.is_null() {
-    unsafe {
-      if *argc > 1 {
-        *argc = 1;
-      }
+  if argc.is_null() || argv.is_null() {
+    return;
+  }
+
+  unsafe {
+    let len = *argc;
+    if len <= 1 {
+      return;
     }
+
+    let mut write = 1;
+    for read in 1..len {
+      let arg = *argv.add(read as usize);
+      if arg.is_null() {
+        continue;
+      }
+      let arg = std::ffi::CStr::from_ptr(arg).to_string_lossy();
+      if consume_v8_flag(&arg) {
+        continue;
+      }
+      *argv.add(write as usize) = *argv.add(read as usize);
+      write += 1;
+    }
+    *argc = write;
+  }
+}
+
+fn consume_v8_flag(flag: &str) -> bool {
+  let name = flag
+    .trim_start_matches('-')
+    .split_once('=')
+    .map_or(flag.trim_start_matches('-'), |(name, _)| name)
+    .replace('-', "_");
+  match name.as_str() {
+    "use_strict" => {
+      crate::quickjs::core::FORCE_STRICT
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+      true
+    }
+    "no_use_strict" => {
+      crate::quickjs::core::FORCE_STRICT
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+      true
+    }
+    // Recognized V8 flags that do not have a QuickJS observable equivalent.
+    "help" | "log_colour" | "log_color" => true,
+    _ => false,
   }
 }
 
@@ -84,18 +125,7 @@ pub extern "C" fn v8__V8__SetFlagsFromString(flags: *const u8, length: usize) {
     return;
   };
   for tok in text.split_whitespace() {
-    let name = tok.trim_start_matches('-').replace('-', "_");
-    match name.as_str() {
-      "use_strict" => {
-        crate::quickjs::core::FORCE_STRICT
-          .store(true, std::sync::atomic::Ordering::Relaxed);
-      }
-      "no_use_strict" => {
-        crate::quickjs::core::FORCE_STRICT
-          .store(false, std::sync::atomic::Ordering::Relaxed);
-      }
-      _ => {}
-    }
+    consume_v8_flag(tok);
   }
 }
 
