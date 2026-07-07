@@ -965,6 +965,8 @@ pub extern "C" fn v8__Value__GetHash(this: *const Value) -> u32 {
 
   let payload = match v.tag {
     JS_TAG_BOOL => unsafe { v.u.int32 as u64 },
+    JS_TAG_NULL | JS_TAG_UNDEFINED | JS_TAG_UNINITIALIZED
+    | JS_TAG_CATCH_OFFSET | JS_TAG_EXCEPTION => 0,
     _ => jsv_get_ptr(&v) as u64,
   };
   hash_payload(v.tag as u64, payload)
