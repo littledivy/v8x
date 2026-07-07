@@ -1,6 +1,29 @@
 use std::env;
 use std::path::PathBuf;
 
+/// Emit `$OUT_DIR/bc_embed.rs` defining `EMBEDDED_BC`. When `V82JSC_BC_BLOB`
+/// points at a packed bytecode blob (see `module.rs` for the format), its bytes
+/// are `include_bytes!`'d straight into the binary so startup reads compiled
+/// module bytecode from memory instead of the on-disk cache. Absent the env
+/// var, `EMBEDDED_BC` is empty and the disk cache path is used as before.
+fn emit_bc_embed() {
+  let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+  let dst = out_dir.join("bc_embed.rs");
+  println!("cargo:rerun-if-env-changed=V82JSC_BC_BLOB");
+  let body = match env::var_os("V82JSC_BC_BLOB") {
+    Some(p) if PathBuf::from(&p).is_file() => {
+      let p = PathBuf::from(&p);
+      println!("cargo:rerun-if-changed={}", p.display());
+      format!(
+        "pub static EMBEDDED_BC: &[u8] = include_bytes!(r\"{}\");",
+        p.display()
+      )
+    }
+    _ => "pub static EMBEDDED_BC: &[u8] = &[];".to_string(),
+  };
+  std::fs::write(&dst, body).unwrap();
+}
+
 fn main() {
   let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
@@ -27,6 +50,8 @@ fn main() {
     binding_path.display()
   );
   println!("cargo:rerun-if-changed={}", binding_path.display());
+
+  emit_bc_embed();
 
   // --- JSC backend: generate full FFI bindings from the SDK header. ---
   // `src/jsc_sys.rs` `include!`s the output, so the complete JavaScriptCore

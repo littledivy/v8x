@@ -109,7 +109,44 @@ fn bc_path(key: u64) -> Option<std::path::PathBuf> {
   Some(bc_cache_dir()?.join(format!("{key:016x}.qbc")))
 }
 
+// Build-time embedded bytecode blob (empty unless V82JSC_BC_BLOB was set at
+// build). Defines `EMBEDDED_BC: &[u8]`. Blob format: [count u32 LE] then
+// `count` entries of [key u64 LE][len u32 LE][bytes]. Lets a shipped binary
+// carry precompiled module bytecode instead of warming an on-disk cache.
+include!(concat!(env!("OUT_DIR"), "/bc_embed.rs"));
+
+fn embedded_bc() -> &'static HashMap<u64, &'static [u8]> {
+  use std::sync::OnceLock;
+  static M: OnceLock<HashMap<u64, &'static [u8]>> = OnceLock::new();
+  M.get_or_init(|| {
+    let mut m = HashMap::new();
+    let b = EMBEDDED_BC;
+    if b.len() >= 4 {
+      let count = u32::from_le_bytes(b[0..4].try_into().unwrap()) as usize;
+      let mut off = 4usize;
+      for _ in 0..count {
+        if off + 12 > b.len() {
+          break;
+        }
+        let key = u64::from_le_bytes(b[off..off + 8].try_into().unwrap());
+        let len =
+          u32::from_le_bytes(b[off + 8..off + 12].try_into().unwrap()) as usize;
+        off += 12;
+        if off + len > b.len() {
+          break;
+        }
+        m.insert(key, &b[off..off + len]);
+        off += len;
+      }
+    }
+    m
+  })
+}
+
 pub(crate) fn bc_load(key: u64) -> Option<Vec<u8>> {
+  if let Some(&bytes) = embedded_bc().get(&key) {
+    return Some(bytes.to_vec());
+  }
   let p = bc_path(key)?;
   std::fs::read(p).ok().filter(|b| !b.is_empty())
 }
