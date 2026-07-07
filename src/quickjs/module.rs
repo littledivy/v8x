@@ -238,6 +238,25 @@ thread_local! {
 
     static RESOLVED_SPECIFIERS: RefCell<HashMap<(std::string::String, std::string::String), std::string::String>> =
         RefCell::new(HashMap::new());
+
+    static SCRIPT_SOURCE_MAP_URLS: RefCell<HashMap<usize, std::string::String>> =
+        RefCell::new(HashMap::new());
+}
+
+#[repr(C)]
+struct RawScriptOrigin {
+  resource_name: usize,
+  source_map_url: usize,
+}
+
+#[repr(C)]
+struct RawSource {
+  source_string: usize,
+  resource_name: usize,
+  resource_line_offset: int,
+  resource_column_offset: int,
+  resource_options: int,
+  source_map_url: usize,
 }
 
 thread_local! {
@@ -1824,7 +1843,7 @@ pub extern "C" fn v8__ScriptOrigin__CONSTRUCT(
   _resource_column_offset: i32,
   _resource_is_shared_cross_origin: bool,
   _script_id: i32,
-  _source_map_url: *const Value,
+  source_map_url: *const Value,
   _resource_is_opaque: bool,
   _is_wasm: bool,
   _is_module: bool,
@@ -1833,7 +1852,9 @@ pub extern "C" fn v8__ScriptOrigin__CONSTRUCT(
   if !buf.is_null() {
     unsafe {
       ptr::write_bytes(buf as *mut u8, 0u8, size_of::<ScriptOrigin>());
-      *(buf as *mut usize) = resource_name as usize;
+      let raw = buf as *mut RawScriptOrigin;
+      (*raw).resource_name = resource_name as usize;
+      (*raw).source_map_url = source_map_url as usize;
     }
   }
 }
@@ -1850,10 +1871,12 @@ pub extern "C" fn v8__ScriptCompiler__Source__CONSTRUCT(
   }
   unsafe {
     ptr::write_bytes(buf as *mut u8, 0u8, size_of::<Source>());
-    let slots = buf as *mut usize;
-    *slots = source_string as usize;
+    let raw = buf as *mut RawSource;
+    (*raw).source_string = source_string as usize;
     if !origin.is_null() {
-      *slots.add(1) = *(origin as *const usize);
+      let origin = origin as *const RawScriptOrigin;
+      (*raw).resource_name = (*origin).resource_name;
+      (*raw).source_map_url = (*origin).source_map_url;
     }
   }
 }
@@ -1873,7 +1896,7 @@ unsafe fn source_string_of(source: *mut Source) -> *const V8String {
   if source.is_null() {
     return ptr::null();
   }
-  unsafe { *(source as *const usize) as *const V8String }
+  unsafe { (*(source as *const RawSource)).source_string as *const V8String }
 }
 
 #[inline]
@@ -1884,7 +1907,8 @@ unsafe fn resource_name_of(
   if source.is_null() || ctx.is_null() {
     return std::string::String::new();
   }
-  let name_ptr = unsafe { *((source as *const usize).add(1)) } as *const Value;
+  let name_ptr =
+    unsafe { (*(source as *const RawSource)).resource_name } as *const Value;
   if name_ptr.is_null() {
     return std::string::String::new();
   }
@@ -1893,6 +1917,89 @@ unsafe fn resource_name_of(
     return std::string::String::new();
   }
   unsafe { jsval_to_rust(ctx, v) }
+}
+
+#[inline]
+unsafe fn source_map_url_of(
+  ctx: *mut JSContext,
+  source: *mut Source,
+) -> Option<std::string::String> {
+  if source.is_null() || ctx.is_null() {
+    return None;
+  }
+  let url_ptr =
+    unsafe { (*(source as *const RawSource)).source_map_url } as *const Value;
+  if url_ptr.is_null() {
+    return None;
+  }
+  let v = jsval_of(url_ptr);
+  if jsv_is_undefined(&v) || jsv_is_null(&v) {
+    return None;
+  }
+  let url = unsafe { jsval_to_rust(ctx, v) };
+  if url.is_empty() { None } else { Some(url) }
+}
+
+#[inline]
+fn script_value_key(v: JSValue) -> Option<usize> {
+  match v.tag {
+    JS_TAG_STRING | JS_TAG_STRING_ROPE | JS_TAG_OBJECT => {
+      let ptr = jsv_get_ptr(&v) as usize;
+      (ptr != 0).then_some(ptr)
+    }
+    _ => None,
+  }
+}
+
+fn record_script_source_map_url(
+  source_value: JSValue,
+  url: Option<std::string::String>,
+) {
+  let Some(key) = script_value_key(source_value) else {
+    return;
+  };
+  SCRIPT_SOURCE_MAP_URLS.with(|m| {
+    let mut map = m.borrow_mut();
+    if map.len() > 256 && !map.contains_key(&key) {
+      map.clear();
+    }
+    match url {
+      Some(url) => {
+        map.insert(key, url);
+      }
+      None => {
+        map.remove(&key);
+      }
+    }
+  });
+}
+
+fn script_source_map_url(source_value: JSValue) -> Option<std::string::String> {
+  let key = script_value_key(source_value)?;
+  SCRIPT_SOURCE_MAP_URLS.with(|m| m.borrow().get(&key).cloned())
+}
+
+unsafe fn source_map_url_for_source(
+  ctx: *mut JSContext,
+  source: *mut Source,
+  text: &str,
+) -> Option<std::string::String> {
+  unsafe { source_map_url_of(ctx, source) }
+    .or_else(|| extract_source_mapping_url(text))
+}
+
+fn new_string_value(ctx: *mut JSContext, text: &str) -> *const Value {
+  if ctx.is_null() {
+    return intern::<Value>(jsv_undefined());
+  }
+  let val = unsafe {
+    JS_NewStringLen(
+      ctx,
+      text.as_ptr() as *const std::os::raw::c_char,
+      text.len(),
+    )
+  };
+  intern::<Value>(val)
 }
 
 #[repr(C)]
@@ -1951,6 +2058,7 @@ pub extern "C" fn v8__ScriptCompiler__Compile(
   }
   let src_val = jsval_of(src);
   let text = unsafe { jsval_to_rust(ctx, src_val) };
+  let source_map_url = unsafe { source_map_url_for_source(ctx, source, &text) };
   let Ok(csrc) = CString::new(text) else {
     return ptr::null();
   };
@@ -1971,6 +2079,7 @@ pub extern "C" fn v8__ScriptCompiler__Compile(
   }
   unsafe { JS_FreeValue(ctx, compiled) };
 
+  record_script_source_map_url(src_val, source_map_url);
   intern_dup::<Script>(ctx, src_val)
 }
 
@@ -2173,6 +2282,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileUnboundScript(
   }
   let src_val = jsval_of(src);
   let text = unsafe { jsval_to_rust(ctx, src_val) };
+  let source_map_url = unsafe { source_map_url_for_source(ctx, source, &text) };
   let Ok(csrc) = CString::new(text) else {
     return ptr::null();
   };
@@ -2192,6 +2302,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileUnboundScript(
     return ptr::null();
   }
   unsafe { JS_FreeValue(ctx, compiled) };
+  record_script_source_map_url(src_val, source_map_url);
   intern_dup::<UnboundScript>(ctx, src_val)
 }
 
@@ -2208,8 +2319,23 @@ pub extern "C" fn v8__UnboundScript__BindToCurrentContext(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__UnboundScript__GetSourceMappingURL(
-  _script: *const UnboundScript,
+  script: *const UnboundScript,
 ) -> *const Value {
+  if script.is_null() {
+    return intern::<Value>(jsv_undefined());
+  }
+  let ctx = current_ctx();
+  let value = jsval_of(script);
+  let url = script_source_map_url(value).or_else(|| {
+    if ctx.is_null() {
+      return None;
+    }
+    let text = unsafe { jsval_to_rust(ctx, value) };
+    extract_source_mapping_url(&text)
+  });
+  if let Some(url) = url {
+    return new_string_value(ctx, &url);
+  }
   intern::<Value>(jsv_undefined())
 }
 
