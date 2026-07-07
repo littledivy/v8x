@@ -202,8 +202,13 @@ function streamWithWatchdog(bin, args, cwd) {
       // `(?: - should panic)?` strips libtest's display annotation so the name
       // is the bare test PATH `--skip` expects (the panic suffix is not part of
       // the filter name).
+      // The dangling line is not always CLEAN: the crashing test's stderr can
+      // interleave onto it before any newline (`test X ... thread 'X' has
+      // overflowed its stack`), so require only that the suffix is NOT a
+      // libtest result — not that the line ends after `... `.
       let inFlight = null;
-      const startRe = /^test (.+?)(?: - should panic)? \.\.\. *$/gm;
+      const startRe =
+        /^test (.+?)(?: - should panic)? \.\.\. (?!ok\b|FAILED\b|ignored\b)[^\n]*$/gm;
       for (let m; (m = startRe.exec(output)) !== null; ) inFlight = m[1];
       resolve({ output, killed, code, signal, inFlight });
     });
@@ -279,7 +284,58 @@ async function runBins(bins, cwd) {
     codesign(bin);
     // Print the path so parseLibtest can attribute tests to a binary.
     out += `Running ${bin}\n`;
-    out += (await runOneBin(bin, cwd, ["--test-threads", "1", "--color", "never"])) + "\n";
+    const batch = await runOneBin(bin, cwd, ["--test-threads", "1", "--color", "never"]);
+    out += batch + "\n";
+    if (flag("rescue")) out += await rescueHiddenPasses(bin, cwd, batch);
+  }
+  return out;
+}
+
+// --rescue: solo-rerun every batch-FAILED test, and count a solo pass.
+//
+// runOneBin's recovery handles tests that HANG or CRASH the process — but not
+// the third failure mode: a test that panics while holding the vendored
+// suite's shared PROCESS_LOCK *write* guard POISONS the lock. Every later test
+// in the same process then fails inside setup() (`RwLock::read().unwrap()`)
+// while the process runs on, so nothing dangles and no recovery triggers —
+// dozens of genuinely-passing tests report FAILED. That's a batch artifact,
+// not a backend failure: each FAILED test gets one solo `--exact` rerun (own
+// process, fresh lock) and a solo "ok" supersedes the batch FAILED in
+// parseLibtest. Opt-in per CI cell: a cell that turns --rescue on must refresh
+// its baseline in the same PR (rescue surfaces passes --check would flag).
+async function rescueHiddenPasses(bin, cwd, batchOutput) {
+  const failed = [];
+  const re = /^test (.+?)(?: - should panic)? \.\.\. FAILED\b/gm;
+  for (let m; (m = re.exec(batchOutput)) !== null; ) {
+    // Never solo-run a quarantined test: IGNORE holds tests that hang, crash,
+    // or OOM the machine (e.g. heap_limits) — a solo rerun re-triggers exactly
+    // that (killed our CI runner twice before this check).
+    if (!IGNORE.has(m[1])) failed.push(m[1]);
+  }
+  let out = "";
+  let rescued = 0;
+  for (const name of failed) {
+    // On Linux, cap each solo run's address space at 8 GiB: a test that
+    // allocates unboundedly (heap_limits-class) must die with its own OOM
+    // instead of taking down the CI runner VM. macOS has no working
+    // `ulimit -v`, so the plain spawn is used there (dev machines have swap;
+    // the output-silence watchdog still bounds wall clock).
+    const args = [name, "--exact", "--test-threads", "1", "--color", "never"];
+    const r =
+      os.platform() === "linux"
+        ? await streamWithWatchdog(
+            "/bin/sh",
+            ["-c", `ulimit -v 8388608; exec "$0" "$@"`, bin, ...args],
+            cwd,
+          )
+        : await streamWithWatchdog(bin, args, cwd);
+    if (/^test result: ok\. 1 passed/m.test(r.output)) {
+      out += `test ${name} ... ok\n`;
+      rescued++;
+    }
+  }
+  if (failed.length) {
+    console.error(`  [rescue] ${rescued}/${failed.length} batch-FAILED tests pass solo`);
   }
   return out;
 }

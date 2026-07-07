@@ -92,10 +92,15 @@ jobs:
           node-version: 22
       - name: rusty_v8 suite (${{ matrix.backend }})
         run: |
+          # --rescue solo-reruns batch-FAILED tests (poisoned PROCESS_LOCK
+          # fallout — see run.mjs rescueHiddenPasses). Opt-in per cell: a cell
+          # turning it on must refresh its baseline in the same PR.
+          RESCUE=""
+          if [ "${{ matrix.backend }}" = "quickjs" ]; then RESCUE="--rescue"; fi
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            node tests/harness/run.mjs rusty_v8 ${{ matrix.backend }} --check
+            node tests/harness/run.mjs rusty_v8 ${{ matrix.backend }} --check $RESCUE
           else
-            node tests/harness/run.mjs rusty_v8 ${{ matrix.backend }}
+            node tests/harness/run.mjs rusty_v8 ${{ matrix.backend }} $RESCUE
           fi
       - name: Upload run results
         if: always()
@@ -143,6 +148,12 @@ jobs:
             git submodule update --init --depth 1 vendor/rusty_v8 vendor/quickjs-ng vendor/wamr
           fi
       - uses: dtolnay/rust-toolchain@stable
+      # deno_core::tests::test_rebuild_async_stubs shells out to a stock
+      # `deno` CLI (and panics rather than skipping when it's absent); the
+      # macos-15 image stopped shipping one.
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
       - name: Install ninja (WebKit build)
         if: matrix.ninja
         run: brew install ninja

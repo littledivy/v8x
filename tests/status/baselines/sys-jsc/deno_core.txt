@@ -291,6 +291,7 @@ deno_core::source_map::tests::test_source_mapper
 deno_core::tasks::tests::test_spawner_parallel
 deno_core::tasks::tests::test_spawner_serial
 deno_core::tests::located_script_name
+deno_core::tests::test_rebuild_async_stubs
 deno_core::uv_compat::tests::check_fires_callback
 deno_core::uv_compat::tests::close_check_handle
 deno_core::uv_compat::tests::close_fires_callback

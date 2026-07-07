@@ -141,6 +141,18 @@ struct ObjTemplate {
   parent_fn: *const FnTemplate,
 }
 
+impl ObjTemplate {
+  /// Bare template for tape replay.
+  fn default_for_tape() -> ObjTemplate {
+    ObjTemplate {
+      internal_field_count: 0,
+      props: Vec::new(),
+      accessors: Vec::new(),
+      parent_fn: std::ptr::null(),
+    }
+  }
+}
+
 struct DispatchEntry {
   callback: FunctionCallback,
 
@@ -484,7 +496,7 @@ unsafe fn make_cfunc_magic(
   }
 }
 
-unsafe fn make_function_len(
+pub(crate) unsafe fn make_function_len(
   ctx: *mut JSContext,
   callback: FunctionCallback,
   data: JSValue,
@@ -585,6 +597,29 @@ fn ext_class_id_current() -> JSClassID {
   iso_state(iso).ext_class_id
 }
 
+/// Build a v8::External-style wrapper object (owned +1 JSValue). Shared by
+/// `v8__External__New` and the snapshot tape replayer.
+pub(crate) fn make_external_jsvalue(
+  isolate: *mut RealIsolate,
+  ctx: *mut JSContext,
+  value: *mut c_void,
+) -> JSValue {
+  if isolate.is_null() || ctx.is_null() {
+    return jsv_undefined();
+  }
+  let cid = iso_state(isolate).ext_class_id;
+  let obj = unsafe { JS_NewObjectClass(ctx, cid as c_int) };
+  if jsv_is_exception(&obj) {
+    return jsv_undefined();
+  }
+  unsafe { JS_SetOpaque(obj, value) };
+  external_values()
+    .lock()
+    .unwrap()
+    .insert(external_key(obj), value as usize);
+  obj
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__External__New(
   isolate: *mut RealIsolate,
@@ -598,18 +633,18 @@ pub extern "C" fn v8__External__New(
   if ctx.is_null() {
     return ptr::null();
   }
-  let cid = st.ext_class_id;
-  let obj = unsafe { JS_NewObjectClass(ctx, cid as c_int) };
-  if jsv_is_exception(&obj) {
+  let obj = make_external_jsvalue(isolate, ctx, value);
+  if jsv_is_undefined(&obj) {
     return ptr::null();
   }
-  unsafe { JS_SetOpaque(obj, value) };
-  external_values()
-    .lock()
-    .unwrap()
-    .insert(external_key(obj), value as usize);
-
-  intern::<External>(obj)
+  let h = intern::<External>(obj);
+  crate::quickjs::capi_tape::rec(|r| {
+    let e = r.ext_ref(value as usize, "External__New value");
+    let id = r.produced(h as *const _);
+    r.ops
+      .push(crate::quickjs::capi_tape::TapeOp::ExternalNew { id, ext_ref: e });
+  });
+  h
 }
 
 #[unsafe(no_mangle)]
@@ -675,7 +710,27 @@ pub extern "C" fn v8__Function__New(
     matches!(constructor_behavior, crate::ConstructorBehavior::Allow);
   let data = jsval_of(data_or_null);
   let f = unsafe { make_function_len(ctx, callback, data, length, construct) };
-  intern::<Function>(f)
+  let h = intern::<Function>(f);
+  crate::quickjs::capi_tape::rec(|r| {
+    let cid = r.ctx_id(ctx);
+    let cb_ref = r.ext_ref(callback as usize, "Function__New callback");
+    let data_id = if data_or_null.is_null() {
+      None
+    } else {
+      Some(r.arg(data_or_null as *const _, "Function__New data"))
+    };
+    let id = r.produced(h as *const _);
+    r.ops.push(crate::quickjs::capi_tape::TapeOp::FunctionNew {
+      id,
+      ctx: cid,
+      cb_ext_ref: cb_ref,
+      data: data_id,
+      data_ext: None,
+      name: None,
+      length,
+    });
+  });
+  h
 }
 
 #[unsafe(no_mangle)]
@@ -690,6 +745,56 @@ pub extern "C" fn v8__Function__Call(
   if ctx.is_null() || this.is_null() {
     return ptr::null();
   }
+  // Rust-driven call on a recording creator: tape it (the JS it runs is
+  // otherwise invisible to a restore). Argument/result ids resolved OUTSIDE
+  // the depth guard; the call body itself must not re-record.
+  let tape_ids = if crate::quickjs::capi_tape::recording() {
+    let mut out = None;
+    crate::quickjs::capi_tape::rec(|r| {
+      // A Rust-driven call whose callee or arguments the tape cannot
+      // represent (e.g. deno_core passing TypedArray views over
+      // process-local ContextState buffers to __setTickInfo) is per-process
+      // wiring: the embedder re-issues it on every start — including after a
+      // restore — so it must NOT be replayed. Skip silently.
+      let Some(fid) = r.try_arg(this as *const _) else {
+        r.ops.push(crate::quickjs::capi_tape::TapeOp::WiringCall);
+        return;
+      };
+      let rid = if recv.is_null() {
+        None
+      } else {
+        match r.try_arg(recv as *const _) {
+          Some(id) => Some(id),
+          None => {
+            r.ops.push(crate::quickjs::capi_tape::TapeOp::WiringCall);
+            return;
+          }
+        }
+      };
+      let mut aids = Vec::new();
+      let mut ok = true;
+      for i in 0..argc.max(0) as usize {
+        let ap = unsafe { *argv.add(i) };
+        match r.try_arg(ap as *const _) {
+          Some(id) => aids.push(id),
+          None => {
+            ok = false;
+            break;
+          }
+        }
+      }
+      if !ok {
+        r.ops.push(crate::quickjs::capi_tape::TapeOp::WiringCall);
+        return;
+      }
+      let cid = r.ctx_id(ctx);
+      out = Some((cid, fid, rid.unwrap_or(u32::MAX), aids));
+    });
+    out
+  } else {
+    None
+  };
+  let _jsg = crate::quickjs::capi_tape::JsDepthGuard::enter();
   let func = jsval_of(this);
   let recv_v = if recv.is_null() {
     jsv_undefined()
@@ -722,7 +827,38 @@ pub extern "C" fn v8__Function__Call(
     return ptr::null();
   }
 
-  intern::<Value>(r)
+  let h = intern::<Value>(r);
+  {
+    let iso_now = crate::quickjs::core::current_iso();
+    if !iso_now.is_null() {
+      crate::quickjs::capi_tape::on_wiring_call_done(iso_now);
+    }
+  }
+  if let Some((cid, fid, rid, aids)) = tape_ids {
+    drop(_jsg);
+    crate::quickjs::capi_tape::rec(|rr| {
+      let result = rr.produced(h as *const _);
+      // recv id u32::MAX encodes "undefined receiver" — replay maps it to a
+      // fresh UndefinedNew entry instead of a missing handle.
+      let recv_id = if rid == u32::MAX {
+        let id = rr.produced(std::ptr::null());
+        rr.ops
+          .push(crate::quickjs::capi_tape::TapeOp::UndefinedNew { id });
+        id
+      } else {
+        rid
+      };
+      rr.ops
+        .push(crate::quickjs::capi_tape::TapeOp::FunctionCall {
+          result,
+          ctx: cid,
+          callee: fid,
+          recv: recv_id,
+          args: aids,
+        });
+    });
+  }
+  h
 }
 
 #[unsafe(no_mangle)]
@@ -1145,6 +1281,67 @@ pub extern "C" fn v8__FunctionTemplate__New(
   }));
   unsafe { (*instance).parent_fn = t };
   register_template(t as usize, TemplKind::Func);
+  crate::quickjs::capi_tape::rec(|r| {
+    let data_ext = {
+      let d = unsafe { (*t).data };
+      let opaque = unsafe { JS_GetOpaque(d, ext_class_id_current()) };
+      if opaque.is_null() {
+        if !jsv_is_undefined(&d) {
+          r.incomplete
+            .push("FunctionTemplate__New data is not an External".into());
+        }
+        None
+      } else {
+        Some(r.ext_ref(opaque as usize, "FunctionTemplate__New data"))
+      }
+    };
+    let cb_ref = r.ext_ref(callback as usize, "FunctionTemplate__New cb");
+    let id = r.produced(t as *const _);
+    r.ops.push(crate::quickjs::capi_tape::TapeOp::TemplateNew {
+      id,
+      cb_ext_ref: cb_ref,
+      data_ext,
+      length,
+      constructable,
+    });
+  });
+  t as *const FunctionTemplate
+}
+
+/// Tape replay: reconstruct a FunctionTemplate (same struct the C-ABI ctor
+/// builds) with a remapped callback/data pointer.
+pub(crate) fn tape_make_template(
+  callback: FunctionCallback,
+  data_ptr: Option<*mut c_void>,
+  length: i32,
+  constructable: bool,
+) -> *const FunctionTemplate {
+  let ctx = crate::quickjs::core::current_ctx();
+  let data = match data_ptr {
+    Some(p) if !p.is_null() && !ctx.is_null() => {
+      make_external_jsvalue(crate::quickjs::core::current_iso(), ctx, p)
+    }
+    _ => jsv_undefined(),
+  };
+  let proto = Box::into_raw(Box::new(ObjTemplate::default_for_tape()));
+  let instance = Box::into_raw(Box::new(ObjTemplate::default_for_tape()));
+  register_template(proto as usize, TemplKind::Obj);
+  register_template(instance as usize, TemplKind::Obj);
+  let t = Box::into_raw(Box::new(FnTemplate {
+    callback,
+    data,
+    constructable,
+    length,
+    class_name: None,
+    proto,
+    instance,
+    parent: ptr::null(),
+    props: Vec::new(),
+    accessors: Vec::new(),
+    cached_proto: jsv_undefined(),
+  }));
+  unsafe { (*instance).parent_fn = t };
+  register_template(t as usize, TemplKind::Func);
   t as *const FunctionTemplate
 }
 
@@ -1208,7 +1405,41 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
   }
 
   timing::add(&timing::GETFN_N, &timing::GETFN_T, _tm);
-  intern::<Function>(f)
+  let h = intern::<Function>(f);
+  crate::quickjs::capi_tape::rec(|r| {
+    let cid = r.ctx_id(ctx);
+    let cb_ref = r.ext_ref(t.callback as usize, "FunctionTemplate callback");
+    // Data is a raw JSValue on the template. If it wraps an External whose
+    // pointer is in the ext table (deno's op ctx), encode that; otherwise
+    // record undefined and note the gap.
+    let data_ext = {
+      let opaque = unsafe { JS_GetOpaque(t.data, ext_class_id_current()) };
+      if opaque.is_null() {
+        if !jsv_is_undefined(&t.data) {
+          r.incomplete
+            .push("FunctionTemplate data is not an External".into());
+        }
+        None
+      } else {
+        Some(r.ext_ref(opaque as usize, "FunctionTemplate data External"))
+      }
+    };
+    if !t.props.is_empty() || !t.accessors.is_empty() {
+      r.incomplete
+        .push("FunctionTemplate with props/accessors".into());
+    }
+    let id = r.produced(h as *const _);
+    r.ops.push(crate::quickjs::capi_tape::TapeOp::FunctionNew {
+      id,
+      ctx: cid,
+      cb_ext_ref: cb_ref,
+      data: None,
+      data_ext,
+      name: None,
+      length: t.length,
+    });
+  });
+  h
 }
 
 unsafe fn build_prototype_object(

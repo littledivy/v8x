@@ -1249,6 +1249,21 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
   }
   let error = unsafe { *argv.add(0) };
   let sites = unsafe { *argv.add(1) };
+  if std::env::var_os("QJS_DEBUG_PST").is_some() {
+    unsafe {
+      let mut l = 0usize;
+      let s = JS_ToCStringLen(ctx, &mut l, error);
+      if !s.is_null() {
+        let b = std::slice::from_raw_parts(s as *const u8, l);
+        eprintln!(
+          "[QJS_PST] error={} rust_bt:\n{}",
+          std::string::String::from_utf8_lossy(b),
+          std::backtrace::Backtrace::force_capture()
+        );
+        JS_FreeCString(ctx, s);
+      }
+    }
+  }
 
   // Header: `name: message` (V8's first stack line).
   let name = unsafe { read_str_prop(ctx, error, c"name") }
@@ -1495,6 +1510,26 @@ unsafe fn source_mapped_stack(
   if ctx.is_null() {
     return None;
   }
+  // QuickJS builds `.stack` EAGERLY at throw time; V8 defers to the first
+  // `.stack` read. An exception thrown while the embedder is still
+  // initializing would reach its callback before any state pointer exists
+  // (deno_core's prepare_stack_trace_callback does Rc::from_raw on embedder
+  // slot 0 unconditionally). V8 can't call the callback in that window —
+  // match it: decline until the embedder stores something in slot 0
+  // (raw slot 1; slot 0 is the rusty_v8 annex).
+  {
+    let iso = super::core::current_iso();
+    if iso.is_null()
+      || super::core::iso_state(iso)
+        .data_slots
+        .get(1)
+        .copied()
+        .unwrap_or(std::ptr::null_mut())
+        .is_null()
+    {
+      return None;
+    }
+  }
   let sites = unsafe { build_callsites(ctx, frames) }?;
 
   let (error_obj, saved) = unsafe { take_prepare_stack_trace(ctx) };
@@ -1512,7 +1547,9 @@ unsafe fn source_mapped_stack(
         let ret = cb(c_l, e_l, s_l);
         // PrepareStackTraceCallbackRet wraps a private `*const Value`.
         let v: *const Value = std::mem::transmute(ret);
-        if v.is_null() {
+        if v.is_null() || jsv_is_undefined(&jsval_of(v)) {
+          // Null/undefined = the embedder declined (e.g. deno_core during
+          // runtime init, before its state exists) — keep our own string.
           None
         } else {
           Some(JS_DupValue(ctx, jsval_of(v)))

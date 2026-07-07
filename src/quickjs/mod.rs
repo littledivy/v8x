@@ -7,6 +7,7 @@
 
 mod allocator;
 mod arraybuffer;
+mod capi_tape;
 mod cli_extra;
 mod core;
 mod exception;
@@ -24,6 +25,7 @@ mod runtime;
 mod serializer;
 mod shims;
 mod simdutf;
+pub(crate) mod snapshot;
 mod string;
 mod value;
 mod wasm;

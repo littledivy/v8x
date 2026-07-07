@@ -283,6 +283,15 @@ pub use support::MapFnTo;
 pub const TYPED_ARRAY_MAX_SIZE_IN_HEAP: usize =
   binding::v8__TYPED_ARRAY_MAX_SIZE_IN_HEAP as _;
 
+/// The engine backend this build of the shim runs on.
+pub const V8X_ENGINE: &str = if cfg!(feature = "engine_quickjs") {
+  "quickjs"
+} else if cfg!(feature = "vendor_jsc") {
+  "jsc"
+} else {
+  "system-jsc"
+};
+
 #[cfg(test)]
 #[allow(unused)]
 pub(crate) fn initialize_v8() {

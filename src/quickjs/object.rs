@@ -97,7 +97,7 @@ fn just_bool(b: bool) -> MaybeBool {
 }
 
 #[inline]
-fn key_atom<T>(ctx: *mut JSContext, key: *const T) -> JSAtom {
+pub(crate) fn key_atom<T>(ctx: *mut JSContext, key: *const T) -> JSAtom {
   if key.is_null() {
     return 0;
   }
@@ -143,7 +143,13 @@ pub extern "C" fn v8__Object__New(isolate: *mut RealIsolate) -> *const Object {
   if o.tag == JS_TAG_EXCEPTION {
     return ptr::null();
   }
-  intern::<Object>(o)
+  let h = intern::<Object>(o);
+  crate::quickjs::capi_tape::rec(|r| {
+    let id = r.produced(h as *const _);
+    r.ops
+      .push(crate::quickjs::capi_tape::TapeOp::ObjectNew { id });
+  });
+  h
 }
 
 #[unsafe(no_mangle)]
@@ -205,7 +211,27 @@ pub extern "C" fn v8__Object__Get(
     return ptr::null();
   }
 
-  intern::<Value>(v)
+  let h = intern::<Value>(v);
+  crate::quickjs::capi_tape::rec(|r| {
+    // Reads on values the tape has never seen (e.g. `.message` of a caught
+    // init-time exception) are transient Rust-side inspections: skip them —
+    // the result cannot become load-bearing heap state, and only writes and
+    // calls mutate. If a skipped read's result IS referenced later, the
+    // later op reports the missing id.
+    let Some(oid) = r.try_arg(this as *const _) else {
+      return;
+    };
+    let kid = r.arg(key as *const _, "Object__Get key");
+    let id = r.produced(h as *const _);
+    let cid = r.ctx_id(ctx);
+    r.ops.push(crate::quickjs::capi_tape::TapeOp::GetProp {
+      id,
+      ctx: cid,
+      obj: oid,
+      key: kid,
+    });
+  });
+  h
 }
 
 #[unsafe(no_mangle)]
@@ -266,6 +292,31 @@ pub extern "C" fn v8__Object__Set(
     }
     return MaybeBool::Nothing;
   }
+  crate::quickjs::capi_tape::rec(|rr| {
+    let cid = rr.ctx_id(ctx);
+    let oid = rr.arg(this as *const _, "Object__Set this");
+    let kid = rr.arg(key as *const _, "Object__Set key");
+    let key_preview = unsafe {
+      let cs = JS_ToCString(ctx, jsval_of(key));
+      if cs.is_null() {
+        std::string::String::new()
+      } else {
+        let out = std::ffi::CStr::from_ptr(cs).to_string_lossy().into_owned();
+        JS_FreeCString(ctx, cs);
+        out
+      }
+    };
+    let vid = rr.arg(
+      value as *const _,
+      &format!("Object__Set value key={key_preview}"),
+    );
+    rr.ops.push(crate::quickjs::capi_tape::TapeOp::SetProp {
+      ctx: cid,
+      obj: oid,
+      key: kid,
+      value: vid,
+    });
+  });
   just_bool(r != 0)
 }
 
@@ -330,6 +381,17 @@ pub extern "C" fn v8__Object__SetPrototype(
   if r < 0 {
     return MaybeBool::Nothing;
   }
+  crate::quickjs::capi_tape::rec(|rr| {
+    let cid = rr.ctx_id(ctx);
+    let oid = rr.arg(this as *const _, "SetPrototype this");
+    let pid = rr.arg(prototype as *const _, "SetPrototype proto");
+    rr.ops
+      .push(crate::quickjs::capi_tape::TapeOp::SetPrototype {
+        ctx: cid,
+        obj: oid,
+        proto: pid,
+      });
+  });
   just_bool(r != 0)
 }
 
@@ -357,6 +419,18 @@ pub extern "C" fn v8__Object__CreateDataProperty(
   if r < 0 {
     return MaybeBool::Nothing;
   }
+  crate::quickjs::capi_tape::rec(|rr| {
+    let cid = rr.ctx_id(ctx);
+    let oid = rr.arg(this as *const _, "CreateDataProperty this");
+    let kid = rr.arg(key as *const _, "CreateDataProperty key");
+    let vid = rr.arg(value as *const _, "CreateDataProperty value");
+    rr.ops.push(crate::quickjs::capi_tape::TapeOp::SetProp {
+      ctx: cid,
+      obj: oid,
+      key: kid,
+      value: vid,
+    });
+  });
   just_bool(r != 0)
 }
 
@@ -384,6 +458,20 @@ pub extern "C" fn v8__Object__DefineOwnProperty(
   if r < 0 {
     return MaybeBool::Nothing;
   }
+  let raw_attr = read_attr(&attr);
+  crate::quickjs::capi_tape::rec(|rr| {
+    let cid = rr.ctx_id(ctx);
+    let oid = rr.arg(this as *const _, "DefineOwnProperty this");
+    let kid = rr.arg(key as *const _, "DefineOwnProperty key");
+    let vid = rr.arg(value as *const _, "DefineOwnProperty value");
+    rr.ops.push(crate::quickjs::capi_tape::TapeOp::DefineProp {
+      ctx: cid,
+      obj: oid,
+      key: kid,
+      value: vid,
+      attrs: raw_attr as u32,
+    });
+  });
   just_bool(r != 0)
 }
 
@@ -453,8 +541,12 @@ pub extern "C" fn v8__Object__Delete(
   if atom == 0 {
     return MaybeBool::Nothing;
   }
-  let r =
-    unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, JS_PROP_THROW) };
+  // flags=0, NOT JS_PROP_THROW: V8's `Object::Delete` reports an
+  // unconfigurable property as `false` without throwing (sloppy-mode delete
+  // semantics). JS_PROP_THROW would leave a pending exception the embedder
+  // never expects (deno_core deletes init-only props and ignores the result;
+  // the stale exception then aborts the next unrelated eval).
+  let r = unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, 0) };
   unsafe { JS_FreeAtom(ctx, atom) };
   if r < 0 {
     return MaybeBool::Nothing;
@@ -797,8 +889,12 @@ pub extern "C" fn v8__Object__DeleteIndex(
   if atom == 0 {
     return MaybeBool::Nothing;
   }
-  let r =
-    unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, JS_PROP_THROW) };
+  // flags=0, NOT JS_PROP_THROW: V8's `Object::Delete` reports an
+  // unconfigurable property as `false` without throwing (sloppy-mode delete
+  // semantics). JS_PROP_THROW would leave a pending exception the embedder
+  // never expects (deno_core deletes init-only props and ignores the result;
+  // the stale exception then aborts the next unrelated eval).
+  let r = unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, 0) };
   unsafe { JS_FreeAtom(ctx, atom) };
   if r < 0 {
     return MaybeBool::Nothing;
@@ -842,8 +938,12 @@ pub extern "C" fn v8__Object__DeletePrivate(
   if atom == 0 {
     return MaybeBool::Nothing;
   }
-  let r =
-    unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, JS_PROP_THROW) };
+  // flags=0, NOT JS_PROP_THROW: V8's `Object::Delete` reports an
+  // unconfigurable property as `false` without throwing (sloppy-mode delete
+  // semantics). JS_PROP_THROW would leave a pending exception the embedder
+  // never expects (deno_core deletes init-only props and ignores the result;
+  // the stale exception then aborts the next unrelated eval).
+  let r = unsafe { JS_DeleteProperty(ctx, jsval_of(this), atom, 0) };
   unsafe { JS_FreeAtom(ctx, atom) };
   if r < 0 {
     return MaybeBool::Nothing;

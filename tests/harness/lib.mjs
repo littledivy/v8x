@@ -143,9 +143,14 @@ export function parseLibtest(output) {
     const m = line.match(/^test (.+?) \.\.\. (ok|FAILED|ignored)\b/);
     if (!m) continue;
     const name = bin ? `${bin}::${m[1]}` : m[1];
-    if (m[2] === "ok") pass.add(name);
-    else if (m[2] === "FAILED") fail.add(name);
-    else skip.add(name);
+    if (m[2] === "ok") {
+      pass.add(name);
+      // A later solo-rerun "ok" (run.mjs --rescue) supersedes an earlier
+      // FAILED from the same binary's poisoned batch run.
+      fail.delete(name);
+    } else if (m[2] === "FAILED") {
+      if (!pass.has(name)) fail.add(name);
+    } else skip.add(name);
   }
   return { pass, fail, skip };
 }

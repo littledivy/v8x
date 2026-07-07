@@ -84,20 +84,32 @@ fn bc_cache_dir() -> Option<std::path::PathBuf> {
     .clone()
 }
 
-fn bc_key(source: &str) -> u64 {
-  use std::hash::{Hash, Hasher};
-  let mut h = std::collections::hash_map::DefaultHasher::new();
-  BC_MAGIC.hash(&mut h);
-  source.len().hash(&mut h);
-  source.hash(&mut h);
-  h.finish()
+/// FNV-1a over 8-byte lanes. Cache keys hash multiple MB of extension source
+/// on EVERY boot (each module eval + each transpile lookup); SipHash
+/// (DefaultHasher) was a measurable slice of denort startup. Collision
+/// resistance only needs to beat accidental edits, not adversaries.
+pub(crate) fn fast_content_hash(seed: u64, bytes: &[u8]) -> u64 {
+  const PRIME: u64 = 0x0000_0100_0000_01B3;
+  let mut h = 0xcbf2_9ce4_8422_2325u64 ^ seed;
+  let mut chunks = bytes.chunks_exact(8);
+  for c in &mut chunks {
+    h = (h ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(PRIME);
+  }
+  for &b in chunks.remainder() {
+    h = (h ^ b as u64).wrapping_mul(PRIME);
+  }
+  h ^ (bytes.len() as u64)
+}
+
+pub(crate) fn bc_key(source: &str) -> u64 {
+  fast_content_hash(BC_MAGIC as u64, source.as_bytes())
 }
 
 fn bc_path(key: u64) -> Option<std::path::PathBuf> {
   Some(bc_cache_dir()?.join(format!("{key:016x}.qbc")))
 }
 
-fn bc_load(key: u64) -> Option<Vec<u8>> {
+pub(crate) fn bc_load(key: u64) -> Option<Vec<u8>> {
   let p = bc_path(key)?;
   std::fs::read(p).ok().filter(|b| !b.is_empty())
 }
@@ -114,7 +126,7 @@ fn bc_store(key: u64, bytes: &[u8]) {
   }
 }
 
-unsafe fn bc_write(ctx: *mut JSContext, key: u64, obj: JSValue) {
+pub(crate) unsafe fn bc_write(ctx: *mut JSContext, key: u64, obj: JSValue) {
   if bc_cache_dir().is_none() {
     return;
   }
@@ -347,7 +359,16 @@ unsafe extern "C" fn dynamic_import_hook(
 
   let context = intern_ctx(ctx);
   let host_opts = intern::<Data>(jsv_undefined());
-  let referrer = intern_dup::<Value>(ctx, basename);
+  // Scripts compiled without a resource name run under our synthetic
+  // "<eval>"/"<anonymous>" filenames; V8 reports an EMPTY referrer for
+  // those (deno prints "(no referrer)").
+  let base_str = unsafe { jsval_to_rust(ctx, basename) };
+  let referrer = if base_str == "<eval>" || base_str == "<anonymous>" {
+    let empty = unsafe { JS_NewString(ctx, c"".as_ptr()) };
+    intern::<Value>(empty)
+  } else {
+    intern_dup::<Value>(ctx, basename)
+  };
   let spec_handle = intern_dup::<V8String>(ctx, specifier);
   let attrs_handle =
     intern::<FixedArray>(unsafe { build_dyn_attrs(ctx, attributes) });
@@ -403,6 +424,16 @@ unsafe extern "C" fn dynamic_import_hook(
   let mut args = [d, resolve, reject];
   let r = unsafe { JS_Call(ctx, chain, jsv_undefined(), 3, args.as_mut_ptr()) };
   unsafe { JS_FreeValue(ctx, r) };
+}
+
+/// Tape replay: bytecode-born module defs bypass the loader, so their
+/// `import.meta` must be populated explicitly before evaluation.
+pub(crate) fn populate_import_meta_for_replay(
+  ctx: *mut JSContext,
+  def: usize,
+  name: &str,
+) {
+  unsafe { populate_import_meta(ctx, def as *mut JSModuleDef, name) }
 }
 
 unsafe fn populate_import_meta(
@@ -565,9 +596,31 @@ fn lookup_resolved_specifier_any(spec: &str) -> Option<std::string::String> {
 }
 
 fn mark_all_modules_evaluated() {
+  // Evaluating a root pulls its whole dependency graph, so its deps flip to
+  // Evaluated together — but ONLY those. Query quickjs per-def instead of
+  // sweeping every registered module: a compiled-but-never-evaluated module
+  // (e.g. an extension entry point awaiting its own mod_evaluate) must stay
+  // Instantiated, or deno_core's "already evaluated" early-return skips it.
+  let evaluated_names: std::collections::HashSet<std::string::String> =
+    MODULE_DEF_CACHE.with(|c| {
+      c.borrow()
+        .iter()
+        .filter(|(_, d)| unsafe {
+          v82jsc_module_is_evaluated(**d as *mut JSModuleDef) != 0
+        })
+        .map(|(n, _)| n.clone())
+        .collect()
+    });
   MODULE_STATE.with(|t| {
     for m in t.borrow_mut().values_mut() {
-      m.status = ModuleStatus::Evaluated;
+      if m.status == ModuleStatus::Evaluated {
+        continue;
+      }
+      let def_evaluated = !m.module_def.is_null()
+        && unsafe { v82jsc_module_is_evaluated(m.module_def) != 0 };
+      if def_evaluated || evaluated_names.contains(&m.source_name) {
+        m.status = ModuleStatus::Evaluated;
+      }
     }
   });
   AFTER_FIRST_EVAL.with(|f| f.set(true));
@@ -576,6 +629,11 @@ fn mark_all_modules_evaluated() {
 #[allow(dead_code)]
 fn after_first_eval() -> bool {
   AFTER_FIRST_EVAL.with(|f| f.get())
+}
+
+/// Public key for a module wrapper: the underlying JS object pointer.
+pub(crate) fn module_obj_key(this: *const Module) -> usize {
+  handle_key(this)
 }
 
 #[inline]
@@ -1148,6 +1206,7 @@ thread_local! {
 }
 
 unsafe fn drain_jobs(rt: *mut JSRuntime) {
+  let _jsg = crate::quickjs::capi_tape::JsDepthGuard::enter();
   if rt.is_null() {
     return;
   }
@@ -1179,6 +1238,159 @@ pub(crate) fn register_module_source(name: &str, source: &str) {
 
 fn lookup_module_source_by_name(name: &str) -> Option<std::string::String> {
   MODULE_SOURCES_BY_NAME.with(|t| t.borrow().get(name).cloned())
+}
+
+/// Snapshot replay: fetch a registered module source by exact name.
+pub(crate) fn lookup_module_source(name: &str) -> Option<std::string::String> {
+  lookup_module_source_by_name(name)
+}
+
+/// Intern a module WRAPPER handle into an immortal slot. Wrapper pointers ARE
+/// module identity (every side table + the embedder's Globals key on them),
+/// so they must never be recycled by handle-scope pops the way arena slots
+/// are. Owns the +1 JSValue; reclaimed only at registry teardown.
+fn intern_module(v: JSValue) -> *const Module {
+  Box::into_raw(Box::new(v)) as *const Module
+}
+
+/// Tape replay: after the deferred ModuleEval entries ran, resolve each
+/// tape wrapper's def by name and lift its status to match the engine.
+/// Register a module def under a name in the def cache (tape replay: defs
+/// born from bytecode reads are invisible to the engine's loaded-module
+/// registry).
+pub(crate) fn cache_module_def(name: &str, def: usize) {
+  MODULE_DEF_CACHE.with(|c| {
+    c.borrow_mut().insert(name.to_string(), def);
+  });
+}
+
+pub(crate) fn refresh_tape_module_state(
+  ctx: *mut JSContext,
+  wrapper: *const Module,
+) {
+  let Some(name) =
+    with_module_state(wrapper as *const Module, |m| m.source_name.clone())
+  else {
+    return;
+  };
+  let mut def = MODULE_DEF_CACHE
+    .with(|c| c.borrow().get(&name).copied())
+    .unwrap_or(0) as *mut JSModuleDef;
+  if def.is_null() && !ctx.is_null() {
+    // ModuleEval replays through raw JS_Eval, which registers the def in the
+    // ENGINE registry, not our cache — look it up there.
+    if let Ok(cn) = CString::new(name.clone()) {
+      def = unsafe { v82jsc_get_loaded_module(ctx, cn.as_ptr()) }
+        as *mut JSModuleDef;
+    }
+  }
+  if std::env::var_os("QJS_DEBUG_TAPE").is_some() {
+    eprintln!(
+      "[qjs tape] refresh module {name}: def={def:?} src_known={}",
+      lookup_module_source_by_name(&name).is_some()
+    );
+  }
+  if !def.is_null() {
+    let evaluated = unsafe { v82jsc_module_is_evaluated(def) != 0 }
+      || unsafe { v82jsc_module_eval_started(def) != 0 };
+    with_module_state(wrapper as *const Module, |m| {
+      m.module_def = def;
+      if evaluated {
+        m.status = ModuleStatus::Evaluated;
+      }
+    });
+    return;
+  }
+  // No def and no source: a synthetic module (e.g. deno's virtual ops
+  // module). It WAS evaluated on the creator — reflect that; the restoring
+  // embedder rebuilt its exports natively (ops re-binding), and nothing
+  // imports the def through the engine after restore.
+  if lookup_module_source_by_name(&name).is_none() {
+    with_module_state(wrapper as *const Module, |m| {
+      m.status = ModuleStatus::Evaluated;
+    });
+  }
+}
+
+/// True when `p` is a registered module WRAPPER handle. Module identity in
+/// every side table is the wrapper pointer itself, so handle copies
+/// (Global/Local) must preserve it — see `core::is_non_value_handle`.
+pub(crate) fn is_module_wrapper(p: *const std::os::raw::c_void) -> bool {
+  // Module identity keys on the wrapped JS OBJECT pointer (handle_key), so
+  // any handle copy of a wrapper matches.
+  MODULE_STATE
+    .with(|t| t.borrow().contains_key(&handle_key(p as *const Module)))
+}
+
+/// Tape replay: recreate a module WRAPPER handle for `name`. The wrapper is
+/// deno_core's module identity (Global<Module> in its map); its side-table
+/// state carries just enough for post-restore queries — status comes from
+/// the def cache once the ModuleEval tape entry has run, the namespace path
+/// falls back to the def cache by name.
+pub(crate) fn tape_make_module_handle(
+  ctx: *mut JSContext,
+  name: &str,
+) -> *const Module {
+  let handle_val = unsafe { JS_NewObject(ctx) };
+  if handle_val.tag == JS_TAG_EXCEPTION {
+    let e = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, e) };
+    return std::ptr::null();
+  }
+  let this = intern_module(handle_val);
+  if this.is_null() {
+    return this;
+  }
+  let source = lookup_module_source_by_name(name).unwrap_or_default();
+  let def = MODULE_DEF_CACHE
+    .with(|c| c.borrow().get(name).copied())
+    .unwrap_or(0) as *mut JSModuleDef;
+  let evaluated =
+    !def.is_null() && unsafe { v82jsc_module_is_evaluated(def) != 0 };
+  record_module_state(
+    this,
+    ModuleState {
+      status: if evaluated {
+        ModuleStatus::Evaluated
+      } else {
+        ModuleStatus::Instantiated
+      },
+      module_def: def,
+      bytecode: None,
+      import_specifiers: parse_import_specifiers(&source),
+      import_offsets: Vec::new(),
+      import_attributes: Vec::new(),
+      source_imports: Vec::new(),
+      synthetic: false,
+      is_async: has_top_level_await(&source),
+      source_text: source.clone(),
+      source_name: name.to_string(),
+      source_map_url: None,
+    },
+  );
+  record_module_wrapper(name, this);
+  this
+}
+
+/// Reset every module registry on this thread. Called from
+/// `v8__Isolate__Dispose`: these thread-locals are keyed by module NAME or by
+/// pointers into the disposed runtime, so a later isolate on the same thread
+/// (e.g. a runtime restored from a snapshot the disposed isolate created)
+/// would otherwise resolve its modules to dangling defs from the old runtime.
+/// Values are dropped WITHOUT JS_FreeValue — their runtime is already gone.
+pub(crate) fn clear_thread_module_caches() {
+  MODULE_STATE.with(|c| c.borrow_mut().clear());
+  MODULE_SOURCES_BY_NAME.with(|c| c.borrow_mut().clear());
+  MODULE_DEF_CACHE.with(|c| c.borrow_mut().clear());
+  SYNTHETIC_EXPORTS.with(|c| c.borrow_mut().clear());
+  SYNTHETIC_NS_EXPORTS.with(|c| c.borrow_mut().clear());
+  SYNTHETIC_DEFS.with(|c| c.borrow_mut().clear());
+  SYNTHETIC_EVAL_STEPS.with(|c| c.borrow_mut().clear());
+  AFTER_FIRST_EVAL.with(|c| c.set(false));
+  RESOLVED_SPECIFIERS.with(|c| c.borrow_mut().clear());
+  MODULE_WRAPPER_BY_NAME.with(|c| c.borrow_mut().clear());
+  MAIN_MODULE_URL.with(|c| c.borrow_mut().take());
+  PENDING_SOURCE_IMPORTS.with(|c| c.borrow_mut().clear());
 }
 
 pub(crate) unsafe extern "C" fn module_normalize_callback(
@@ -1762,6 +1974,12 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
 
   register_module_source(&fname, &text);
   note_main_module(&fname);
+  super::capi_tape::rec(|r| {
+    r.ops.push(super::capi_tape::TapeOp::ModuleSource {
+      name: fname.as_bytes().to_vec(),
+      source: text.as_bytes().to_vec(),
+    });
+  });
   if std::env::var_os("QJS_DEBUG_MOD").is_some() {
     eprintln!("[QJS CompileModule] {fname} imports={import_specifiers:?}");
   }
@@ -1772,10 +1990,20 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
     unsafe { JS_FreeValue(ctx, exc) };
     return ptr::null();
   }
-  let this = intern::<Module>(handle_val);
+  let this = intern_module(handle_val);
   if this.is_null() {
     return ptr::null();
   }
+  super::capi_tape::rec(|r| {
+    let cid = r.ctx_id(ctx);
+    let id = r.produced(this as *const _);
+    r.module_obj_ids.insert(handle_key(this), id);
+    r.ops.push(super::capi_tape::TapeOp::ModuleCompile {
+      id,
+      ctx: cid,
+      name: fname.as_bytes().to_vec(),
+    });
+  });
   if !source_imports.is_empty() {
     PENDING_SOURCE_IMPORTS.with(|p| {
       p.borrow_mut().push((this, source_imports.clone()));
@@ -2500,6 +2728,35 @@ pub extern "C" fn v8__Module__Evaluate(
   })
   .unwrap_or((None, std::string::String::new(), std::string::String::new()));
   let source_name_dbg = source_name.clone();
+  // Snapshot recording: modules evaluated on a creator isolate replay via
+  // JS_Eval(TYPE_MODULE) of their registered source (deps come from the
+  // ModuleSource tape entries recorded at compile time).
+  if super::capi_tape::recording() && !source_name.is_empty() {
+    let tape_bc = lookup_module_source(&source_name)
+      .map(|src| bc_key(&src))
+      .and_then(bc_load)
+      .unwrap_or_default();
+    let src_bytes = lookup_module_source(&source_name)
+      .map(|s| s.into_bytes())
+      .unwrap_or_default();
+    // Result handle: the promise this Evaluate returns is created further
+    // down on several paths; the tape binds a fresh placeholder id instead
+    // (nothing dereferences a module-eval completion value via C).
+    super::capi_tape::rec(|r| {
+      let cid = r.ctx_id(ctx);
+      let rid = r.produced(std::ptr::null());
+      r.ops.push(super::capi_tape::TapeOp::ModuleEval {
+        result: rid,
+        ctx: cid,
+        name: source_name.as_bytes().to_vec(),
+        bytecode: tape_bc.clone(),
+        source: src_bytes.clone(),
+      });
+    });
+  }
+  // Everything below runs module bodies; C-API calls fired by ops inside them
+  // must not re-record (the ModuleEval entry above reproduces them).
+  let _jsg = super::capi_tape::JsDepthGuard::enter();
 
   if !source_name.is_empty() {
     let cached =
@@ -2815,7 +3072,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
     unsafe { JS_FreeValue(ctx, exc) };
     return ptr::null();
   }
-  let this = intern::<Module>(handle_val);
+  let this = intern_module(handle_val);
   if this.is_null() {
     return ptr::null();
   }
@@ -2828,6 +3085,19 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   SYNTHETIC_DEFS.with(|t| {
     t.borrow_mut().insert(handle_key(this), def as usize);
   });
+  {
+    let nm = unsafe { jsval_to_rust(ctx, jsval_of(module_name)) };
+    super::capi_tape::rec(|r| {
+      let cid = r.ctx_id(ctx);
+      let id = r.produced(this as *const _);
+      r.module_obj_ids.insert(handle_key(this), id);
+      r.ops.push(super::capi_tape::TapeOp::ModuleCompile {
+        id,
+        ctx: cid,
+        name: nm.as_bytes().to_vec(),
+      });
+    });
+  }
 
   let steps: SyntheticModuleEvaluationSteps<'static> =
     unsafe { std::mem::transmute(evaluation_steps) };
@@ -3178,16 +3448,19 @@ pub extern "C" fn v8__ModuleRequest__GetImportAttributes(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__IsSourceTextModule(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  let this = this as *const Module;
+  with_module_state(this, |m| !m.synthetic).unwrap_or(false)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__ScriptId(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  // V8 script ids are small ints; any per-module stable value works. Derive
+  // one from the handle-state key so it survives instantiate/evaluate.
+  ((this as usize >> 4) & 0x3fff_ffff) as crate::support::int
 }
 
 #[unsafe(no_mangle)]

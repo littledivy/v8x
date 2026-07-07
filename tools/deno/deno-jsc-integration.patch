@@ -1,5 +1,5 @@
 diff --git a/.cargo/config.toml b/.cargo/config.toml
-index 8fb5a3a8..b7753f83 100644
+index 8fb5a3a..b7753f8 100644
 --- a/.cargo/config.toml
 +++ b/.cargo/config.toml
 @@ -39,7 +39,7 @@ rustflags = [
@@ -11,8 +11,112 @@ index 8fb5a3a8..b7753f83 100644
  ]
  
  [target.'cfg(all())']
+diff --git a/Cargo.lock b/Cargo.lock
+index 1514e9b..9d66bfe 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2097,7 +2097,7 @@ dependencies = [
+  "walkdir",
+  "wasm_dep_analyzer",
+  "wasmparser",
+- "which 8.0.0",
++ "which",
+  "windows-sys 0.59.0",
+  "winres",
+  "zip",
+@@ -3260,7 +3260,7 @@ dependencies = [
+  "thiserror 2.0.12",
+  "unicode-normalization",
+  "url",
+- "which 8.0.0",
++ "which",
+  "windows-sys 0.59.0",
+ ]
+ 
+@@ -3475,7 +3475,7 @@ dependencies = [
+  "sys_traits",
+  "thiserror 2.0.12",
+  "tokio",
+- "which 8.0.0",
++ "which",
+  "windows-sys 0.59.0",
+ ]
+ 
+@@ -4904,16 +4904,6 @@ dependencies = [
+  "libc",
+ ]
+ 
+-[[package]]
+-name = "fslock"
+-version = "0.2.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "04412b8935272e3a9bae6f48c7bfff74c2911f60525404edfdd28e49884c3bfb"
+-dependencies = [
+- "libc",
+- "winapi",
+-]
+-
+ [[package]]
+ name = "funty"
+ version = "2.0.0"
+@@ -5220,15 +5210,6 @@ dependencies = [
+  "subtle",
+ ]
+ 
+-[[package]]
+-name = "gzip-header"
+-version = "1.0.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "95cc527b92e6029a62960ad99aa8a6660faa4555fe5f731aab13aa6a921795a2"
+-dependencies = [
+- "crc32fast",
+-]
+-
+ [[package]]
+ name = "h2"
+ version = "0.4.7"
+@@ -11170,18 +11151,12 @@ dependencies = [
+ [[package]]
+ name = "v8"
+ version = "149.4.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ebfd8d6919bfb4b627ca778a67f85ca45e5fb442d352947ba093798bdf9b07e0"
+ dependencies = [
+- "bindgen 0.72.1",
++ "bindgen 0.70.1",
+  "bitflags 2.9.3",
+- "fslock",
+- "gzip-header",
+- "home",
+- "miniz_oxide 0.8.8",
++ "cc",
+  "paste",
+  "temporal_capi",
+- "which 6.0.1",
+ ]
+ 
+ [[package]]
+@@ -11642,18 +11617,6 @@ dependencies = [
+  "web-sys",
+ ]
+ 
+-[[package]]
+-name = "which"
+-version = "6.0.1"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "8211e4f58a2b2805adfbefbc07bab82958fc91e3836339b1ab7ae32465dce0d7"
+-dependencies = [
+- "either",
+- "home",
+- "rustix 0.38.34",
+- "winsafe",
+-]
+-
+ [[package]]
+ name = "which"
+ version = "8.0.0"
 diff --git a/Cargo.toml b/Cargo.toml
-index 51bfbf14..1b03de10 100644
+index 51bfbf1..2e1102f 100644
 --- a/Cargo.toml
 +++ b/Cargo.toml
 @@ -105,7 +105,7 @@ deno_task_shell = "=0.33.0"
@@ -33,7 +137,7 @@ index 51bfbf14..1b03de10 100644
 +[patch.crates-io]
 +v8 = { path = "/Users/divy/gh/v82jsc", default-features = false, features = ["simdutf", "engine_jsc", "vendor_jsc"] }
 diff --git a/cli/args/flags.rs b/cli/args/flags.rs
-index 1a76c185..9586dcc5 100644
+index 1a76c18..9586dcc 100644
 --- a/cli/args/flags.rs
 +++ b/cli/args/flags.rs
 @@ -1484,7 +1484,7 @@ pub fn clap_root() -> Command {
@@ -46,7 +150,7 @@ index 1a76c185..9586dcc5 100644
    );
  
 diff --git a/libs/core/01_core.js b/libs/core/01_core.js
-index ff6044d3..4cb0afa4 100755
+index ff6044d..4cb0afa 100755
 --- a/libs/core/01_core.js
 +++ b/libs/core/01_core.js
 @@ -13,6 +13,7 @@
@@ -83,7 +187,7 @@ index ff6044d3..4cb0afa4 100755
  
    function createLazyLoader(specifier) {
 diff --git a/libs/core/runtime/jsruntime.rs b/libs/core/runtime/jsruntime.rs
-index 6f1ce4da..84ff9d4d 100644
+index 6f1ce4d..84ff9d4 100644
 --- a/libs/core/runtime/jsruntime.rs
 +++ b/libs/core/runtime/jsruntime.rs
 @@ -1566,12 +1566,24 @@ impl JsRuntime {
@@ -190,7 +294,7 @@ index 6f1ce4da..84ff9d4d 100644
      Ok(())
    }
 diff --git a/runtime/ops/bootstrap.rs b/runtime/ops/bootstrap.rs
-index 5f20276f..6f664a09 100644
+index 5f20276..6f664a0 100644
 --- a/runtime/ops/bootstrap.rs
 +++ b/runtime/ops/bootstrap.rs
 @@ -60,7 +60,10 @@ impl Default for SnapshotOptions {
@@ -206,7 +310,7 @@ index 5f20276f..6f664a09 100644
      }
    }
 diff --git a/runtime/transpile.rs b/runtime/transpile.rs
-index e0ecaa10..20320e20 100644
+index e0ecaa1..20320e2 100644
 --- a/runtime/transpile.rs
 +++ b/runtime/transpile.rs
 @@ -23,6 +23,67 @@ deno_error::js_error_wrapper!(
