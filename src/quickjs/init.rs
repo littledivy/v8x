@@ -6,13 +6,28 @@
 
 use crate::Platform;
 use crate::support::{SharedPtrBase, UniquePtr, long};
-use std::os::raw::{c_char, c_int};
+use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
 type RawEntropySource = unsafe extern "C" fn(*mut u8, usize) -> bool;
 
+unsafe extern "C" {
+  fn v8__Platform__CustomPlatform__BASE__PostTask(
+    context: *mut c_void,
+    isolate: *mut c_void,
+    task: *mut c_void,
+  );
+  fn v8__Platform__CustomPlatform__BASE__DROP(context: *mut c_void);
+}
+
+struct QuickJsPlatform {
+  custom_context: *mut c_void,
+}
+
 static ENTROPY_SOURCE: AtomicPtr<std::ffi::c_void> =
+  AtomicPtr::new(ptr::null_mut());
+static CURRENT_PLATFORM: AtomicPtr<std::ffi::c_void> =
   AtomicPtr::new(ptr::null_mut());
 
 pub(crate) fn has_entropy_source() -> bool {
@@ -28,8 +43,48 @@ pub(crate) fn fill_entropy(buf: &mut [u8]) -> bool {
   unsafe { callback(buf.as_mut_ptr(), buf.len()) }
 }
 
+pub(crate) fn post_foreground_task() {
+  let platform = CURRENT_PLATFORM.load(Ordering::SeqCst);
+  if platform.is_null() {
+    return;
+  }
+  let platform = platform as *mut QuickJsPlatform;
+  let context = unsafe { (*platform).custom_context };
+  if context.is_null() {
+    return;
+  }
+  unsafe {
+    v8__Platform__CustomPlatform__BASE__PostTask(
+      context,
+      super::core::current_iso() as *mut c_void,
+      ptr::null_mut(),
+    );
+  }
+}
+
+fn new_platform(custom_context: *mut c_void) -> *mut Platform {
+  Box::into_raw(Box::new(QuickJsPlatform { custom_context })) as *mut Platform
+}
+
+unsafe fn drop_platform(platform: *mut Platform) {
+  if platform.is_null() {
+    return;
+  }
+  if CURRENT_PLATFORM.load(Ordering::SeqCst) == platform as *mut c_void {
+    CURRENT_PLATFORM.store(ptr::null_mut(), Ordering::SeqCst);
+  }
+  let platform = unsafe { Box::from_raw(platform as *mut QuickJsPlatform) };
+  if !platform.custom_context.is_null() {
+    unsafe {
+      v8__Platform__CustomPlatform__BASE__DROP(platform.custom_context)
+    };
+  }
+}
+
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__V8__InitializePlatform(_platform: *mut Platform) {}
+pub extern "C" fn v8__V8__InitializePlatform(platform: *mut Platform) {
+  CURRENT_PLATFORM.store(platform as *mut c_void, Ordering::SeqCst);
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__Initialize() {}
@@ -40,7 +95,9 @@ pub extern "C" fn v8__V8__Dispose() -> bool {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__V8__DisposePlatform() {}
+pub extern "C" fn v8__V8__DisposePlatform() {
+  CURRENT_PLATFORM.store(ptr::null_mut(), Ordering::SeqCst);
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__GetVersion() -> *const c_char {
@@ -139,16 +196,16 @@ pub extern "C" fn v8__Platform__NewCustomPlatform(
   _thread_pool_size: c_int,
   _idle_task_support: bool,
   _unprotected: bool,
-  _context: *mut std::ffi::c_void,
+  context: *mut std::ffi::c_void,
 ) -> *mut Platform {
-  Box::into_raw(Box::new(0u8)) as *mut Platform
+  new_platform(context)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__NewSingleThreadedDefaultPlatform(
   _idle_task_support: bool,
 ) -> *mut Platform {
-  Box::into_raw(Box::new(0u8)) as *mut Platform
+  new_platform(ptr::null_mut())
 }
 
 #[unsafe(no_mangle)]
@@ -156,7 +213,7 @@ pub extern "C" fn v8__Platform__NewUnprotectedDefaultPlatform(
   _thread_pool_size: c_int,
   _idle_task_support: bool,
 ) -> *mut Platform {
-  Box::into_raw(Box::new(0u8)) as *mut Platform
+  new_platform(ptr::null_mut())
 }
 
 #[unsafe(no_mangle)]
@@ -164,7 +221,7 @@ pub extern "C" fn v8__Platform__NewDefaultPlatform(
   _thread_pool_size: c_int,
   _idle_task_support: bool,
 ) -> *mut Platform {
-  Box::into_raw(Box::new(0u8)) as *mut Platform
+  new_platform(ptr::null_mut())
 }
 
 #[unsafe(no_mangle)]
@@ -196,9 +253,7 @@ pub extern "C" fn v8__Platform__NotifyIsolateShutdown(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__DELETE(this: *mut Platform) {
-  if !this.is_null() {
-    unsafe { drop(Box::from_raw(this as *mut u8)) };
-  }
+  unsafe { drop_platform(this) };
 }
 
 #[repr(C)]
@@ -271,10 +326,7 @@ pub extern "C" fn std__shared_ptr__v8__Platform__reset(
       *refcount -= 1;
       if *refcount == 0 {
         drop(Box::from_raw(refcount));
-        let p = (*repr).platform as *mut u8;
-        if !p.is_null() {
-          drop(Box::from_raw(p));
-        }
+        drop_platform((*repr).platform as *mut Platform);
       }
     }
     (*repr).platform = ptr::null_mut();

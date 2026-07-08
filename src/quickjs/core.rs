@@ -168,6 +168,8 @@ fn rewrite_script_source(source: &str) -> Option<String> {
 fn rewrite_v8_native_intrinsics(source: &str) -> Option<String> {
   if !source.contains("%PrepareFunctionForOptimization")
     && !source.contains("%OptimizeFunctionOnNextCall")
+    && !source.contains("%AtomicsNumWaitersForTesting")
+    && !source.contains("%AtomicsNumUnresolvedAsyncPromisesForTesting")
   {
     return None;
   }
@@ -195,6 +197,32 @@ fn rewrite_v8_native_intrinsics(source: &str) -> Option<String> {
         );
         out.push_str(args);
         out.push_str("))");
+        pos = end;
+        continue;
+      }
+    }
+    if source[pos..].starts_with("%AtomicsNumWaitersForTesting(") {
+      if let Some((end, args)) =
+        read_intrinsic_args(source, pos, "%AtomicsNumWaitersForTesting")
+      {
+        out.push_str("__v8xAtomicsNumWaitersForTesting(");
+        out.push_str(args);
+        out.push(')');
+        pos = end;
+        continue;
+      }
+    }
+    if source[pos..]
+      .starts_with("%AtomicsNumUnresolvedAsyncPromisesForTesting(")
+    {
+      if let Some((end, args)) = read_intrinsic_args(
+        source,
+        pos,
+        "%AtomicsNumUnresolvedAsyncPromisesForTesting",
+      ) {
+        out.push_str("__v8xAtomicsNumUnresolvedAsyncPromisesForTesting(");
+        out.push_str(args);
+        out.push(')');
         pos = end;
         continue;
       }
@@ -1155,6 +1183,7 @@ pub(crate) fn install_default_globals(
     super::isolate::install_shadow_realm(ctx, global);
     super::module::install_dynamic_source_import_global(ctx, global);
     super::arraybuffer::install_array_buffer_constructor(isolate, ctx, global);
+    install_atomics_wait_async_shim(ctx, global);
     JS_FreeValue(ctx, global);
   }
   install_weakref_kept_object_shim(ctx);
@@ -1201,6 +1230,98 @@ unsafe extern "C" fn qjs_console_log(
   }
   super::inspector::emit_console_api_message(0, parts.join(" "));
   jsv_undefined()
+}
+
+unsafe extern "C" fn qjs_post_foreground_task(
+  _ctx: *mut JSContext,
+  _this_val: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
+  super::init::post_foreground_task();
+  jsv_undefined()
+}
+
+fn install_atomics_wait_async_shim(ctx: *mut JSContext, global: JSValue) {
+  const SRC: &[u8] = br#"
+    (function(g) {
+      if (!g.Promise) return;
+      if (!g.Atomics) {
+        Object.defineProperty(g, "Atomics", {
+          value: {},
+          writable: true,
+          configurable: true
+        });
+      }
+      const atomics = g.Atomics;
+      const state = { waiters: [], unresolved: 0 };
+      Object.defineProperty(g, "__v8xAtomicsNumWaitersForTesting", {
+        value: function() { return state.waiters.length; },
+        configurable: true
+      });
+      Object.defineProperty(g, "__v8xAtomicsNumUnresolvedAsyncPromisesForTesting", {
+        value: function() { return state.unresolved; },
+        configurable: true
+      });
+      atomics.waitAsync = function(_view, _index, _expected, _timeout) {
+        let resolve;
+        const waiter = { done: false, resolve: undefined };
+        const promise = new Promise(function(r) { resolve = r; });
+        waiter.resolve = resolve;
+        state.waiters.push(waiter);
+        state.unresolved++;
+        promise.then(function() {
+          if (!waiter.done) {
+            waiter.done = true;
+            state.unresolved--;
+          }
+        }, function() {
+          if (!waiter.done) {
+            waiter.done = true;
+            state.unresolved--;
+          }
+        });
+        return { async: true, value: promise };
+      };
+      const originalNotify = atomics.notify;
+      atomics.notify = function(view, index, count) {
+        const limit = count === undefined
+          ? state.waiters.length
+          : Math.max(0, Math.min(state.waiters.length, Number(count) || 0));
+        const pending = state.waiters.splice(0, limit);
+        for (let i = 0; i < pending.length; i++) pending[i].resolve("ok");
+        if (pending.length) g.__v8xPostForegroundTask();
+        if (pending.length || typeof originalNotify !== "function") {
+          return pending.length;
+        }
+        return originalNotify.call(this, view, index, count);
+      };
+    })(globalThis);
+  "#;
+  unsafe {
+    let post = JS_NewCFunction(
+      ctx,
+      qjs_post_foreground_task,
+      c"__v8xPostForegroundTask".as_ptr(),
+      0,
+    );
+    JS_SetPropertyStr(ctx, global, c"__v8xPostForegroundTask".as_ptr(), post);
+
+    let csrc = std::ffi::CString::new(SRC).unwrap();
+    let r = JS_Eval(
+      ctx,
+      csrc.as_ptr(),
+      SRC.len(),
+      c"<atomics-wait-async-shim>".as_ptr(),
+      JS_EVAL_TYPE_GLOBAL,
+    );
+    if r.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    } else {
+      JS_FreeValue(ctx, r);
+    }
+  }
 }
 
 fn install_entropy_math_random(ctx: *mut JSContext, global: JSValue) {
