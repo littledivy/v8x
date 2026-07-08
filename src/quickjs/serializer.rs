@@ -366,6 +366,7 @@ pub extern "C" fn v8__ValueSerializer__Release(
     *ptr = out;
     *size = len;
   }
+  st.buf.clear();
 }
 
 #[unsafe(no_mangle)]
