@@ -807,6 +807,83 @@ fn terminate_target(isolate: *const RealIsolate) -> *mut RealIsolate {
   }
 }
 
+pub(crate) fn set_near_heap_limit_callback(
+  isolate: *mut RealIsolate,
+  callback: crate::isolate::NearHeapLimitCallback,
+  data: *mut c_void,
+) {
+  let iso = terminate_target(isolate);
+  if iso.is_null() {
+    return;
+  }
+  let st = iso_state(iso);
+  st.near_heap_limit_callback_data
+    .store(data as usize, Ordering::Relaxed);
+  st.near_heap_limit_callback
+    .store(callback as usize, Ordering::Release);
+  if st.near_heap_limit_current.load(Ordering::Relaxed) == 0 {
+    const DEFAULT_LIMIT: usize = 16 * 1024 * 1024;
+    st.near_heap_limit_current
+      .store(DEFAULT_LIMIT, Ordering::Relaxed);
+    st.near_heap_limit_initial
+      .store(DEFAULT_LIMIT, Ordering::Relaxed);
+  }
+}
+
+pub(crate) fn maybe_drive_near_heap_limit_callback(isolate: *mut RealIsolate) {
+  let iso = terminate_target(isolate);
+  if iso.is_null() {
+    return;
+  }
+
+  let (rt, cb_addr, data, limit, initial) = {
+    let st = iso_state(iso);
+    let cb_addr = st.near_heap_limit_callback.load(Ordering::Acquire);
+    let limit = st.near_heap_limit_current.load(Ordering::Relaxed);
+    if cb_addr == 0
+      || limit == 0
+      || st.near_heap_limit_in_callback.swap(true, Ordering::AcqRel)
+    {
+      return;
+    }
+    (
+      st.rt,
+      cb_addr,
+      st.near_heap_limit_callback_data.load(Ordering::Relaxed) as *mut c_void,
+      limit,
+      st.near_heap_limit_initial.load(Ordering::Relaxed),
+    )
+  };
+
+  let mut usage = JSMemoryUsage::default();
+  if !rt.is_null() {
+    unsafe { JS_ComputeMemoryUsage(rt, &mut usage) };
+  }
+  let used = (usage.malloc_size.max(usage.memory_used_size)).max(0) as usize;
+  if used < limit {
+    iso_state(iso)
+      .near_heap_limit_in_callback
+      .store(false, Ordering::Release);
+    return;
+  }
+
+  let cb: crate::isolate::NearHeapLimitCallback =
+    unsafe { std::mem::transmute(cb_addr) };
+  let new_limit =
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+      cb(data, limit, initial)
+    }))
+    .unwrap_or(limit);
+
+  let st = iso_state(iso);
+  if new_limit > limit {
+    st.near_heap_limit_current
+      .store(new_limit, Ordering::Relaxed);
+  }
+  st.near_heap_limit_in_callback
+    .store(false, Ordering::Release);
+}
+
 /// QuickJS interrupt callback. Returns non-zero (→ uncatchable "interrupted"
 /// error that unwinds the running script) once `TerminateExecution` is
 /// requested. Polled at loop back-edges and calls, so it terminates a runaway
@@ -988,10 +1065,25 @@ pub extern "C" fn v8__Isolate__GetHeapStatistics(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__RemoveNearHeapLimitCallback(
-  _isolate: *mut RealIsolate,
+  isolate: *mut RealIsolate,
   _callback: crate::isolate::NearHeapLimitCallback,
-  _heap_limit: usize,
+  heap_limit: usize,
 ) {
+  let iso = terminate_target(isolate);
+  if iso.is_null() {
+    return;
+  }
+  let st = iso_state(iso);
+  st.near_heap_limit_callback.store(0, Ordering::Release);
+  st.near_heap_limit_callback_data.store(0, Ordering::Relaxed);
+  st.near_heap_limit_in_callback
+    .store(false, Ordering::Release);
+  if heap_limit != 0 {
+    st.near_heap_limit_current
+      .store(heap_limit, Ordering::Relaxed);
+    st.near_heap_limit_initial
+      .store(heap_limit, Ordering::Relaxed);
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1329,11 +1421,12 @@ pub extern "C" fn v8__ResourceConstraints__ConfigureDefaults(
 pub extern "C" fn v8__ResourceConstraints__ConfigureDefaultsFromHeapSize(
   constraints: *mut RC,
   _initial_heap_size_in_bytes: usize,
-  _maximum_heap_size_in_bytes: usize,
+  maximum_heap_size_in_bytes: usize,
 ) {
   if !constraints.is_null() {
     unsafe {
-      ptr::write_bytes(constraints as *mut u8, 0, std::mem::size_of::<RC>())
+      ptr::write_bytes(constraints as *mut u8, 0, std::mem::size_of::<RC>());
+      rc_set_word(constraints, 1, maximum_heap_size_in_bytes);
     };
   }
 }

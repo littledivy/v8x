@@ -1962,10 +1962,13 @@ pub extern "C" fn v8__Isolate__AddGCEpilogueCallback(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__AddNearHeapLimitCallback(
-  _isolate: *mut RealIsolate,
-  _callback: crate::isolate::NearHeapLimitCallback,
-  _data: *mut c_void,
+  isolate: *mut RealIsolate,
+  callback: crate::isolate::NearHeapLimitCallback,
+  data: *mut c_void,
 ) {
+  crate::quickjs::isolate::set_near_heap_limit_callback(
+    isolate, callback, data,
+  );
 }
 
 #[unsafe(no_mangle)]

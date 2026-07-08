@@ -46,8 +46,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 pub(crate) type WeakCallback = unsafe extern "C" fn(*const c_void);
 
@@ -357,6 +357,16 @@ pub(crate) struct IsoState {
   pub javascript_execution_disallow_scopes: Vec<crate::scope::OnFailure>,
 
   pub javascript_execution_allow_depth: usize,
+
+  pub near_heap_limit_callback: AtomicUsize,
+
+  pub near_heap_limit_callback_data: AtomicUsize,
+
+  pub near_heap_limit_current: AtomicUsize,
+
+  pub near_heap_limit_initial: AtomicUsize,
+
+  pub near_heap_limit_in_callback: AtomicBool,
 
   // Emulates `v8::Isolate::TerminateExecution`. Set by `TerminateExecution`,
   // cleared by `CancelTerminateExecution`; while set, the op-dispatch boundary
@@ -686,8 +696,14 @@ fn sab_funcs_table() -> *const JSSharedArrayBufferFunctions {
   &FUNCS.0
 }
 
+fn runtime_lifecycle_lock() -> MutexGuard<'static, ()> {
+  static LOCK: Mutex<()> = Mutex::new(());
+  LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
+  let _lifecycle_guard = runtime_lifecycle_lock();
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
@@ -748,6 +764,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   let external_references =
     super::snapshot::external_references_from_params(raw_params);
   let restored_snapshot = super::snapshot::blob_from_params(raw_params);
+  let heap_limit = heap_limit_from_params(raw_params);
   let restored_isolate_data = restored_snapshot
     .as_ref()
     .map(|blob| blob.isolate_data.iter().cloned().map(Some).collect())
@@ -788,6 +805,11 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     counter_lookup_callback,
     javascript_execution_disallow_scopes: Vec::new(),
     javascript_execution_allow_depth: 0,
+    near_heap_limit_callback: AtomicUsize::new(0),
+    near_heap_limit_callback_data: AtomicUsize::new(0),
+    near_heap_limit_current: AtomicUsize::new(heap_limit),
+    near_heap_limit_initial: AtomicUsize::new(heap_limit),
+    near_heap_limit_in_callback: AtomicBool::new(false),
     terminating: std::sync::atomic::AtomicBool::new(false),
     pending_interrupts: Mutex::new(Vec::new()),
     array_buffer_allocator,
@@ -811,6 +833,15 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     );
   }
   iso
+}
+
+fn heap_limit_from_params(
+  params: *const crate::isolate_create_params::raw::CreateParams,
+) -> usize {
+  if params.is_null() {
+    return 0;
+  }
+  unsafe { (*params).constraints.max_old_generation_size_in_bytes() }
 }
 
 #[unsafe(no_mangle)]
@@ -840,6 +871,7 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
   if this.is_null() {
     return;
   }
+  let _lifecycle_guard = runtime_lifecycle_lock();
   unsafe {
     let mut st = Box::from_raw(this as *mut IsoState);
 
@@ -1987,6 +2019,9 @@ pub extern "C" fn v8__Script__Run(
   }
   if result.tag != JS_TAG_EXCEPTION {
     super::isolate::run_microtasks_if_auto();
+    if !iso.is_null() {
+      super::isolate::maybe_drive_near_heap_limit_callback(iso);
+    }
     let h_result = intern::<Value>(unsafe { JS_DupValue(ctx, result) });
     unsafe { JS_FreeCString(ctx, cstr) };
     if result.tag != JS_TAG_EXCEPTION {
