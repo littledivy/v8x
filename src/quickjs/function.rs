@@ -2896,6 +2896,22 @@ unsafe extern "C" fn global_define_property_trampoline(
       };
 
       let mut intercepted = false;
+      if let Some(descriptor) = entry.handler.descriptor {
+        let (state, value) = unsafe {
+          call_named_getter(ctx, target, atom, &entry.handler, descriptor)
+        };
+        if state < 0 {
+          unsafe {
+            JS_FreeAtom(ctx, atom);
+            free_parsed_define_descriptor(ctx, desc);
+          }
+          return jsv_exception();
+        }
+        if state > 0 {
+          unsafe { JS_FreeValue(ctx, value) };
+        }
+      }
+
       if desc.flags & JS_PROP_HAS_VALUE_QJS != 0 {
         if let Some(setter) = entry.handler.setter {
           let state = unsafe {
@@ -4660,7 +4676,10 @@ fn install_global_define_property_handler(
   global: JSValue,
   handler: &NamedHandler,
 ) {
-  if handler.setter.is_none() && handler.definer.is_none() {
+  if handler.setter.is_none()
+    && handler.definer.is_none()
+    && handler.descriptor.is_none()
+  {
     return;
   }
 
