@@ -32,7 +32,7 @@ use crate::quickjs::core::{
 use crate::quickjs::quickjs_sys::*;
 use crate::{
   Array, Boolean, Context, Data, External, Function, FunctionCallback,
-  FunctionCallbackInfo, FunctionTemplate, Integer, Name, Object,
+  FunctionCallbackInfo, FunctionTemplate, Integer, Intrinsic, Name, Object,
   ObjectTemplate, PropertyAttribute, PropertyDescriptor, RealIsolate,
   Signature, String, Value,
 };
@@ -3453,6 +3453,7 @@ fn own_template_value(ctx: *mut JSContext, v: JSValue) -> JSValue {
 }
 
 const JS_TAG_TEMPLATE: i64 = 0x7633;
+const JS_TAG_INTRINSIC: i64 = 0x7634;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionTemplate__New(
@@ -3632,6 +3633,9 @@ unsafe fn build_prototype_object(
   if jsv_is_object(&t.cached_proto) {
     return t.cached_proto;
   }
+  if let Some(proto) = template_prototype_override(ctx, t) {
+    return proto;
+  }
   let _tm = timing::now();
   let proto_obj = unsafe { JS_NewObject(ctx) };
   let proto = unsafe { &*t.proto };
@@ -3678,11 +3682,14 @@ fn apply_props(
       continue;
     }
 
-    let value = materialize_template_value(ctx, value);
+    let (value, owned_value) = materialize_template_value(ctx, value);
     let v = unsafe { JS_DupValue(ctx, value) };
     unsafe {
       JS_DefinePropertyValue(ctx, obj, atom, v, prop_flags_from_attr(attr));
       JS_FreeAtom(ctx, atom);
+      if owned_value {
+        JS_FreeValue(ctx, value);
+      }
     }
   }
 }
@@ -3701,7 +3708,17 @@ fn prop_flags_from_attr(attr: u32) -> c_int {
   flags
 }
 
-fn materialize_template_value(ctx: *mut JSContext, value: JSValue) -> JSValue {
+fn materialize_template_value(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> (JSValue, bool) {
+  if value.tag == JS_TAG_INTRINSIC {
+    let intrinsic = unsafe { value.u.int32 };
+    return (materialize_intrinsic(ctx, intrinsic), true);
+  }
+  if value.tag != JS_TAG_TEMPLATE {
+    return (value, false);
+  }
   let raw = unsafe { value.u.ptr } as usize;
   let kind = TEMPLATES.with(|t| t.borrow().get(&raw).copied());
   match kind {
@@ -3710,17 +3727,165 @@ fn materialize_template_value(ctx: *mut JSContext, value: JSValue) -> JSValue {
         raw as *const FunctionTemplate,
         ctx as *const Context,
       );
-      if f.is_null() { value } else { jsval_of(f) }
+      if f.is_null() {
+        (value, false)
+      } else {
+        (jsval_of(f), false)
+      }
     }
     Some(TemplKind::Obj) => {
       let o = v8__ObjectTemplate__NewInstance(
         raw as *const ObjectTemplate,
         ctx as *const Context,
       );
-      if o.is_null() { value } else { jsval_of(o) }
+      if o.is_null() {
+        (value, false)
+      } else {
+        (jsval_of(o), false)
+      }
     }
-    None => value,
+    None => (value, false),
   }
+}
+
+fn materialize_intrinsic(ctx: *mut JSContext, intrinsic: i32) -> JSValue {
+  match intrinsic {
+    x if x == Intrinsic::ArrayPrototype as i32 => {
+      global_prototype(ctx, c"Array".as_ptr())
+    }
+    x if x == Intrinsic::ArrayProtoEntries as i32 => {
+      global_prototype_property(ctx, c"Array".as_ptr(), c"entries".as_ptr())
+    }
+    x if x == Intrinsic::ArrayProtoForEach as i32 => {
+      global_prototype_property(ctx, c"Array".as_ptr(), c"forEach".as_ptr())
+    }
+    x if x == Intrinsic::ArrayProtoKeys as i32 => {
+      global_prototype_property(ctx, c"Array".as_ptr(), c"keys".as_ptr())
+    }
+    x if x == Intrinsic::ArrayProtoValues as i32 => {
+      global_prototype_property(ctx, c"Array".as_ptr(), c"values".as_ptr())
+    }
+    x if x == Intrinsic::ErrorPrototype as i32 => {
+      global_prototype(ctx, c"Error".as_ptr())
+    }
+    x if x == Intrinsic::ObjProtoValueOf as i32 => {
+      global_prototype_property(ctx, c"Object".as_ptr(), c"valueOf".as_ptr())
+    }
+    _ => jsv_undefined(),
+  }
+}
+
+fn global_prototype(ctx: *mut JSContext, ctor_name: *const c_char) -> JSValue {
+  if ctx.is_null() {
+    return jsv_undefined();
+  }
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let ctor = JS_GetPropertyStr(ctx, global, ctor_name);
+    JS_FreeValue(ctx, global);
+    if !jsv_is_object(&ctor) {
+      if ctor.tag != JS_TAG_EXCEPTION {
+        JS_FreeValue(ctx, ctor);
+      }
+      return jsv_undefined();
+    }
+    let proto = JS_GetPropertyStr(ctx, ctor, c"prototype".as_ptr());
+    JS_FreeValue(ctx, ctor);
+    if proto.tag == JS_TAG_EXCEPTION {
+      jsv_undefined()
+    } else {
+      proto
+    }
+  }
+}
+
+fn global_prototype_property(
+  ctx: *mut JSContext,
+  ctor_name: *const c_char,
+  prop_name: *const c_char,
+) -> JSValue {
+  let proto = global_prototype(ctx, ctor_name);
+  if !jsv_is_object(&proto) {
+    return jsv_undefined();
+  }
+  unsafe {
+    let value = JS_GetPropertyStr(ctx, proto, prop_name);
+    JS_FreeValue(ctx, proto);
+    if value.tag == JS_TAG_EXCEPTION {
+      jsv_undefined()
+    } else {
+      value
+    }
+  }
+}
+
+fn template_prototype_override(
+  ctx: *mut JSContext,
+  t: &mut FnTemplate,
+) -> Option<JSValue> {
+  for idx in 0..t.props.len() {
+    let (key, value, _) = t.props[idx];
+    if !template_key_is(ctx, key, b"prototype") {
+      continue;
+    }
+
+    let (proto, owned_proto) = materialize_template_value(ctx, value);
+    if jsv_is_object(&proto) {
+      let cached = if owned_proto {
+        proto
+      } else {
+        unsafe { JS_DupValue(ctx, proto) }
+      };
+      t.cached_proto = cached;
+      return Some(cached);
+    }
+    if owned_proto {
+      unsafe { JS_FreeValue(ctx, proto) };
+    }
+  }
+  None
+}
+
+fn template_key_is(ctx: *mut JSContext, key: JSValue, expected: &[u8]) -> bool {
+  if ctx.is_null() {
+    return false;
+  }
+  let mut len = 0usize;
+  let s = unsafe { JS_ToCStringLen(ctx, &mut len, key) };
+  if s.is_null() {
+    return false;
+  }
+  let ok = unsafe { slice::from_raw_parts(s as *const u8, len) } == expected;
+  unsafe { JS_FreeCString(ctx, s) };
+  ok
+}
+
+fn intrinsic_template_value(intrinsic: Intrinsic) -> JSValue {
+  make_value(
+    JS_TAG_INTRINSIC,
+    JSValueUnion {
+      int32: intrinsic as i32,
+    },
+  )
+}
+
+fn store_intrinsic_template_property(
+  this: *const crate::Template,
+  key: *const Name,
+  intrinsic: Intrinsic,
+  attr: PropertyAttribute,
+) {
+  if this.is_null() {
+    return;
+  }
+
+  let raw = this as *const c_void as usize;
+  let ctx = current_ctx();
+  let key_owned = own_template_value(ctx, jsval_of(key));
+  let stored = intrinsic_template_value(intrinsic);
+  with_template_props(raw, |props| {
+    props.push((key_owned, stored, attr.as_u32_lenient()));
+  });
 }
 
 #[unsafe(no_mangle)]
@@ -4429,9 +4594,15 @@ pub extern "C" fn v8__Signature__New(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Template__SetIntrinsicDataProperty(
-  _this: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
-  _intrinsic: crate::Intrinsic,
-  _attr: crate::PropertyAttribute,
+  this: *const std::os::raw::c_void,
+  key: *const std::os::raw::c_void,
+  intrinsic: crate::Intrinsic,
+  attr: crate::PropertyAttribute,
 ) {
+  store_intrinsic_template_property(
+    this as *const crate::Template,
+    key as *const Name,
+    intrinsic,
+    attr,
+  );
 }
