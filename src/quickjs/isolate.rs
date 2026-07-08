@@ -2,7 +2,7 @@
 
 use crate::quickjs::core::{
   ctx_of, current_ctx, current_host_defined_options, current_iso, intern,
-  intern_dup, iso_state, jsval_of,
+  intern_ctx, intern_dup, iso_state, jsval_of,
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::support::int;
@@ -30,6 +30,195 @@ thread_local! {
   static CODEGEN_DISABLED: std::cell::RefCell<
     std::collections::HashMap<*mut JSContext, (JSValue, JSValue)>,
   > = std::cell::RefCell::new(std::collections::HashMap::new());
+
+  static SHADOW_REALM_CONTEXTS: std::cell::RefCell<
+    std::collections::HashMap<i32, *mut JSContext>,
+  > = std::cell::RefCell::new(std::collections::HashMap::new());
+
+  static NEXT_SHADOW_REALM_ID: std::cell::Cell<i32> = const { std::cell::Cell::new(1) };
+}
+
+// --- ShadowRealm host-create-context callback shim ---
+
+#[cfg(not(target_os = "windows"))]
+type ShadowRealmContextCallback = unsafe extern "C" fn(
+  initiator_context: crate::Local<Context>,
+) -> *mut Context;
+
+#[cfg(target_os = "windows")]
+type ShadowRealmContextCallback = unsafe extern "C" fn(
+  rv: *mut *mut Context,
+  initiator_context: crate::Local<Context>,
+) -> *mut *mut Context;
+
+thread_local! {
+  static SHADOW_REALM_CONTEXT_CB:
+    std::cell::Cell<Option<ShadowRealmContextCallback>> =
+      const { std::cell::Cell::new(None) };
+}
+
+pub(crate) unsafe fn install_shadow_realm(
+  ctx: *mut JSContext,
+  global: JSValue,
+) {
+  unsafe {
+    let existing = JS_GetPropertyStr(ctx, global, c"ShadowRealm".as_ptr());
+    let absent = jsv_is_undefined(&existing) || existing.tag == JS_TAG_NULL;
+    JS_FreeValue(ctx, existing);
+    if !absent {
+      return;
+    }
+    let ctor = JS_NewCFunction2(
+      ctx,
+      shadow_realm_constructor,
+      c"ShadowRealm".as_ptr(),
+      0,
+      JS_CFUNC_CONSTRUCTOR,
+      0,
+    );
+    JS_SetPropertyStr(ctx, global, c"ShadowRealm".as_ptr(), ctor);
+  }
+}
+
+#[cfg(not(target_os = "windows"))]
+unsafe fn call_shadow_realm_context_callback(
+  callback: ShadowRealmContextCallback,
+  initiator_context: crate::Local<Context>,
+) -> *mut Context {
+  unsafe { callback(initiator_context) }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn call_shadow_realm_context_callback(
+  callback: ShadowRealmContextCallback,
+  initiator_context: crate::Local<Context>,
+) -> *mut Context {
+  let mut out = ptr::null_mut();
+  unsafe {
+    callback(&mut out, initiator_context);
+  }
+  out
+}
+
+unsafe extern "C" fn shadow_realm_constructor(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
+  let Some(callback) = SHADOW_REALM_CONTEXT_CB.with(|c| c.get()) else {
+    return unsafe {
+      JS_ThrowTypeError(ctx, c"ShadowRealm host callback is not set".as_ptr())
+    };
+  };
+  let Some(initiator_context) =
+    (unsafe { crate::Local::from_raw(intern_ctx(ctx)) })
+  else {
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"ShadowRealm initiator context is unavailable".as_ptr(),
+      )
+    };
+  };
+  let context_ptr =
+    unsafe { call_shadow_realm_context_callback(callback, initiator_context) };
+  if context_ptr.is_null() {
+    if unsafe { JS_HasException(ctx) } {
+      return jsv_exception();
+    }
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"ShadowRealm host callback returned no context".as_ptr(),
+      )
+    };
+  }
+  let realm_ctx = ctx_of(context_ptr);
+  if realm_ctx.is_null() {
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"ShadowRealm host callback returned an invalid context".as_ptr(),
+      )
+    };
+  }
+  let id = NEXT_SHADOW_REALM_ID.with(|next| {
+    let id = next.get();
+    next.set(id.saturating_add(1));
+    id
+  });
+  SHADOW_REALM_CONTEXTS.with(|contexts| {
+    contexts.borrow_mut().insert(id, realm_ctx);
+  });
+  unsafe {
+    let obj = JS_NewObject(ctx);
+    JS_SetPropertyStr(
+      ctx,
+      obj,
+      c"__v8x_shadow_realm_id".as_ptr(),
+      JS_NewInt32(ctx, id),
+    );
+    let eval =
+      JS_NewCFunction(ctx, shadow_realm_evaluate, c"evaluate".as_ptr(), 1);
+    JS_SetPropertyStr(ctx, obj, c"evaluate".as_ptr(), eval);
+    obj
+  }
+}
+
+unsafe extern "C" fn shadow_realm_evaluate(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  if argc < 1 || argv.is_null() {
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"ShadowRealm evaluate requires source text".as_ptr(),
+      )
+    };
+  }
+  let id_val = unsafe {
+    JS_GetPropertyStr(ctx, this_val, c"__v8x_shadow_realm_id".as_ptr())
+  };
+  if id_val.tag == JS_TAG_EXCEPTION {
+    return id_val;
+  }
+  let mut id = 0;
+  if unsafe { JS_ToInt32(ctx, &mut id, id_val) } < 0 {
+    unsafe { JS_FreeValue(ctx, id_val) };
+    return jsv_exception();
+  }
+  unsafe { JS_FreeValue(ctx, id_val) };
+  let Some(realm_ctx) =
+    SHADOW_REALM_CONTEXTS.with(|contexts| contexts.borrow().get(&id).copied())
+  else {
+    return unsafe {
+      JS_ThrowTypeError(ctx, c"ShadowRealm context is unavailable".as_ptr())
+    };
+  };
+  let mut len = 0usize;
+  let source = unsafe { JS_ToCStringLen(ctx, &mut len, *argv) };
+  if source.is_null() {
+    return jsv_exception();
+  }
+  let result = unsafe {
+    JS_Eval(
+      realm_ctx,
+      source,
+      len,
+      c"<shadowrealm>".as_ptr(),
+      JS_EVAL_TYPE_GLOBAL,
+    )
+  };
+  unsafe { JS_FreeCString(ctx, source) };
+  if result.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(realm_ctx) };
+    return unsafe { JS_Throw(ctx, exc) };
+  }
+  result
 }
 
 unsafe extern "C" fn codegen_thrower(
@@ -947,21 +1136,23 @@ pub extern "C" fn v8__Isolate__SetHostImportModuleWithPhaseDynamicallyCallback(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetHostCreateShadowRealmContextCallback(
   _isolate: *mut RealIsolate,
-  _callback: unsafe extern "C" fn(
+  callback: unsafe extern "C" fn(
     initiator_context: crate::Local<Context>,
   ) -> *mut Context,
 ) {
+  SHADOW_REALM_CONTEXT_CB.with(|c| c.set(Some(callback)));
 }
 
 #[cfg(target_os = "windows")]
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetHostCreateShadowRealmContextCallback(
   _isolate: *mut RealIsolate,
-  _callback: unsafe extern "C" fn(
+  callback: unsafe extern "C" fn(
     rv: *mut *mut Context,
     initiator_context: crate::Local<Context>,
   ) -> *mut *mut Context,
 ) {
+  SHADOW_REALM_CONTEXT_CB.with(|c| c.set(Some(callback)));
 }
 
 thread_local! {

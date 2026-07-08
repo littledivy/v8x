@@ -980,6 +980,7 @@ pub(crate) fn install_default_globals(
     if super::init::has_entropy_source() {
       install_entropy_math_random(ctx, global);
     }
+    super::isolate::install_shadow_realm(ctx, global);
     super::module::install_dynamic_source_import_global(ctx, global);
     super::arraybuffer::install_array_buffer_constructor(isolate, ctx, global);
     JS_FreeValue(ctx, global);
