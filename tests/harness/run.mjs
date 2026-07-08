@@ -365,6 +365,7 @@ async function runCargoSelf() {
 
 async function runCargoDeno() {
   const denoDir = reqDenoDir();
+  ensureDenoV8Patch(denoDir);
   const env = {
     CARGO_TERM_COLOR: "never",
     NEXTEST_EXPERIMENTAL_LIBTEST_JSON: "1",
@@ -424,8 +425,11 @@ async function runCargoDeno() {
     ],
     { cwd: denoDir, env, echo: false },
   );
-  if (r.code !== 0) process.stderr.write(r.out);
-  return finalize(parseNextestJson(r.out));
+  const parsed = parseNextestJson(r.out);
+  if (r.code !== 0 && parsed.pass.size + parsed.fail.size + parsed.skip.size === 0) {
+    process.stderr.write(r.out);
+  }
+  return finalize(parsed);
 }
 
 function nextestBinaryPaths(output) {
@@ -494,6 +498,24 @@ function discoverBins(depsDir, names) {
 
 function reqDenoDir() {
   return opt("deno-dir") || die("--deno-dir=PATH required for this suite");
+}
+
+function ensureDenoV8Patch(denoDir) {
+  const cargoToml = path.join(denoDir, "Cargo.toml");
+  const text = fs.existsSync(cargoToml) ? fs.readFileSync(cargoToml, "utf8") : "";
+  const patchedPaths = [];
+  const re = /^\s*v8\s*=\s*\{[^}]*\bpath\s*=\s*"([^"]+)"/gm;
+  for (let m; (m = re.exec(text)) !== null; ) {
+    patchedPaths.push(path.resolve(denoDir, m[1]));
+  }
+  if (!patchedPaths.some((p) => p === ROOT)) {
+    const found = patchedPaths.length ? patchedPaths.join(", ") : "none";
+    die(
+      `deno checkout is not patched to use this v8x checkout.\n` +
+        `expected [patch.crates-io] v8 path: ${ROOT}\n` +
+        `found v8 patch path(s): ${found}`,
+    );
+  }
 }
 
 // Resolve the engine's version string for the dashboard label. Runs inside the
