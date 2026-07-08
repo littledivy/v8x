@@ -11,12 +11,13 @@ use crate::value_deserializer::{
 };
 use crate::value_serializer::{CxxValueSerializer, CxxValueSerializerDelegate};
 use crate::{
-  ArrayBuffer, Context, Local, Object, RealIsolate, SharedArrayBuffer, Value,
+  ArrayBuffer, Context, Local, Object, RealIsolate, SharedArrayBuffer,
+  String as V8String, Value,
 };
 
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
-use std::os::raw::c_int;
+use std::os::raw::{c_char, c_int};
 
 const JS_WRITE_OBJ_REFERENCE: c_int = 1 << 3;
 const JS_WRITE_OBJ_SAB: c_int = 1 << 2;
@@ -41,6 +42,9 @@ const TAG_ARRAY: u8 = b'A';
 const TAG_LEAF: u8 = b'L';
 const TAG_HOST: u8 = b'H';
 const TAG_OBJECT: u8 = b'O';
+const TAG_SAB: u8 = b'S';
+
+const SAB_CLONE_ERROR: &[u8] = b"#<SharedArrayBuffer> could not be cloned.";
 
 #[repr(C)]
 struct JSPropertyEnum {
@@ -50,6 +54,7 @@ struct JSPropertyEnum {
 const JS_GPN_OWN_ENUM: c_int = (1 << 0) | (1 << 1) | (1 << 4); // string|symbol|enum-only
 
 unsafe extern "C" {
+  fn JS_IsInstanceOf(ctx: *mut JSContext, val: JSValue, obj: JSValue) -> c_int;
   fn JS_ValueToAtom(ctx: *mut JSContext, val: JSValue) -> JSAtom;
   fn JS_GetOwnPropertyNames(
     ctx: *mut JSContext,
@@ -71,11 +76,26 @@ unsafe extern "C" {
   ) -> c_int;
   // deno's serializer-delegate trampolines (rusty_v8, same crate, #[no_mangle]).
   // In real V8 these are called BY the C++ serializer; here we drive them.
+  fn v8__ValueSerializer__Delegate__ThrowDataCloneError(
+    delegate: *mut CxxValueSerializerDelegate,
+    message: *const V8String,
+  );
+  fn v8__ValueSerializer__Delegate__GetSharedArrayBufferId(
+    delegate: *mut CxxValueSerializerDelegate,
+    isolate: *mut RealIsolate,
+    shared_array_buffer: *const SharedArrayBuffer,
+    clone_id: *mut u32,
+  ) -> bool;
   fn v8__ValueSerializer__Delegate__WriteHostObject(
     delegate: *mut CxxValueSerializerDelegate,
     isolate: *mut RealIsolate,
     object: *const Object,
   ) -> MaybeBool;
+  fn v8__ValueDeserializer__Delegate__GetSharedArrayBufferFromId(
+    delegate: *mut CxxValueDeserializerDelegate,
+    isolate: *mut RealIsolate,
+    transfer_id: u32,
+  ) -> *const SharedArrayBuffer;
   fn v8__ValueDeserializer__Delegate__ReadHostObject(
     delegate: *mut CxxValueDeserializerDelegate,
     isolate: *mut RealIsolate,
@@ -116,7 +136,37 @@ fn is_host_object(ctx: *mut JSContext, v: JSValue, brand: JSAtom) -> bool {
     && unsafe { JS_HasProperty(ctx, v, brand) } > 0
 }
 
-/// Does the value graph contain a transferred ArrayBuffer or a host object?
+fn is_shared_array_buffer(ctx: *mut JSContext, v: JSValue) -> bool {
+  if ctx.is_null() || !jsv_is_object(&v) {
+    return false;
+  }
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let ctor = JS_GetPropertyStr(
+      ctx,
+      global,
+      c"SharedArrayBuffer".as_ptr() as *const c_char,
+    );
+    let result = if jsv_is_object(&ctor) {
+      let r = JS_IsInstanceOf(ctx, v, ctor);
+      if r < 0 {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+        false
+      } else {
+        r > 0
+      }
+    } else {
+      false
+    };
+    JS_FreeValue(ctx, ctor);
+    JS_FreeValue(ctx, global);
+    result
+  }
+}
+
+/// Does the value graph contain a SharedArrayBuffer, transferred ArrayBuffer, or
+/// host object?
 /// Read-only (pure QuickJS, no delegate/scope machinery), so it is safe to run on
 /// every serialize; only walks arrays (host objects nested in plain objects need
 /// the not-yet-added object-enumeration path and stay on the default path).
@@ -129,6 +179,9 @@ fn graph_needs_walk(
 ) -> bool {
   if !jsv_is_object(&v) || depth > 200 {
     return false;
+  }
+  if is_shared_array_buffer(ctx, v) {
+    return true;
   }
   let ptr = unsafe { v.u.ptr } as usize;
   if st.xfer_ab.contains_key(&ptr) || is_host_object(ctx, v, brand) {
@@ -200,6 +253,7 @@ struct SerState {
   // (MessagePort / CryptoKey) via the delegate trampolines.
   isolate: *mut RealIsolate,
   delegate: *mut CxxValueSerializerDelegate,
+  data_clone_error: bool,
 }
 
 struct DeState {
@@ -266,6 +320,7 @@ pub extern "C" fn v8__ValueSerializer__CONSTRUCT(
     xfer_ab: std::collections::HashMap::new(),
     isolate,
     delegate,
+    data_clone_error: false,
   });
   unsafe {
     let slot = buf as *mut *mut SerState;
@@ -358,6 +413,7 @@ pub extern "C" fn v8__ValueSerializer__WriteValue(
   let ctx = ctx_of(context.as_non_null().as_ptr() as *const Context);
 
   let v = jsval_of::<Value>(value.as_non_null().as_ptr() as *const Value);
+  st.data_clone_error = false;
 
   // Default path: a single opaque `JS_WriteObject` blob under `TAG_VALUE`. Only
   // switch to the recursive graph walk when the value carries a transferred
@@ -376,9 +432,88 @@ pub extern "C" fn v8__ValueSerializer__WriteValue(
   }
   if ok {
     MaybeBool::JustTrue
+  } else if st.data_clone_error {
+    MaybeBool::Nothing
   } else {
     MaybeBool::JustFalse
   }
+}
+
+fn throw_sab_clone_error(st: &mut SerState, ctx: *mut JSContext) {
+  st.data_clone_error = true;
+  if ctx.is_null() || st.delegate.is_null() {
+    return;
+  }
+  let message = unsafe {
+    JS_NewStringLen(
+      ctx,
+      SAB_CLONE_ERROR.as_ptr() as *const c_char,
+      SAB_CLONE_ERROR.len(),
+    )
+  };
+  if message.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return;
+  }
+  let message = intern::<V8String>(message);
+  if !message.is_null() {
+    unsafe {
+      v8__ValueSerializer__Delegate__ThrowDataCloneError(st.delegate, message);
+    }
+    throw_error_if_clear(ctx, message);
+  }
+}
+
+fn throw_error_if_clear(ctx: *mut JSContext, message: *const V8String) {
+  if ctx.is_null() || message.is_null() || unsafe { JS_HasException(ctx) } {
+    return;
+  }
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let ctor = JS_GetPropertyStr(ctx, global, c"Error".as_ptr());
+    JS_FreeValue(ctx, global);
+    if ctor.tag == JS_TAG_EXCEPTION || !JS_IsConstructor(ctx, ctor) {
+      JS_FreeValue(ctx, ctor);
+      return;
+    }
+
+    let msg = JS_DupValue(ctx, jsval_of::<V8String>(message));
+    let mut args = [msg];
+    let err = JS_CallConstructor(ctx, ctor, 1, args.as_mut_ptr());
+    JS_FreeValue(ctx, ctor);
+    JS_FreeValue(ctx, msg);
+    if err.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      return;
+    }
+    JS_Throw(ctx, err);
+  }
+}
+
+fn get_shared_array_buffer_id(
+  st: &mut SerState,
+  ctx: *mut JSContext,
+  v: JSValue,
+) -> Option<u32> {
+  if st.delegate.is_null() {
+    return None;
+  }
+  let sab = intern::<SharedArrayBuffer>(unsafe { JS_DupValue(ctx, v) });
+  if sab.is_null() {
+    return None;
+  }
+  let mut id = 0;
+  let ok = unsafe {
+    v8__ValueSerializer__Delegate__GetSharedArrayBufferId(
+      st.delegate,
+      st.isolate,
+      sab,
+      &mut id,
+    )
+  };
+  ok.then_some(id)
 }
 
 /// Serialize one value as an opaque `JS_WriteObject` blob under `tag` (a length-
@@ -410,9 +545,10 @@ fn ser_blob(
   true
 }
 
-/// Recursive structured-clone walk (graph mode). Intercepts transferred
-/// ArrayBuffers (emit a transfer-id reference) and recurses arrays element-wise;
-/// everything else is an opaque `JS_WriteObject` leaf.
+/// Recursive structured-clone walk (graph mode). Intercepts SharedArrayBuffers
+/// and transferred ArrayBuffers (emit delegate/transfer-id references), then
+/// recurses arrays element-wise; everything else is an opaque `JS_WriteObject`
+/// leaf.
 fn ser_rec(
   st: &mut SerState,
   ctx: *mut JSContext,
@@ -420,6 +556,15 @@ fn ser_rec(
   brand: JSAtom,
 ) -> bool {
   if jsv_is_object(&v) {
+    if is_shared_array_buffer(ctx, v) {
+      if let Some(id) = get_shared_array_buffer_id(st, ctx, v) {
+        st.buf.push(TAG_SAB);
+        st.buf.extend_from_slice(&id.to_le_bytes());
+        return true;
+      }
+      throw_sab_clone_error(st, ctx);
+      return false;
+    }
     let ptr = unsafe { v.u.ptr } as usize;
     if let Some(&id) = st.xfer_ab.get(&ptr) {
       st.buf.push(TAG_XFER_AB);
@@ -703,6 +848,24 @@ fn de_rec(st: &mut DeState, ctx: *mut JSContext) -> JSValue {
         Some(&ab) => unsafe { JS_DupValue(ctx, ab) },
         None => jsv_exception(),
       }
+    }
+    Some(TAG_SAB) => {
+      let id = match read_le_u32(&st.buf, &mut st.pos) {
+        Some(i) => i,
+        None => return jsv_exception(),
+      };
+      let sab = unsafe {
+        v8__ValueDeserializer__Delegate__GetSharedArrayBufferFromId(
+          st.delegate,
+          st.isolate,
+          id,
+        )
+      };
+      if sab.is_null() {
+        return jsv_exception();
+      }
+      let v = jsval_of::<SharedArrayBuffer>(sab);
+      unsafe { JS_DupValue(ctx, v) }
     }
     Some(TAG_ARRAY) => {
       let len = match read_le_u32(&st.buf, &mut st.pos) {
