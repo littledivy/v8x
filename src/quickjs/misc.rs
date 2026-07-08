@@ -689,7 +689,21 @@ pub extern "C" fn v8__SnapshotCreator__CONSTRUCT(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__SnapshotCreator__DESTRUCT(_this: *mut c_void) {}
+pub extern "C" fn v8__SnapshotCreator__DESTRUCT(this: *mut c_void) {
+  if this.is_null() {
+    return;
+  }
+  let slot = this as *mut *mut RealIsolate;
+  let iso = unsafe { *slot };
+  if iso.is_null() {
+    return;
+  }
+  if crate::quickjs::core::v8__Isolate__GetCurrent() == iso {
+    crate::quickjs::core::v8__Isolate__Exit(iso);
+  }
+  crate::quickjs::core::v8__Isolate__Dispose(iso);
+  unsafe { *slot = ptr::null_mut() };
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__GetIsolate(

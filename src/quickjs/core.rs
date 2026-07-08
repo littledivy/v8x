@@ -454,6 +454,7 @@ pub(crate) fn note_compiled_bytecode(
 thread_local! {
     static CURRENT_ISO: RefCell<*mut RealIsolate> = const { RefCell::new(ptr::null_mut()) };
     static CURRENT_CTX: RefCell<*mut JSContext> = const { RefCell::new(ptr::null_mut()) };
+    static ISO_STACK: RefCell<Vec<*mut RealIsolate>> = const { RefCell::new(Vec::new()) };
 
     static LAST_ISO: RefCell<*mut RealIsolate> = const { RefCell::new(ptr::null_mut()) };
 }
@@ -481,6 +482,9 @@ fn set_current(iso: *mut RealIsolate) {
   CURRENT_ISO.with(|c| *c.borrow_mut() = iso);
   if !iso.is_null() {
     LAST_ISO.with(|c| *c.borrow_mut() = iso);
+    refresh_current_ctx(iso_state(iso));
+  } else {
+    CURRENT_CTX.with(|c| *c.borrow_mut() = ptr::null_mut());
   }
 }
 
@@ -495,6 +499,34 @@ fn clear_last_iso(iso: *mut RealIsolate) {
 fn refresh_current_ctx(st: &IsoState) {
   let ctx = st.contexts.last().copied().unwrap_or(st.ctx);
   CURRENT_CTX.with(|c| *c.borrow_mut() = ctx);
+}
+
+fn push_current_iso(iso: *mut RealIsolate) {
+  ISO_STACK.with(|s| s.borrow_mut().push(iso));
+  set_current(iso);
+}
+
+fn pop_current_iso(iso: *mut RealIsolate) {
+  let next = ISO_STACK.with(|s| {
+    let mut s = s.borrow_mut();
+    if s.last().copied() == Some(iso) {
+      s.pop();
+    } else if let Some(pos) = s.iter().rposition(|entry| *entry == iso) {
+      s.remove(pos);
+    }
+    s.last().copied().unwrap_or(ptr::null_mut())
+  });
+  set_current(next);
+}
+
+fn remove_current_iso(iso: *mut RealIsolate) {
+  let next = ISO_STACK.with(|s| {
+    let mut s = s.borrow_mut();
+    s.retain(|entry| *entry != iso);
+    s.last().copied().unwrap_or(ptr::null_mut())
+  });
+  set_current(next);
+  clear_last_iso(iso);
 }
 
 #[inline(always)]
@@ -853,21 +885,17 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
   // runtime restored from the snapshot this isolate just created) would
   // resolve its ext: modules to this isolate's dangling defs. Drop them all.
   super::module::clear_thread_module_caches();
-  set_current(ptr::null_mut());
-  clear_last_iso(this);
+  remove_current_iso(this);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__Enter(this: *mut RealIsolate) {
-  set_current(this);
-  if !this.is_null() {
-    refresh_current_ctx(iso_state(this));
-  }
+  push_current_iso(this);
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__Exit(_this: *mut RealIsolate) {
-  set_current(ptr::null_mut());
+pub extern "C" fn v8__Isolate__Exit(this: *mut RealIsolate) {
+  pop_current_iso(this);
 }
 
 #[unsafe(no_mangle)]
