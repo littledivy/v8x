@@ -39,8 +39,8 @@
 use super::quickjs_sys::*;
 use crate::support::SharedPtrBase;
 use crate::{
-  Allocator, Context, Data, Object, Primitive, RealIsolate, String as V8String,
-  Value,
+  Allocator, Context, Data, Object, ObjectTemplate, Primitive, RealIsolate,
+  String as V8String, Value,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -812,7 +812,7 @@ pub extern "C" fn v8__Undefined(isolate: *mut RealIsolate) -> *const Primitive {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__New(
   isolate: *mut RealIsolate,
-  _templ: *const c_void,
+  templ: *const c_void,
   _global_object: *const c_void,
   _microtask_queue: *mut c_void,
 ) -> *const Context {
@@ -835,6 +835,17 @@ pub extern "C" fn v8__Context__New(
     c
   };
   install_default_globals(isolate, ctx);
+  if !templ.is_null() {
+    unsafe {
+      let global = JS_GetGlobalObject(ctx);
+      super::function::apply_object_template_to_global(
+        ctx,
+        global,
+        templ as *const ObjectTemplate,
+      );
+      JS_FreeValue(ctx, global);
+    }
+  }
 
   // Snapshot restore: every plain Context::New on a snapshot-backed isolate
   // materializes the snapshot's default context (matches V8 semantics).

@@ -1268,6 +1268,10 @@ thread_local! {
         std::cell::RefCell::new(HashMap::new());
 }
 
+unsafe extern "C" {
+  fn JS_IsStrictEqual(ctx: *mut JSContext, op1: JSValue, op2: JSValue) -> bool;
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__SetEmbedderData(
   this: *const Context,
@@ -1374,6 +1378,38 @@ pub extern "C" fn v8__Context__SetSecurityToken(
   });
 }
 
+fn context_security_token(ctx: *mut JSContext) -> JSValue {
+  if ctx.is_null() {
+    return jsv_undefined();
+  }
+  let found = SECURITY_TOKEN.with(|m| m.borrow().get(&(ctx as usize)).copied());
+  match found {
+    Some(v) => unsafe { JS_DupValue(ctx, v) },
+    None => unsafe { JS_GetGlobalObject(ctx) },
+  }
+}
+
+pub(crate) fn contexts_share_security_token(
+  accessing_ctx: *mut JSContext,
+  target_ctx: *mut JSContext,
+) -> bool {
+  if accessing_ctx.is_null() || target_ctx.is_null() {
+    return false;
+  }
+  if accessing_ctx == target_ctx {
+    return true;
+  }
+
+  let accessing = context_security_token(accessing_ctx);
+  let target = context_security_token(target_ctx);
+  let matches = unsafe { JS_IsStrictEqual(accessing_ctx, accessing, target) };
+  unsafe {
+    JS_FreeValue(accessing_ctx, accessing);
+    JS_FreeValue(accessing_ctx, target);
+  }
+  matches
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetSecurityToken(
   this: *const Context,
@@ -1382,11 +1418,22 @@ pub extern "C" fn v8__Context__GetSecurityToken(
   if ctx.is_null() {
     return ptr::null();
   }
-  let found = SECURITY_TOKEN.with(|m| m.borrow().get(&(ctx as usize)).copied());
-  match found {
-    Some(v) => intern_dup::<Value>(ctx, v),
-    None => intern::<Value>(jsv_undefined()),
+  intern::<Value>(context_security_token(ctx))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__UseDefaultSecurityToken(this: *const Context) {
+  let ctx = ctx_of(this);
+  if ctx.is_null() {
+    return;
   }
+  SECURITY_TOKEN.with(|m| {
+    if let Some(old) = m.borrow_mut().remove(&(ctx as usize)) {
+      if old.tag < 0 {
+        unsafe { JS_FreeValue(ctx, old) };
+      }
+    }
+  });
 }
 
 #[unsafe(no_mangle)]

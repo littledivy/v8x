@@ -37,6 +37,7 @@ use crate::{
 };
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+use std::ptr::NonNull;
 
 unsafe extern "C" {
 
@@ -64,6 +65,12 @@ unsafe extern "C" {
   ) -> c_int;
 
   fn JS_ValueToAtom(ctx: *mut JSContext, val: JSValue) -> JSAtom;
+  fn JS_DupAtom(ctx: *mut JSContext, v: JSAtom) -> JSAtom;
+  fn JS_GetProperty(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: JSAtom,
+  ) -> JSValue;
   fn JS_DefinePropertyValue(
     ctx: *mut JSContext,
     this_obj: JSValue,
@@ -71,6 +78,18 @@ unsafe extern "C" {
     val: JSValue,
     flags: c_int,
   ) -> c_int;
+  fn JS_GetOwnPropertyNames(
+    ctx: *mut JSContext,
+    ptab: *mut *mut JSPropertyEnum,
+    plen: *mut u32,
+    obj: JSValue,
+    flags: c_int,
+  ) -> c_int;
+  fn JS_FreePropertyEnum(
+    ctx: *mut JSContext,
+    tab: *mut JSPropertyEnum,
+    len: u32,
+  );
 }
 
 type JSClassFinalizer = unsafe extern "C" fn(rt: *mut JSRuntime, val: JSValue);
@@ -133,10 +152,17 @@ struct TemplAccessor {
   attr: u32,
 }
 
+struct NamedHandler {
+  getter: Option<crate::NamedPropertyGetterCallback>,
+  data: JSValue,
+  owner_ctx: *mut JSContext,
+}
+
 struct ObjTemplate {
   internal_field_count: i32,
   props: Vec<(JSValue, JSValue, u32)>,
   accessors: Vec<TemplAccessor>,
+  named_handler: Option<NamedHandler>,
 
   parent_fn: *const FnTemplate,
 }
@@ -148,10 +174,19 @@ impl ObjTemplate {
       internal_field_count: 0,
       props: Vec::new(),
       accessors: Vec::new(),
+      named_handler: None,
       parent_fn: std::ptr::null(),
     }
   }
 }
+
+#[repr(C)]
+struct JSPropertyEnum {
+  is_enumerable: bool,
+  atom: JSAtom,
+}
+
+const JS_GPN_STRING_MASK_QJS: c_int = 1 << 0;
 
 struct DispatchEntry {
   callback: FunctionCallback,
@@ -164,6 +199,16 @@ struct DispatchEntry {
 thread_local! {
     static DISPATCH: std::cell::RefCell<Vec<DispatchEntry>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static NAMED_GETTER_DISPATCH: std::cell::RefCell<Vec<NamedGetterEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Copy)]
+struct NamedGetterEntry {
+  getter: crate::NamedPropertyGetterCallback,
+  data: JSValue,
+  owner_ctx: *mut JSContext,
+  atom: JSAtom,
 }
 
 pub(crate) mod timing {
@@ -248,6 +293,59 @@ fn lookup_dispatch(
       .get(idx as usize)
       .map(|e| (e.callback, e.data, e.instance))
   })
+}
+
+fn register_named_getter(
+  ctx: *mut JSContext,
+  handler: &NamedHandler,
+  atom: JSAtom,
+) -> c_int {
+  let Some(getter) = handler.getter else {
+    return 0;
+  };
+  NAMED_GETTER_DISPATCH.with(|d| {
+    let mut d = d.borrow_mut();
+    let idx = d.len() as c_int;
+    d.push(NamedGetterEntry {
+      getter,
+      data: unsafe { JS_DupValue(ctx, handler.data) },
+      owner_ctx: handler.owner_ctx,
+      atom: unsafe { JS_DupAtom(ctx, atom) },
+    });
+    idx
+  })
+}
+
+fn lookup_named_getter(idx: c_int) -> Option<NamedGetterEntry> {
+  NAMED_GETTER_DISPATCH.with(|d| d.borrow().get(idx as usize).copied())
+}
+
+unsafe fn materialize_named_handler_data(
+  ctx: *mut JSContext,
+  entry: NamedGetterEntry,
+) -> (JSValue, bool) {
+  if entry.owner_ctx.is_null() || entry.owner_ctx == ctx {
+    return (entry.data, false);
+  }
+
+  let obj = unsafe { JS_NewObject(ctx) };
+  let value =
+    unsafe { JS_GetProperty(entry.owner_ctx, entry.data, entry.atom) };
+  if value.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(entry.owner_ctx) };
+    unsafe { JS_FreeValue(entry.owner_ctx, exc) };
+    return (obj, true);
+  }
+  unsafe {
+    JS_DefinePropertyValue(
+      ctx,
+      obj,
+      entry.atom,
+      value,
+      JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE,
+    );
+  }
+  (obj, true)
 }
 
 unsafe fn dispatch(
@@ -467,6 +565,90 @@ unsafe extern "C" fn fn_construct_trampoline(
   result
 }
 
+unsafe extern "C" fn named_getter_trampoline(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+  magic: c_int,
+) -> JSValue {
+  let Some(entry) = lookup_named_getter(magic) else {
+    return jsv_undefined();
+  };
+
+  if !entry.owner_ctx.is_null()
+    && entry.owner_ctx != ctx
+    && !super::misc::contexts_share_security_token(ctx, entry.owner_ctx)
+  {
+    return unsafe { JS_ThrowTypeError(ctx, c"no access".as_ptr()) };
+  }
+
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let (callback_data, free_callback_data) =
+    unsafe { materialize_named_handler_data(ctx, entry) };
+
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: callback_data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Value>;
+
+  let key = unsafe { JS_AtomToValue(ctx, entry.atom) };
+  let key_handle = intern::<Name>(key);
+  let Some(key_handle) = NonNull::new(key_handle as *mut Name) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    return jsv_undefined();
+  };
+  let intercepted =
+    unsafe { (entry.getter)(crate::SealedLocal(key_handle), prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let intercepted = unsafe { std::mem::transmute_copy::<_, u32>(&intercepted) };
+  let result = if unsafe { JS_HasException(ctx) } {
+    jsv_exception()
+  } else if intercepted == 0 {
+    if jsv_is_undefined(&ret) {
+      jsv_undefined()
+    } else {
+      unsafe { JS_DupValue(ctx, ret) }
+    }
+  } else {
+    jsv_undefined()
+  };
+
+  if !iso.is_null() {
+    let st = iso_state(iso);
+    while st.handles.len() > saved_depth {
+      if let Some(slot) = st.handles.pop() {
+        unsafe {
+          JS_FreeValue(st.ctx, *slot);
+          drop(Box::from_raw(slot));
+        }
+      }
+    }
+  }
+  if free_callback_data {
+    unsafe { JS_FreeValue(ctx, callback_data) };
+  }
+
+  result
+}
+
 unsafe fn make_cfunc_magic(
   ctx: *mut JSContext,
   trampoline: unsafe extern "C" fn(
@@ -550,6 +732,29 @@ const JS_CFUNC_CONSTRUCTOR_OR_FUNC_MAGIC: c_int = 5;
 #[inline]
 fn cbinfo<'a>(this: *const FunctionCallbackInfo) -> &'a mut CbInfo {
   unsafe { &mut *(this as *mut CbInfo) }
+}
+
+unsafe fn prop_cbinfo<'a>(this: *const c_void) -> Option<&'a mut CbInfo> {
+  if this.is_null() {
+    return None;
+  }
+  let info_ptr = unsafe { *(this as *const *mut c_void) as *mut CbInfo };
+  if info_ptr.is_null() {
+    None
+  } else {
+    Some(unsafe { &mut *info_ptr })
+  }
+}
+
+fn property_return_scratch() -> usize {
+  thread_local! {
+      static SCRATCH: std::cell::UnsafeCell<JSValue> =
+          const { std::cell::UnsafeCell::new(JSValue {
+              u: JSValueUnion { int32: 0 },
+              tag: JS_TAG_UNDEFINED,
+          }) };
+  }
+  SCRATCH.with(|s| s.get() as usize)
 }
 
 unsafe extern "C" fn ext_finalize(_rt: *mut JSRuntime, _val: JSValue) {}
@@ -1158,12 +1363,14 @@ pub extern "C" fn v8__FunctionTemplate__New(
     internal_field_count: 0,
     props: Vec::new(),
     accessors: Vec::new(),
+    named_handler: None,
     parent_fn: ptr::null(),
   }));
   let instance = Box::into_raw(Box::new(ObjTemplate {
     internal_field_count: 0,
     props: Vec::new(),
     accessors: Vec::new(),
+    named_handler: None,
     parent_fn: ptr::null(),
   }));
   register_template(proto as usize, TemplKind::Obj);
@@ -1455,6 +1662,7 @@ pub extern "C" fn v8__ObjectTemplate__New(
     internal_field_count: 0,
     props: Vec::new(),
     accessors: Vec::new(),
+    named_handler: None,
     parent_fn: templ as *const FnTemplate,
   }));
   register_template(t as usize, TemplKind::Obj);
@@ -1493,6 +1701,83 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
   }
   timing::add(&timing::NEWINST_N, &timing::NEWINST_T, _tm);
   intern::<Object>(obj)
+}
+
+fn install_named_global_handler(
+  ctx: *mut JSContext,
+  global: JSValue,
+  handler: &NamedHandler,
+) {
+  if handler.getter.is_none() || jsv_is_undefined(&handler.data) {
+    return;
+  }
+
+  let mut tab: *mut JSPropertyEnum = ptr::null_mut();
+  let mut len: u32 = 0;
+  let rc = unsafe {
+    JS_GetOwnPropertyNames(
+      ctx,
+      &mut tab,
+      &mut len,
+      handler.data,
+      JS_GPN_STRING_MASK_QJS,
+    )
+  };
+  if rc < 0 {
+    return;
+  }
+
+  for i in 0..len {
+    let atom = unsafe { (*tab.add(i as usize)).atom };
+    let has = unsafe { JS_HasProperty(ctx, global, atom) };
+    if has != 0 {
+      continue;
+    }
+
+    let magic = register_named_getter(ctx, handler, atom);
+    let getter = unsafe {
+      make_cfunc_magic(
+        ctx,
+        named_getter_trampoline,
+        ptr::null(),
+        0,
+        JS_CFUNC_GENERIC_MAGIC,
+        magic,
+      )
+    };
+    unsafe {
+      JS_DefinePropertyGetSet(
+        ctx,
+        global,
+        atom,
+        getter,
+        jsv_undefined(),
+        JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE,
+      );
+    }
+  }
+
+  unsafe { JS_FreePropertyEnum(ctx, tab, len) };
+}
+
+pub(crate) fn apply_object_template_to_global(
+  ctx: *mut JSContext,
+  global: JSValue,
+  templ: *const ObjectTemplate,
+) {
+  if ctx.is_null() || templ.is_null() {
+    return;
+  }
+  let t = unsafe { &*(templ as *const ObjTemplate) };
+  super::object::set_internal_field_count_for_value(
+    global,
+    t.internal_field_count,
+  );
+  apply_props(ctx, global, &t.props);
+  apply_accessors(ctx, global, &t.accessors);
+  if let Some(handler) = &t.named_handler {
+    install_named_global_handler(ctx, global, handler);
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1651,24 +1936,31 @@ pub extern "C" fn v8__ObjectTemplate__SetNamedPropertyHandler(
   flags: crate::PropertyHandlerFlags,
 ) {
   let _ = (
-    this,
-    getter,
-    setter,
-    query,
-    deleter,
-    enumerator,
-    definer,
-    descriptor,
-    data_or_null,
-    flags,
+    setter, query, deleter, enumerator, definer, descriptor, flags,
   );
+  if this.is_null() {
+    return;
+  }
+  let data = if data_or_null.is_null() {
+    jsv_undefined()
+  } else {
+    own_template_value(current_ctx(), jsval_of(data_or_null))
+  };
+  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  t.named_handler = Some(NamedHandler {
+    getter,
+    data,
+    owner_ctx: current_ctx(),
+  });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__PropertyCallbackInfo__GetIsolate(
-  _this: *const c_void,
+  this: *const c_void,
 ) -> *mut RealIsolate {
-  current_iso()
+  unsafe { prop_cbinfo(this) }
+    .map(|info| info.isolate)
+    .unwrap_or_else(current_iso)
 }
 
 #[unsafe(no_mangle)]
@@ -1676,16 +1968,11 @@ pub extern "C" fn v8__PropertyCallbackInfo__GetReturnValue(
   this: *const c_void,
 ) -> usize {
   if this.is_null() {
-    thread_local! {
-        static SCRATCH: std::cell::UnsafeCell<JSValue> =
-            const { std::cell::UnsafeCell::new(JSValue {
-                u: JSValueUnion { int32: 0 },
-                tag: JS_TAG_UNDEFINED,
-            }) };
-    }
-    return SCRATCH.with(|s| s.get() as usize);
+    return property_return_scratch();
   }
-  let info = cbinfo(this as *const FunctionCallbackInfo);
+  let Some(info) = (unsafe { prop_cbinfo(this) }) else {
+    return property_return_scratch();
+  };
   (&mut *info.return_slot as *mut JSValue) as usize
 }
 
@@ -1696,7 +1983,9 @@ pub extern "C" fn v8__PropertyCallbackInfo__Holder(
   if this.is_null() {
     return ptr::null();
   }
-  let info = cbinfo(this as *const FunctionCallbackInfo);
+  let Some(info) = (unsafe { prop_cbinfo(this) }) else {
+    return ptr::null();
+  };
   intern_dup::<Object>(info.ctx, info.this)
 }
 
@@ -1808,9 +2097,12 @@ pub extern "C" fn v8__ObjectTemplate__SetNativeDataProperty(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__PropertyCallbackInfo__Data(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let Some(info) = (unsafe { prop_cbinfo(this) }) else {
+    return std::ptr::null();
+  };
+  intern_dup::<Value>(info.ctx, info.data) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]
