@@ -148,6 +148,20 @@ fn maybe_report_strict_mode_use(source: &[u8]) {
   }
 }
 
+pub(crate) fn note_compilation_cache_miss() {
+  let iso = current_iso();
+  if iso.is_null() {
+    return;
+  }
+  let callback = iso_state(iso).counter_lookup_callback;
+  if let Some(callback) = callback {
+    let counter = unsafe { callback(c"c:V8.CompilationCacheMisses".as_ptr()) };
+    if !counter.is_null() {
+      unsafe { *counter += 1 };
+    }
+  }
+}
+
 pub(crate) struct IsoState {
   pub rt: *mut JSRuntime,
 
@@ -210,6 +224,9 @@ pub(crate) struct IsoState {
   pub message_listeners: Vec<crate::isolate::MessageCallback>,
 
   pub use_counter_callback: Option<crate::UseCounterCallback>,
+
+  pub counter_lookup_callback:
+    Option<crate::isolate_create_params::CounterLookupCallback>,
 
   pub javascript_execution_disallow_scopes: Vec<crate::scope::OnFailure>,
 
@@ -539,12 +556,20 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   if std::env::var_os("QJS_NO_WASM").is_none() {
     super::wasm::install_webassembly(ctx);
   }
-  let array_buffer_allocator = if params.is_null() {
+  let raw_params = if params.is_null() {
+    ptr::null()
+  } else {
+    params as *const crate::isolate_create_params::raw::CreateParams
+  };
+  let counter_lookup_callback = if raw_params.is_null() {
+    None
+  } else {
+    unsafe { (*raw_params).counter_lookup_callback }
+  };
+  let array_buffer_allocator = if raw_params.is_null() {
     SharedPtrBase::<Allocator>::default()
   } else {
-    let params =
-      params as *const crate::isolate_create_params::raw::CreateParams;
-    let shared = unsafe { &(*params).array_buffer_allocator_shared };
+    let shared = unsafe { &(*raw_params).array_buffer_allocator_shared };
     let shared = shared as *const _ as *const SharedPtrBase<Allocator>;
     super::allocator::allocator_shared_copy(shared)
   };
@@ -572,6 +597,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     gc_epilogue_callbacks: Vec::new(),
     message_listeners: Vec::new(),
     use_counter_callback: None,
+    counter_lookup_callback,
     javascript_execution_disallow_scopes: Vec::new(),
     javascript_execution_allow_depth: 0,
     terminating: std::sync::atomic::AtomicBool::new(false),
@@ -895,11 +921,20 @@ pub(crate) fn install_default_globals(
 
     let existing = JS_GetPropertyStr(ctx, global, c"console".as_ptr());
     let absent = jsv_is_undefined(&existing) || existing.tag == JS_TAG_NULL;
-    JS_FreeValue(ctx, existing);
+    let console = if absent { JS_NewObject(ctx) } else { existing };
+    if jsv_is_object(&console) {
+      let log = JS_GetPropertyStr(ctx, console, c"log".as_ptr());
+      let log_absent = jsv_is_undefined(&log) || log.tag == JS_TAG_NULL;
+      JS_FreeValue(ctx, log);
+      if log_absent {
+        let log_fn = JS_NewCFunction(ctx, qjs_console_log, c"log".as_ptr(), 0);
+        JS_SetPropertyStr(ctx, console, c"log".as_ptr(), log_fn);
+      }
+    }
     if absent {
-      let console = JS_NewObject(ctx);
-
       JS_SetPropertyStr(ctx, global, c"console".as_ptr(), console);
+    } else {
+      JS_FreeValue(ctx, console);
     }
 
     let intl = JS_GetPropertyStr(ctx, global, c"Intl".as_ptr());
@@ -939,6 +974,15 @@ unsafe extern "C" fn qjs_gc(
   if !isolate.is_null() {
     super::misc::v8__Isolate__RequestGarbageCollectionForTesting(isolate, 0);
   }
+  jsv_undefined()
+}
+
+unsafe extern "C" fn qjs_console_log(
+  _ctx: *mut JSContext,
+  _this_val: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
   jsv_undefined()
 }
 
@@ -1284,6 +1328,7 @@ pub extern "C" fn v8__Script__Compile(
         stamp_syntax_error_location(ctx, name.as_ref());
         return ptr::null();
       }
+      note_compilation_cache_miss();
       JS_FreeValue(ctx, compiled);
     }
   }
