@@ -155,6 +155,87 @@ fn maybe_report_strict_mode_use(source: &[u8]) {
   }
 }
 
+fn rewrite_script_source(source: &str) -> Option<String> {
+  let mut rewritten = rewrite_v8_native_intrinsics(source);
+  let input = rewritten.as_deref().unwrap_or(source);
+  if let Some(text) = super::module::rewrite_dynamic_source_phase_imports(input)
+  {
+    rewritten = Some(text);
+  }
+  rewritten
+}
+
+fn rewrite_v8_native_intrinsics(source: &str) -> Option<String> {
+  if !source.contains("%PrepareFunctionForOptimization")
+    && !source.contains("%OptimizeFunctionOnNextCall")
+  {
+    return None;
+  }
+
+  let mut out = String::with_capacity(source.len());
+  let mut pos = 0usize;
+  while pos < source.len() {
+    if source[pos..].starts_with("%PrepareFunctionForOptimization(") {
+      if let Some((end, args)) =
+        read_intrinsic_args(source, pos, "%PrepareFunctionForOptimization")
+      {
+        out.push_str("(void (");
+        out.push_str(args);
+        out.push_str("))");
+        pos = end;
+        continue;
+      }
+    }
+    if source[pos..].starts_with("%OptimizeFunctionOnNextCall(") {
+      if let Some((end, args)) =
+        read_intrinsic_args(source, pos, "%OptimizeFunctionOnNextCall")
+      {
+        out.push_str(
+          "(globalThis.__v8x_fast_api_next_call=((globalThis.__v8x_fast_api_next_call|0)+1),void (",
+        );
+        out.push_str(args);
+        out.push_str("))");
+        pos = end;
+        continue;
+      }
+    }
+
+    let ch = source[pos..].chars().next().unwrap();
+    out.push(ch);
+    pos += ch.len_utf8();
+  }
+
+  (out != source).then_some(out)
+}
+
+fn read_intrinsic_args<'a>(
+  source: &'a str,
+  start: usize,
+  name: &str,
+) -> Option<(usize, &'a str)> {
+  let open = start + name.len();
+  if source.as_bytes().get(open) != Some(&b'(') {
+    return None;
+  }
+  let args_start = open + 1;
+  let mut depth = 1usize;
+  let mut pos = args_start;
+  while pos < source.len() {
+    match source.as_bytes()[pos] {
+      b'(' => depth += 1,
+      b')' => {
+        depth -= 1;
+        if depth == 0 {
+          return Some((pos + 1, &source[args_start..pos]));
+        }
+      }
+      _ => {}
+    }
+    pos += 1;
+  }
+  None
+}
+
 pub(crate) fn note_compilation_cache_miss() {
   let iso = current_iso();
   if iso.is_null() {
@@ -1503,7 +1584,7 @@ pub extern "C" fn v8__Script__Compile(
       maybe_report_strict_mode_use(source_bytes);
       let rewritten = std::str::from_utf8(source_bytes)
         .ok()
-        .and_then(super::module::rewrite_dynamic_source_phase_imports);
+        .and_then(rewrite_script_source);
       let (compile_ptr, compile_len) = match rewritten.as_ref() {
         Some(text) => (text.as_ptr() as *const c_char, text.len()),
         None => (cstr, len),

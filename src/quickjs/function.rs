@@ -32,12 +32,12 @@ use crate::quickjs::core::{
 use crate::quickjs::quickjs_sys::*;
 use crate::{
   Array, Boolean, Context, Data, External, Function, FunctionCallback,
-  FunctionCallbackInfo, FunctionTemplate, Integer, Intrinsic, Name, Object,
-  ObjectTemplate, PropertyAttribute, PropertyDescriptor, RealIsolate,
+  FunctionCallbackInfo, FunctionTemplate, Integer, Intrinsic, Local, Name,
+  Object, ObjectTemplate, PropertyAttribute, PropertyDescriptor, RealIsolate,
   Signature, String, Value,
 };
 use std::mem::MaybeUninit;
-use std::os::raw::{c_char, c_int, c_void};
+use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::ptr;
 use std::ptr::NonNull;
 use std::slice;
@@ -236,6 +236,7 @@ struct FnTemplate {
   accessors: Vec<TemplAccessor>,
 
   cached_proto: JSValue,
+  fast_overloads: Vec<RawCFunction>,
 }
 
 struct TemplAccessor {
@@ -332,6 +333,52 @@ struct DispatchEntry {
 
   instance: *const ObjTemplate,
   signature: *const FnTemplate,
+  fast_overloads: Vec<RawCFunction>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawCTypeInfo {
+  type_: u8,
+  flags_: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawCFunctionInfo {
+  return_info_: RawCTypeInfo,
+  repr_: u8,
+  arg_count_: c_uint,
+  arg_info_: *const RawCTypeInfo,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawCFunction {
+  address_: *const c_void,
+  type_info_: *const RawCFunctionInfo,
+}
+
+const CTYPE_VOID: u8 = 0;
+const CTYPE_UINT32: u8 = 4;
+const CTYPE_UINT64: u8 = 6;
+const CTYPE_POINTER: u8 = 9;
+const CTYPE_V8_VALUE: u8 = 10;
+const CTYPE_SEQ_ONE_BYTE_STRING: u8 = 11;
+const CTYPE_CALLBACK_OPTIONS: u8 = 255;
+const INT64_REPR_BIGINT: u8 = 1;
+
+fn copy_fast_overloads(
+  c_functions: *const crate::fast_api::CFunction,
+  c_functions_len: usize,
+) -> Vec<RawCFunction> {
+  if c_functions.is_null() || c_functions_len == 0 {
+    return Vec::new();
+  }
+  unsafe {
+    slice::from_raw_parts(c_functions as *const RawCFunction, c_functions_len)
+      .to_vec()
+  }
 }
 
 thread_local! {
@@ -431,6 +478,7 @@ fn register_dispatch(
   data: JSValue,
   instance: *const ObjTemplate,
   signature: *const FnTemplate,
+  fast_overloads: Vec<RawCFunction>,
 ) -> c_int {
   DISPATCH.with(|t| {
     let mut t = t.borrow_mut();
@@ -440,6 +488,7 @@ fn register_dispatch(
       data,
       instance,
       signature,
+      fast_overloads,
     });
     idx
   })
@@ -452,11 +501,18 @@ fn lookup_dispatch(
   JSValue,
   *const ObjTemplate,
   *const FnTemplate,
+  Vec<RawCFunction>,
 )> {
   DISPATCH.with(|t| {
-    t.borrow()
-      .get(idx as usize)
-      .map(|e| (e.callback, e.data, e.instance, e.signature))
+    t.borrow().get(idx as usize).map(|e| {
+      (
+        e.callback,
+        e.data,
+        e.instance,
+        e.signature,
+        e.fast_overloads.clone(),
+      )
+    })
   })
 }
 
@@ -2035,6 +2091,371 @@ unsafe fn dispatch(
   result
 }
 
+unsafe fn try_fast_dispatch(
+  ctx: *mut JSContext,
+  fast_overloads: &[RawCFunction],
+  data: JSValue,
+  this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> Option<JSValue> {
+  if fast_overloads.is_empty() || unsafe { fast_api_next_call_count(ctx) } <= 0
+  {
+    return None;
+  }
+
+  for overload in fast_overloads {
+    if let Some(result) =
+      unsafe { call_fast_overload(ctx, overload, data, this_val, argc, argv) }
+    {
+      unsafe { consume_fast_api_next_call(ctx) };
+      return Some(result);
+    }
+  }
+  None
+}
+
+unsafe fn fast_api_next_call_count(ctx: *mut JSContext) -> i32 {
+  if ctx.is_null() {
+    return 0;
+  }
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let value = unsafe {
+    JS_GetPropertyStr(ctx, global, c"__v8x_fast_api_next_call".as_ptr())
+  };
+  unsafe { JS_FreeValue(ctx, global) };
+  if value.tag == JS_TAG_EXCEPTION {
+    unsafe {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    return 0;
+  }
+  let mut count = 0;
+  if unsafe { JS_ToInt32(ctx, &mut count, value) } < 0 {
+    unsafe {
+      JS_FreeValue(ctx, value);
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    return 0;
+  }
+  unsafe { JS_FreeValue(ctx, value) };
+  count
+}
+
+unsafe fn consume_fast_api_next_call(ctx: *mut JSContext) {
+  let count = unsafe { fast_api_next_call_count(ctx) };
+  if count <= 0 || ctx.is_null() {
+    return;
+  }
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      global,
+      c"__v8x_fast_api_next_call".as_ptr(),
+      JS_NewInt32(ctx, count - 1),
+    );
+    JS_FreeValue(ctx, global);
+  }
+}
+
+unsafe fn call_fast_overload(
+  ctx: *mut JSContext,
+  overload: &RawCFunction,
+  data: JSValue,
+  this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> Option<JSValue> {
+  if overload.address_.is_null() || overload.type_info_.is_null() {
+    return None;
+  }
+  let info = unsafe { &*overload.type_info_ };
+  let arg_count = info.arg_count_ as usize;
+  if arg_count == 0 || info.arg_info_.is_null() {
+    return None;
+  }
+  let has_options = unsafe {
+    (*info.arg_info_.add(arg_count - 1)).type_ == CTYPE_CALLBACK_OPTIONS
+  };
+  let effective_arg_count = if has_options {
+    arg_count - 1
+  } else {
+    arg_count
+  };
+  if effective_arg_count != argc.max(0) as usize + 1 {
+    return None;
+  }
+
+  let mut arg_types = Vec::with_capacity(effective_arg_count);
+  for i in 0..effective_arg_count {
+    arg_types.push(unsafe { (*info.arg_info_.add(i)).type_ });
+  }
+  if arg_types.first().copied() != Some(CTYPE_V8_VALUE) {
+    return None;
+  }
+
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+
+  let recv = unsafe { fast_local_object(ctx, this_val) };
+  let mut options = unsafe { fast_options(ctx, iso, data) };
+  let options_ptr =
+    &mut options as *mut crate::fast_api::FastApiCallbackOptions<'static>;
+
+  let result =
+    match (info.return_info_.type_, arg_types.as_slice(), has_options) {
+      (CTYPE_UINT32, [CTYPE_V8_VALUE, CTYPE_UINT32, CTYPE_UINT32], true) => {
+        let a = unsafe { fast_u32(ctx, js_argv(argc, argv, 0)?)? };
+        let b = unsafe { fast_u32(ctx, js_argv(argc, argv, 1)?)? };
+        let f: unsafe fn(
+          Local<'static, Object>,
+          u32,
+          u32,
+          *mut crate::fast_api::FastApiCallbackOptions<'static>,
+        ) -> u32 = unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewUint32(ctx, f(recv, a, b, options_ptr)) }
+      }
+      (CTYPE_VOID, [CTYPE_V8_VALUE, CTYPE_V8_VALUE], false) => {
+        let value = unsafe { fast_local_value(ctx, js_argv(argc, argv, 0)?) };
+        let f: unsafe fn(Local<'static, Object>, Local<'static, Value>) =
+          unsafe { std::mem::transmute(overload.address_) };
+        unsafe { f(recv, value) };
+        jsv_undefined()
+      }
+      (
+        CTYPE_UINT32,
+        [CTYPE_V8_VALUE, CTYPE_UINT32, CTYPE_UINT32, CTYPE_V8_VALUE],
+        false,
+      ) => {
+        let a = unsafe { fast_u32(ctx, js_argv(argc, argv, 0)?)? };
+        let b = unsafe { fast_u32(ctx, js_argv(argc, argv, 1)?)? };
+        let value = unsafe { fast_local_value(ctx, js_argv(argc, argv, 2)?) };
+        let f: unsafe fn(
+          Local<'static, Object>,
+          u32,
+          u32,
+          Local<'static, Value>,
+        ) -> u32 = unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewUint32(ctx, f(recv, a, b, value)) }
+      }
+      (CTYPE_UINT32, [CTYPE_V8_VALUE, CTYPE_V8_VALUE], false) => {
+        let value = unsafe { fast_local_value(ctx, js_argv(argc, argv, 0)?) };
+        let f: unsafe fn(Local<'static, Object>, Local<'static, Value>) -> u32 =
+          unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewUint32(ctx, f(recv, value)) }
+      }
+      (CTYPE_UINT32, [CTYPE_V8_VALUE], false) => {
+        let f: unsafe fn(Local<'static, Object>) -> u32 =
+          unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewUint32(ctx, f(recv)) }
+      }
+      (CTYPE_VOID, [CTYPE_V8_VALUE, CTYPE_UINT32], false) => {
+        let a = unsafe { fast_u32(ctx, js_argv(argc, argv, 0)?)? };
+        let f: unsafe fn(Local<'static, Object>, u32) =
+          unsafe { std::mem::transmute(overload.address_) };
+        unsafe { f(recv, a) };
+        jsv_undefined()
+      }
+      (CTYPE_VOID, [CTYPE_V8_VALUE, CTYPE_UINT32, CTYPE_UINT32], false) => {
+        let a = unsafe { fast_u32(ctx, js_argv(argc, argv, 0)?)? };
+        let b = unsafe { fast_u32(ctx, js_argv(argc, argv, 1)?)? };
+        let f: unsafe fn(Local<'static, Object>, u32, u32) =
+          unsafe { std::mem::transmute(overload.address_) };
+        unsafe { f(recv, a, b) };
+        jsv_undefined()
+      }
+      (CTYPE_VOID, [CTYPE_V8_VALUE], true) => {
+        let f: unsafe fn(
+          Local<'static, Object>,
+          *mut crate::fast_api::FastApiCallbackOptions<'static>,
+        ) = unsafe { std::mem::transmute(overload.address_) };
+        unsafe { f(recv, options_ptr) };
+        jsv_undefined()
+      }
+      (CTYPE_UINT32, [CTYPE_V8_VALUE, CTYPE_SEQ_ONE_BYTE_STRING], false) => {
+        let (string, cstr) =
+          unsafe { fast_one_byte_string(ctx, js_argv(argc, argv, 0)?)? };
+        let f: unsafe fn(
+          Local<'static, Object>,
+          *const crate::fast_api::FastApiOneByteString,
+        ) -> u32 = unsafe { std::mem::transmute(overload.address_) };
+        let out = unsafe { f(recv, &*string) };
+        unsafe { JS_FreeCString(ctx, cstr) };
+        unsafe { JS_NewUint32(ctx, out) }
+      }
+      (CTYPE_UINT64, [CTYPE_V8_VALUE, CTYPE_UINT64, CTYPE_UINT64], false) => {
+        let a = unsafe { fast_u64(ctx, js_argv(argc, argv, 0)?, info.repr_)? };
+        let b = unsafe { fast_u64(ctx, js_argv(argc, argv, 1)?, info.repr_)? };
+        let f: unsafe fn(Local<'static, Object>, u64, u64) -> u64 =
+          unsafe { std::mem::transmute(overload.address_) };
+        let out = unsafe { f(recv, a, b) };
+        if info.repr_ == INT64_REPR_BIGINT {
+          unsafe { JS_NewBigUint64(ctx, out) }
+        } else {
+          unsafe { JS_NewFloat64(ctx, out as f64) }
+        }
+      }
+      (CTYPE_POINTER, [CTYPE_V8_VALUE, CTYPE_POINTER], false) => {
+        let ptr = unsafe { fast_pointer_arg(js_argv(argc, argv, 0)?)? };
+        let f: unsafe fn(Local<'static, Object>, *mut c_void) -> *mut c_void =
+          unsafe { std::mem::transmute(overload.address_) };
+        let out = unsafe { f(recv, ptr) };
+        if out.is_null() {
+          jsv_null()
+        } else {
+          make_external_jsvalue(iso, ctx, out)
+        }
+      }
+      _ => {
+        unsafe { restore_handle_depth(iso, saved_depth) };
+        return None;
+      }
+    };
+
+  let result = if unsafe { JS_HasException(ctx) } {
+    jsv_exception()
+  } else {
+    result
+  };
+  unsafe { restore_handle_depth(iso, saved_depth) };
+  Some(result)
+}
+
+unsafe fn restore_handle_depth(iso: *mut RealIsolate, saved_depth: usize) {
+  if iso.is_null() {
+    return;
+  }
+  let st = iso_state(iso);
+  while st.handles.len() > saved_depth {
+    if let Some(slot) = st.handles.pop() {
+      unsafe {
+        JS_FreeValue(st.ctx, *slot);
+        drop(Box::from_raw(slot));
+      }
+    }
+  }
+}
+
+unsafe fn js_argv(
+  argc: c_int,
+  argv: *mut JSValue,
+  index: usize,
+) -> Option<JSValue> {
+  if argv.is_null() || index >= argc.max(0) as usize {
+    return None;
+  }
+  Some(unsafe { *argv.add(index) })
+}
+
+unsafe fn fast_local_value(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> Local<'static, Value> {
+  let handle = intern_dup::<Value>(ctx, value);
+  unsafe { Local::from_raw_unchecked(handle) }
+}
+
+unsafe fn fast_local_object(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> Local<'static, Object> {
+  let handle = intern_dup::<Object>(ctx, value);
+  unsafe { Local::from_raw_unchecked(handle) }
+}
+
+unsafe fn fast_options(
+  ctx: *mut JSContext,
+  iso: *mut RealIsolate,
+  data: JSValue,
+) -> crate::fast_api::FastApiCallbackOptions<'static> {
+  crate::fast_api::FastApiCallbackOptions {
+    isolate: iso,
+    data: unsafe { fast_local_value(ctx, data) },
+  }
+}
+
+unsafe fn fast_u32(ctx: *mut JSContext, value: JSValue) -> Option<u32> {
+  let mut out = 0i32;
+  if unsafe { JS_ToInt32(ctx, &mut out, value) } < 0 {
+    unsafe {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    None
+  } else {
+    Some(out as u32)
+  }
+}
+
+unsafe extern "C" {
+  fn JS_ToBigUint64(ctx: *mut JSContext, pres: *mut u64, val: JSValue)
+  -> c_int;
+}
+
+unsafe fn fast_u64(
+  ctx: *mut JSContext,
+  value: JSValue,
+  repr: u8,
+) -> Option<u64> {
+  if repr == INT64_REPR_BIGINT {
+    let mut out = 0u64;
+    if unsafe { JS_ToBigUint64(ctx, &mut out, value) } < 0 {
+      unsafe {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+      }
+      return None;
+    }
+    Some(out)
+  } else {
+    let mut out = 0f64;
+    if unsafe { JS_ToFloat64(ctx, &mut out, value) } < 0 {
+      unsafe {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+      }
+      return None;
+    }
+    Some(out as u64)
+  }
+}
+
+unsafe fn fast_pointer_arg(value: JSValue) -> Option<*mut c_void> {
+  if jsv_is_null(&value) || jsv_is_undefined(&value) {
+    return Some(ptr::null_mut());
+  }
+  external_pointer_from_value(value)
+}
+
+unsafe fn fast_one_byte_string(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> Option<(Box<crate::fast_api::FastApiOneByteString>, *const c_char)> {
+  let mut len = 0usize;
+  let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, value) };
+  if cstr.is_null() {
+    unsafe {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    return None;
+  }
+  Some((
+    Box::new(crate::fast_api::FastApiOneByteString {
+      data: cstr,
+      length: len as u32,
+    }),
+    cstr,
+  ))
+}
+
 pub(crate) unsafe fn call_callback_for_wasm(
   ctx: *mut JSContext,
   callback: FunctionCallback,
@@ -2102,12 +2523,18 @@ unsafe extern "C" fn fn_trampoline(
   argv: *mut JSValue,
   magic: c_int,
 ) -> JSValue {
-  let Some((callback, data, _instance, signature)) = lookup_dispatch(magic)
+  let Some((callback, data, _instance, signature, fast_overloads)) =
+    lookup_dispatch(magic)
   else {
     return jsv_undefined();
   };
   if !receiver_matches_signature(ctx, this_val, signature) {
     return unsafe { JS_ThrowTypeError(ctx, c"Illegal invocation".as_ptr()) };
+  }
+  if let Some(result) = unsafe {
+    try_fast_dispatch(ctx, &fast_overloads, data, this_val, argc, argv)
+  } {
+    return result;
   }
   unsafe {
     dispatch(
@@ -2130,7 +2557,8 @@ unsafe extern "C" fn fn_construct_trampoline(
   argv: *mut JSValue,
   magic: c_int,
 ) -> JSValue {
-  let Some((callback, data, instance, _signature)) = lookup_dispatch(magic)
+  let Some((callback, data, instance, _signature, _fast_overloads)) =
+    lookup_dispatch(magic)
   else {
     return unsafe { JS_NewObject(ctx) };
   };
@@ -2770,6 +3198,7 @@ pub(crate) unsafe fn make_function_len(
       construct,
       ptr::null(),
       ptr::null(),
+      Vec::new(),
     )
   }
 }
@@ -2782,13 +3211,20 @@ unsafe fn make_function_len_with_instance(
   construct: bool,
   instance: *const ObjTemplate,
   signature: *const FnTemplate,
+  fast_overloads: Vec<RawCFunction>,
 ) -> JSValue {
   let data_owned = if jsv_is_undefined(&data) {
     jsv_undefined()
   } else {
     unsafe { JS_DupValue(ctx, data) }
   };
-  let magic = register_dispatch(callback, data_owned, instance, signature);
+  let magic = register_dispatch(
+    callback,
+    data_owned,
+    instance,
+    signature,
+    fast_overloads,
+  );
   let cproto = if construct {
     JS_CFUNC_CONSTRUCTOR_OR_FUNC_MAGIC
   } else {
@@ -3593,7 +4029,8 @@ pub extern "C" fn v8__FunctionTemplate__New(
   c_functions: *const crate::fast_api::CFunction,
   c_functions_len: usize,
 ) -> *const FunctionTemplate {
-  let _ = (isolate, side_effect_type, c_functions, c_functions_len);
+  let _ = (isolate, side_effect_type);
+  let fast_overloads = copy_fast_overloads(c_functions, c_functions_len);
   let constructable =
     matches!(constructor_behavior, crate::ConstructorBehavior::Allow);
   let signature = if signature_or_null.is_null() {
@@ -3644,6 +4081,7 @@ pub extern "C" fn v8__FunctionTemplate__New(
     props: Vec::new(),
     accessors: Vec::new(),
     cached_proto: jsv_undefined(),
+    fast_overloads,
   }));
   unsafe { (*instance).parent_fn = t };
   register_template(t as usize, TemplKind::Func);
@@ -3682,6 +4120,7 @@ pub(crate) fn tape_make_template(
     props: Vec::new(),
     accessors: Vec::new(),
     cached_proto: jsv_undefined(),
+    fast_overloads: Vec::new(),
   }));
   unsafe { (*instance).parent_fn = t };
   register_template(t as usize, TemplKind::Func);
@@ -3712,6 +4151,7 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
       t.constructable && t.signature.is_null(),
       t.instance,
       t.signature,
+      t.fast_overloads.clone(),
     )
   };
 
