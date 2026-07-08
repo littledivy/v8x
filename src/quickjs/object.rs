@@ -1685,6 +1685,21 @@ pub(crate) fn set_internal_field_count_for_value(
   });
 }
 
+pub(crate) fn internal_field_count_for_value(
+  obj: JSValue,
+) -> crate::support::int {
+  if !jsv_is_object(&obj) {
+    return 0;
+  }
+  let key = value_key(obj);
+  INTERNAL_FIELDS.with(|t| {
+    t.borrow()
+      .get(&key)
+      .map(|fields| fields.len() as crate::support::int)
+      .unwrap_or(0)
+  })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__Wrap(
   _isolate: *const RealIsolate,
@@ -1781,13 +1796,7 @@ pub extern "C" fn v8__Object__InternalFieldCount(
   if this.is_null() {
     return 0;
   }
-  let key = value_key(jsval_of(this));
-  INTERNAL_FIELDS.with(|t| {
-    t.borrow()
-      .get(&key)
-      .map(|fields| fields.len() as crate::support::int)
-      .unwrap_or(0)
-  })
+  internal_field_count_for_value(jsval_of(this))
 }
 
 #[unsafe(no_mangle)]

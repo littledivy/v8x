@@ -182,6 +182,9 @@ fn is_serialized_host_object(
   brand: JSAtom,
   custom_hosts: bool,
 ) -> bool {
+  if crate::quickjs::object::internal_field_count_for_value(v) > 0 {
+    return true;
+  }
   is_host_object(ctx, v, brand)
     || is_custom_host_object(st, ctx, v, custom_hosts)
 }
