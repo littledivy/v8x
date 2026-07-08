@@ -237,6 +237,9 @@ thread_local! {
 
     static SYNTHETIC_DEFS: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
 
+    static SYNTHETIC_EXPORT_NAMES: RefCell<HashMap<usize, std::collections::HashSet<std::string::String>>> =
+        RefCell::new(HashMap::new());
+
     static SYNTHETIC_EVAL_STEPS: RefCell<HashMap<usize, (SyntheticModuleEvaluationSteps<'static>, JSValue)>> =
         RefCell::new(HashMap::new());
 
@@ -1720,6 +1723,7 @@ pub(crate) fn clear_thread_module_caches() {
   SYNTHETIC_EXPORTS.with(|c| c.borrow_mut().clear());
   SYNTHETIC_NS_EXPORTS.with(|c| c.borrow_mut().clear());
   SYNTHETIC_DEFS.with(|c| c.borrow_mut().clear());
+  SYNTHETIC_EXPORT_NAMES.with(|c| c.borrow_mut().clear());
   SYNTHETIC_EVAL_STEPS.with(|c| c.borrow_mut().clear());
   AFTER_FIRST_EVAL.with(|c| c.set(false));
   RESOLVED_SPECIFIERS.with(|c| c.borrow_mut().clear());
@@ -3102,6 +3106,9 @@ pub extern "C" fn v8__Module__GetModuleNamespace(
       let mut exports =
         SYNTHETIC_NS_EXPORTS.with(|t| t.borrow().get(&def).cloned());
       if exports.is_none() {
+        exports = SYNTHETIC_EXPORTS.with(|t| t.borrow().get(&def).cloned());
+      }
+      if exports.is_none() {
         unsafe { run_synthetic_eval_steps(ctx, def as *mut JSModuleDef) };
         exports = SYNTHETIC_EXPORTS.with(|t| t.borrow().get(&def).cloned());
       }
@@ -3382,6 +3389,21 @@ pub extern "C" fn v8__Module__Evaluate(
   } else {
     None
   };
+
+  if with_module_state(this, |m| m.synthetic).unwrap_or(false) {
+    let already_evaluated =
+      with_module_state(this, |m| matches!(m.status, ModuleStatus::Evaluated))
+        .unwrap_or(false);
+    if !already_evaluated {
+      let def =
+        with_module_state(this, |m| m.module_def).unwrap_or(ptr::null_mut());
+      if !def.is_null() {
+        unsafe { run_synthetic_eval_steps(ctx, def) };
+      }
+      with_module_state(this, |m| m.status = ModuleStatus::Evaluated);
+    }
+    return make_resolved_promise(ctx);
+  }
 
   let already_evaluated = with_module_state(this, |m| {
     if !m.module_def.is_null() {
@@ -3710,6 +3732,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   if def.is_null() {
     return ptr::null();
   }
+  let mut export_names = std::collections::HashSet::new();
   if !export_names_raw.is_null() {
     for i in 0..export_names_len {
       let n = unsafe { *export_names_raw.add(i) };
@@ -3717,8 +3740,9 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
         continue;
       }
       let s = unsafe { jsval_to_rust(ctx, jsval_of(n)) };
-      if let Ok(c) = CString::new(s) {
+      if let Ok(c) = CString::new(s.as_str()) {
         unsafe { JS_AddModuleExport(ctx, def, c.as_ptr()) };
+        export_names.insert(s);
       }
     }
   }
@@ -3742,6 +3766,9 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   SYNTHETIC_DEFS.with(|t| {
     t.borrow_mut().insert(handle_key(this), def as usize);
   });
+  SYNTHETIC_EXPORT_NAMES.with(|t| {
+    t.borrow_mut().insert(def as usize, export_names);
+  });
   {
     let nm = unsafe { jsval_to_rust(ctx, jsval_of(module_name)) };
   }
@@ -3756,7 +3783,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   record_module_state(
     this,
     ModuleState {
-      status: ModuleStatus::Instantiated,
+      status: ModuleStatus::Uninstantiated,
       module_def: def,
       bytecode: None,
       import_specifiers: Vec::new(),
@@ -3854,6 +3881,27 @@ pub extern "C" fn v8__Module__SetSyntheticModuleExport(
     return MaybeBool::JustFalse;
   };
   let name = unsafe { jsval_to_rust(ctx, jsval_of(export_name)) };
+  let declared = SYNTHETIC_EXPORT_NAMES.with(|t| {
+    t.borrow()
+      .get(&(def as usize))
+      .map(|names| names.contains(&name))
+      .unwrap_or(false)
+  });
+  if !declared {
+    if let Ok(msg) =
+      CString::new(format!("synthetic module has no export named '{name}'"))
+    {
+      unsafe { JS_ThrowReferenceError(ctx, msg.as_ptr()) };
+    } else {
+      unsafe {
+        JS_ThrowReferenceError(
+          ctx,
+          c"synthetic module has no such export".as_ptr(),
+        )
+      };
+    }
+    return MaybeBool::Nothing;
+  }
 
   let val = unsafe { JS_DupValue(ctx, jsval_of(export_value)) };
   if std::env::var_os("QJS_DEBUG_MOD").is_some() {
