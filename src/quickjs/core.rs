@@ -1602,6 +1602,7 @@ pub extern "C" fn v8__Script__Run(
   let _current_script_name = push_current_script_name(fname_owned.as_ref());
   let _current_host_defined_options =
     push_current_host_defined_options(host_defined_options);
+  super::inspector::maybe_pause_on_next_statement();
   // Capture the source under its eval filename for the stack-trace shim.
   if let Some(name) = fname_owned.as_ref()
     && let Ok(fname) = name.to_str()

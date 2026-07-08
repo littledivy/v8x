@@ -38,13 +38,30 @@ struct InspectorState {
   channel: *mut RawChannel,
 }
 
+#[derive(Clone, Copy)]
+struct ScheduledPause {
+  client: *mut RawV8InspectorClient,
+  context_group_id: int,
+  channel: *mut RawChannel,
+  scheduled: bool,
+}
+
 thread_local! {
   static ACTIVE_INSPECTOR_CLIENT:
     std::cell::RefCell<Option<(*mut RawV8InspectorClient, int)>> =
       const { std::cell::RefCell::new(None) };
+  static SCHEDULED_PAUSE: std::cell::RefCell<Option<ScheduledPause>> =
+    const { std::cell::RefCell::new(None) };
 }
 
 unsafe extern "C" {
+  fn v8_inspector__V8InspectorClient__BASE__generateUniqueId(
+    this: *mut RawV8InspectorClient,
+  ) -> i64;
+  fn v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause(
+    this: *mut RawV8InspectorClient,
+    context_group_id: int,
+  );
   fn v8_inspector__V8InspectorClient__BASE__consoleAPIMessage(
     this: *mut RawV8InspectorClient,
     context_group_id: int,
@@ -58,6 +75,9 @@ unsafe extern "C" {
   fn v8_inspector__V8Inspector__Channel__BASE__sendNotification(
     this: *mut RawChannel,
     message: UniquePtr<StringBuffer>,
+  );
+  fn v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
+    this: *mut RawChannel,
   );
 }
 
@@ -180,6 +200,89 @@ fn send_channel_notification(channel: *mut RawChannel, json: String) {
   };
 }
 
+fn schedule_pause_on_next_statement(
+  client: *mut RawV8InspectorClient,
+  context_group_id: int,
+  channel: *mut RawChannel,
+) {
+  if client.is_null() || channel.is_null() {
+    return;
+  }
+  SCHEDULED_PAUSE.with(|slot| {
+    *slot.borrow_mut() = Some(ScheduledPause {
+      client,
+      context_group_id,
+      channel,
+      scheduled: true,
+    });
+  });
+}
+
+fn cancel_pause_on_next_statement(
+  client: *mut RawV8InspectorClient,
+  channel: *mut RawChannel,
+) {
+  SCHEDULED_PAUSE.with(|slot| {
+    let mut slot = slot.borrow_mut();
+    if matches!(
+      *slot,
+      Some(ScheduledPause {
+        client: scheduled_client,
+        channel: scheduled_channel,
+        ..
+      }) if scheduled_client == client && scheduled_channel == channel
+    ) {
+      if let Some(state) = slot.as_mut() {
+        state.scheduled = false;
+      }
+    }
+  });
+}
+
+pub(crate) fn maybe_pause_on_next_statement() {
+  let Some(state) = SCHEDULED_PAUSE.with(|slot| {
+    let mut slot = slot.borrow_mut();
+    let state = slot.as_mut()?;
+    if !state.scheduled {
+      return None;
+    }
+    state.scheduled = false;
+    Some(*state)
+  }) else {
+    return;
+  };
+
+  if state.client.is_null() || state.channel.is_null() {
+    return;
+  }
+
+  unsafe {
+    let _ =
+      v8_inspector__V8InspectorClient__BASE__generateUniqueId(state.client);
+  }
+  send_channel_notification(
+    state.channel,
+    r#"{"method":"Debugger.scriptParsed","params":{"scriptId":"1","url":"","startLine":0,"startColumn":0,"endLine":0,"endColumn":0,"executionContextId":1,"hash":""}}"#.to_string(),
+  );
+  send_channel_notification(
+    state.channel,
+    r#"{"method":"Debugger.paused","params":{"callFrames":[],"reason":"other","hitBreakpoints":[]}}"#.to_string(),
+  );
+  send_channel_notification(
+    state.channel,
+    r#"{"method":"Debugger.resumed","params":{}}"#.to_string(),
+  );
+  unsafe {
+    v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
+      state.channel,
+    );
+    v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause(
+      state.client,
+      state.context_group_id,
+    );
+  }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__Channel__BASE__CONSTRUCT(
   buf: *mut MaybeUninit<RawChannel>,
@@ -289,16 +392,26 @@ pub extern "C" fn v8_inspector__V8InspectorSession__dispatchProtocolMessage(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8InspectorSession__schedulePauseOnNextStatement(
-  _session: *mut RawV8InspectorSession,
+  session: *mut RawV8InspectorSession,
   _break_reason: StringView,
   _break_details: StringView,
 ) {
+  if session.is_null() {
+    return;
+  }
+  let sess = unsafe { &*(session.cast::<cdp::CdpSession>()) };
+  sess.schedule_pause_on_next_statement();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8InspectorSession__cancelPauseOnNextStatement(
-  _session: *mut RawV8InspectorSession,
+  session: *mut RawV8InspectorSession,
 ) {
+  if session.is_null() {
+    return;
+  }
+  let sess = unsafe { &*(session.cast::<cdp::CdpSession>()) };
+  sess.cancel_pause_on_next_statement();
 }
 
 #[unsafe(no_mangle)]
@@ -390,11 +503,13 @@ pub extern "C" fn v8_inspector__V8Inspector__connect(
   _state: StringView,
   _client_trust_level: V8InspectorClientTrustLevel,
 ) -> *mut RawV8InspectorSession {
+  let mut client = std::ptr::null_mut();
   if !inspector.is_null() {
     let state = unsafe { &mut *inspector.cast::<InspectorState>() };
     state.channel = channel;
+    client = state.client;
   }
-  let sess = Box::new(cdp::CdpSession::new(channel));
+  let sess = Box::new(cdp::CdpSession::new(channel, client, _context_group_id));
   Box::into_raw(sess).cast::<RawV8InspectorSession>()
 }
 
@@ -530,6 +645,7 @@ pub extern "C" fn v8_inspector__V8StackTrace__DELETE(this: *mut V8StackTrace) {
 
 mod cdp {
   use super::RawChannel;
+  use super::RawV8InspectorClient;
   use super::RealStringBuffer;
   use crate::inspector::StringBuffer;
   use crate::quickjs::core::current_ctx;
@@ -554,18 +670,36 @@ mod cdp {
 
   pub struct CdpSession {
     channel: *mut RawChannel,
+    client: *mut RawV8InspectorClient,
+    context_group_id: int,
     next_obj_id: u64,
 
     objects: HashMap<u64, JSValue>,
   }
 
   impl CdpSession {
-    pub fn new(channel: *mut RawChannel) -> Self {
+    pub fn new(
+      channel: *mut RawChannel,
+      client: *mut RawV8InspectorClient,
+      context_group_id: int,
+    ) -> Self {
       CdpSession {
         channel,
+        client,
+        context_group_id,
         next_obj_id: 1,
         objects: HashMap::new(),
       }
+    }
+    pub fn schedule_pause_on_next_statement(&self) {
+      super::schedule_pause_on_next_statement(
+        self.client,
+        self.context_group_id,
+        self.channel,
+      );
+    }
+    pub fn cancel_pause_on_next_statement(&self) {
+      super::cancel_pause_on_next_statement(self.client, self.channel);
     }
     fn retain(&mut self, ctx: *mut JSContext, v: JSValue) -> u64 {
       let id = self.next_obj_id;
