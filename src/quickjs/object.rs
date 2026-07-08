@@ -1176,33 +1176,23 @@ pub extern "C" fn v8__Object__GetPropertyAttributes(
   key: *const Value,
   out: *mut Maybe<PropertyAttribute>,
 ) {
-  if out.is_null() {
+  let ctx = ctx_of(context);
+  if out.is_null() || ctx.is_null() || this.is_null() {
     return;
   }
-  let ctx = ctx_of(context);
-  let has = if ctx.is_null() || this.is_null() {
-    false
-  } else {
-    let atom = key_atom(ctx, key);
-    if atom == 0 {
-      false
-    } else {
-      let r = unsafe { JS_HasProperty(ctx, jsval_of(this), atom) };
-      unsafe { JS_FreeAtom(ctx, atom) };
-      r > 0
-    }
-  };
-  let m: Maybe<PropertyAttribute> = if has {
-    let mut tmp: Maybe<PropertyAttribute> = unsafe { std::mem::zeroed() };
 
-    unsafe {
-      *(&mut tmp as *mut Maybe<PropertyAttribute> as *mut bool) = true;
-    }
-    tmp
+  let atom = key_atom(ctx, key);
+  if atom == 0 {
+    unsafe { maybe_attr_none(out) };
+    return;
+  }
+  let r = unsafe { JS_HasProperty(ctx, jsval_of(this), atom) };
+  unsafe { JS_FreeAtom(ctx, atom) };
+  if r < 0 {
+    unsafe { maybe_attr_none(out) };
   } else {
-    unsafe { std::mem::zeroed() }
-  };
-  unsafe { ptr::write(out, m) };
+    unsafe { maybe_attr_set(out, 0) };
+  }
 }
 
 #[unsafe(no_mangle)]
