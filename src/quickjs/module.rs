@@ -206,6 +206,7 @@ struct ModuleState {
 
   source_text: std::string::String,
   source_name: std::string::String,
+  module_name: std::string::String,
   script_id: int,
 
   // The `//# sourceMappingURL=` magic-comment value (if any), extracted from the
@@ -733,6 +734,8 @@ unsafe fn populate_import_meta(
   if def.is_null() || !IMPORT_META_ENABLED.with(|c| c.get()) {
     return;
   }
+  let source_name = source_name_for_module_name(name);
+  let source_name = source_name.as_str();
 
   // Preferred path: hand the meta object to deno's real
   // HostInitializeImportMetaObjectCallback. It populates url/main/filename/
@@ -773,9 +776,9 @@ unsafe fn populate_import_meta(
     }
   }
 
-  if !(name.starts_with("file://")
-    || name.starts_with("http://")
-    || name.starts_with("https://"))
+  if !(source_name.starts_with("file://")
+    || source_name.starts_with("http://")
+    || source_name.starts_with("https://"))
   {
     return;
   }
@@ -785,7 +788,7 @@ unsafe fn populate_import_meta(
     unsafe { JS_FreeValue(ctx, exc) };
     return;
   }
-  if let Ok(curl) = CString::new(name) {
+  if let Ok(curl) = CString::new(source_name) {
     let url_val = unsafe { JS_NewString(ctx, curl.as_ptr()) };
     unsafe { JS_SetPropertyStr(ctx, meta, c"url".as_ptr(), url_val) };
 
@@ -820,12 +823,12 @@ unsafe fn populate_import_meta(
     }
     unsafe { JS_FreeValue(ctx, factory) };
   }
-  let is_main = if is_main_module(name) { 1 } else { 0 };
+  let is_main = if is_main_module(source_name) { 1 } else { 0 };
   unsafe {
     JS_SetPropertyStr(ctx, meta, c"main".as_ptr(), JS_NewBool(ctx, is_main))
   };
 
-  if name.ends_with(".wasm") {
+  if source_name.ends_with(".wasm") {
     let global = unsafe { JS_GetGlobalObject(ctx) };
     let wasm =
       unsafe { JS_GetPropertyStr(ctx, global, c"WebAssembly".as_ptr()) };
@@ -907,7 +910,7 @@ fn mark_all_modules_evaluated() {
       }
       let def_evaluated = !m.module_def.is_null()
         && unsafe { v82jsc_module_is_evaluated(m.module_def) != 0 };
-      if def_evaluated || evaluated_names.contains(&m.source_name) {
+      if def_evaluated || evaluated_names.contains(&m.module_name) {
         m.status = ModuleStatus::Evaluated;
       }
     }
@@ -1542,6 +1545,33 @@ fn lookup_module_source_by_name(name: &str) -> Option<std::string::String> {
   MODULE_SOURCES_BY_NAME.with(|t| t.borrow().get(name).cloned())
 }
 
+fn module_name_for_source(
+  source_name: &str,
+  source: &str,
+  script_id: int,
+) -> std::string::String {
+  if source_name.is_empty() {
+    return "<module>".to_string();
+  }
+  match lookup_module_source_by_name(source_name) {
+    Some(existing) if existing != source => {
+      format!("{source_name}#v8x:{script_id}")
+    }
+    _ => source_name.to_string(),
+  }
+}
+
+fn source_name_for_module_name(name: &str) -> std::string::String {
+  MODULE_STATE
+    .with(|t| {
+      t.borrow()
+        .values()
+        .find(|m| m.module_name == name)
+        .map(|m| m.source_name.clone())
+    })
+    .unwrap_or_else(|| name.to_string())
+}
+
 /// Snapshot replay: fetch a registered module source by exact name.
 pub(crate) fn lookup_module_source(name: &str) -> Option<std::string::String> {
   lookup_module_source_by_name(name)
@@ -1571,7 +1601,7 @@ pub(crate) fn refresh_tape_module_state(
   wrapper: *const Module,
 ) {
   let Some(name) =
-    with_module_state(wrapper as *const Module, |m| m.source_name.clone())
+    with_module_state(wrapper as *const Module, |m| m.module_name.clone())
   else {
     return;
   };
@@ -1668,6 +1698,7 @@ pub(crate) fn tape_make_module_handle(
       is_async: has_top_level_await(&source),
       source_text: source.clone(),
       source_name: name.to_string(),
+      module_name: name.to_string(),
       script_id,
       source_map_url: None,
     },
@@ -1799,7 +1830,7 @@ unsafe fn build_resolution_map(
     }
     let Some((base, specs, attrs, src_imports)) = with_module_state(m, |st| {
       (
-        st.source_name.clone(),
+        st.module_name.clone(),
         st.import_specifiers.clone(),
         st.import_attributes.clone(),
         st.source_imports.clone(),
@@ -1853,7 +1884,7 @@ unsafe fn build_resolution_map(
         continue;
       }
       if let Some(rname) =
-        with_module_state(resolved, |st| st.source_name.clone())
+        with_module_state(resolved, |st| st.module_name.clone())
       {
         if !rname.is_empty() && rname != spec {
           record_resolved_specifier(&base, &spec, &rname);
@@ -2394,6 +2425,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   };
   let source_map_url = unsafe { source_map_url_for_source(ctx, source, &text) };
   let script_id = assign_module_script_id(&fname);
+  let module_name = module_name_for_source(&fname, &text, script_id);
 
   let import_specifiers = parse_import_specifiers(&text);
   let spec_strs: Vec<std::string::String> =
@@ -2402,10 +2434,12 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   let import_attributes = compute_import_attributes(&text, &spec_strs);
   let is_async = has_top_level_await(&text);
 
-  register_module_source(&fname, &text);
+  register_module_source(&module_name, &text);
   note_main_module(&fname);
   if std::env::var_os("QJS_DEBUG_MOD").is_some() {
-    eprintln!("[QJS CompileModule] {fname} imports={import_specifiers:?}");
+    eprintln!(
+      "[QJS CompileModule] {fname} as {module_name} imports={import_specifiers:?}"
+    );
   }
 
   let handle_val = unsafe { JS_NewObject(ctx) };
@@ -2432,13 +2466,14 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
       is_async,
       source_text: text,
       source_name: fname.clone(),
+      module_name: module_name.clone(),
       script_id,
       source_map_url,
     },
   );
   // Map name -> this wrapper so deno's import.meta callback can be handed the
   // exact handle it registered (it looks modules up by Global identity).
-  record_module_wrapper(&fname, this);
+  record_module_wrapper(&module_name, this);
   this
 }
 
@@ -3070,8 +3105,8 @@ unsafe fn materialize_module_def(
   if !existing.is_null() {
     return existing;
   }
-  let Some((source_text, source_name)) =
-    with_module_state(this, |m| (m.source_text.clone(), m.source_name.clone()))
+  let Some((source_text, module_name)) =
+    with_module_state(this, |m| (m.source_text.clone(), m.module_name.clone()))
   else {
     return ptr::null_mut();
   };
@@ -3079,13 +3114,13 @@ unsafe fn materialize_module_def(
     return ptr::null_mut();
   }
 
-  if !source_name.is_empty() {
-    if let Ok(cn) = CString::new(source_name.clone()) {
+  if !module_name.is_empty() {
+    if let Ok(cn) = CString::new(module_name.clone()) {
       let loaded = unsafe { v82jsc_get_loaded_module(ctx, cn.as_ptr()) };
       if !loaded.is_null() {
         with_module_state(this, |m| m.module_def = loaded);
         MODULE_DEF_CACHE.with(|c| {
-          c.borrow_mut().insert(source_name.clone(), loaded as usize);
+          c.borrow_mut().insert(module_name.clone(), loaded as usize);
         });
 
         let is_ev = unsafe { v82jsc_module_is_evaluated(loaded) };
@@ -3124,10 +3159,10 @@ unsafe fn materialize_module_def(
     iso_state(iso).rt
   };
   let key = bc_key(&source_text);
-  let Ok(cname) = CString::new(if source_name.is_empty() {
+  let Ok(cname) = CString::new(if module_name.is_empty() {
     "<module>".to_string()
   } else {
-    source_name
+    module_name.clone()
   }) else {
     return ptr::null_mut();
   };
@@ -3176,7 +3211,7 @@ unsafe fn materialize_module_def(
   let meta_name = with_module_state(this, |m| {
     m.module_def = def;
     m.status = ModuleStatus::Evaluated;
-    m.source_name.clone()
+    m.module_name.clone()
   })
   .unwrap_or_default();
   unsafe { populate_import_meta(ctx, def, &meta_name) };
@@ -3319,19 +3354,27 @@ pub extern "C" fn v8__Module__Evaluate(
     return make_resolved_promise(ctx);
   }
 
-  let (bytecode, source_text, source_name) = with_module_state(this, |m| {
-    m.status = ModuleStatus::Evaluated;
-    (
-      m.bytecode.take(),
-      m.source_text.clone(),
-      m.source_name.clone(),
-    )
-  })
-  .unwrap_or((None, std::string::String::new(), std::string::String::new()));
+  let (bytecode, source_text, source_name, module_name) =
+    with_module_state(this, |m| {
+      m.status = ModuleStatus::Evaluated;
+      (
+        m.bytecode.take(),
+        m.source_text.clone(),
+        m.source_name.clone(),
+        m.module_name.clone(),
+      )
+    })
+    .unwrap_or((
+      None,
+      std::string::String::new(),
+      std::string::String::new(),
+      std::string::String::new(),
+    ));
   let source_name_dbg = source_name.clone();
-  if !source_name.is_empty() {
+  let module_name_dbg = module_name.clone();
+  if !module_name.is_empty() {
     let cached =
-      MODULE_DEF_CACHE.with(|c| c.borrow().get(&source_name).copied());
+      MODULE_DEF_CACHE.with(|c| c.borrow().get(&module_name).copied());
     if std::env::var_os("QJS_DEBUG_MOD").is_some()
       && source_name.contains("stream")
     {
@@ -3345,7 +3388,7 @@ pub extern "C" fn v8__Module__Evaluate(
         None => (-1, -1),
       };
       eprintln!(
-        "[STREAM-EVAL] {source_name} cached={} is_evaluated={isev} eval_started={evst} bytecode={}",
+        "[STREAM-EVAL] {module_name} cached={} is_evaluated={isev} eval_started={evst} bytecode={}",
         cached.is_some(),
         bytecode.is_some()
       );
@@ -3376,7 +3419,7 @@ pub extern "C" fn v8__Module__Evaluate(
           let exc = unsafe { JS_GetException(ctx) };
           if std::env::var_os("QJS_DEBUG_MOD").is_some() {
             let s = unsafe { jsval_to_rust(ctx, exc) };
-            eprintln!("[qjs Evaluate reuse {source_name}] exception: {s}");
+            eprintln!("[qjs Evaluate reuse {module_name}] exception: {s}");
           }
           unsafe { JS_FreeValue(ctx, exc) };
           return make_resolved_promise(ctx);
@@ -3388,8 +3431,9 @@ pub extern "C" fn v8__Module__Evaluate(
 
   if std::env::var_os("QJS_DEBUG_MOD").is_some() {
     eprintln!(
-      "[QJS Evaluate] {} (precompiled={})",
+      "[QJS Evaluate] {} as {} (precompiled={})",
       source_name,
+      module_name,
       bytecode.is_some()
     );
   }
@@ -3417,10 +3461,10 @@ pub extern "C" fn v8__Module__Evaluate(
     }
   } else if !source_text.is_empty() {
     let key = bc_key(&source_text);
-    let cname = CString::new(if source_name.is_empty() {
+    let cname = CString::new(if module_name.is_empty() {
       "<module>".to_string()
     } else {
-      source_name
+      module_name
     })
     .ok();
     if let Some(cname) = cname {
@@ -3464,7 +3508,7 @@ pub extern "C" fn v8__Module__Evaluate(
       let result = if let Some(mv) = module_val {
         let def = unsafe { mv.u.ptr } as *mut JSModuleDef;
         with_module_state(this, |m| m.module_def = def);
-        unsafe { populate_import_meta(ctx, def, &source_name_dbg) };
+        unsafe { populate_import_meta(ctx, def, &module_name_dbg) };
         unsafe { JS_EvalFunction(ctx, mv) }
       } else if let Ok(csrc) = CString::new(source_text.clone()) {
         unsafe {
@@ -3614,7 +3658,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   } else {
     unsafe { jsval_to_rust(ctx, jsval_of(module_name)) }
   };
-  let Ok(cname) = CString::new(name) else {
+  let Ok(cname) = CString::new(name.clone()) else {
     return ptr::null();
   };
 
@@ -3682,6 +3726,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
       source_map_url: None,
       source_text: std::string::String::new(),
       source_name: std::string::String::new(),
+      module_name: name,
       script_id: assign_module_script_id(""),
     },
   );
@@ -3809,7 +3854,7 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
       m.module_def
     } else {
       MODULE_DEF_CACHE
-        .with(|c| c.borrow().get(&m.source_name).copied())
+        .with(|c| c.borrow().get(&m.module_name).copied())
         .map(|d| d as *mut JSModuleDef)
         .unwrap_or(ptr::null_mut())
     };
