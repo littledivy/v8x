@@ -269,6 +269,7 @@ struct RawSource {
   resource_options: int,
   source_map_url: usize,
   host_defined_options: usize,
+  cached_data: usize,
 }
 
 fn next_module_script_id() -> int {
@@ -1954,7 +1955,7 @@ pub extern "C" fn v8__ScriptCompiler__Source__CONSTRUCT(
   buf: *mut MaybeUninit<Source>,
   source_string: *const V8String,
   origin: *const ScriptOrigin,
-  _cached_data: *mut CachedData,
+  cached_data: *mut CachedData,
 ) {
   if buf.is_null() {
     return;
@@ -1963,6 +1964,7 @@ pub extern "C" fn v8__ScriptCompiler__Source__CONSTRUCT(
     ptr::write_bytes(buf as *mut u8, 0u8, size_of::<Source>());
     let raw = buf as *mut RawSource;
     (*raw).source_string = source_string as usize;
+    (*raw).cached_data = cached_data as usize;
     if !origin.is_null() {
       let origin = origin as *const RawScriptOrigin;
       (*raw).resource_name = (*origin).resource_name;
@@ -1973,13 +1975,24 @@ pub extern "C" fn v8__ScriptCompiler__Source__CONSTRUCT(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__ScriptCompiler__Source__DESTRUCT(_this: *mut Source) {}
+pub extern "C" fn v8__ScriptCompiler__Source__DESTRUCT(this: *mut Source) {
+  if this.is_null() {
+    return;
+  }
+  let cached_data = unsafe { (*(this as *const RawSource)).cached_data };
+  if cached_data != 0 {
+    v8__ScriptCompiler__CachedData__DELETE(cached_data as *mut CachedData);
+  }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptCompiler__Source__GetCachedData<'a>(
-  _this: *const Source,
+  this: *const Source,
 ) -> *const CachedData<'a> {
-  ptr::null()
+  if this.is_null() {
+    return ptr::null();
+  }
+  unsafe { (*(this as *const RawSource)).cached_data as *const CachedData<'a> }
 }
 
 #[inline]
