@@ -3627,8 +3627,18 @@ pub extern "C" fn v8__Function__Call(
   for i in 0..n {
     args.push(jsval_of(unsafe { *argv.add(i) }));
   }
+  let saved_pending = unsafe {
+    if JS_HasException(ctx) {
+      Some(JS_GetException(ctx))
+    } else {
+      None
+    }
+  };
   let r = unsafe { JS_Call(ctx, func, recv_v, n as c_int, args.as_mut_ptr()) };
   if jsv_is_exception(&r) {
+    if let Some(saved) = saved_pending {
+      unsafe { JS_FreeValue(ctx, saved) };
+    }
     if std::env::var("V82JSC_DEBUG").is_ok() {
       unsafe {
         let exc = JS_GetException(ctx);
@@ -3649,6 +3659,11 @@ pub extern "C" fn v8__Function__Call(
   }
 
   let h = intern::<Value>(r);
+  if let Some(saved) = saved_pending {
+    unsafe {
+      JS_Throw(ctx, saved);
+    }
+  }
   h
 }
 
