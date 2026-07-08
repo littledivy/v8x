@@ -38,6 +38,15 @@ use crate::{
 use std::os::raw::c_char;
 use std::ptr;
 
+thread_local! {
+  static TRY_CATCH_DEPTH: std::cell::Cell<usize> =
+    const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn has_active_try_catch() -> bool {
+  TRY_CATCH_DEPTH.with(|depth| depth.get() != 0)
+}
+
 unsafe fn peek_pending(ctx: *mut JSContext) -> Option<JSValue> {
   if ctx.is_null() || !JS_HasException(ctx) {
     return None;
@@ -49,7 +58,7 @@ unsafe fn peek_pending(ctx: *mut JSContext) -> Option<JSValue> {
   Some(exc)
 }
 
-unsafe fn clear_pending(ctx: *mut JSContext) {
+pub(crate) unsafe fn clear_pending(ctx: *mut JSContext) {
   if ctx.is_null() || !JS_HasException(ctx) {
     return;
   }
@@ -732,6 +741,7 @@ pub extern "C" fn v8__TryCatch__CONSTRUCT(
   buf: *mut usize,
   isolate: *mut RealIsolate,
 ) {
+  TRY_CATCH_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
   unsafe {
     *buf.add(0) = isolate as usize;
     *buf.add(1) = 0;
@@ -764,6 +774,7 @@ pub extern "C" fn v8__TryCatch__DESTRUCT(this: *mut usize) {
   if this.is_null() {
     return;
   }
+  TRY_CATCH_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
   unsafe {
     let rethrow = *this.add(1) != 0;
 

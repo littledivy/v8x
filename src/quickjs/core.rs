@@ -1459,6 +1459,10 @@ pub extern "C" fn v8__Script__Run(
       }
     }
 
+    if !super::exception::has_active_try_catch() {
+      unsafe { super::exception::clear_pending(ctx) };
+    }
+
     return ptr::null();
   }
 

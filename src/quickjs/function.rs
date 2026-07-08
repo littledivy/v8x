@@ -2071,9 +2071,12 @@ pub extern "C" fn v8__PropertyCallbackInfo__ShouldThrowOnError(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionCallbackInfo__IsConstructCall(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  if this.is_null() {
+    return false;
+  }
+  cbinfo(this as *const FunctionCallbackInfo).is_construct
 }
 
 #[unsafe(no_mangle)]
@@ -2194,15 +2197,27 @@ pub extern "C" fn v8__PropertyCallbackInfo__Data(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ReturnValue__Value__Get(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let slot = unsafe { rv_slot(this as *mut RawReturnValue) };
+  if slot.is_null() {
+    return ptr::null();
+  }
+  let value = unsafe { *slot };
+  intern_dup::<Value>(current_ctx(), value) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ReturnValue__Value__SetEmptyString(
-  _this: *mut std::os::raw::c_void,
+  this: *mut std::os::raw::c_void,
 ) {
+  let slot = unsafe { rv_slot(this as *mut RawReturnValue) };
+  let ctx = current_ctx();
+  if !slot.is_null() && !ctx.is_null() {
+    unsafe {
+      *slot = JS_NewStringLen(ctx, c"".as_ptr(), 0);
+    }
+  }
 }
 
 #[unsafe(no_mangle)]
