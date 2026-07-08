@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=deno_core.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 393 passing. DO NOT hand-sort; the
+# (run.mjs --update). 406 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 deno_core::arena::raw_arena::tests::test_add_clear_many
 deno_core::arena::raw_arena::tests::test_add_remove_many
@@ -97,11 +97,13 @@ deno_core::modules::tests::builtin_core_module
 deno_core::modules::tests::dyn_import_borrow_mut_error
 deno_core::modules::tests::dyn_import_err
 deno_core::modules::tests::dyn_import_ok
+deno_core::modules::tests::dynamic_imports_snapshot
 deno_core::modules::tests::evaluate_already_evaluated_module
 deno_core::modules::tests::evaluate_already_evaluated_module_sync
 deno_core::modules::tests::ext_module_loader_relative
 deno_core::modules::tests::import_meta_filename_dirname
 deno_core::modules::tests::import_meta_resolve
+deno_core::modules::tests::import_meta_snapshot
 deno_core::modules::tests::invalid_utf8_module
 deno_core::modules::tests::loader_disappears_after_error
 deno_core::modules::tests::main_and_side_module
@@ -219,6 +221,7 @@ deno_core::runtime::tests::error::test_error_builder
 deno_core::runtime::tests::jsrealm::js_realm_ref_unref_ops
 deno_core::runtime::tests::jsrealm::lazy
 deno_core::runtime::tests::misc::dangling_shared_isolate
+deno_core::runtime::tests::misc::foreground_tasks_delivered_without_tokio_handle
 deno_core::runtime::tests::misc::generic_in_extension_middleware
 deno_core::runtime::tests::misc::icu
 deno_core::runtime::tests::misc::inspector
@@ -287,6 +290,8 @@ deno_core::runtime::tests::misc::test_resolve_value::case_14
 deno_core::runtime::tests::misc::test_resolve_value::case_15
 deno_core::runtime::tests::misc::test_set_macrotask_callback_set_next_tick_callback
 deno_core::runtime::tests::misc::test_stalled_tla
+deno_core::runtime::tests::misc::test_timer_return_protocol_keeps_timers_armed_from_promise_hook
+deno_core::runtime::tests::misc::test_timer_return_protocol_keeps_timers_armed_from_run_next_ticks
 deno_core::runtime::tests::misc::test_v8_platform
 deno_core::runtime::tests::misc::test_wakers_for_async_ops
 deno_core::runtime::tests::ops::duplicate_op_names
@@ -305,6 +310,11 @@ deno_core::runtime::tests::ops::test_op_return_serde_v8_error
 deno_core::runtime::tests::ops::test_ref_unref_ops
 deno_core::runtime::tests::ops::test_sync_op_serialize_object_with_numbers_as_keys
 deno_core::runtime::tests::ops::test_top_level_await
+deno_core::runtime::tests::snapshot::es_snapshot_without_runtime_module_loader
+deno_core::runtime::tests::snapshot::test_from_snapshot
+deno_core::runtime::tests::snapshot::test_snapshot_callbacks
+deno_core::runtime::tests::snapshot::test_snapshot_creator
+deno_core::runtime::tests::snapshot::will_snapshot
 deno_core::source_map::tests::test_source_map_relative_path_existing_file
 deno_core::source_map::tests::test_source_map_relative_path_nonexistent_file
 deno_core::source_map::tests::test_source_mapper
@@ -392,6 +402,9 @@ deno_core::webidl::tests::nullable
 deno_core::webidl::tests::r#enum
 deno_core::webidl::tests::record
 deno_core::webidl::tests::sequence
+deno_core::webidl::tests::sequence_check_next_method_once
+deno_core::webidl::tests::sequence_next_method_must_be_callable
+deno_core::webidl::tests::sequence_propagates_next_getter_exception
 deno_core::webidl::tests::string
 deno_core::webidl::tests::unrestricted_double
 deno_core::webidl::tests::unrestricted_float

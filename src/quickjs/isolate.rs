@@ -355,7 +355,13 @@ pub extern "C" fn v8__Context__GetDataFromSnapshotOnce(
   let Some(bytes) = bytes else {
     return ptr::null();
   };
-  let Some(value) = super::snapshot::deserialize_value(ctx, &bytes) else {
+  let external_refs = {
+    let st = super::core::iso_state(iso);
+    st.external_references.clone()
+  };
+  let Some(value) =
+    super::snapshot::deserialize_value_with_refs(ctx, &bytes, &external_refs)
+  else {
     return ptr::null();
   };
   intern::<Data>(value)
@@ -1750,7 +1756,13 @@ pub extern "C" fn v8__Isolate__GetDataFromSnapshotOnce(
   let Some(bytes) = bytes else {
     return ptr::null();
   };
-  let Some(value) = super::snapshot::deserialize_value(ctx, &bytes) else {
+  let external_refs = {
+    let st = iso_state(iso);
+    st.external_references.clone()
+  };
+  let Some(value) =
+    super::snapshot::deserialize_value_with_refs(ctx, &bytes, &external_refs)
+  else {
     return ptr::null();
   };
   intern::<Data>(value) as *const std::os::raw::c_void

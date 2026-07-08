@@ -5,13 +5,14 @@
 //! and `CreateBlob` serializes them; restoring replays the calls against a
 //! fresh runtime. This module keeps only the shared value/blob plumbing:
 //!
-//! - `serialize_value` / `deserialize_value`: structured-clone one JS value
-//!   to/from bytes (`JS_WriteObject`/`JS_ReadObject`, no bytecode) — used for
-//!   tape `ClonedValue` entries and embedder-data snapshots.
+//! - `serialize_value` / `deserialize_value`: serialize one trusted JS value
+//!   to/from bytes (`JS_WriteObject`/`JS_ReadObject`) — used for tape
+//!   `ClonedValue` entries and embedder-data snapshots.
 //! - `leak_blob` / `free_blob`: hand a serialized blob across the C ABI with
 //!   `StartupData`-compatible ownership.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
@@ -21,11 +22,34 @@ use crate::FunctionCallback;
 use crate::RealIsolate;
 
 const MAGIC: &[u8; 8] = b"V8XSNP1\0";
+const DATA_MAGIC: &[u8; 8] = b"V8XSDAT\0";
 const NO_REF_INDEX: u32 = u32::MAX;
 const GLOBAL_VALUE: u8 = 0;
 const GLOBAL_FUNCTION: u8 = 1;
+const SNAPSHOT_DATA_MODULE: u8 = 1;
+const SNAPSHOT_DATA_OBJECT: u8 = 2;
+const SNAPSHOT_DATA_HOST_OBJECT: u8 = 3;
+const SNAPSHOT_DATA_HOST_FUNCTION: u8 = 4;
+const SNAPSHOT_DATA_JS_FUNCTION: u8 = 5;
+const SNAPSHOT_DATA_ASYNC_STUB: u8 = 6;
+const SNAPSHOT_DATA_NOOP_FUNCTION: u8 = 7;
+const JS_WRITE_OBJ_BYTECODE: c_int = 1 << 0;
+const JS_WRITE_OBJ_SAB: c_int = 1 << 2;
+const JS_WRITE_OBJ_REFERENCE: c_int = 1 << 3;
+const JS_READ_OBJ_BYTECODE: c_int = 1 << 0;
 const JS_GPN_STRING_MASK: c_int = 1 << 0;
 const JS_GPN_ENUM_ONLY: c_int = 1 << 4;
+const ASYNC_STUB_SRC: &str = "(function setUpAsyncStub(opName,originalOp,maybeProto){\
+  var fn=function(){\
+    var args=Array.prototype.slice.call(arguments);\
+    try { return Promise.resolve(originalOp.apply(this,[0].concat(args))); }\
+    catch(e) { return Promise.reject(e); }\
+  };\
+  try { Object.defineProperty(fn,'name',{value:opName,configurable:true}); } catch(_) {}\
+  if (maybeProto) { maybeProto[opName]=fn; return; }\
+  return fn;\
+})\0";
+const NOOP_FUNCTION_SRC: &str = "(function(){})\0";
 
 #[repr(C)]
 struct JSPropertyEnum {
@@ -120,8 +144,45 @@ pub(crate) fn serialize_value(
   ctx: *mut JSContext,
   v: JSValue,
 ) -> Option<Vec<u8>> {
+  serialize_value_with_refs(ctx, v, &[])
+}
+
+fn serialize_value_with_refs(
+  ctx: *mut JSContext,
+  v: JSValue,
+  external_refs: &[usize],
+) -> Option<Vec<u8>> {
+  if let Some(name) = super::module::module_name_for_value(v) {
+    return Some(encode_module_data(&name));
+  }
+  if let Some(info) = super::function::snapshot_function_info(v) {
+    return Some(encode_function_data(info, external_refs));
+  }
+  if !ctx.is_null() && unsafe { JS_IsFunction(ctx, v) } {
+    if let Some(bytes) = write_object_bytes(ctx, v) {
+      return Some(encode_js_function_data(&bytes));
+    }
+    return Some(encode_noop_function_data());
+  }
+  let Some(out) = write_object_bytes(ctx, v) else {
+    if v.tag < 0 {
+      return Some(encode_object_data());
+    }
+    return None;
+  };
+  Some(out)
+}
+
+fn write_object_bytes(ctx: *mut JSContext, v: JSValue) -> Option<Vec<u8>> {
   let mut size: usize = 0;
-  let buf = unsafe { JS_WriteObject(ctx, &mut size, v, 0) };
+  let buf = super::exception::with_prepare_stack_suppressed(|| unsafe {
+    JS_WriteObject(
+      ctx,
+      &mut size,
+      v,
+      JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE,
+    )
+  });
   if buf.is_null() {
     // Clear the pending exception JS_WriteObject leaves behind.
     let exc = unsafe { JS_GetException(ctx) };
@@ -133,20 +194,326 @@ pub(crate) fn serialize_value(
   Some(out)
 }
 
-pub(crate) fn deserialize_value(
+pub(crate) fn deserialize_value_with_refs(
   ctx: *mut JSContext,
   bytes: &[u8],
+  external_refs: &[usize],
 ) -> Option<JSValue> {
   if ctx.is_null() || bytes.is_empty() {
     return None;
   }
-  let value = unsafe { JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), 0) };
+  if let Some(value) = decode_special_data(ctx, bytes, external_refs) {
+    return Some(value);
+  }
+  let value = unsafe {
+    JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), JS_READ_OBJ_BYTECODE)
+  };
   if value.tag == JS_TAG_EXCEPTION {
     let exc = unsafe { JS_GetException(ctx) };
     unsafe { JS_FreeValue(ctx, exc) };
     return None;
   }
+  if value.tag == JS_TAG_FUNCTION_BYTECODE {
+    let value = unsafe { JS_EvalFunction(ctx, value) };
+    if value.tag == JS_TAG_EXCEPTION {
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+      return None;
+    }
+    return Some(value);
+  }
   Some(value)
+}
+
+fn serialize_host_object(
+  ctx: *mut JSContext,
+  v: JSValue,
+  external_refs: &[usize],
+) -> Option<Vec<u8>> {
+  let mut seen = HashSet::new();
+  super::exception::with_prepare_stack_suppressed(|| {
+    serialize_host_object_inner(ctx, v, external_refs, &mut seen, 0)
+  })
+}
+
+fn serialize_host_object_inner(
+  ctx: *mut JSContext,
+  v: JSValue,
+  external_refs: &[usize],
+  seen: &mut HashSet<usize>,
+  depth: usize,
+) -> Option<Vec<u8>> {
+  if ctx.is_null() {
+    return None;
+  }
+  if super::module::module_name_for_value(v).is_some()
+    || super::function::snapshot_function_info(v).is_some()
+    || unsafe { JS_IsFunction(ctx, v) }
+    || v.tag >= 0
+  {
+    return serialize_value_with_refs(ctx, v, external_refs);
+  }
+  if depth > 8 {
+    return Some(encode_object_data());
+  }
+  let key = unsafe { v.u.ptr as usize };
+  if key == 0 || !seen.insert(key) {
+    return Some(encode_object_data());
+  }
+
+  let mut props_out = Vec::new();
+  unsafe {
+    let mut tab: *mut JSPropertyEnum = ptr::null_mut();
+    let mut len = 0u32;
+    let rc =
+      JS_GetOwnPropertyNames(ctx, &mut tab, &mut len, v, JS_GPN_STRING_MASK);
+    if rc < 0 {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      seen.remove(&key);
+      return Some(encode_object_data());
+    }
+    let props = std::slice::from_raw_parts(tab, len as usize);
+    for prop in props {
+      let Some(name) = atom_to_string(ctx, prop.atom) else {
+        continue;
+      };
+      let value = JS_GetProperty(ctx, v, prop.atom);
+      if value.tag == JS_TAG_EXCEPTION {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+        continue;
+      }
+      if let Some(mut bytes) =
+        serialize_host_object_inner(ctx, value, external_refs, seen, depth + 1)
+      {
+        if name == "setUpAsyncStub" && JS_IsFunction(ctx, value) {
+          bytes = encode_async_stub_data();
+        }
+        props_out.push((name, bytes));
+      }
+      JS_FreeValue(ctx, value);
+    }
+    JS_FreePropertyEnum(ctx, tab, len);
+  }
+
+  seen.remove(&key);
+  Some(encode_host_object_data(&props_out))
+}
+
+fn encode_module_data(name: &str) -> Vec<u8> {
+  let mut out = Vec::with_capacity(DATA_MAGIC.len() + 1 + 4 + name.len());
+  out.extend_from_slice(DATA_MAGIC);
+  out.push(SNAPSHOT_DATA_MODULE);
+  put_str(&mut out, name);
+  out
+}
+
+fn encode_object_data() -> Vec<u8> {
+  let mut out = Vec::with_capacity(DATA_MAGIC.len() + 1);
+  out.extend_from_slice(DATA_MAGIC);
+  out.push(SNAPSHOT_DATA_OBJECT);
+  out
+}
+
+fn encode_function_data(
+  info: super::function::SnapshotFunctionInfo,
+  external_refs: &[usize],
+) -> Vec<u8> {
+  let mut out = Vec::new();
+  out.extend_from_slice(DATA_MAGIC);
+  out.push(SNAPSHOT_DATA_HOST_FUNCTION);
+  put_ref_slot(
+    &mut out,
+    ExternalRefSlot::new(info.callback as usize, external_refs),
+  );
+  put_opt_ref_slot(
+    &mut out,
+    info
+      .data_external
+      .map(|ptr| ExternalRefSlot::new(ptr as usize, external_refs)),
+  );
+  put_i32(&mut out, info.length);
+  out.push(u8::from(info.constructable));
+  out
+}
+
+fn encode_js_function_data(bytes: &[u8]) -> Vec<u8> {
+  let mut out = Vec::new();
+  out.extend_from_slice(DATA_MAGIC);
+  out.push(SNAPSHOT_DATA_JS_FUNCTION);
+  put_bytes(&mut out, bytes);
+  out
+}
+
+fn encode_async_stub_data() -> Vec<u8> {
+  let mut out = Vec::new();
+  out.extend_from_slice(DATA_MAGIC);
+  out.push(SNAPSHOT_DATA_ASYNC_STUB);
+  out
+}
+
+fn encode_noop_function_data() -> Vec<u8> {
+  let mut out = Vec::new();
+  out.extend_from_slice(DATA_MAGIC);
+  out.push(SNAPSHOT_DATA_NOOP_FUNCTION);
+  out
+}
+
+fn encode_host_object_data(props: &[(String, Vec<u8>)]) -> Vec<u8> {
+  let mut out = Vec::new();
+  out.extend_from_slice(DATA_MAGIC);
+  out.push(SNAPSHOT_DATA_HOST_OBJECT);
+  put_vec(&mut out, props, |out, (name, bytes)| {
+    put_str(out, name);
+    put_bytes(out, bytes);
+  });
+  out
+}
+
+fn decode_special_data(
+  ctx: *mut JSContext,
+  bytes: &[u8],
+  external_refs: &[usize],
+) -> Option<JSValue> {
+  if !bytes.starts_with(DATA_MAGIC) {
+    return None;
+  }
+  let mut input = Reader {
+    bytes,
+    pos: DATA_MAGIC.len(),
+  };
+  match input.get_u8()? {
+    SNAPSHOT_DATA_MODULE => {
+      let name = input.get_string()?;
+      let module = super::module::tape_make_module_handle(ctx, &name);
+      if module.is_null() {
+        return None;
+      }
+      super::module::refresh_tape_module_state(ctx, module);
+      Some(unsafe { JS_DupValue(ctx, super::core::jsval_of(module)) })
+    }
+    SNAPSHOT_DATA_HOST_FUNCTION => {
+      let callback = input.get_ref_slot()?.resolve(external_refs);
+      if callback == 0 {
+        return None;
+      }
+      let callback =
+        unsafe { std::mem::transmute::<usize, FunctionCallback>(callback) };
+      let data = input
+        .get_opt_ref_slot()?
+        .map(|slot| slot.resolve(external_refs))
+        .filter(|raw| *raw != 0)
+        .map(|raw| {
+          super::function::make_external_jsvalue(
+            super::core::current_iso(),
+            ctx,
+            raw as *mut c_void,
+          )
+        })
+        .unwrap_or_else(jsv_undefined);
+      let length = input.get_i32()?;
+      let constructable = input.get_u8()? != 0;
+      let function = unsafe {
+        super::function::make_function_len(
+          ctx,
+          callback,
+          data,
+          length,
+          constructable,
+        )
+      };
+      if !jsv_is_undefined(&data) {
+        unsafe { JS_FreeValue(ctx, data) };
+      }
+      Some(function)
+    }
+    SNAPSHOT_DATA_JS_FUNCTION => {
+      let bytes = input.get_bytes()?;
+      let value = unsafe {
+        JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), JS_READ_OBJ_BYTECODE)
+      };
+      if value.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return None;
+      }
+      let value = unsafe { JS_EvalFunction(ctx, value) };
+      if value.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return None;
+      }
+      Some(value)
+    }
+    SNAPSHOT_DATA_ASYNC_STUB => {
+      let value = unsafe {
+        JS_Eval(
+          ctx,
+          ASYNC_STUB_SRC.as_ptr() as *const c_char,
+          ASYNC_STUB_SRC.len() - 1,
+          c"<v8x-async-stub>".as_ptr(),
+          JS_EVAL_TYPE_GLOBAL,
+        )
+      };
+      if value.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return None;
+      }
+      Some(value)
+    }
+    SNAPSHOT_DATA_NOOP_FUNCTION => {
+      let value = unsafe {
+        JS_Eval(
+          ctx,
+          NOOP_FUNCTION_SRC.as_ptr() as *const c_char,
+          NOOP_FUNCTION_SRC.len() - 1,
+          c"<v8x-noop-function>".as_ptr(),
+          JS_EVAL_TYPE_GLOBAL,
+        )
+      };
+      if value.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return None;
+      }
+      Some(value)
+    }
+    SNAPSHOT_DATA_OBJECT => {
+      let value = unsafe { JS_NewObject(ctx) };
+      if value.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return None;
+      }
+      Some(value)
+    }
+    SNAPSHOT_DATA_HOST_OBJECT => {
+      let value = unsafe { JS_NewObject(ctx) };
+      if value.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return None;
+      }
+      let len = input.get_u32()? as usize;
+      for _ in 0..len {
+        let name = input.get_string()?;
+        let bytes = input.get_bytes()?;
+        let Ok(name) = CString::new(name) else {
+          continue;
+        };
+        let Some(prop_value) =
+          deserialize_value_with_refs(ctx, &bytes, external_refs)
+        else {
+          continue;
+        };
+        unsafe { JS_SetPropertyStr(ctx, value, name.as_ptr(), prop_value) };
+      }
+      Some(value)
+    }
+    _ => None,
+  }
 }
 
 pub(crate) fn external_references_from_params(
@@ -236,7 +603,8 @@ pub(crate) fn replay_context(
     let Some(bytes) = value else {
       continue;
     };
-    let Some(value) = deserialize_value(ctx, bytes) else {
+    let Some(value) = deserialize_value_with_refs(ctx, bytes, external_refs)
+    else {
       continue;
     };
     super::misc::set_embedder_data_raw(ctx, index, value);
@@ -293,7 +661,11 @@ fn capture_globals(
           length: info.length,
           constructable: info.constructable,
         });
-      } else if let Some(bytes) = serialize_value(ctx, value) {
+      } else if let Some(bytes) = if name == "Deno" {
+        serialize_host_object(ctx, value, external_refs)
+      } else {
+        serialize_value_with_refs(ctx, value, external_refs)
+      } {
         out.push(GlobalEntry::Value { name, bytes });
       }
       JS_FreeValue(ctx, value);
@@ -323,7 +695,8 @@ unsafe fn replay_global_entry(
       let Ok(name) = CString::new(name.as_str()) else {
         return;
       };
-      let Some(value) = deserialize_value(ctx, bytes) else {
+      let Some(value) = deserialize_value_with_refs(ctx, bytes, external_refs)
+      else {
         return;
       };
       unsafe { JS_SetPropertyStr(ctx, global, name.as_ptr(), value) };
@@ -396,6 +769,7 @@ fn should_skip_global(name: &str) -> bool {
       | "__v8xKeptObjectsCleared"
       | "WeakRef"
       | "ArrayBuffer"
+      | "WebAssembly"
       | "__v82jsc_wasm_src"
   )
 }

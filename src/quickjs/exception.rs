@@ -1387,6 +1387,8 @@ pub extern "C" fn v8__TryCatch__StackTrace(
 thread_local! {
   static PREPARE_STACK_ACTIVE: std::cell::Cell<bool> =
     const { std::cell::Cell::new(false) };
+  static PREPARE_STACK_SUPPRESS_DEPTH: std::cell::Cell<u32> =
+    const { std::cell::Cell::new(0) };
 
   // deno's native PrepareStackTraceCallback (registered via
   // v8__Isolate__SetPrepareStackTraceCallback). QuickJS has no engine hook for
@@ -1401,6 +1403,24 @@ thread_local! {
 
 pub(crate) fn is_prepare_stack_active() -> bool {
   PREPARE_STACK_ACTIVE.with(|c| c.get())
+}
+
+fn is_prepare_stack_suppressed() -> bool {
+  PREPARE_STACK_SUPPRESS_DEPTH.with(|c| c.get() != 0)
+}
+
+pub(crate) fn with_prepare_stack_suppressed<T>(f: impl FnOnce() -> T) -> T {
+  struct Guard;
+
+  impl Drop for Guard {
+    fn drop(&mut self) {
+      PREPARE_STACK_SUPPRESS_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+  }
+
+  PREPARE_STACK_SUPPRESS_DEPTH.with(|c| c.set(c.get().saturating_add(1)));
+  let _guard = Guard;
+  f()
 }
 
 /// Store deno's native PrepareStackTraceCallback so our `Error.prepareStackTrace`
@@ -1620,6 +1640,9 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
   argv: *mut JSValue,
 ) -> JSValue {
   if argc < 2 || argv.is_null() || ctx.is_null() {
+    return jsv_undefined();
+  }
+  if is_prepare_stack_suppressed() {
     return jsv_undefined();
   }
   let error = unsafe { *argv.add(0) };

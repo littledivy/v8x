@@ -931,6 +931,14 @@ pub(crate) fn module_obj_key(this: *const Module) -> usize {
   handle_key(this)
 }
 
+pub(crate) fn module_name_for_value(v: JSValue) -> Option<std::string::String> {
+  if v.tag >= 0 {
+    return None;
+  }
+  let key = unsafe { v.u.ptr as usize };
+  MODULE_STATE.with(|t| t.borrow().get(&key).map(|m| m.module_name.clone()))
+}
+
 #[inline]
 fn handle_key(this: *const Module) -> usize {
   let v = jsval_of(this);
