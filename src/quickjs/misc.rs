@@ -23,7 +23,8 @@ use crate::quickjs::core::{
 use crate::quickjs::quickjs_sys::*;
 use crate::{Context, Data, Object, RealIsolate, String as V8String, Value};
 
-use std::os::raw::{c_char, c_void};
+use std::collections::HashSet;
+use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::Ordering;
 
@@ -42,6 +43,33 @@ struct ProxyRevokeEntry {
 thread_local! {
   static PROXY_REVOKES: std::cell::RefCell<Vec<ProxyRevokeEntry>> =
     const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[repr(C)]
+struct JSPropertyEnum {
+  is_enumerable: bool,
+  atom: JSAtom,
+}
+
+const JS_GPN_STRING_MASK: c_int = 1 << 0;
+const JS_GPN_SYMBOL_MASK: c_int = 1 << 1;
+const JS_GPN_ENUM_ONLY: c_int = 1 << 4;
+const HEAP_SNAPSHOT_MAX_DEPTH: usize = 5;
+const HEAP_SNAPSHOT_ARRAY_SAMPLE: u32 = 64;
+
+unsafe extern "C" {
+  fn JS_GetOwnPropertyNames(
+    ctx: *mut JSContext,
+    ptab: *mut *mut JSPropertyEnum,
+    plen: *mut u32,
+    obj: JSValue,
+    flags: c_int,
+  ) -> c_int;
+  fn JS_GetProperty(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: JSAtom,
+  ) -> JSValue;
 }
 
 fn same_value_identity(a: JSValue, b: JSValue) -> bool {
@@ -1672,12 +1700,225 @@ pub extern "C" fn v8__Isolate__SetAllowWasmCodeGenerationCallback(
 ) {
 }
 
+unsafe fn qjs_value_to_string(
+  ctx: *mut JSContext,
+  v: JSValue,
+) -> Option<String> {
+  let mut len = 0usize;
+  let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, v) };
+  if cstr.is_null() {
+    return None;
+  }
+  let text = unsafe {
+    let bytes = std::slice::from_raw_parts(cstr as *const u8, len);
+    String::from_utf8_lossy(bytes).into_owned()
+  };
+  unsafe { JS_FreeCString(ctx, cstr) };
+  Some(text)
+}
+
+unsafe fn qjs_atom_to_string(
+  ctx: *mut JSContext,
+  atom: JSAtom,
+) -> Option<String> {
+  let value = unsafe { JS_AtomToString(ctx, atom) };
+  if value.tag == JS_TAG_EXCEPTION {
+    return None;
+  }
+  let text = unsafe { qjs_value_to_string(ctx, value) };
+  unsafe { JS_FreeValue(ctx, value) };
+  text
+}
+
+fn push_snapshot_name(
+  names: &mut Vec<String>,
+  seen_names: &mut HashSet<String>,
+  name: String,
+) {
+  if name.is_empty() || name == "undefined" || name == "null" {
+    return;
+  }
+  if seen_names.insert(name.clone()) {
+    names.push(name);
+  }
+}
+
+unsafe fn collect_constructor_name(
+  ctx: *mut JSContext,
+  value: JSValue,
+  names: &mut Vec<String>,
+  seen_names: &mut HashSet<String>,
+) {
+  if !jsv_is_object(&value) {
+    return;
+  }
+  let ctor = unsafe { JS_GetPropertyStr(ctx, value, c"constructor".as_ptr()) };
+  if ctor.tag == JS_TAG_EXCEPTION {
+    return;
+  }
+  let name = unsafe { JS_GetPropertyStr(ctx, ctor, c"name".as_ptr()) };
+  if name.tag != JS_TAG_EXCEPTION {
+    if let Some(text) = unsafe { qjs_value_to_string(ctx, name) } {
+      push_snapshot_name(names, seen_names, text);
+    }
+  }
+  unsafe {
+    JS_FreeValue(ctx, name);
+    JS_FreeValue(ctx, ctor);
+  }
+}
+
+unsafe fn collect_heap_snapshot_names(
+  ctx: *mut JSContext,
+  value: JSValue,
+  depth: usize,
+  seen_objects: &mut HashSet<usize>,
+  seen_names: &mut HashSet<String>,
+  names: &mut Vec<String>,
+) {
+  if depth > HEAP_SNAPSHOT_MAX_DEPTH || !jsv_is_object(&value) {
+    return;
+  }
+
+  let ptr = unsafe { value.u.ptr } as usize;
+  if ptr == 0 || !seen_objects.insert(ptr) {
+    return;
+  }
+
+  unsafe { collect_constructor_name(ctx, value, names, seen_names) };
+
+  if unsafe { JS_IsArray(value) } {
+    let len_value =
+      unsafe { JS_GetPropertyStr(ctx, value, c"length".as_ptr()) };
+    let mut len = 0i32;
+    unsafe {
+      JS_ToInt32(ctx, &mut len, len_value);
+      JS_FreeValue(ctx, len_value);
+    }
+    for index in 0..(len.max(0) as u32).min(HEAP_SNAPSHOT_ARRAY_SAMPLE) {
+      let element = unsafe { JS_GetPropertyUint32(ctx, value, index) };
+      unsafe {
+        collect_heap_snapshot_names(
+          ctx,
+          element,
+          depth + 1,
+          seen_objects,
+          seen_names,
+          names,
+        );
+        JS_FreeValue(ctx, element);
+      }
+    }
+  }
+
+  let mut ptab: *mut JSPropertyEnum = ptr::null_mut();
+  let mut plen = 0u32;
+  let flags = JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_ENUM_ONLY;
+  let rc =
+    unsafe { JS_GetOwnPropertyNames(ctx, &mut ptab, &mut plen, value, flags) };
+  if rc != 0 || ptab.is_null() {
+    return;
+  }
+
+  for index in 0..plen as usize {
+    let atom = unsafe { (*ptab.add(index)).atom };
+    if let Some(name) = unsafe { qjs_atom_to_string(ctx, atom) } {
+      push_snapshot_name(names, seen_names, name);
+    }
+    let property = unsafe { JS_GetProperty(ctx, value, atom) };
+    unsafe {
+      collect_heap_snapshot_names(
+        ctx,
+        property,
+        depth + 1,
+        seen_objects,
+        seen_names,
+        names,
+      );
+      JS_FreeValue(ctx, property);
+      JS_FreeAtom(ctx, atom);
+    }
+  }
+  unsafe { js_free(ctx, ptab as *mut c_void) };
+}
+
+fn push_json_string(out: &mut String, value: &str) {
+  out.push('"');
+  for ch in value.chars() {
+    match ch {
+      '"' => out.push_str("\\\""),
+      '\\' => out.push_str("\\\\"),
+      '\n' => out.push_str("\\n"),
+      '\r' => out.push_str("\\r"),
+      '\t' => out.push_str("\\t"),
+      ch if ch.is_control() => {
+        use std::fmt::Write;
+        let _ = write!(out, "\\u{:04x}", ch as u32);
+      }
+      ch => out.push(ch),
+    }
+  }
+  out.push('"');
+}
+
+fn quickjs_heap_snapshot_json(isolate: *mut RealIsolate) -> Vec<u8> {
+  if isolate.is_null() {
+    return br#"{"snapshot":{"meta":{}},"nodes":[],"strings":[]}"#.to_vec();
+  }
+  let ctx = {
+    let current = current_ctx();
+    if !current.is_null() {
+      current
+    } else {
+      let st = iso_state(isolate);
+      st.contexts.last().copied().unwrap_or(st.ctx)
+    }
+  };
+  if ctx.is_null() {
+    return br#"{"snapshot":{"meta":{}},"nodes":[],"strings":[]}"#.to_vec();
+  }
+
+  let mut names = Vec::new();
+  let mut seen_names = HashSet::new();
+  let mut seen_objects = HashSet::new();
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    collect_heap_snapshot_names(
+      ctx,
+      global,
+      0,
+      &mut seen_objects,
+      &mut seen_names,
+      &mut names,
+    );
+    JS_FreeValue(ctx, global);
+  }
+
+  let mut json =
+    String::from("{\"snapshot\":{\"meta\":{}},\"nodes\":[],\"strings\":[");
+  for (index, name) in names.iter().enumerate() {
+    if index > 0 {
+      json.push(',');
+    }
+    push_json_string(&mut json, name);
+  }
+  json.push_str("]}");
+  json.into_bytes()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__HeapProfiler__TakeHeapSnapshot(
-  _isolate: *mut RealIsolate,
-  _callback: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> bool,
-  _arg: *mut c_void,
+  isolate: *mut RealIsolate,
+  callback: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> bool,
+  arg: *mut c_void,
 ) {
+  let snapshot = quickjs_heap_snapshot_json(isolate);
+  if snapshot.is_empty() {
+    return;
+  }
+  unsafe {
+    callback(arg, snapshot.as_ptr(), snapshot.len());
+  }
 }
 
 #[unsafe(no_mangle)]
