@@ -44,12 +44,11 @@
         "rv8_test_concurrent_isolate_creation_and_disposal",
         "rv8_test_cppgc"
       ],
-      "ignore_comment": "concurrent_isolate_creation_and_disposal races and SIGABRTs ~75% of CI runs on quickjs (Linux) — a genuine concurrency flake that was blocking every PR. Quarantined on quickjs until the underlying isolate create/dispose race is fixed. heap_limits allocates until V8's near-heap-limit callback fires; quickjs never fires it, so the test eats RAM until the CI runner is OOM-killed (runner 'shutdown signal', exit 143) — quarantined until heap-limit callbacks are implemented (resource_constraints_near_heap_limit is the same class).",
+      "ignore_comment": "quickjs-only quarantines: concurrent_isolate_creation_and_disposal has hit Linux CI SIGABRTs during isolate create/dispose stress, so keep it skipped until that shim race is fixed. heap_limits and resource_constraints_near_heap_limit rely on V8 near-heap-limit callbacks; quickjs currently does not fire them, so they run until OOM.",
       "ignore": [],
       "ignore_by_backend": {
         "quickjs": [
           "concurrent_isolate_creation_and_disposal",
-          "dynamic_source_phase_import",
           "heap_limits",
           "resource_constraints_near_heap_limit"
         ]
