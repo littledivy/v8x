@@ -969,9 +969,10 @@ pub extern "C" fn v8__StackFrame__GetScriptId(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackFrame__GetScriptNameOrSourceURL(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  v8__StackFrame__GetScriptName(this as *const StackFrame)
+    as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]
@@ -1006,7 +1007,19 @@ pub extern "C" fn v8__StackFrame__IsWasm(
 pub extern "C" fn v8__StackTrace__CurrentScriptNameOrSourceURL(
   _isolate: *mut std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  let Some(name) = super::core::current_script_name_or_source_url() else {
+    return ptr::null();
+  };
+  let v =
+    unsafe { JS_NewStringLen(ctx, name.as_ptr() as *const c_char, name.len()) };
+  if v.tag == JS_TAG_EXCEPTION {
+    return ptr::null();
+  }
+  intern::<String>(v) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]

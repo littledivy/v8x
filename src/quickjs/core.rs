@@ -1115,6 +1115,40 @@ thread_local! {
   static SCRIPT_SOURCES: RefCell<
     std::collections::HashMap<std::string::String, std::string::String>,
   > = RefCell::new(std::collections::HashMap::new());
+
+  static CURRENT_SCRIPT_NAMES: RefCell<Vec<std::string::String>> =
+    const { RefCell::new(Vec::new()) };
+}
+
+struct CurrentScriptNameGuard {
+  pushed: bool,
+}
+
+impl Drop for CurrentScriptNameGuard {
+  fn drop(&mut self) {
+    if self.pushed {
+      CURRENT_SCRIPT_NAMES.with(|names| {
+        names.borrow_mut().pop();
+      });
+    }
+  }
+}
+
+fn push_current_script_name(
+  name: Option<&std::ffi::CString>,
+) -> CurrentScriptNameGuard {
+  let Some(name) = name.and_then(|n| n.to_str().ok()) else {
+    return CurrentScriptNameGuard { pushed: false };
+  };
+  CURRENT_SCRIPT_NAMES.with(|names| {
+    names.borrow_mut().push(name.to_string());
+  });
+  CurrentScriptNameGuard { pushed: true }
+}
+
+pub(crate) fn current_script_name_or_source_url() -> Option<std::string::String>
+{
+  CURRENT_SCRIPT_NAMES.with(|names| names.borrow().last().cloned())
 }
 
 /// Remember a script's source under its eval filename so the stack-trace shim
@@ -1363,6 +1397,7 @@ pub extern "C" fn v8__Script__Run(
     Some(name) => name.as_ptr(),
     None => c"<eval>".as_ptr(),
   };
+  let _current_script_name = push_current_script_name(fname_owned.as_ref());
   // Capture the source under its eval filename for the stack-trace shim.
   if let Some(name) = fname_owned.as_ref()
     && let Ok(fname) = name.to_str()
