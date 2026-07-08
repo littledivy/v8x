@@ -661,7 +661,7 @@ pub extern "C" fn v8__String__Length(this: *const V8String) -> c_int {
 }
 
 #[repr(C)]
-struct ViewState {
+pub(super) struct ViewState {
   data: *mut c_void,
   len: usize,
   is_one_byte: bool,

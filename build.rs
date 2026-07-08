@@ -475,6 +475,7 @@ fn build_quickjs(manifest_dir: &std::path::Path) {
     .flag_if_supported("-Wno-sign-compare")
     .flag_if_supported("-Wno-unused-parameter")
     .flag_if_supported("-Wno-unused-but-set-variable")
+    .flag_if_supported("-Wno-unused-variable")
     .opt_level(2)
     .compile("quickjs");
   println!("cargo:rerun-if-changed={}", qjs.display());

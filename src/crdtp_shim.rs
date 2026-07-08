@@ -43,6 +43,7 @@ unsafe extern "C" {
     call_id: i32,
     message: *mut c_void,
   );
+  #[allow(dead_code)]
   fn crdtp__FrontendChannel__BASE__sendProtocolNotification(
     this: *mut c_void,
     message: *mut c_void,
@@ -396,13 +397,13 @@ fn serialize(v: &Json, out: &mut String) {
 // ===========================================================================
 
 /// `std::vector<uint8_t>` analogue used by the serializer / json codec.
-type CppVecU8 = Vec<u8>;
+pub(crate) type CppVecU8 = Vec<u8>;
 
-struct Serializable {
+pub(crate) struct Serializable {
   bytes: Vec<u8>,
 }
 
-struct Dispatchable {
+pub(crate) struct Dispatchable {
   ok: bool,
   has_call_id: bool,
   call_id: i32,
@@ -418,18 +419,18 @@ enum RespKind {
   Error,
 }
 
-struct DispatchResponse {
+pub(crate) struct DispatchResponse {
   kind: RespKind,
   code: i32,
   message: String,
 }
 
-struct UberDispatcher {
+pub(crate) struct UberDispatcher {
   channel: *mut c_void,
   domains: Vec<(Vec<u8>, *mut DomainDispatcher)>,
 }
 
-struct DomainDispatcher {
+pub(crate) struct DomainDispatcher {
   channel: *mut c_void,
   rust_dispatcher: *mut c_void,
 }
@@ -450,7 +451,7 @@ enum Runnable {
   },
 }
 
-struct DispatchResult {
+pub(crate) struct DispatchResult {
   method_found: bool,
   runnable: Option<Runnable>,
 }

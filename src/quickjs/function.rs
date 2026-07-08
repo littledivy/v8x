@@ -196,10 +196,10 @@ struct JSClassDef {
 }
 
 #[repr(C)]
-struct RawReturnValue(usize);
+pub(super) struct RawReturnValue(usize);
 
 #[repr(C)]
-struct RawFunctionCallbackInfoParts {
+pub(super) struct RawFunctionCallbackInfoParts {
   isolate: *mut RealIsolate,
   return_value: usize,
   data: *const Value,
