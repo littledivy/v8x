@@ -165,6 +165,7 @@ struct BsInner {
   data: *mut c_void,
   byte_length: usize,
   is_shared: bool,
+  is_resizable_by_user_javascript: bool,
 
   deleter: BackingStoreDeleterCallback,
   deleter_data: *mut c_void,
@@ -225,6 +226,7 @@ impl BsInner {
       data,
       byte_length,
       is_shared,
+      is_resizable_by_user_javascript: false,
       deleter,
       deleter_data,
       owns_malloc,
@@ -343,11 +345,34 @@ fn backing_store_for_buffer(
     BsInner::boxed(data, len, false, noop_deleter, ptr::null_mut(), false);
 
   unsafe {
+    (*inner).is_resizable_by_user_javascript =
+      is_resizable_by_user_javascript(ctx, buf, false);
     (*inner).retained_ctx = ctx;
     (*inner).retained_val = JS_DupValue(ctx, buf);
   }
   registry_add(data as usize, inner);
   make_shared_ref(inner)
+}
+
+unsafe fn is_resizable_by_user_javascript(
+  ctx: *mut JSContext,
+  buf: JSValue,
+  is_shared: bool,
+) -> bool {
+  let prop_name = if is_shared {
+    c"growable".as_ptr()
+  } else {
+    c"resizable".as_ptr()
+  };
+  let prop = unsafe { JS_GetPropertyStr(ctx, buf, prop_name) };
+  if prop.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return false;
+  }
+  let resizable = unsafe { JS_ToBool(ctx, prop) } != 0;
+  unsafe { JS_FreeValue(ctx, prop) };
+  resizable
 }
 
 unsafe fn read_len_prop(
@@ -934,7 +959,7 @@ pub extern "C" fn v8__BackingStore__IsShared(
 pub extern "C" fn v8__BackingStore__IsResizableByUserJavaScript(
   this: *const BackingStore,
 ) -> bool {
-  false
+  bs_inner(this).is_some_and(|b| b.is_resizable_by_user_javascript)
 }
 
 #[unsafe(no_mangle)]
