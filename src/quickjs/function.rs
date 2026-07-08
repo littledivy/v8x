@@ -60,6 +60,7 @@ unsafe extern "C" {
     proto: JSValue,
   ) -> c_int;
   fn JS_PreventExtensions(ctx: *mut JSContext, obj: JSValue) -> c_int;
+  fn JS_IsStrictEqual(ctx: *mut JSContext, op1: JSValue, op2: JSValue) -> bool;
 
   fn JS_DefinePropertyValueStr(
     ctx: *mut JSContext,
@@ -332,6 +333,8 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     static NAMED_GETTER_DISPATCH: std::cell::RefCell<Vec<NamedGetterEntry>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static GLOBAL_DEFINE_DISPATCH: std::cell::RefCell<Vec<*const GlobalDefineEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[derive(Clone, Copy)]
@@ -340,6 +343,13 @@ struct NamedGetterEntry {
   data: JSValue,
   owner_ctx: *mut JSContext,
   atom: JSAtom,
+}
+
+struct GlobalDefineEntry {
+  original: JSValue,
+  object_ctor: JSValue,
+  global: JSValue,
+  handler: NamedHandler,
 }
 
 pub(crate) mod timing {
@@ -449,6 +459,25 @@ fn register_named_getter(
 
 fn lookup_named_getter(idx: c_int) -> Option<NamedGetterEntry> {
   NAMED_GETTER_DISPATCH.with(|d| d.borrow().get(idx as usize).copied())
+}
+
+fn register_global_define(entry: GlobalDefineEntry) -> c_int {
+  GLOBAL_DEFINE_DISPATCH.with(|d| {
+    let mut d = d.borrow_mut();
+    let idx = d.len() as c_int;
+    d.push(Box::into_raw(Box::new(entry)));
+    idx
+  })
+}
+
+fn lookup_global_define(idx: c_int) -> Option<&'static GlobalDefineEntry> {
+  GLOBAL_DEFINE_DISPATCH.with(|d| {
+    d.borrow()
+      .get(idx as usize)
+      .copied()
+      .filter(|ptr| !ptr.is_null())
+      .map(|ptr| unsafe { &*ptr })
+  })
 }
 
 unsafe fn materialize_named_handler_data(
@@ -2195,6 +2224,247 @@ unsafe extern "C" fn named_getter_trampoline(
   result
 }
 
+struct ParsedDefineDescriptor {
+  value: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+  flags: c_int,
+}
+
+unsafe fn free_parsed_define_descriptor(
+  ctx: *mut JSContext,
+  desc: ParsedDefineDescriptor,
+) {
+  unsafe {
+    JS_FreeValue(ctx, desc.value);
+    JS_FreeValue(ctx, desc.getter);
+    JS_FreeValue(ctx, desc.setter);
+  }
+}
+
+unsafe fn parse_descriptor_bool(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  name: *const c_char,
+  has_flag: c_int,
+  value_flag: c_int,
+  flags: &mut c_int,
+) -> c_int {
+  let has = unsafe { JS_HasPropertyStr(ctx, obj, name) };
+  if has <= 0 {
+    return has;
+  }
+  let value = unsafe { JS_GetPropertyStr(ctx, obj, name) };
+  if jsv_is_exception(&value) {
+    return -1;
+  }
+  *flags |= has_flag;
+  if unsafe { JS_ToBool(ctx, value) } != 0 {
+    *flags |= value_flag;
+  }
+  unsafe { JS_FreeValue(ctx, value) };
+  0
+}
+
+unsafe fn parse_define_descriptor(
+  ctx: *mut JSContext,
+  desc_obj: JSValue,
+) -> Option<ParsedDefineDescriptor> {
+  let mut desc = ParsedDefineDescriptor {
+    value: jsv_undefined(),
+    getter: jsv_undefined(),
+    setter: jsv_undefined(),
+    flags: 0,
+  };
+
+  let has_value =
+    unsafe { JS_HasPropertyStr(ctx, desc_obj, c"value".as_ptr()) };
+  if has_value < 0 {
+    return None;
+  }
+  if has_value > 0 {
+    let value = unsafe { JS_GetPropertyStr(ctx, desc_obj, c"value".as_ptr()) };
+    if jsv_is_exception(&value) {
+      return None;
+    }
+    desc.value = value;
+    desc.flags |= JS_PROP_HAS_VALUE_QJS;
+  }
+
+  let has_get = unsafe { JS_HasPropertyStr(ctx, desc_obj, c"get".as_ptr()) };
+  if has_get < 0 {
+    unsafe { free_parsed_define_descriptor(ctx, desc) };
+    return None;
+  }
+  if has_get > 0 {
+    let getter = unsafe { JS_GetPropertyStr(ctx, desc_obj, c"get".as_ptr()) };
+    if jsv_is_exception(&getter) {
+      unsafe { free_parsed_define_descriptor(ctx, desc) };
+      return None;
+    }
+    desc.getter = getter;
+    desc.flags |= JS_PROP_HAS_GET_QJS;
+  }
+
+  let has_set = unsafe { JS_HasPropertyStr(ctx, desc_obj, c"set".as_ptr()) };
+  if has_set < 0 {
+    unsafe { free_parsed_define_descriptor(ctx, desc) };
+    return None;
+  }
+  if has_set > 0 {
+    let setter = unsafe { JS_GetPropertyStr(ctx, desc_obj, c"set".as_ptr()) };
+    if jsv_is_exception(&setter) {
+      unsafe { free_parsed_define_descriptor(ctx, desc) };
+      return None;
+    }
+    desc.setter = setter;
+    desc.flags |= JS_PROP_HAS_SET_QJS;
+  }
+
+  if unsafe {
+    parse_descriptor_bool(
+      ctx,
+      desc_obj,
+      c"enumerable".as_ptr(),
+      JS_PROP_HAS_ENUMERABLE_QJS,
+      JS_PROP_ENUMERABLE,
+      &mut desc.flags,
+    )
+  } < 0
+  {
+    unsafe { free_parsed_define_descriptor(ctx, desc) };
+    return None;
+  }
+  if unsafe {
+    parse_descriptor_bool(
+      ctx,
+      desc_obj,
+      c"configurable".as_ptr(),
+      JS_PROP_HAS_CONFIGURABLE_QJS,
+      JS_PROP_CONFIGURABLE,
+      &mut desc.flags,
+    )
+  } < 0
+  {
+    unsafe { free_parsed_define_descriptor(ctx, desc) };
+    return None;
+  }
+  if unsafe {
+    parse_descriptor_bool(
+      ctx,
+      desc_obj,
+      c"writable".as_ptr(),
+      JS_PROP_HAS_WRITABLE_QJS,
+      JS_PROP_WRITABLE,
+      &mut desc.flags,
+    )
+  } < 0
+  {
+    unsafe { free_parsed_define_descriptor(ctx, desc) };
+    return None;
+  }
+
+  Some(desc)
+}
+
+unsafe extern "C" fn global_define_property_trampoline(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  magic: c_int,
+) -> JSValue {
+  let Some(entry) = lookup_global_define(magic) else {
+    return jsv_exception();
+  };
+
+  if argc >= 3 && !argv.is_null() {
+    let target = unsafe { *argv };
+    let desc_obj = unsafe { *argv.add(2) };
+    if unsafe { JS_IsStrictEqual(ctx, target, entry.global) }
+      && jsv_is_object(&desc_obj)
+    {
+      let atom = unsafe { JS_ValueToAtom(ctx, *argv.add(1)) };
+      if atom == 0 && unsafe { JS_HasException(ctx) } {
+        return jsv_exception();
+      }
+
+      let Some(desc) = (unsafe { parse_define_descriptor(ctx, desc_obj) })
+      else {
+        unsafe { JS_FreeAtom(ctx, atom) };
+        return jsv_exception();
+      };
+
+      let mut intercepted = false;
+      if desc.flags & JS_PROP_HAS_VALUE_QJS != 0 {
+        if let Some(setter) = entry.handler.setter {
+          let state = unsafe {
+            call_named_setter(
+              ctx,
+              target,
+              atom,
+              desc.value,
+              &entry.handler,
+              setter,
+            )
+          };
+          if state < 0 {
+            unsafe {
+              JS_FreeAtom(ctx, atom);
+              free_parsed_define_descriptor(ctx, desc);
+            }
+            return jsv_exception();
+          }
+          intercepted |= state > 0;
+        }
+      }
+
+      if let Some(definer) = entry.handler.definer {
+        let state = unsafe {
+          call_named_definer(
+            ctx,
+            target,
+            atom,
+            desc.value,
+            desc.getter,
+            desc.setter,
+            desc.flags,
+            &entry.handler,
+            definer,
+          )
+        };
+        if state < 0 {
+          unsafe {
+            JS_FreeAtom(ctx, atom);
+            free_parsed_define_descriptor(ctx, desc);
+          }
+          return jsv_exception();
+        }
+        intercepted |= state > 0;
+      }
+
+      unsafe {
+        JS_FreeAtom(ctx, atom);
+        free_parsed_define_descriptor(ctx, desc);
+      }
+
+      if intercepted {
+        return unsafe { JS_DupValue(ctx, target) };
+      }
+    }
+  }
+
+  unsafe {
+    JS_Call(
+      ctx,
+      entry.original,
+      entry.object_ctor,
+      argc,
+      if argc > 0 { argv } else { ptr::null_mut() },
+    )
+  }
+}
+
 pub(crate) unsafe fn call_accessor_name_getter(
   ctx: *mut JSContext,
   this_val: JSValue,
@@ -3579,6 +3849,8 @@ fn install_named_global_handler(
   global: JSValue,
   handler: &NamedHandler,
 ) {
+  install_global_define_property_handler(ctx, global, handler);
+
   if handler.getter.is_none() || jsv_is_undefined(&handler.data) {
     return;
   }
@@ -3629,6 +3901,47 @@ fn install_named_global_handler(
   }
 
   unsafe { JS_FreePropertyEnum(ctx, tab, len) };
+}
+
+fn install_global_define_property_handler(
+  ctx: *mut JSContext,
+  global: JSValue,
+  handler: &NamedHandler,
+) {
+  if handler.setter.is_none() && handler.definer.is_none() {
+    return;
+  }
+
+  unsafe {
+    let object_ctor = JS_GetPropertyStr(ctx, global, c"Object".as_ptr());
+    if !jsv_is_object(&object_ctor) {
+      JS_FreeValue(ctx, object_ctor);
+      return;
+    }
+    let original =
+      JS_GetPropertyStr(ctx, object_ctor, c"defineProperty".as_ptr());
+    if !jsv_is_object(&original) {
+      JS_FreeValue(ctx, original);
+      JS_FreeValue(ctx, object_ctor);
+      return;
+    }
+
+    let magic = register_global_define(GlobalDefineEntry {
+      original,
+      object_ctor,
+      global: JS_DupValue(ctx, global),
+      handler: clone_named_handler(ctx, handler),
+    });
+    let wrapper = make_cfunc_magic(
+      ctx,
+      global_define_property_trampoline,
+      c"defineProperty".as_ptr(),
+      3,
+      JS_CFUNC_GENERIC_MAGIC,
+      magic,
+    );
+    JS_SetPropertyStr(ctx, object_ctor, c"defineProperty".as_ptr(), wrapper);
+  }
 }
 
 pub(crate) fn apply_object_template_to_global(
