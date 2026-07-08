@@ -37,14 +37,17 @@
 #![allow(non_snake_case)]
 
 use super::quickjs_sys::*;
+use crate::support::SharedPtrBase;
 use crate::{
-  Context, Data, Object, Primitive, RealIsolate, String as V8String, Value,
+  Allocator, Context, Data, MicrotaskQueue, MicrotasksPolicy, Object,
+  ObjectTemplate, Primitive, RealIsolate, String as V8String, Value,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::os::raw::{c_int, c_void};
+use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 
 pub(crate) type WeakCallback = unsafe extern "C" fn(*const c_void);
 
@@ -54,11 +57,22 @@ pub(crate) struct WeakHandle {
   pub callback: WeakCallback,
 }
 
+pub(crate) struct PersistentHandle {
+  pub slot: *mut JSValue,
+  pub is_weak: bool,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct GcCallbackEntry {
   pub callback: crate::isolate::GcCallbackWithData,
   pub data: *mut c_void,
   pub gc_type_filter: crate::gc::GCType,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct InterruptEntry {
+  pub callback: crate::isolate::InterruptCallback,
+  pub data: *mut c_void,
 }
 
 /// Process-wide "force strict mode" flag, toggled by
@@ -79,6 +93,191 @@ pub(crate) fn global_eval_flags() -> c_int {
   flags
 }
 
+fn skip_js_space_and_comments(mut bytes: &[u8]) -> &[u8] {
+  loop {
+    bytes = bytes.trim_ascii_start();
+    if let Some(rest) = bytes.strip_prefix(b"//") {
+      bytes = match rest.iter().position(|b| *b == b'\n' || *b == b'\r') {
+        Some(pos) => &rest[pos + 1..],
+        None => &[],
+      };
+      continue;
+    }
+    if let Some(rest) = bytes.strip_prefix(b"/*") {
+      bytes = match rest.windows(2).position(|w| w == b"*/") {
+        Some(pos) => &rest[pos + 2..],
+        None => &[],
+      };
+      continue;
+    }
+    return bytes;
+  }
+}
+
+fn starts_with_strict_directive(source: &[u8]) -> bool {
+  let source = skip_js_space_and_comments(source);
+  let Some((&quote, rest)) = source.split_first() else {
+    return false;
+  };
+  if quote != b'\'' && quote != b'"' {
+    return false;
+  }
+  let Some(after_literal) = rest.strip_prefix(b"use strict") else {
+    return false;
+  };
+  let Some((&end_quote, after_quote)) = after_literal.split_first() else {
+    return false;
+  };
+  if end_quote != quote {
+    return false;
+  }
+  after_quote
+    .first()
+    .is_none_or(|b| b.is_ascii_whitespace() || *b == b';')
+}
+
+fn maybe_report_strict_mode_use(source: &[u8]) {
+  if !starts_with_strict_directive(source) {
+    return;
+  }
+  let iso = current_iso();
+  if iso.is_null() {
+    return;
+  }
+  let callback = iso_state(iso).use_counter_callback;
+  if let Some(callback) = callback {
+    let mut isolate = unsafe {
+      crate::Isolate::from_raw_isolate_ptr(
+        crate::UnsafeRawIsolatePtr::from_real_ptr(iso),
+      )
+    };
+    unsafe { callback(&mut isolate, crate::UseCounterFeature::kStrictMode) };
+  }
+}
+
+fn rewrite_script_source(source: &str) -> Option<String> {
+  let mut rewritten = rewrite_v8_native_intrinsics(source);
+  let input = rewritten.as_deref().unwrap_or(source);
+  if let Some(text) = super::module::rewrite_dynamic_source_phase_imports(input)
+  {
+    rewritten = Some(text);
+  }
+  rewritten
+}
+
+fn rewrite_v8_native_intrinsics(source: &str) -> Option<String> {
+  if !source.contains("%PrepareFunctionForOptimization")
+    && !source.contains("%OptimizeFunctionOnNextCall")
+    && !source.contains("%AtomicsNumWaitersForTesting")
+    && !source.contains("%AtomicsNumUnresolvedAsyncPromisesForTesting")
+  {
+    return None;
+  }
+
+  let mut out = String::with_capacity(source.len());
+  let mut pos = 0usize;
+  while pos < source.len() {
+    if source[pos..].starts_with("%PrepareFunctionForOptimization(") {
+      if let Some((end, args)) =
+        read_intrinsic_args(source, pos, "%PrepareFunctionForOptimization")
+      {
+        out.push_str("(void (");
+        out.push_str(args);
+        out.push_str("))");
+        pos = end;
+        continue;
+      }
+    }
+    if source[pos..].starts_with("%OptimizeFunctionOnNextCall(") {
+      if let Some((end, args)) =
+        read_intrinsic_args(source, pos, "%OptimizeFunctionOnNextCall")
+      {
+        out.push_str(
+          "(globalThis.__v8x_fast_api_next_call=((globalThis.__v8x_fast_api_next_call|0)+1),void (",
+        );
+        out.push_str(args);
+        out.push_str("))");
+        pos = end;
+        continue;
+      }
+    }
+    if source[pos..].starts_with("%AtomicsNumWaitersForTesting(") {
+      if let Some((end, args)) =
+        read_intrinsic_args(source, pos, "%AtomicsNumWaitersForTesting")
+      {
+        out.push_str("__v8xAtomicsNumWaitersForTesting(");
+        out.push_str(args);
+        out.push(')');
+        pos = end;
+        continue;
+      }
+    }
+    if source[pos..]
+      .starts_with("%AtomicsNumUnresolvedAsyncPromisesForTesting(")
+    {
+      if let Some((end, args)) = read_intrinsic_args(
+        source,
+        pos,
+        "%AtomicsNumUnresolvedAsyncPromisesForTesting",
+      ) {
+        out.push_str("__v8xAtomicsNumUnresolvedAsyncPromisesForTesting(");
+        out.push_str(args);
+        out.push(')');
+        pos = end;
+        continue;
+      }
+    }
+
+    let ch = source[pos..].chars().next().unwrap();
+    out.push(ch);
+    pos += ch.len_utf8();
+  }
+
+  (out != source).then_some(out)
+}
+
+fn read_intrinsic_args<'a>(
+  source: &'a str,
+  start: usize,
+  name: &str,
+) -> Option<(usize, &'a str)> {
+  let open = start + name.len();
+  if source.as_bytes().get(open) != Some(&b'(') {
+    return None;
+  }
+  let args_start = open + 1;
+  let mut depth = 1usize;
+  let mut pos = args_start;
+  while pos < source.len() {
+    match source.as_bytes()[pos] {
+      b'(' => depth += 1,
+      b')' => {
+        depth -= 1;
+        if depth == 0 {
+          return Some((pos + 1, &source[args_start..pos]));
+        }
+      }
+      _ => {}
+    }
+    pos += 1;
+  }
+  None
+}
+
+pub(crate) fn note_compilation_cache_miss() {
+  let iso = current_iso();
+  if iso.is_null() {
+    return;
+  }
+  let callback = iso_state(iso).counter_lookup_callback;
+  if let Some(callback) = callback {
+    let counter = unsafe { callback(c"c:V8.CompilationCacheMisses".as_ptr()) };
+    if !counter.is_null() {
+      unsafe { *counter += 1 };
+    }
+  }
+}
+
 pub(crate) struct IsoState {
   pub rt: *mut JSRuntime,
 
@@ -88,6 +287,10 @@ pub(crate) struct IsoState {
 
   pub handles: Vec<*mut JSValue>,
 
+  pub persistent_handles: Vec<PersistentHandle>,
+
+  pub private_symbols: Vec<(JSValue, JSValue)>,
+
   pub data_slots: [*mut c_void; 4],
 
   // QuickJS class id for `v8::External` objects. Registered on the runtime
@@ -96,6 +299,10 @@ pub(crate) struct IsoState {
   // time and never grows it, so a class registered afterward would make
   // `JS_NewObjectClass(ctx, id)` read `class_proto[id]` out of bounds.
   pub ext_class_id: JSClassID,
+
+  // QuickJS class id for ObjectTemplate named-property-handler instances.
+  // It has the same registration timing constraint as `ext_class_id`.
+  pub named_handler_class_id: JSClassID,
 
   // Whether the bootstrap context (`ctx`) has been handed out by
   // `v8__Context__New`. QuickJS has one global object per JSContext, but
@@ -115,10 +322,22 @@ pub(crate) struct IsoState {
   pub ctx_data_counts: HashMap<usize, usize>,
   pub iso_data_count: usize,
   pub iso_added_contexts: usize,
+  pub snap_default_context: Option<usize>,
+  pub snap_contexts: Vec<usize>,
+  pub snap_isolate_data: Vec<Vec<u8>>,
+  pub snap_context_data: HashMap<usize, Vec<Vec<u8>>>,
+  pub restored_snapshot: Option<super::snapshot::SnapshotBlob>,
+  pub restored_isolate_data: Vec<Option<Vec<u8>>>,
+  pub restored_context_data: HashMap<usize, Vec<Option<Vec<u8>>>>,
+  pub external_references: Vec<usize>,
 
   pub external_memory: AtomicI64,
 
   pub external_string_memory: AtomicI64,
+
+  pub bytecode_and_metadata_size: AtomicUsize,
+
+  pub global_handles: AtomicI64,
 
   pub weak_handles: Vec<WeakHandle>,
 
@@ -128,18 +347,59 @@ pub(crate) struct IsoState {
 
   pub gc_epilogue_callbacks: Vec<GcCallbackEntry>,
 
+  pub message_listeners: Vec<crate::isolate::MessageCallback>,
+
+  pub use_counter_callback: Option<crate::UseCounterCallback>,
+
+  pub counter_lookup_callback:
+    Option<crate::isolate_create_params::CounterLookupCallback>,
+
+  pub javascript_execution_disallow_scopes: Vec<crate::scope::OnFailure>,
+
+  pub javascript_execution_allow_depth: usize,
+
   // Emulates `v8::Isolate::TerminateExecution`. Set by `TerminateExecution`,
   // cleared by `CancelTerminateExecution`; while set, the op-dispatch boundary
   // and the microtask/job drain refuse to run JS (matching V8, which throws an
   // uncatchable termination exception on the next safe point). An `AtomicBool`
   // because V8's terminate may be requested from another thread.
   pub terminating: std::sync::atomic::AtomicBool,
+
+  pub pending_interrupts: Mutex<Vec<InterruptEntry>>,
+
+  pub array_buffer_allocator: SharedPtrBase<Allocator>,
+
+  pub pending_array_buffer_frees: Vec<(*mut Allocator, *mut c_void, usize)>,
+
+  pub microtasks_policy: MicrotasksPolicy,
+
+  pub default_microtask_queue: *mut MicrotaskQueue,
+
+  pub context_microtask_queues: HashMap<usize, *mut MicrotaskQueue>,
 }
 
 impl IsoState {
   #[inline(always)]
   pub fn is_terminating(&self) -> bool {
     self.terminating.load(std::sync::atomic::Ordering::Acquire)
+  }
+}
+
+#[inline]
+pub(crate) fn javascript_execution_allowed() -> bool {
+  let iso = current_iso();
+  if iso.is_null() {
+    return true;
+  }
+  let st = iso_state(iso);
+  st.javascript_execution_allow_depth > 0
+    || st.javascript_execution_disallow_scopes.is_empty()
+}
+
+#[inline]
+unsafe fn throw_javascript_execution_disallowed(ctx: *mut JSContext) {
+  unsafe {
+    JS_ThrowTypeError(ctx, c"Javascript execution is disallowed".as_ptr());
   }
 }
 
@@ -179,9 +439,22 @@ pub(crate) fn release_external_string_memory(st: &IsoState) -> i64 {
   released
 }
 
+#[inline]
+pub(crate) fn note_compiled_bytecode(
+  isolate: *mut RealIsolate,
+  source_len: usize,
+) {
+  if !isolate.is_null() {
+    iso_state(isolate)
+      .bytecode_and_metadata_size
+      .fetch_add(source_len.max(1), Ordering::SeqCst);
+  }
+}
+
 thread_local! {
     static CURRENT_ISO: RefCell<*mut RealIsolate> = const { RefCell::new(ptr::null_mut()) };
     static CURRENT_CTX: RefCell<*mut JSContext> = const { RefCell::new(ptr::null_mut()) };
+    static ISO_STACK: RefCell<Vec<*mut RealIsolate>> = const { RefCell::new(Vec::new()) };
 
     static LAST_ISO: RefCell<*mut RealIsolate> = const { RefCell::new(ptr::null_mut()) };
 }
@@ -209,6 +482,9 @@ fn set_current(iso: *mut RealIsolate) {
   CURRENT_ISO.with(|c| *c.borrow_mut() = iso);
   if !iso.is_null() {
     LAST_ISO.with(|c| *c.borrow_mut() = iso);
+    refresh_current_ctx(iso_state(iso));
+  } else {
+    CURRENT_CTX.with(|c| *c.borrow_mut() = ptr::null_mut());
   }
 }
 
@@ -223,6 +499,34 @@ fn clear_last_iso(iso: *mut RealIsolate) {
 fn refresh_current_ctx(st: &IsoState) {
   let ctx = st.contexts.last().copied().unwrap_or(st.ctx);
   CURRENT_CTX.with(|c| *c.borrow_mut() = ctx);
+}
+
+fn push_current_iso(iso: *mut RealIsolate) {
+  ISO_STACK.with(|s| s.borrow_mut().push(iso));
+  set_current(iso);
+}
+
+fn pop_current_iso(iso: *mut RealIsolate) {
+  let next = ISO_STACK.with(|s| {
+    let mut s = s.borrow_mut();
+    if s.last().copied() == Some(iso) {
+      s.pop();
+    } else if let Some(pos) = s.iter().rposition(|entry| *entry == iso) {
+      s.remove(pos);
+    }
+    s.last().copied().unwrap_or(ptr::null_mut())
+  });
+  set_current(next);
+}
+
+fn remove_current_iso(iso: *mut RealIsolate) {
+  let next = ISO_STACK.with(|s| {
+    let mut s = s.borrow_mut();
+    s.retain(|entry| *entry != iso);
+    s.last().copied().unwrap_or(ptr::null_mut())
+  });
+  set_current(next);
+  clear_last_iso(iso);
 }
 
 #[inline(always)]
@@ -253,6 +557,21 @@ pub(crate) fn intern_ctx(ctx: *mut JSContext) -> *const Context {
 #[inline(always)]
 pub(crate) fn is_non_value_handle<T>(p: *const T) -> bool {
   !p.is_null() && super::function::is_template_ptr(p as *const c_void)
+}
+
+#[inline(always)]
+pub(crate) fn is_interned_handle<T>(p: *const T) -> bool {
+  let iso = current_iso();
+  !iso.is_null() && {
+    let st = iso_state(iso);
+    st.handles
+      .iter()
+      .any(|&h| std::ptr::addr_eq(h, p as *const JSValue))
+      || st
+        .persistent_handles
+        .iter()
+        .any(|h| std::ptr::addr_eq(h.slot, p as *const JSValue))
+  }
 }
 
 #[inline(always)]
@@ -368,7 +687,7 @@ fn sab_funcs_table() -> *const JSSharedArrayBufferFunctions {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
+pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
@@ -394,12 +713,14 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
       ptr::null_mut(),
     )
   };
-  // Register custom classes (currently just `v8::External`) on the runtime
+  // Register custom classes on the runtime
   // BEFORE creating the context, so the context's `class_proto` array is sized
   // to include them. Registering after `JS_NewContext` would leave
   // `JS_NewObjectClass` indexing `class_proto` out of bounds (heap overflow that
   // hands back a garbage prototype and later corrupts the GC heap).
   let ext_class_id = super::function::register_external_class(rt);
+  let named_handler_class_id =
+    super::function::register_named_handler_class(rt);
 
   let ctx = unsafe { JS_NewContext(rt) };
   assert!(!ctx.is_null(), "JS_NewContext failed");
@@ -407,25 +728,75 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
   if std::env::var_os("QJS_NO_WASM").is_none() {
     super::wasm::install_webassembly(ctx);
   }
+  let raw_params = if params.is_null() {
+    ptr::null()
+  } else {
+    params as *const crate::isolate_create_params::raw::CreateParams
+  };
+  let counter_lookup_callback = if raw_params.is_null() {
+    None
+  } else {
+    unsafe { (*raw_params).counter_lookup_callback }
+  };
+  let array_buffer_allocator = if raw_params.is_null() {
+    SharedPtrBase::<Allocator>::default()
+  } else {
+    let shared = unsafe { &(*raw_params).array_buffer_allocator_shared };
+    let shared = shared as *const _ as *const SharedPtrBase<Allocator>;
+    super::allocator::allocator_shared_copy(shared)
+  };
+  let external_references =
+    super::snapshot::external_references_from_params(raw_params);
+  let restored_snapshot = super::snapshot::blob_from_params(raw_params);
+  let restored_isolate_data = restored_snapshot
+    .as_ref()
+    .map(|blob| blob.isolate_data.iter().cloned().map(Some).collect())
+    .unwrap_or_default();
   let state = Box::new(IsoState {
     rt,
     ctx,
     contexts: Vec::new(),
     handles: Vec::new(),
+    persistent_handles: Vec::new(),
+    private_symbols: Vec::new(),
     data_slots: [ptr::null_mut(); 4],
     ext_class_id,
+    named_handler_class_id,
     main_ctx_claimed: false,
     extra_contexts: Vec::new(),
     ctx_data_counts: HashMap::new(),
     iso_data_count: 0,
     iso_added_contexts: 0,
+    snap_default_context: None,
+    snap_contexts: Vec::new(),
+    snap_isolate_data: Vec::new(),
+    snap_context_data: HashMap::new(),
+    restored_snapshot,
+    restored_isolate_data,
+    restored_context_data: HashMap::new(),
+    external_references,
     external_memory: AtomicI64::new(0),
     external_string_memory: AtomicI64::new(0),
+    bytecode_and_metadata_size: AtomicUsize::new(0),
+    global_handles: AtomicI64::new(0),
     weak_handles: Vec::new(),
     kept_objects_cleared: false,
     gc_prologue_callbacks: Vec::new(),
     gc_epilogue_callbacks: Vec::new(),
+    message_listeners: Vec::new(),
+    use_counter_callback: None,
+    counter_lookup_callback,
+    javascript_execution_disallow_scopes: Vec::new(),
+    javascript_execution_allow_depth: 0,
     terminating: std::sync::atomic::AtomicBool::new(false),
+    pending_interrupts: Mutex::new(Vec::new()),
+    array_buffer_allocator,
+    pending_array_buffer_frees: Vec::new(),
+    microtasks_policy: MicrotasksPolicy::Auto,
+    default_microtask_queue: super::isolate::new_microtask_queue_state(
+      MicrotasksPolicy::Auto,
+    ),
+    context_microtask_queues: HashMap::new(),
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;
   // Arm the interrupt handler so a runaway loop unwinds once
@@ -479,6 +850,15 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
       JS_FreeValue(st.ctx, v);
       drop(Box::from_raw(slot));
     }
+    while let Some(slot) = st.persistent_handles.pop() {
+      let v = *slot.slot;
+      JS_FreeValue(st.ctx, v);
+      drop(Box::from_raw(slot.slot));
+    }
+    while let Some((symbol, name)) = st.private_symbols.pop() {
+      JS_FreeValue(st.ctx, symbol);
+      JS_FreeValue(st.ctx, name);
+    }
     // Release any saved eval/Function bindings a context held while code
     // generation from strings was disabled, before its JSContext is freed.
     for c in &st.extra_contexts {
@@ -492,27 +872,30 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
     if std::env::var_os("QJS_SKIP_FREE_RT").is_none() {
       JS_FreeRuntime(st.rt);
     }
+    for (allocator, data, byte_length) in
+      std::mem::take(&mut st.pending_array_buffer_frees)
+    {
+      super::allocator::allocator_free(allocator, data, byte_length);
+    }
+    super::isolate::drop_microtask_queue_state(st.default_microtask_queue);
+    st.context_microtask_queues.clear();
   }
   // The module registries are thread-locals keyed by NAME or by pointers into
   // the runtime that was just freed. A later isolate on this thread (e.g. a
   // runtime restored from the snapshot this isolate just created) would
   // resolve its ext: modules to this isolate's dangling defs. Drop them all.
   super::module::clear_thread_module_caches();
-  set_current(ptr::null_mut());
-  clear_last_iso(this);
+  remove_current_iso(this);
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__Enter(this: *mut RealIsolate) {
-  set_current(this);
-  if !this.is_null() {
-    refresh_current_ctx(iso_state(this));
-  }
+  push_current_iso(this);
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__Exit(_this: *mut RealIsolate) {
-  set_current(ptr::null_mut());
+pub extern "C" fn v8__Isolate__Exit(this: *mut RealIsolate) {
+  pop_current_iso(this);
 }
 
 #[unsafe(no_mangle)]
@@ -663,9 +1046,9 @@ pub extern "C" fn v8__Undefined(isolate: *mut RealIsolate) -> *const Primitive {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__New(
   isolate: *mut RealIsolate,
-  _templ: *const c_void,
+  templ: *const c_void,
   _global_object: *const c_void,
-  _microtask_queue: *mut c_void,
+  microtask_queue: *mut c_void,
 ) -> *const Context {
   if isolate.is_null() {
     return ptr::null();
@@ -685,10 +1068,42 @@ pub extern "C" fn v8__Context__New(
     st.extra_contexts.push(c);
     c
   };
-  install_default_globals(ctx);
+  if !microtask_queue.is_null() {
+    st.context_microtask_queues
+      .insert(ctx as usize, microtask_queue as *mut MicrotaskQueue);
+  }
+  install_default_globals(isolate, ctx);
+  if !templ.is_null() {
+    unsafe {
+      let global = JS_GetGlobalObject(ctx);
+      super::function::apply_object_template_to_global(
+        ctx,
+        global,
+        templ as *const ObjectTemplate,
+      );
+      JS_FreeValue(ctx, global);
+    }
+  }
 
   // Snapshot restore: every plain Context::New on a snapshot-backed isolate
   // materializes the snapshot's default context (matches V8 semantics).
+  if let Some(snapshot) = st
+    .restored_snapshot
+    .as_ref()
+    .and_then(|blob| blob.default_context.clone())
+  {
+    let external_references = st.external_references.clone();
+    super::snapshot::replay_context(
+      isolate,
+      ctx,
+      &snapshot,
+      &external_references,
+    );
+    st.restored_context_data.insert(
+      ctx as usize,
+      snapshot.context_data.iter().cloned().map(Some).collect(),
+    );
+  }
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
     eprintln!("[qjs snapshot] Context__New ctx={ctx:?}");
   }
@@ -696,7 +1111,57 @@ pub extern "C" fn v8__Context__New(
   intern_ctx(ctx)
 }
 
-pub(crate) fn install_default_globals(ctx: *mut JSContext) {
+pub(crate) fn context_from_snapshot(
+  isolate: *mut RealIsolate,
+  context_snapshot_index: usize,
+  microtask_queue: *mut MicrotaskQueue,
+) -> *const Context {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let st = iso_state(isolate);
+  let Some(snapshot) = st
+    .restored_snapshot
+    .as_ref()
+    .and_then(|blob| blob.contexts.get(context_snapshot_index).cloned())
+  else {
+    return ptr::null();
+  };
+  let ctx = if !st.main_ctx_claimed {
+    st.main_ctx_claimed = true;
+    st.ctx
+  } else {
+    let c = unsafe { JS_NewContext(st.rt) };
+    assert!(!c.is_null(), "JS_NewContext failed");
+    if std::env::var_os("QJS_NO_WASM").is_none() {
+      super::wasm::install_webassembly(c);
+    }
+    st.extra_contexts.push(c);
+    c
+  };
+  if !microtask_queue.is_null() {
+    st.context_microtask_queues
+      .insert(ctx as usize, microtask_queue as *mut MicrotaskQueue);
+  }
+  install_default_globals(isolate, ctx);
+  let external_references = st.external_references.clone();
+  super::snapshot::replay_context(
+    isolate,
+    ctx,
+    &snapshot,
+    &external_references,
+  );
+  st.restored_context_data.insert(
+    ctx as usize,
+    snapshot.context_data.iter().cloned().map(Some).collect(),
+  );
+  intern_ctx(ctx)
+}
+
+pub(crate) fn install_default_globals(
+  isolate: *mut RealIsolate,
+  ctx: *mut JSContext,
+) {
   if ctx.is_null() {
     return;
   }
@@ -705,11 +1170,24 @@ pub(crate) fn install_default_globals(ctx: *mut JSContext) {
 
     let existing = JS_GetPropertyStr(ctx, global, c"console".as_ptr());
     let absent = jsv_is_undefined(&existing) || existing.tag == JS_TAG_NULL;
-    JS_FreeValue(ctx, existing);
+    let console = if absent { JS_NewObject(ctx) } else { existing };
+    if jsv_is_object(&console) {
+      for name in [c"log", c"error", c"trace"] {
+        let existing = JS_GetPropertyStr(ctx, console, name.as_ptr());
+        let method_absent =
+          jsv_is_undefined(&existing) || existing.tag == JS_TAG_NULL;
+        JS_FreeValue(ctx, existing);
+        if method_absent {
+          let function =
+            JS_NewCFunction(ctx, qjs_console_log, name.as_ptr(), 0);
+          JS_SetPropertyStr(ctx, console, name.as_ptr(), function);
+        }
+      }
+    }
     if absent {
-      let console = JS_NewObject(ctx);
-
       JS_SetPropertyStr(ctx, global, c"console".as_ptr(), console);
+    } else {
+      JS_FreeValue(ctx, console);
     }
 
     let intl = JS_GetPropertyStr(ctx, global, c"Intl".as_ptr());
@@ -718,12 +1196,195 @@ pub(crate) fn install_default_globals(ctx: *mut JSContext) {
     if intl_absent {
       install_intl_stub(ctx, global);
     }
+
+    let gc = JS_GetPropertyStr(ctx, global, c"gc".as_ptr());
+    let gc_absent = jsv_is_undefined(&gc) || gc.tag == JS_TAG_NULL;
+    JS_FreeValue(ctx, gc);
+    if gc_absent {
+      let gc_fn = JS_NewCFunction(ctx, qjs_gc, c"gc".as_ptr(), 0);
+      JS_SetPropertyStr(ctx, global, c"gc".as_ptr(), gc_fn);
+    }
+
+    if super::init::has_entropy_source() {
+      install_entropy_math_random(ctx, global);
+    }
+    super::isolate::install_shadow_realm(ctx, global);
+    super::module::install_dynamic_source_import_global(ctx, global);
+    super::arraybuffer::install_array_buffer_constructor(isolate, ctx, global);
+    install_atomics_wait_async_shim(ctx, global);
     JS_FreeValue(ctx, global);
   }
   install_weakref_kept_object_shim(ctx);
   // Install our V8-accurate `Error.prepareStackTrace` (no-op unless deno
   // registered a PrepareStackTraceCallback — see exception.rs).
   super::exception::install_prepare_stack_trace(ctx);
+}
+
+unsafe extern "C" fn qjs_gc(
+  _ctx: *mut JSContext,
+  _this_val: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
+  let isolate = current_iso();
+  if !isolate.is_null() {
+    super::misc::v8__Isolate__RequestGarbageCollectionForTesting(isolate, 0);
+  }
+  jsv_undefined()
+}
+
+unsafe extern "C" fn qjs_console_log(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  let mut parts = Vec::new();
+  if !argv.is_null() {
+    for index in 0..argc.max(0) as usize {
+      let value = unsafe { *argv.add(index) };
+      let mut len = 0usize;
+      let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, value) };
+      if cstr.is_null() {
+        continue;
+      }
+      let part = unsafe {
+        let bytes = std::slice::from_raw_parts(cstr as *const u8, len);
+        String::from_utf8_lossy(bytes).into_owned()
+      };
+      unsafe { JS_FreeCString(ctx, cstr) };
+      parts.push(part);
+    }
+  }
+  super::inspector::emit_console_api_message(0, parts.join(" "));
+  jsv_undefined()
+}
+
+unsafe extern "C" fn qjs_post_foreground_task(
+  _ctx: *mut JSContext,
+  _this_val: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
+  super::init::post_foreground_task();
+  jsv_undefined()
+}
+
+fn install_atomics_wait_async_shim(ctx: *mut JSContext, global: JSValue) {
+  const SRC: &[u8] = br#"
+    (function(g) {
+      if (!g.Promise) return;
+      if (!g.Atomics) {
+        Object.defineProperty(g, "Atomics", {
+          value: {},
+          writable: true,
+          configurable: true
+        });
+      }
+      const atomics = g.Atomics;
+      const state = { waiters: [], unresolved: 0 };
+      Object.defineProperty(g, "__v8xAtomicsNumWaitersForTesting", {
+        value: function() { return state.waiters.length; },
+        configurable: true
+      });
+      Object.defineProperty(g, "__v8xAtomicsNumUnresolvedAsyncPromisesForTesting", {
+        value: function() { return state.unresolved; },
+        configurable: true
+      });
+      atomics.waitAsync = function(_view, _index, _expected, _timeout) {
+        let resolve;
+        const waiter = { done: false, resolve: undefined };
+        const promise = new Promise(function(r) { resolve = r; });
+        waiter.resolve = resolve;
+        state.waiters.push(waiter);
+        state.unresolved++;
+        promise.then(function() {
+          if (!waiter.done) {
+            waiter.done = true;
+            state.unresolved--;
+          }
+        }, function() {
+          if (!waiter.done) {
+            waiter.done = true;
+            state.unresolved--;
+          }
+        });
+        return { async: true, value: promise };
+      };
+      const originalNotify = atomics.notify;
+      atomics.notify = function(view, index, count) {
+        const limit = count === undefined
+          ? state.waiters.length
+          : Math.max(0, Math.min(state.waiters.length, Number(count) || 0));
+        const pending = state.waiters.splice(0, limit);
+        for (let i = 0; i < pending.length; i++) pending[i].resolve("ok");
+        if (pending.length) g.__v8xPostForegroundTask();
+        if (pending.length || typeof originalNotify !== "function") {
+          return pending.length;
+        }
+        return originalNotify.call(this, view, index, count);
+      };
+    })(globalThis);
+  "#;
+  unsafe {
+    let post = JS_NewCFunction(
+      ctx,
+      qjs_post_foreground_task,
+      c"__v8xPostForegroundTask".as_ptr(),
+      0,
+    );
+    JS_SetPropertyStr(ctx, global, c"__v8xPostForegroundTask".as_ptr(), post);
+
+    let csrc = std::ffi::CString::new(SRC).unwrap();
+    let r = JS_Eval(
+      ctx,
+      csrc.as_ptr(),
+      SRC.len(),
+      c"<atomics-wait-async-shim>".as_ptr(),
+      JS_EVAL_TYPE_GLOBAL,
+    );
+    if r.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    } else {
+      JS_FreeValue(ctx, r);
+    }
+  }
+}
+
+fn install_entropy_math_random(ctx: *mut JSContext, global: JSValue) {
+  unsafe {
+    let math = JS_GetPropertyStr(ctx, global, c"Math".as_ptr());
+    let math_absent = jsv_is_undefined(&math) || math.tag == JS_TAG_NULL;
+    let math_obj = if math_absent { JS_NewObject(ctx) } else { math };
+
+    let random_fn =
+      JS_NewCFunction(ctx, qjs_entropy_random, c"random".as_ptr(), 0);
+    JS_SetPropertyStr(ctx, math_obj, c"random".as_ptr(), random_fn);
+
+    if math_absent {
+      JS_SetPropertyStr(ctx, global, c"Math".as_ptr(), math_obj);
+    } else {
+      JS_FreeValue(ctx, math_obj);
+    }
+  }
+}
+
+unsafe extern "C" fn qjs_entropy_random(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
+  let mut bytes = [0u8; 8];
+  if !super::init::fill_entropy(&mut bytes) {
+    return unsafe { JS_NewFloat64(ctx, 0.0) };
+  }
+
+  // Match the usual Math.random shape: 53 random mantissa bits in [0, 1).
+  let bits = u64::from_le_bytes(bytes) >> 11;
+  let value = (bits as f64) * (1.0 / ((1u64 << 53) as f64));
+  unsafe { JS_NewFloat64(ctx, value) }
 }
 
 fn install_weakref_kept_object_shim(ctx: *mut JSContext) {
@@ -883,6 +1544,9 @@ thread_local! {
     std::collections::HashMap<usize, std::ffi::CString>,
   > = RefCell::new(std::collections::HashMap::new());
 
+  static SCRIPT_HOST_DEFINED_OPTIONS: RefCell<HashMap<usize, usize>> =
+    RefCell::new(HashMap::new());
+
   // Source text per script filename, captured at eval time. Used by the
   // error-stack `Error.prepareStackTrace` shim (see `exception.rs`) to recover
   // V8's `new`-keyword column for `new X()` frames: quickjs records the
@@ -891,6 +1555,82 @@ thread_local! {
   static SCRIPT_SOURCES: RefCell<
     std::collections::HashMap<std::string::String, std::string::String>,
   > = RefCell::new(std::collections::HashMap::new());
+
+  static CURRENT_SCRIPT_NAMES: RefCell<Vec<std::string::String>> =
+    const { RefCell::new(Vec::new()) };
+
+  static CURRENT_HOST_DEFINED_OPTIONS: RefCell<Vec<usize>> =
+    const { RefCell::new(Vec::new()) };
+}
+
+struct CurrentScriptNameGuard {
+  pushed: bool,
+}
+
+impl Drop for CurrentScriptNameGuard {
+  fn drop(&mut self) {
+    if self.pushed {
+      CURRENT_SCRIPT_NAMES.with(|names| {
+        names.borrow_mut().pop();
+      });
+    }
+  }
+}
+
+struct CurrentHostDefinedOptionsGuard {
+  _private: (),
+}
+
+impl Drop for CurrentHostDefinedOptionsGuard {
+  fn drop(&mut self) {
+    CURRENT_HOST_DEFINED_OPTIONS.with(|options| {
+      options.borrow_mut().pop();
+    });
+  }
+}
+
+fn push_current_script_name(
+  name: Option<&std::ffi::CString>,
+) -> CurrentScriptNameGuard {
+  let Some(name) = name.and_then(|n| n.to_str().ok()) else {
+    return CurrentScriptNameGuard { pushed: false };
+  };
+  CURRENT_SCRIPT_NAMES.with(|names| {
+    names.borrow_mut().push(name.to_string());
+  });
+  CurrentScriptNameGuard { pushed: true }
+}
+
+fn push_current_host_defined_options(
+  options: Option<usize>,
+) -> CurrentHostDefinedOptionsGuard {
+  CURRENT_HOST_DEFINED_OPTIONS.with(|stack| {
+    stack.borrow_mut().push(options.unwrap_or(0));
+  });
+  CurrentHostDefinedOptionsGuard { _private: () }
+}
+
+pub(crate) fn record_script_host_defined_options(
+  script: *const crate::Script,
+  options: *const Data,
+) {
+  if script.is_null() || options.is_null() {
+    return;
+  }
+  SCRIPT_HOST_DEFINED_OPTIONS.with(|m| {
+    m.borrow_mut().insert(script as usize, options as usize);
+  });
+}
+
+pub(crate) fn current_host_defined_options() -> *const Data {
+  CURRENT_HOST_DEFINED_OPTIONS
+    .with(|stack| stack.borrow().last().copied())
+    .unwrap_or(0) as *const Data
+}
+
+pub(crate) fn current_script_name_or_source_url() -> Option<std::string::String>
+{
+  CURRENT_SCRIPT_NAMES.with(|names| names.borrow().last().cloned())
 }
 
 /// Remember a script's source under its eval filename so the stack-trace shim
@@ -956,6 +1696,13 @@ unsafe fn origin_resource_name(
   std::ffi::CString::new(owned).ok()
 }
 
+unsafe fn origin_host_defined_options(origin: *const c_void) -> *const Data {
+  if origin.is_null() {
+    return ptr::null();
+  }
+  unsafe { *((origin as *const usize).add(3)) as *const Data }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Script__Compile(
   context: *const Context,
@@ -968,6 +1715,7 @@ pub extern "C" fn v8__Script__Compile(
   }
 
   let name = unsafe { origin_resource_name(ctx, origin) };
+  let host_defined_options = unsafe { origin_host_defined_options(origin) };
 
   // Syntax-check now: V8 reports syntax errors at *compile* time, and deno's
   // `execute_script` reads the exception straight from a failed compile. QuickJS
@@ -981,14 +1729,29 @@ pub extern "C" fn v8__Script__Compile(
     let mut len: usize = 0;
     let cstr = JS_ToCStringLen(ctx, &mut len, jsval_of(source));
     if !cstr.is_null() {
+      let source_bytes = std::slice::from_raw_parts(cstr as *const u8, len);
+      maybe_report_strict_mode_use(source_bytes);
+      let rewritten = std::str::from_utf8(source_bytes)
+        .ok()
+        .and_then(rewrite_script_source);
+      let rewritten_bytes = rewritten.as_ref().map(|text| {
+        let mut bytes = Vec::with_capacity(text.len() + 1);
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.push(0);
+        bytes
+      });
+      let (compile_ptr, compile_len) = match rewritten_bytes.as_ref() {
+        Some(bytes) => (bytes.as_ptr() as *const c_char, bytes.len() - 1),
+        None => (cstr, len),
+      };
       let url_ptr = match name.as_ref() {
         Some(n) => n.as_ptr(),
         None => c"<anonymous>".as_ptr(),
       };
       let compiled = JS_Eval(
         ctx,
-        cstr,
-        len,
+        compile_ptr,
+        compile_len,
         url_ptr,
         global_eval_flags() | JS_EVAL_FLAG_COMPILE_ONLY,
       );
@@ -997,11 +1760,27 @@ pub extern "C" fn v8__Script__Compile(
         stamp_syntax_error_location(ctx, name.as_ref());
         return ptr::null();
       }
+      note_compiled_bytecode(current_iso(), compile_len);
+      note_compilation_cache_miss();
       JS_FreeValue(ctx, compiled);
+      if let Some(text) = rewritten {
+        let script_source =
+          JS_NewStringLen(ctx, text.as_ptr() as *const c_char, text.len());
+        let handle = intern::<crate::Script>(script_source);
+        record_script_host_defined_options(handle, host_defined_options);
+        if !handle.is_null()
+          && let Some(name) = name
+        {
+          SCRIPT_RESOURCE_NAMES
+            .with(|m| m.borrow_mut().insert(handle as usize, name));
+        }
+        return handle;
+      }
     }
   }
 
   let handle = intern_dup::<crate::Script>(ctx, jsval_of(source));
+  record_script_host_defined_options(handle, host_defined_options);
   if !handle.is_null()
     && let Some(name) = name
   {
@@ -1089,6 +1868,14 @@ pub extern "C" fn v8__Script__Run(
   if ctx.is_null() || script.is_null() {
     return ptr::null();
   }
+  if !javascript_execution_allowed() {
+    unsafe { throw_javascript_execution_disallowed(ctx) };
+    return ptr::null();
+  }
+  let iso = current_iso();
+  if !iso.is_null() {
+    super::isolate::run_pending_interrupts(iso);
+  }
   let src_val = jsval_of(script);
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
     let mut l = 0usize;
@@ -1129,10 +1916,16 @@ pub extern "C" fn v8__Script__Run(
   // `<eval>` for scripts compiled without a ScriptOrigin.
   let fname_owned =
     SCRIPT_RESOURCE_NAMES.with(|m| m.borrow_mut().remove(&(script as usize)));
+  let host_defined_options = SCRIPT_HOST_DEFINED_OPTIONS
+    .with(|m| m.borrow().get(&(script as usize)).copied());
   let fname_ptr = match fname_owned.as_ref() {
     Some(name) => name.as_ptr(),
     None => c"<eval>".as_ptr(),
   };
+  let _current_script_name = push_current_script_name(fname_owned.as_ref());
+  let _current_host_defined_options =
+    push_current_host_defined_options(host_defined_options);
+  super::inspector::maybe_pause_on_next_statement();
   // Capture the source under its eval filename for the stack-trace shim.
   if let Some(name) = fname_owned.as_ref()
     && let Ok(fname) = name.to_str()
@@ -1193,6 +1986,7 @@ pub extern "C" fn v8__Script__Run(
     eprintln!("[qjs snapshot]   -> result.tag={}", result.tag);
   }
   if result.tag != JS_TAG_EXCEPTION {
+    super::isolate::run_microtasks_if_auto();
     let h_result = intern::<Value>(unsafe { JS_DupValue(ctx, result) });
     unsafe { JS_FreeCString(ctx, cstr) };
     if result.tag != JS_TAG_EXCEPTION {
@@ -1200,6 +1994,11 @@ pub extern "C" fn v8__Script__Run(
     }
     return h_result;
   }
+  let source_for_message = if result.tag == JS_TAG_EXCEPTION {
+    Some(std::string::String::from_utf8_lossy(source_bytes).into_owned())
+  } else {
+    None
+  };
   unsafe { JS_FreeCString(ctx, cstr) };
   if result.tag == JS_TAG_EXCEPTION {
     if std::env::var_os("QJS_DEBUG_EXC").is_some() {
@@ -1227,6 +2026,19 @@ pub extern "C" fn v8__Script__Run(
 
         JS_Throw(ctx, exc);
       }
+    }
+
+    if !super::exception::has_active_try_catch() {
+      let resource_name =
+        fname_owned.as_ref().and_then(|name| name.to_str().ok());
+      unsafe {
+        super::exception::notify_message_listeners(
+          ctx,
+          resource_name,
+          source_for_message.as_deref().unwrap_or(""),
+        )
+      };
+      unsafe { super::exception::clear_pending(ctx) };
     }
 
     return ptr::null();

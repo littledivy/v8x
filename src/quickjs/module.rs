@@ -36,8 +36,10 @@ use std::mem::MaybeUninit;
 use std::ptr;
 
 use crate::quickjs::core::{
-  ctx_of, current_ctx, current_iso, intern, intern_ctx, intern_dup, iso_state,
-  jsval_of,
+  ctx_of, current_ctx, current_host_defined_options, current_iso,
+  current_script_name_or_source_url, intern, intern_ctx, intern_dup, iso_state,
+  jsval_of, note_compilation_cache_miss, note_compiled_bytecode,
+  record_script_host_defined_options,
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::{
@@ -179,6 +181,8 @@ pub(crate) unsafe fn bc_write(ctx: *mut JSContext, key: u64, obj: JSValue) {
   }
 }
 
+type ImportAttribute = (std::string::String, std::string::String, i32);
+
 struct ModuleState {
   status: ModuleStatus,
 
@@ -192,7 +196,7 @@ struct ModuleState {
   // opening quote in the module source (deno's `referrer_source_offset`) and
   // the full `with { ... }` attribute key/value set for that import.
   import_offsets: Vec<i32>,
-  import_attributes: Vec<Vec<(std::string::String, std::string::String)>>,
+  import_attributes: Vec<Vec<ImportAttribute>>,
 
   source_imports: Vec<(u64, std::string::String)>,
 
@@ -202,6 +206,8 @@ struct ModuleState {
 
   source_text: std::string::String,
   source_name: std::string::String,
+  module_name: std::string::String,
+  script_id: int,
 
   // The `//# sourceMappingURL=` magic-comment value (if any), extracted from the
   // module source at compile time. deno reads it via
@@ -231,6 +237,9 @@ thread_local! {
 
     static SYNTHETIC_DEFS: RefCell<HashMap<usize, usize>> = RefCell::new(HashMap::new());
 
+    static SYNTHETIC_EXPORT_NAMES: RefCell<HashMap<usize, std::collections::HashSet<std::string::String>>> =
+        RefCell::new(HashMap::new());
+
     static SYNTHETIC_EVAL_STEPS: RefCell<HashMap<usize, (SyntheticModuleEvaluationSteps<'static>, JSValue)>> =
         RefCell::new(HashMap::new());
 
@@ -238,6 +247,61 @@ thread_local! {
 
     static RESOLVED_SPECIFIERS: RefCell<HashMap<(std::string::String, std::string::String), std::string::String>> =
         RefCell::new(HashMap::new());
+
+    static SCRIPT_SOURCE_MAP_URLS: RefCell<HashMap<usize, std::string::String>> =
+        RefCell::new(HashMap::new());
+
+    static MODULE_SCRIPT_IDS_BY_NAME: RefCell<HashMap<std::string::String, int>> =
+        RefCell::new(HashMap::new());
+
+    static NEXT_MODULE_SCRIPT_ID: std::cell::Cell<int> = const { std::cell::Cell::new(1) };
+}
+
+#[repr(C)]
+struct RawScriptOrigin {
+  resource_name: usize,
+  source_map_url: usize,
+  script_id: int,
+  host_defined_options: usize,
+}
+
+#[repr(C)]
+struct RawSource {
+  source_string: usize,
+  resource_name: usize,
+  resource_line_offset: int,
+  resource_column_offset: int,
+  resource_options: int,
+  source_map_url: usize,
+  host_defined_options: usize,
+  cached_data: usize,
+}
+
+fn next_module_script_id() -> int {
+  NEXT_MODULE_SCRIPT_ID.with(|next| {
+    let id = next.get();
+    next.set(id.saturating_add(1).max(1));
+    id
+  })
+}
+
+fn assign_module_script_id(name: &str) -> int {
+  let id = next_module_script_id();
+  if !name.is_empty() {
+    MODULE_SCRIPT_IDS_BY_NAME.with(|m| {
+      m.borrow_mut().insert(name.to_string(), id);
+    });
+  }
+  id
+}
+
+fn module_script_id_for_name(name: &str) -> int {
+  if name.is_empty() {
+    return assign_module_script_id(name);
+  }
+  MODULE_SCRIPT_IDS_BY_NAME
+    .with(|m| m.borrow().get(name).copied())
+    .unwrap_or_else(|| assign_module_script_id(name))
 }
 
 thread_local! {
@@ -316,15 +380,16 @@ thread_local! {
         Option<crate::isolate::RawHostImportModuleDynamicallyCallback>,
     > = const { std::cell::Cell::new(None) };
 
+    static DYN_IMPORT_PHASE_CB: std::cell::Cell<
+        Option<crate::isolate::RawHostImportModuleWithPhaseDynamicallyCallback>,
+    > = const { std::cell::Cell::new(None) };
+
     static DYN_IMPORT_CHAIN: std::cell::Cell<Option<JSValue>> =
         const { std::cell::Cell::new(None) };
 
     static SOURCE_CB: std::cell::Cell<Option<ResolveSourceCallback<'static>>> =
         const { std::cell::Cell::new(None) };
 
-    static PENDING_SOURCE_IMPORTS: RefCell<
-        Vec<(*const Module, Vec<(u64, std::string::String)>)>,
-    > = const { RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn set_dynamic_import_callback(
@@ -332,6 +397,170 @@ pub(crate) fn set_dynamic_import_callback(
 ) {
   DYN_IMPORT_CB.with(|c| c.set(Some(cb)));
   unsafe { JS_SetDynamicImportHook(dynamic_import_hook) };
+}
+
+pub(crate) fn set_dynamic_import_with_phase_callback(
+  cb: crate::isolate::RawHostImportModuleWithPhaseDynamicallyCallback,
+) {
+  DYN_IMPORT_PHASE_CB.with(|c| c.set(Some(cb)));
+}
+
+pub(crate) unsafe fn install_dynamic_source_import_global(
+  ctx: *mut JSContext,
+  global: JSValue,
+) {
+  let import_source = unsafe {
+    JS_NewCFunction(
+      ctx,
+      dynamic_source_import_js_cb,
+      c"__v8x_import_source".as_ptr(),
+      1,
+    )
+  };
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      global,
+      c"__v8x_import_source".as_ptr(),
+      import_source,
+    );
+  }
+}
+
+unsafe extern "C" fn dynamic_source_import_js_cb(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  argc: int,
+  argv: *mut JSValue,
+) -> JSValue {
+  let Some(cb) = DYN_IMPORT_PHASE_CB.with(|c| c.get()) else {
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"dynamic source import: no host callback".as_ptr(),
+      )
+    };
+  };
+  if ctx.is_null() || argc < 1 || argv.is_null() {
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"dynamic source import: missing specifier".as_ptr(),
+      )
+    };
+  }
+
+  let spec = unsafe { jsval_to_rust(ctx, *argv) };
+  let Ok(cspec) = CString::new(spec.as_str()) else {
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"dynamic source import: invalid specifier".as_ptr(),
+      )
+    };
+  };
+  let spec_handle =
+    intern::<V8String>(unsafe { JS_NewString(ctx, cspec.as_ptr()) });
+
+  let host_opts = current_host_defined_options();
+  let host_opts = if host_opts.is_null() {
+    intern::<Data>(jsv_undefined())
+  } else {
+    host_opts
+  };
+
+  let referrer_name = current_script_name_or_source_url().unwrap_or_default();
+  let referrer = if referrer_name == "<eval>" || referrer_name == "<anonymous>"
+  {
+    unsafe { JS_NewString(ctx, c"".as_ptr()) }
+  } else if let Ok(cname) = CString::new(referrer_name.as_str()) {
+    unsafe { JS_NewString(ctx, cname.as_ptr()) }
+  } else {
+    unsafe { JS_NewString(ctx, c"".as_ptr()) }
+  };
+  let referrer = intern::<Value>(referrer);
+  let attrs_handle = intern::<FixedArray>(unsafe { JS_NewArray(ctx) });
+  let context = intern_ctx(ctx);
+
+  let (Some(ctx_l), Some(ho_l), Some(ref_l), Some(spec_l), Some(attr_l)) = (
+    unsafe { crate::Local::from_raw(context) },
+    unsafe { crate::Local::from_raw(host_opts) },
+    unsafe { crate::Local::from_raw(referrer) },
+    unsafe { crate::Local::from_raw(spec_handle) },
+    unsafe { crate::Local::from_raw(attrs_handle) },
+  ) else {
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"dynamic source import: handle alloc failed".as_ptr(),
+      )
+    };
+  };
+
+  let promise_ptr = unsafe {
+    cb(
+      ctx_l,
+      ho_l,
+      ref_l,
+      spec_l,
+      ModuleImportPhase::kSource,
+      attr_l,
+    )
+  };
+  if promise_ptr.is_null() {
+    if unsafe { JS_HasException(ctx) } {
+      return jsv_exception();
+    }
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"dynamic source import: host callback returned null".as_ptr(),
+      )
+    };
+  }
+
+  unsafe { JS_DupValue(ctx, jsval_of(promise_ptr as *const Value)) }
+}
+
+pub(crate) fn rewrite_dynamic_source_phase_imports(
+  body: &str,
+) -> Option<std::string::String> {
+  if !body.contains("import.source") {
+    return None;
+  }
+
+  let bytes = body.as_bytes();
+  let mut out: Vec<u8> = Vec::with_capacity(body.len());
+  let mut i = 0;
+  let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+  let mut changed = false;
+  while i < bytes.len() {
+    if bytes[i] == b'i'
+      && body[i..].starts_with("import.source")
+      && (i == 0 || !is_ident(bytes[i - 1]))
+    {
+      let mut j = i + "import.source".len();
+      while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+        j += 1;
+      }
+      if j < bytes.len() && bytes[j] == b'(' {
+        out.extend_from_slice(b"globalThis.__v8x_import_source(");
+        i = j + 1;
+        changed = true;
+        continue;
+      }
+    }
+    out.push(bytes[i]);
+    i += 1;
+  }
+
+  if changed {
+    Some(
+      std::string::String::from_utf8(out).unwrap_or_else(|_| body.to_string()),
+    )
+  } else {
+    None
+  }
 }
 
 // Flatten QuickJS's null-proto `with` attributes object (e.g. {type:"json"})
@@ -363,6 +592,33 @@ unsafe fn build_dyn_attrs(ctx: *mut JSContext, attributes: JSValue) -> JSValue {
     return unsafe { JS_NewArray(ctx) };
   }
   r
+}
+
+unsafe fn build_static_import_attrs(
+  ctx: *mut JSContext,
+  pairs: &[ImportAttribute],
+) -> JSValue {
+  let arr = unsafe { JS_NewArray(ctx) };
+  if arr.tag == JS_TAG_EXCEPTION {
+    return arr;
+  }
+
+  let mut out = 0u32;
+  for (key, value, offset) in pairs {
+    let (Ok(ck), Ok(cv)) =
+      (CString::new(key.as_str()), CString::new(value.as_str()))
+    else {
+      continue;
+    };
+    unsafe {
+      JS_SetPropertyUint32(ctx, arr, out, JS_NewString(ctx, ck.as_ptr()));
+      JS_SetPropertyUint32(ctx, arr, out + 1, JS_NewString(ctx, cv.as_ptr()));
+      JS_SetPropertyUint32(ctx, arr, out + 2, JS_NewInt32(ctx, *offset));
+    }
+    out += 3;
+  }
+
+  arr
 }
 
 unsafe extern "C" fn dynamic_import_hook(
@@ -481,6 +737,8 @@ unsafe fn populate_import_meta(
   if def.is_null() || !IMPORT_META_ENABLED.with(|c| c.get()) {
     return;
   }
+  let source_name = source_name_for_module_name(name);
+  let source_name = source_name.as_str();
 
   // Preferred path: hand the meta object to deno's real
   // HostInitializeImportMetaObjectCallback. It populates url/main/filename/
@@ -521,9 +779,9 @@ unsafe fn populate_import_meta(
     }
   }
 
-  if !(name.starts_with("file://")
-    || name.starts_with("http://")
-    || name.starts_with("https://"))
+  if !(source_name.starts_with("file://")
+    || source_name.starts_with("http://")
+    || source_name.starts_with("https://"))
   {
     return;
   }
@@ -533,7 +791,7 @@ unsafe fn populate_import_meta(
     unsafe { JS_FreeValue(ctx, exc) };
     return;
   }
-  if let Ok(curl) = CString::new(name) {
+  if let Ok(curl) = CString::new(source_name) {
     let url_val = unsafe { JS_NewString(ctx, curl.as_ptr()) };
     unsafe { JS_SetPropertyStr(ctx, meta, c"url".as_ptr(), url_val) };
 
@@ -568,12 +826,12 @@ unsafe fn populate_import_meta(
     }
     unsafe { JS_FreeValue(ctx, factory) };
   }
-  let is_main = if is_main_module(name) { 1 } else { 0 };
+  let is_main = if is_main_module(source_name) { 1 } else { 0 };
   unsafe {
     JS_SetPropertyStr(ctx, meta, c"main".as_ptr(), JS_NewBool(ctx, is_main))
   };
 
-  if name.ends_with(".wasm") {
+  if source_name.ends_with(".wasm") {
     let global = unsafe { JS_GetGlobalObject(ctx) };
     let wasm =
       unsafe { JS_GetPropertyStr(ctx, global, c"WebAssembly".as_ptr()) };
@@ -655,7 +913,7 @@ fn mark_all_modules_evaluated() {
       }
       let def_evaluated = !m.module_def.is_null()
         && unsafe { v82jsc_module_is_evaluated(m.module_def) != 0 };
-      if def_evaluated || evaluated_names.contains(&m.source_name) {
+      if def_evaluated || evaluated_names.contains(&m.module_name) {
         m.status = ModuleStatus::Evaluated;
       }
     }
@@ -901,7 +1159,7 @@ fn compute_import_offsets(
 fn compute_import_attributes(
   text: &str,
   specifiers: &[std::string::String],
-) -> Vec<Vec<(std::string::String, std::string::String)>> {
+) -> Vec<Vec<ImportAttribute>> {
   let offsets = compute_import_offsets(text, specifiers);
   let mut out = Vec::with_capacity(specifiers.len());
   for (i, spec) in specifiers.iter().enumerate() {
@@ -910,16 +1168,24 @@ fn compute_import_attributes(
     if off >= 0 {
       // Position just past the specifier's closing quote.
       let after = (off as usize + spec.len() + 2).min(text.len());
-      let tail = text[after..].trim_start();
+      let tail_full = &text[after..];
+      let leading_ws = tail_full.len() - tail_full.trim_start().len();
+      let tail_start = after + leading_ws;
+      let tail = &tail_full[leading_ws..];
       let kw = ["with", "assert"].iter().find_map(|k| {
-        tail.strip_prefix(*k).filter(|rest| {
-          rest.starts_with(|c: char| c.is_whitespace() || c == '{')
-        })
+        tail
+          .strip_prefix(*k)
+          .filter(|rest| {
+            rest.starts_with(|c: char| c.is_whitespace() || c == '{')
+          })
+          .map(|rest| (k.len(), rest))
       });
-      if let Some(rest) = kw {
+      if let Some((kw_len, rest)) = kw {
         if let Some(open) = rest.find('{') {
           if let Some(close_rel) = rest[open + 1..].find('}') {
             let body = &rest[open + 1..open + 1 + close_rel];
+            let body_start = tail_start + kw_len + open + 1;
+            let mut body_cursor = 0usize;
             for pair in body.split(',') {
               if let Some((k, v)) = pair.split_once(':') {
                 let key =
@@ -927,9 +1193,15 @@ fn compute_import_attributes(
                 let val =
                   v.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
                 if !key.is_empty() {
-                  attrs.push((key, val));
+                  let key_leading = k.len() - k.trim_start().len();
+                  let quote_offset =
+                    usize::from(k.trim_start().starts_with(['"', '\'']));
+                  let key_offset =
+                    body_start + body_cursor + key_leading + quote_offset;
+                  attrs.push((key, val, key_offset as i32));
                 }
               }
+              body_cursor += pair.len() + 1;
             }
           }
         }
@@ -1276,6 +1548,33 @@ fn lookup_module_source_by_name(name: &str) -> Option<std::string::String> {
   MODULE_SOURCES_BY_NAME.with(|t| t.borrow().get(name).cloned())
 }
 
+fn module_name_for_source(
+  source_name: &str,
+  source: &str,
+  script_id: int,
+) -> std::string::String {
+  if source_name.is_empty() {
+    return "<module>".to_string();
+  }
+  match lookup_module_source_by_name(source_name) {
+    Some(existing) if existing != source => {
+      format!("{source_name}#v8x:{script_id}")
+    }
+    _ => source_name.to_string(),
+  }
+}
+
+fn source_name_for_module_name(name: &str) -> std::string::String {
+  MODULE_STATE
+    .with(|t| {
+      t.borrow()
+        .values()
+        .find(|m| m.module_name == name)
+        .map(|m| m.source_name.clone())
+    })
+    .unwrap_or_else(|| name.to_string())
+}
+
 /// Snapshot replay: fetch a registered module source by exact name.
 pub(crate) fn lookup_module_source(name: &str) -> Option<std::string::String> {
   lookup_module_source_by_name(name)
@@ -1305,7 +1604,7 @@ pub(crate) fn refresh_tape_module_state(
   wrapper: *const Module,
 ) {
   let Some(name) =
-    with_module_state(wrapper as *const Module, |m| m.source_name.clone())
+    with_module_state(wrapper as *const Module, |m| m.module_name.clone())
   else {
     return;
   };
@@ -1378,6 +1677,7 @@ pub(crate) fn tape_make_module_handle(
     return this;
   }
   let source = lookup_module_source_by_name(name).unwrap_or_default();
+  let script_id = module_script_id_for_name(name);
   let def = MODULE_DEF_CACHE
     .with(|c| c.borrow().get(name).copied())
     .unwrap_or(0) as *mut JSModuleDef;
@@ -1401,6 +1701,8 @@ pub(crate) fn tape_make_module_handle(
       is_async: has_top_level_await(&source),
       source_text: source.clone(),
       source_name: name.to_string(),
+      module_name: name.to_string(),
+      script_id,
       source_map_url: None,
     },
   );
@@ -1421,12 +1723,14 @@ pub(crate) fn clear_thread_module_caches() {
   SYNTHETIC_EXPORTS.with(|c| c.borrow_mut().clear());
   SYNTHETIC_NS_EXPORTS.with(|c| c.borrow_mut().clear());
   SYNTHETIC_DEFS.with(|c| c.borrow_mut().clear());
+  SYNTHETIC_EXPORT_NAMES.with(|c| c.borrow_mut().clear());
   SYNTHETIC_EVAL_STEPS.with(|c| c.borrow_mut().clear());
   AFTER_FIRST_EVAL.with(|c| c.set(false));
   RESOLVED_SPECIFIERS.with(|c| c.borrow_mut().clear());
   MODULE_WRAPPER_BY_NAME.with(|c| c.borrow_mut().clear());
   MAIN_MODULE_URL.with(|c| c.borrow_mut().take());
-  PENDING_SOURCE_IMPORTS.with(|c| c.borrow_mut().clear());
+  MODULE_SCRIPT_IDS_BY_NAME.with(|c| c.borrow_mut().clear());
+  NEXT_MODULE_SCRIPT_ID.with(|c| c.set(1));
 }
 
 pub(crate) unsafe extern "C" fn module_normalize_callback(
@@ -1520,7 +1824,7 @@ unsafe fn build_resolution_map(
   cb: ResolveModuleCallback,
   source_cb: Option<ResolveSourceCallback>,
   root: *const Module,
-) {
+) -> bool {
   use std::collections::HashSet;
   let mut visited: HashSet<usize> = HashSet::new();
   let mut stack: Vec<*const Module> = vec![root];
@@ -1528,10 +1832,11 @@ unsafe fn build_resolution_map(
     if !visited.insert(handle_key(m)) {
       continue;
     }
-    let Some((base, specs, src_imports)) = with_module_state(m, |st| {
+    let Some((base, specs, attrs, src_imports)) = with_module_state(m, |st| {
       (
-        st.source_name.clone(),
+        st.module_name.clone(),
         st.import_specifiers.clone(),
+        st.import_attributes.clone(),
         st.source_imports.clone(),
       )
     }) else {
@@ -1543,7 +1848,7 @@ unsafe fn build_resolution_map(
         unsafe { resolve_source_import(ctx, context, scb, m, *id, spec) };
       }
     }
-    for (spec, _ty) in specs {
+    for (si, (spec, _ty)) in specs.into_iter().enumerate() {
       let Ok(cspec) = CString::new(spec.as_str()) else {
         continue;
       };
@@ -1554,9 +1859,12 @@ unsafe fn build_resolution_map(
         continue;
       }
       let spec_handle = intern::<V8String>(sval);
-      let attrs_handle = intern::<FixedArray>(unsafe { JS_NewArray(ctx) });
+      let attr_pairs = attrs.get(si).map(Vec::as_slice).unwrap_or(&[]);
+      let attrs_handle = intern::<FixedArray>(unsafe {
+        build_static_import_attrs(ctx, attr_pairs)
+      });
       if spec_handle.is_null() || attrs_handle.is_null() {
-        continue;
+        return false;
       }
 
       let (
@@ -1571,16 +1879,19 @@ unsafe fn build_resolution_map(
         unsafe { crate::Local::from_raw(m) },
       )
       else {
-        continue;
+        return false;
       };
       let ret = unsafe { cb(ctx_local, spec_local, attrs_local, ref_local) };
 
+      if unsafe { JS_HasException(ctx) } {
+        return false;
+      }
       let resolved: *const Module = unsafe { std::mem::transmute(ret) };
       if resolved.is_null() {
-        continue;
+        return false;
       }
       if let Some(rname) =
-        with_module_state(resolved, |st| st.source_name.clone())
+        with_module_state(resolved, |st| st.module_name.clone())
       {
         if !rname.is_empty() && rname != spec {
           record_resolved_specifier(&base, &spec, &rname);
@@ -1589,6 +1900,7 @@ unsafe fn build_resolution_map(
       }
     }
   }
+  true
 }
 
 unsafe fn resolve_source_import(
@@ -1823,17 +2135,21 @@ pub extern "C" fn v8__ScriptOrigin__CONSTRUCT(
   _resource_line_offset: i32,
   _resource_column_offset: i32,
   _resource_is_shared_cross_origin: bool,
-  _script_id: i32,
-  _source_map_url: *const Value,
+  script_id: i32,
+  source_map_url: *const Value,
   _resource_is_opaque: bool,
   _is_wasm: bool,
   _is_module: bool,
-  _host_defined_options: *const Data,
+  host_defined_options: *const Data,
 ) {
   if !buf.is_null() {
     unsafe {
       ptr::write_bytes(buf as *mut u8, 0u8, size_of::<ScriptOrigin>());
-      *(buf as *mut usize) = resource_name as usize;
+      let raw = buf as *mut RawScriptOrigin;
+      (*raw).resource_name = resource_name as usize;
+      (*raw).source_map_url = source_map_url as usize;
+      (*raw).script_id = script_id;
+      (*raw).host_defined_options = host_defined_options as usize;
     }
   }
 }
@@ -1843,29 +2159,44 @@ pub extern "C" fn v8__ScriptCompiler__Source__CONSTRUCT(
   buf: *mut MaybeUninit<Source>,
   source_string: *const V8String,
   origin: *const ScriptOrigin,
-  _cached_data: *mut CachedData,
+  cached_data: *mut CachedData,
 ) {
   if buf.is_null() {
     return;
   }
   unsafe {
     ptr::write_bytes(buf as *mut u8, 0u8, size_of::<Source>());
-    let slots = buf as *mut usize;
-    *slots = source_string as usize;
+    let raw = buf as *mut RawSource;
+    (*raw).source_string = source_string as usize;
+    (*raw).cached_data = cached_data as usize;
     if !origin.is_null() {
-      *slots.add(1) = *(origin as *const usize);
+      let origin = origin as *const RawScriptOrigin;
+      (*raw).resource_name = (*origin).resource_name;
+      (*raw).source_map_url = (*origin).source_map_url;
+      (*raw).host_defined_options = (*origin).host_defined_options;
     }
   }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__ScriptCompiler__Source__DESTRUCT(_this: *mut Source) {}
+pub extern "C" fn v8__ScriptCompiler__Source__DESTRUCT(this: *mut Source) {
+  if this.is_null() {
+    return;
+  }
+  let cached_data = unsafe { (*(this as *const RawSource)).cached_data };
+  if cached_data != 0 {
+    v8__ScriptCompiler__CachedData__DELETE(cached_data as *mut CachedData);
+  }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptCompiler__Source__GetCachedData<'a>(
-  _this: *const Source,
+  this: *const Source,
 ) -> *const CachedData<'a> {
-  ptr::null()
+  if this.is_null() {
+    return ptr::null();
+  }
+  unsafe { (*(this as *const RawSource)).cached_data as *const CachedData<'a> }
 }
 
 #[inline]
@@ -1873,7 +2204,15 @@ unsafe fn source_string_of(source: *mut Source) -> *const V8String {
   if source.is_null() {
     return ptr::null();
   }
-  unsafe { *(source as *const usize) as *const V8String }
+  unsafe { (*(source as *const RawSource)).source_string as *const V8String }
+}
+
+#[inline]
+unsafe fn host_defined_options_of(source: *mut Source) -> *const Data {
+  if source.is_null() {
+    return ptr::null();
+  }
+  unsafe { (*(source as *const RawSource)).host_defined_options as *const Data }
 }
 
 #[inline]
@@ -1884,7 +2223,8 @@ unsafe fn resource_name_of(
   if source.is_null() || ctx.is_null() {
     return std::string::String::new();
   }
-  let name_ptr = unsafe { *((source as *const usize).add(1)) } as *const Value;
+  let name_ptr =
+    unsafe { (*(source as *const RawSource)).resource_name } as *const Value;
   if name_ptr.is_null() {
     return std::string::String::new();
   }
@@ -1893,6 +2233,89 @@ unsafe fn resource_name_of(
     return std::string::String::new();
   }
   unsafe { jsval_to_rust(ctx, v) }
+}
+
+#[inline]
+unsafe fn source_map_url_of(
+  ctx: *mut JSContext,
+  source: *mut Source,
+) -> Option<std::string::String> {
+  if source.is_null() || ctx.is_null() {
+    return None;
+  }
+  let url_ptr =
+    unsafe { (*(source as *const RawSource)).source_map_url } as *const Value;
+  if url_ptr.is_null() {
+    return None;
+  }
+  let v = jsval_of(url_ptr);
+  if jsv_is_undefined(&v) || jsv_is_null(&v) {
+    return None;
+  }
+  let url = unsafe { jsval_to_rust(ctx, v) };
+  if url.is_empty() { None } else { Some(url) }
+}
+
+#[inline]
+fn script_value_key(v: JSValue) -> Option<usize> {
+  match v.tag {
+    JS_TAG_STRING | JS_TAG_STRING_ROPE | JS_TAG_OBJECT => {
+      let ptr = jsv_get_ptr(&v) as usize;
+      (ptr != 0).then_some(ptr)
+    }
+    _ => None,
+  }
+}
+
+fn record_script_source_map_url(
+  source_value: JSValue,
+  url: Option<std::string::String>,
+) {
+  let Some(key) = script_value_key(source_value) else {
+    return;
+  };
+  SCRIPT_SOURCE_MAP_URLS.with(|m| {
+    let mut map = m.borrow_mut();
+    if map.len() > 256 && !map.contains_key(&key) {
+      map.clear();
+    }
+    match url {
+      Some(url) => {
+        map.insert(key, url);
+      }
+      None => {
+        map.remove(&key);
+      }
+    }
+  });
+}
+
+fn script_source_map_url(source_value: JSValue) -> Option<std::string::String> {
+  let key = script_value_key(source_value)?;
+  SCRIPT_SOURCE_MAP_URLS.with(|m| m.borrow().get(&key).cloned())
+}
+
+unsafe fn source_map_url_for_source(
+  ctx: *mut JSContext,
+  source: *mut Source,
+  text: &str,
+) -> Option<std::string::String> {
+  unsafe { source_map_url_of(ctx, source) }
+    .or_else(|| extract_source_mapping_url(text))
+}
+
+fn new_string_value(ctx: *mut JSContext, text: &str) -> *const Value {
+  if ctx.is_null() {
+    return intern::<Value>(jsv_undefined());
+  }
+  let val = unsafe {
+    JS_NewStringLen(
+      ctx,
+      text.as_ptr() as *const std::os::raw::c_char,
+      text.len(),
+    )
+  };
+  intern::<Value>(val)
 }
 
 #[repr(C)]
@@ -1951,6 +2374,7 @@ pub extern "C" fn v8__ScriptCompiler__Compile(
   }
   let src_val = jsval_of(src);
   let text = unsafe { jsval_to_rust(ctx, src_val) };
+  let source_map_url = unsafe { source_map_url_for_source(ctx, source, &text) };
   let Ok(csrc) = CString::new(text) else {
     return ptr::null();
   };
@@ -1969,9 +2393,16 @@ pub extern "C" fn v8__ScriptCompiler__Compile(
     unsafe { JS_FreeValue(ctx, exc) };
     return ptr::null();
   }
+  note_compiled_bytecode(current_iso(), len);
+  note_compilation_cache_miss();
   unsafe { JS_FreeValue(ctx, compiled) };
 
-  intern_dup::<Script>(ctx, src_val)
+  record_script_source_map_url(src_val, source_map_url);
+  let script = intern_dup::<Script>(ctx, src_val);
+  unsafe {
+    record_script_host_defined_options(script, host_defined_options_of(source));
+  }
+  script
 }
 
 #[unsafe(no_mangle)]
@@ -2000,6 +2431,9 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   } else {
     specifier.clone()
   };
+  let source_map_url = unsafe { source_map_url_for_source(ctx, source, &text) };
+  let script_id = assign_module_script_id(&fname);
+  let module_name = module_name_for_source(&fname, &text, script_id);
 
   let import_specifiers = parse_import_specifiers(&text);
   let spec_strs: Vec<std::string::String> =
@@ -2008,10 +2442,12 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   let import_attributes = compute_import_attributes(&text, &spec_strs);
   let is_async = has_top_level_await(&text);
 
-  register_module_source(&fname, &text);
+  register_module_source(&module_name, &text);
   note_main_module(&fname);
   if std::env::var_os("QJS_DEBUG_MOD").is_some() {
-    eprintln!("[QJS CompileModule] {fname} imports={import_specifiers:?}");
+    eprintln!(
+      "[QJS CompileModule] {fname} as {module_name} imports={import_specifiers:?}"
+    );
   }
 
   let handle_val = unsafe { JS_NewObject(ctx) };
@@ -2023,11 +2459,6 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   let this = intern_module(handle_val);
   if this.is_null() {
     return ptr::null();
-  }
-  if !source_imports.is_empty() {
-    PENDING_SOURCE_IMPORTS.with(|p| {
-      p.borrow_mut().push((this, source_imports.clone()));
-    });
   }
   record_module_state(
     this,
@@ -2041,14 +2472,16 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
       source_imports,
       synthetic: false,
       is_async,
-      source_map_url: extract_source_mapping_url(&text),
       source_text: text,
       source_name: fname.clone(),
+      module_name: module_name.clone(),
+      script_id,
+      source_map_url,
     },
   );
   // Map name -> this wrapper so deno's import.meta callback can be handed the
   // exact handle it registered (it looks modules up by Global identity).
-  record_module_wrapper(&fname, this);
+  record_module_wrapper(&module_name, this);
   this
 }
 
@@ -2058,8 +2491,8 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
   source: *mut Source,
   arguments_count: usize,
   arguments: *const *const V8String,
-  _context_extensions_count: usize,
-  _context_extensions: *const *const Object,
+  context_extensions_count: usize,
+  context_extensions: *const *const Object,
   _options: CompileOptions,
   _no_cache_reason: NoCacheReason,
 ) -> *const Function {
@@ -2090,7 +2523,36 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
     }
   }
 
-  let wrapped = format!("(function({}) {{\n{}\n}})", arg_names.join(","), body);
+  let mut extension_names: Vec<std::string::String> = Vec::new();
+  let has_extensions =
+    context_extensions_count > 0 && !context_extensions.is_null();
+  if has_extensions {
+    extension_names.reserve(context_extensions_count);
+    for i in 0..context_extensions_count {
+      extension_names.push(format!("__v8_ext{i}"));
+    }
+  }
+
+  let wrapped = if has_extensions {
+    let mut wrapped = format!("(function({}) {{\n", extension_names.join(","));
+    for name in &extension_names {
+      wrapped.push_str("with (");
+      wrapped.push_str(name);
+      wrapped.push_str(") {\n");
+    }
+    wrapped.push_str("return (function(");
+    wrapped.push_str(&arg_names.join(","));
+    wrapped.push_str(") {\n");
+    wrapped.push_str(&body);
+    wrapped.push_str("\n});\n");
+    for _ in &extension_names {
+      wrapped.push_str("}\n");
+    }
+    wrapped.push_str("})");
+    wrapped
+  } else {
+    format!("(function({}) {{\n{}\n}})", arg_names.join(","), body)
+  };
   let Ok(csrc) = CString::new(wrapped) else {
     unsafe {
       JS_ThrowTypeError(ctx, c"compile_function: NUL in source".as_ptr())
@@ -2106,7 +2568,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
     name
   })
   .unwrap_or_else(|_| CString::new("<function>").unwrap());
-  let result = unsafe {
+  let compiled = unsafe {
     JS_Eval(
       ctx,
       csrc.as_ptr(),
@@ -2115,7 +2577,42 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
       JS_EVAL_TYPE_GLOBAL,
     )
   };
-  if result.tag == JS_TAG_EXCEPTION {
+  if compiled.tag == JS_TAG_EXCEPTION {
+    return ptr::null();
+  }
+  let result = if has_extensions {
+    if unsafe { !JS_IsFunction(ctx, compiled) } {
+      unsafe { JS_FreeValue(ctx, compiled) };
+      return ptr::null();
+    }
+    let mut args: Vec<JSValue> = Vec::with_capacity(context_extensions_count);
+    for i in 0..context_extensions_count {
+      let extension = unsafe { *context_extensions.add(i) };
+      if extension.is_null() {
+        args.push(jsv_undefined());
+      } else {
+        args.push(jsval_of(extension));
+      }
+    }
+    let result = unsafe {
+      JS_Call(
+        ctx,
+        compiled,
+        jsv_undefined(),
+        args.len() as _,
+        args.as_mut_ptr(),
+      )
+    };
+    unsafe { JS_FreeValue(ctx, compiled) };
+    if result.tag == JS_TAG_EXCEPTION {
+      return ptr::null();
+    }
+    result
+  } else {
+    compiled
+  };
+  if unsafe { !JS_IsFunction(ctx, result) } {
+    unsafe { JS_FreeValue(ctx, result) };
     return ptr::null();
   }
   intern::<Function>(result)
@@ -2173,6 +2670,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileUnboundScript(
   }
   let src_val = jsval_of(src);
   let text = unsafe { jsval_to_rust(ctx, src_val) };
+  let source_map_url = unsafe { source_map_url_for_source(ctx, source, &text) };
   let Ok(csrc) = CString::new(text) else {
     return ptr::null();
   };
@@ -2191,7 +2689,9 @@ pub extern "C" fn v8__ScriptCompiler__CompileUnboundScript(
     unsafe { JS_FreeValue(ctx, exc) };
     return ptr::null();
   }
+  note_compiled_bytecode(isolate, len);
   unsafe { JS_FreeValue(ctx, compiled) };
+  record_script_source_map_url(src_val, source_map_url);
   intern_dup::<UnboundScript>(ctx, src_val)
 }
 
@@ -2208,8 +2708,23 @@ pub extern "C" fn v8__UnboundScript__BindToCurrentContext(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__UnboundScript__GetSourceMappingURL(
-  _script: *const UnboundScript,
+  script: *const UnboundScript,
 ) -> *const Value {
+  if script.is_null() {
+    return intern::<Value>(jsv_undefined());
+  }
+  let ctx = current_ctx();
+  let value = jsval_of(script);
+  let url = script_source_map_url(value).or_else(|| {
+    if ctx.is_null() {
+      return None;
+    }
+    let text = unsafe { jsval_to_rust(ctx, value) };
+    extract_source_mapping_url(&text)
+  });
+  if let Some(url) = url {
+    return new_string_value(ctx, &url);
+  }
   intern::<Value>(jsv_undefined())
 }
 
@@ -2357,7 +2872,7 @@ pub extern "C" fn v8__Module__GetModuleRequests(
         let kv = unsafe { JS_NewArray(ctx) };
         if kv.tag != JS_TAG_EXCEPTION {
           let mut ki = 0u32;
-          for (k, v) in pairs.iter() {
+          for (k, v, _offset) in pairs.iter() {
             if let (Ok(ck), Ok(cv)) =
               (CString::new(k.as_str()), CString::new(v.as_str()))
             {
@@ -2402,12 +2917,167 @@ pub extern "C" fn v8__Module__GetModuleRequests(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__SourceOffsetToLocation(
-  _this: *const Module,
-  _offset: int,
+  this: *const Module,
+  offset: int,
   out: *mut Location,
 ) {
-  if !out.is_null() {
-    unsafe { ptr::write_bytes(out as *mut u8, 0u8, size_of::<Location>()) };
+  if out.is_null() {
+    return;
+  }
+
+  let source =
+    with_module_state(this, |m| m.source_text.clone()).unwrap_or_default();
+  let target = if offset <= 0 {
+    0
+  } else {
+    (offset as usize).min(source.len())
+  };
+  let bytes = source.as_bytes();
+  let mut line = 0i32;
+  let mut column = 0i32;
+  let mut i = 0usize;
+  while i < target {
+    match bytes[i] {
+      b'\n' => {
+        line += 1;
+        column = 0;
+      }
+      b'\r' => {
+        line += 1;
+        column = 0;
+        if i + 1 < target && bytes[i + 1] == b'\n' {
+          i += 1;
+        }
+      }
+      _ => column += 1,
+    }
+    i += 1;
+  }
+
+  unsafe {
+    let p = out as *mut i32;
+    *p = line;
+    *p.add(1) = column;
+  }
+}
+
+fn is_ascii_ident_start(b: u8) -> bool {
+  b == b'_' || b == b'$' || b.is_ascii_alphabetic()
+}
+
+fn is_ascii_ident_continue(b: u8) -> bool {
+  is_ascii_ident_start(b) || b.is_ascii_digit()
+}
+
+fn skip_ascii_ws<'a>(rest: &'a str, column: &mut usize) -> &'a str {
+  let skipped = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+  *column += skipped;
+  &rest[skipped..]
+}
+
+fn exported_function_positions(
+  source: &str,
+) -> Vec<(std::string::String, int, int)> {
+  let mut out = Vec::new();
+  for (line, original) in source.lines().enumerate() {
+    let mut column =
+      original.len() - original.trim_start_matches([' ', '\t']).len();
+    let mut rest = &original[column..];
+
+    let Some(after_export) = rest.strip_prefix("export") else {
+      continue;
+    };
+    rest = after_export;
+    column += "export".len();
+    rest = skip_ascii_ws(rest, &mut column);
+
+    if let Some(after_default) = rest.strip_prefix("default") {
+      rest = after_default;
+      column += "default".len();
+      rest = skip_ascii_ws(rest, &mut column);
+    }
+
+    if let Some(after_async) = rest.strip_prefix("async") {
+      rest = after_async;
+      column += "async".len();
+      rest = skip_ascii_ws(rest, &mut column);
+    }
+
+    let Some(after_function) = rest.strip_prefix("function") else {
+      continue;
+    };
+    rest = after_function;
+    column += "function".len();
+    rest = skip_ascii_ws(rest, &mut column);
+
+    let Some(first) = rest.as_bytes().first().copied() else {
+      continue;
+    };
+    if !is_ascii_ident_start(first) {
+      continue;
+    }
+
+    let name_len = rest
+      .as_bytes()
+      .iter()
+      .copied()
+      .take_while(|b| is_ascii_ident_continue(*b))
+      .count();
+    if name_len == 0 {
+      continue;
+    }
+
+    out.push((
+      rest[..name_len].to_string(),
+      line as int,
+      (column + name_len) as int,
+    ));
+  }
+  out
+}
+
+unsafe fn annotate_namespace_function_positions(
+  ctx: *mut JSContext,
+  namespace: JSValue,
+  module: *const Module,
+) {
+  let Some((source_text, source_name, script_id, source_map_url)) =
+    with_module_state(module, |m| {
+      (
+        m.source_text.clone(),
+        m.source_name.clone(),
+        m.script_id,
+        m.source_map_url.clone(),
+      )
+    })
+  else {
+    return;
+  };
+  if source_text.is_empty() {
+    return;
+  }
+
+  for (name, line, column) in exported_function_positions(&source_text) {
+    let Ok(cname) = CString::new(name) else {
+      continue;
+    };
+    let value = unsafe { JS_GetPropertyStr(ctx, namespace, cname.as_ptr()) };
+    if value.tag == JS_TAG_EXCEPTION {
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+      continue;
+    }
+    if unsafe { JS_IsFunction(ctx, value) } {
+      super::function::record_function_script_position(
+        value,
+        line,
+        column,
+        script_id,
+        (!source_name.is_empty()).then_some(source_name.clone()),
+        source_map_url.clone(),
+      );
+    }
+    unsafe { JS_FreeValue(ctx, value) };
   }
 }
 
@@ -2436,6 +3106,9 @@ pub extern "C" fn v8__Module__GetModuleNamespace(
       let mut exports =
         SYNTHETIC_NS_EXPORTS.with(|t| t.borrow().get(&def).cloned());
       if exports.is_none() {
+        exports = SYNTHETIC_EXPORTS.with(|t| t.borrow().get(&def).cloned());
+      }
+      if exports.is_none() {
         unsafe { run_synthetic_eval_steps(ctx, def as *mut JSModuleDef) };
         exports = SYNTHETIC_EXPORTS.with(|t| t.borrow().get(&def).cloned());
       }
@@ -2458,6 +3131,7 @@ pub extern "C" fn v8__Module__GetModuleNamespace(
   if !def.is_null() {
     let ns = unsafe { JS_GetModuleNamespace(ctx, def) };
     if ns.tag != JS_TAG_EXCEPTION {
+      unsafe { annotate_namespace_function_positions(ctx, ns, this) };
       return intern::<Value>(ns);
     }
     let exc = unsafe { JS_GetException(ctx) };
@@ -2477,8 +3151,8 @@ unsafe fn materialize_module_def(
   if !existing.is_null() {
     return existing;
   }
-  let Some((source_text, source_name)) =
-    with_module_state(this, |m| (m.source_text.clone(), m.source_name.clone()))
+  let Some((source_text, module_name)) =
+    with_module_state(this, |m| (m.source_text.clone(), m.module_name.clone()))
   else {
     return ptr::null_mut();
   };
@@ -2486,13 +3160,13 @@ unsafe fn materialize_module_def(
     return ptr::null_mut();
   }
 
-  if !source_name.is_empty() {
-    if let Ok(cn) = CString::new(source_name.clone()) {
+  if !module_name.is_empty() {
+    if let Ok(cn) = CString::new(module_name.clone()) {
       let loaded = unsafe { v82jsc_get_loaded_module(ctx, cn.as_ptr()) };
       if !loaded.is_null() {
         with_module_state(this, |m| m.module_def = loaded);
         MODULE_DEF_CACHE.with(|c| {
-          c.borrow_mut().insert(source_name.clone(), loaded as usize);
+          c.borrow_mut().insert(module_name.clone(), loaded as usize);
         });
 
         let is_ev = unsafe { v82jsc_module_is_evaluated(loaded) };
@@ -2531,10 +3205,10 @@ unsafe fn materialize_module_def(
     iso_state(iso).rt
   };
   let key = bc_key(&source_text);
-  let Ok(cname) = CString::new(if source_name.is_empty() {
+  let Ok(cname) = CString::new(if module_name.is_empty() {
     "<module>".to_string()
   } else {
-    source_name
+    module_name.clone()
   }) else {
     return ptr::null_mut();
   };
@@ -2583,7 +3257,7 @@ unsafe fn materialize_module_def(
   let meta_name = with_module_state(this, |m| {
     m.module_def = def;
     m.status = ModuleStatus::Evaluated;
-    m.source_name.clone()
+    m.module_name.clone()
   })
   .unwrap_or_default();
   unsafe { populate_import_meta(ctx, def, &meta_name) };
@@ -2638,18 +3312,9 @@ pub extern "C" fn v8__Module__InstantiateModule(
   }
   let ctx = ctx_of(context);
   if !ctx.is_null() {
-    unsafe { build_resolution_map(ctx, context, cb, source_callback, this) };
-
-    if let Some(scb) = source_callback {
-      let pending: Vec<_> =
-        PENDING_SOURCE_IMPORTS.with(|p| p.borrow_mut().drain(..).collect());
-      for (referrer, imports) in pending {
-        for (id, spec) in &imports {
-          unsafe {
-            resolve_source_import(ctx, context, scb, referrer, *id, spec)
-          };
-        }
-      }
+    if !unsafe { build_resolution_map(ctx, context, cb, source_callback, this) }
+    {
+      return MaybeBool::Nothing;
     }
   }
 
@@ -2725,6 +3390,21 @@ pub extern "C" fn v8__Module__Evaluate(
     None
   };
 
+  if with_module_state(this, |m| m.synthetic).unwrap_or(false) {
+    let already_evaluated =
+      with_module_state(this, |m| matches!(m.status, ModuleStatus::Evaluated))
+        .unwrap_or(false);
+    if !already_evaluated {
+      let def =
+        with_module_state(this, |m| m.module_def).unwrap_or(ptr::null_mut());
+      if !def.is_null() {
+        unsafe { run_synthetic_eval_steps(ctx, def) };
+      }
+      with_module_state(this, |m| m.status = ModuleStatus::Evaluated);
+    }
+    return make_resolved_promise(ctx);
+  }
+
   let already_evaluated = with_module_state(this, |m| {
     if !m.module_def.is_null() {
       m.status = ModuleStatus::Evaluated;
@@ -2738,19 +3418,27 @@ pub extern "C" fn v8__Module__Evaluate(
     return make_resolved_promise(ctx);
   }
 
-  let (bytecode, source_text, source_name) = with_module_state(this, |m| {
-    m.status = ModuleStatus::Evaluated;
-    (
-      m.bytecode.take(),
-      m.source_text.clone(),
-      m.source_name.clone(),
-    )
-  })
-  .unwrap_or((None, std::string::String::new(), std::string::String::new()));
+  let (bytecode, source_text, source_name, module_name) =
+    with_module_state(this, |m| {
+      m.status = ModuleStatus::Evaluated;
+      (
+        m.bytecode.take(),
+        m.source_text.clone(),
+        m.source_name.clone(),
+        m.module_name.clone(),
+      )
+    })
+    .unwrap_or((
+      None,
+      std::string::String::new(),
+      std::string::String::new(),
+      std::string::String::new(),
+    ));
   let source_name_dbg = source_name.clone();
-  if !source_name.is_empty() {
+  let module_name_dbg = module_name.clone();
+  if !module_name.is_empty() {
     let cached =
-      MODULE_DEF_CACHE.with(|c| c.borrow().get(&source_name).copied());
+      MODULE_DEF_CACHE.with(|c| c.borrow().get(&module_name).copied());
     if std::env::var_os("QJS_DEBUG_MOD").is_some()
       && source_name.contains("stream")
     {
@@ -2764,7 +3452,7 @@ pub extern "C" fn v8__Module__Evaluate(
         None => (-1, -1),
       };
       eprintln!(
-        "[STREAM-EVAL] {source_name} cached={} is_evaluated={isev} eval_started={evst} bytecode={}",
+        "[STREAM-EVAL] {module_name} cached={} is_evaluated={isev} eval_started={evst} bytecode={}",
         cached.is_some(),
         bytecode.is_some()
       );
@@ -2795,7 +3483,7 @@ pub extern "C" fn v8__Module__Evaluate(
           let exc = unsafe { JS_GetException(ctx) };
           if std::env::var_os("QJS_DEBUG_MOD").is_some() {
             let s = unsafe { jsval_to_rust(ctx, exc) };
-            eprintln!("[qjs Evaluate reuse {source_name}] exception: {s}");
+            eprintln!("[qjs Evaluate reuse {module_name}] exception: {s}");
           }
           unsafe { JS_FreeValue(ctx, exc) };
           return make_resolved_promise(ctx);
@@ -2807,8 +3495,9 @@ pub extern "C" fn v8__Module__Evaluate(
 
   if std::env::var_os("QJS_DEBUG_MOD").is_some() {
     eprintln!(
-      "[QJS Evaluate] {} (precompiled={})",
+      "[QJS Evaluate] {} as {} (precompiled={})",
       source_name,
+      module_name,
       bytecode.is_some()
     );
   }
@@ -2836,10 +3525,10 @@ pub extern "C" fn v8__Module__Evaluate(
     }
   } else if !source_text.is_empty() {
     let key = bc_key(&source_text);
-    let cname = CString::new(if source_name.is_empty() {
+    let cname = CString::new(if module_name.is_empty() {
       "<module>".to_string()
     } else {
-      source_name
+      module_name
     })
     .ok();
     if let Some(cname) = cname {
@@ -2883,7 +3572,7 @@ pub extern "C" fn v8__Module__Evaluate(
       let result = if let Some(mv) = module_val {
         let def = unsafe { mv.u.ptr } as *mut JSModuleDef;
         with_module_state(this, |m| m.module_def = def);
-        unsafe { populate_import_meta(ctx, def, &source_name_dbg) };
+        unsafe { populate_import_meta(ctx, def, &module_name_dbg) };
         unsafe { JS_EvalFunction(ctx, mv) }
       } else if let Ok(csrc) = CString::new(source_text.clone()) {
         unsafe {
@@ -3033,7 +3722,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   } else {
     unsafe { jsval_to_rust(ctx, jsval_of(module_name)) }
   };
-  let Ok(cname) = CString::new(name) else {
+  let Ok(cname) = CString::new(name.clone()) else {
     return ptr::null();
   };
 
@@ -3043,6 +3732,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   if def.is_null() {
     return ptr::null();
   }
+  let mut export_names = std::collections::HashSet::new();
   if !export_names_raw.is_null() {
     for i in 0..export_names_len {
       let n = unsafe { *export_names_raw.add(i) };
@@ -3050,8 +3740,9 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
         continue;
       }
       let s = unsafe { jsval_to_rust(ctx, jsval_of(n)) };
-      if let Ok(c) = CString::new(s) {
+      if let Ok(c) = CString::new(s.as_str()) {
         unsafe { JS_AddModuleExport(ctx, def, c.as_ptr()) };
+        export_names.insert(s);
       }
     }
   }
@@ -3075,6 +3766,9 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   SYNTHETIC_DEFS.with(|t| {
     t.borrow_mut().insert(handle_key(this), def as usize);
   });
+  SYNTHETIC_EXPORT_NAMES.with(|t| {
+    t.borrow_mut().insert(def as usize, export_names);
+  });
   {
     let nm = unsafe { jsval_to_rust(ctx, jsval_of(module_name)) };
   }
@@ -3089,7 +3783,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   record_module_state(
     this,
     ModuleState {
-      status: ModuleStatus::Instantiated,
+      status: ModuleStatus::Uninstantiated,
       module_def: def,
       bytecode: None,
       import_specifiers: Vec::new(),
@@ -3101,6 +3795,8 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
       source_map_url: None,
       source_text: std::string::String::new(),
       source_name: std::string::String::new(),
+      module_name: name,
+      script_id: assign_module_script_id(""),
     },
   );
   this
@@ -3185,6 +3881,27 @@ pub extern "C" fn v8__Module__SetSyntheticModuleExport(
     return MaybeBool::JustFalse;
   };
   let name = unsafe { jsval_to_rust(ctx, jsval_of(export_name)) };
+  let declared = SYNTHETIC_EXPORT_NAMES.with(|t| {
+    t.borrow()
+      .get(&(def as usize))
+      .map(|names| names.contains(&name))
+      .unwrap_or(false)
+  });
+  if !declared {
+    if let Ok(msg) =
+      CString::new(format!("synthetic module has no export named '{name}'"))
+    {
+      unsafe { JS_ThrowReferenceError(ctx, msg.as_ptr()) };
+    } else {
+      unsafe {
+        JS_ThrowReferenceError(
+          ctx,
+          c"synthetic module has no such export".as_ptr(),
+        )
+      };
+    }
+    return MaybeBool::Nothing;
+  }
 
   let val = unsafe { JS_DupValue(ctx, jsval_of(export_value)) };
   if std::env::var_os("QJS_DEBUG_MOD").is_some() {
@@ -3222,18 +3939,22 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
   // Resolve `this` module's underlying QuickJS def. After evaluation the def is
   // recorded in ModuleState; fall back to the by-name cache for paths that only
   // populate it there.
-  let (def, source_name) = with_module_state(this, |m| {
+  let (def, source_name, source_text) = with_module_state(this, |m| {
     let def = if !m.module_def.is_null() {
       m.module_def
     } else {
       MODULE_DEF_CACHE
-        .with(|c| c.borrow().get(&m.source_name).copied())
+        .with(|c| c.borrow().get(&m.module_name).copied())
         .map(|d| d as *mut JSModuleDef)
         .unwrap_or(ptr::null_mut())
     };
-    (def, m.source_name.clone())
+    (def, m.source_name.clone(), m.source_text.clone())
   })
-  .unwrap_or((ptr::null_mut(), std::string::String::new()));
+  .unwrap_or((
+    ptr::null_mut(),
+    std::string::String::new(),
+    std::string::String::new(),
+  ));
 
   // Only a module still parked in EVALUATING_ASYNC has an unresolved top-level
   // await. A resolved TLA advances the module to EVALUATED; deno only reaches
@@ -3244,7 +3965,7 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
     return 0;
   }
 
-  let message = build_stalled_tla_message(ctx, &source_name);
+  let message = build_stalled_tla_message(ctx, &source_name, &source_text);
   if message.is_null() {
     return 0;
   }
@@ -3264,6 +3985,7 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
 fn build_stalled_tla_message(
   ctx: *mut JSContext,
   source_name: &str,
+  source_text: &str,
 ) -> *const Message {
   let factory_src = c"(file)=>{const o={fileName:file,lineNumber:1,columnNumber:0};o.toString=()=>\"Top-level await promise never resolved\";return o;}";
   let factory = unsafe {
@@ -3291,6 +4013,18 @@ fn build_stalled_tla_message(
     unsafe { JS_FreeValue(ctx, JS_GetException(ctx)) };
     return ptr::null();
   }
+  unsafe {
+    super::exception::set_message_text_verbatim(
+      ctx,
+      obj,
+      "Top-level await promise never resolved",
+    );
+    super::exception::set_message_source_line(
+      ctx,
+      obj,
+      source_text.lines().next().unwrap_or(source_text),
+    );
+  };
   intern::<Message>(obj)
 }
 
@@ -3438,28 +4172,41 @@ pub extern "C" fn v8__Module__IsSourceTextModule(
 pub extern "C" fn v8__Module__ScriptId(
   this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  // V8 script ids are small ints; any per-module stable value works. Derive
-  // one from the handle-state key so it survives instantiate/evaluate.
-  ((this as usize >> 4) & 0x3fff_ffff) as crate::support::int
+  with_module_state(this as *const Module, |m| m.script_id).unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptOrigin__ResourceName(
-  _origin: *const std::os::raw::c_void,
+  origin: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  if origin.is_null() {
+    return std::ptr::null();
+  }
+  unsafe {
+    (*(origin as *const RawScriptOrigin)).resource_name
+      as *const std::os::raw::c_void
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptOrigin__ScriptId(
-  _origin: *const std::os::raw::c_void,
+  origin: *const std::os::raw::c_void,
 ) -> i32 {
-  0
+  if origin.is_null() {
+    return 0;
+  }
+  unsafe { (*(origin as *const RawScriptOrigin)).script_id }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptOrigin__SourceMapUrl(
-  _origin: *const std::os::raw::c_void,
+  origin: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  if origin.is_null() {
+    return std::ptr::null();
+  }
+  unsafe {
+    (*(origin as *const RawScriptOrigin)).source_map_url
+      as *const std::os::raw::c_void
+  }
 }

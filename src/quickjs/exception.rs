@@ -35,8 +35,42 @@ use crate::{
   Context, Function, Location, Message, Promise, PromiseResolver, RealIsolate,
   StackFrame, StackTrace, String, Value,
 };
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+
+const MESSAGE_TEXT_PROP: &std::ffi::CStr = c"__v8qjs_message_text";
+const MESSAGE_TEXT_VERBATIM_PROP: &std::ffi::CStr =
+  c"__v8qjs_message_text_verbatim";
+const MESSAGE_SOURCE_LINE_PROP: &std::ffi::CStr = c"__v8qjs_source_line";
+const MESSAGE_STACK_PTR_PROP: &std::ffi::CStr = c"__v8qjs_stack_ptr";
+const JS_CLASS_PROMISE: JSClassID = 52;
+
+#[repr(C)]
+struct QjsListHead {
+  prev: *mut QjsListHead,
+  next: *mut QjsListHead,
+}
+
+#[repr(C)]
+struct QjsPromiseData {
+  promise_state: c_int,
+  promise_reactions: [QjsListHead; 2],
+  is_handled: bool,
+  promise_result: JSValue,
+}
+
+unsafe extern "C" {
+  fn JS_GetOpaque(obj: JSValue, class_id: JSClassID) -> *mut c_void;
+}
+
+thread_local! {
+  static TRY_CATCH_DEPTH: std::cell::Cell<usize> =
+    const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn has_active_try_catch() -> bool {
+  TRY_CATCH_DEPTH.with(|depth| depth.get() != 0)
+}
 
 unsafe fn peek_pending(ctx: *mut JSContext) -> Option<JSValue> {
   if ctx.is_null() || !JS_HasException(ctx) {
@@ -49,7 +83,7 @@ unsafe fn peek_pending(ctx: *mut JSContext) -> Option<JSValue> {
   Some(exc)
 }
 
-unsafe fn clear_pending(ctx: *mut JSContext) {
+pub(crate) unsafe fn clear_pending(ctx: *mut JSContext) {
   if ctx.is_null() || !JS_HasException(ctx) {
     return;
   }
@@ -167,14 +201,33 @@ pub extern "C" fn v8__Message__Get(this: *const Message) -> *const String {
     return ptr::null();
   }
   unsafe {
+    let owned = read_str_prop(ctx, jsval_of(this), MESSAGE_TEXT_PROP);
+    let verbatim = unsafe {
+      read_bool_prop(ctx, jsval_of(this), MESSAGE_TEXT_VERBATIM_PROP)
+    };
     let mut len: usize = 0;
-    let cstr = JS_ToCStringLen(ctx, &mut len, jsval_of(this));
-    if cstr.is_null() {
-      clear_pending(ctx);
-      return ptr::null();
+    let mut cstr_to_free: *const c_char = ptr::null();
+    let bytes: &[u8] = if let Some(text) = owned.as_ref() {
+      text.as_bytes()
+    } else {
+      cstr_to_free = JS_ToCStringLen(ctx, &mut len, jsval_of(this));
+      if cstr_to_free.is_null() {
+        clear_pending(ctx);
+        return ptr::null();
+      }
+      std::slice::from_raw_parts(cstr_to_free as *const u8, len)
+    };
+    let s = if verbatim || bytes.starts_with(b"Uncaught ") {
+      JS_NewStringLen(ctx, bytes.as_ptr() as *const c_char, bytes.len())
+    } else {
+      let mut message = Vec::with_capacity(b"Uncaught ".len() + bytes.len());
+      message.extend_from_slice(b"Uncaught ");
+      message.extend_from_slice(bytes);
+      JS_NewStringLen(ctx, message.as_ptr() as *const c_char, message.len())
+    };
+    if !cstr_to_free.is_null() {
+      JS_FreeCString(ctx, cstr_to_free);
     }
-    let s = JS_NewStringLen(ctx, cstr, len);
-    JS_FreeCString(ctx, cstr);
     if s.tag == JS_TAG_EXCEPTION {
       return ptr::null();
     }
@@ -237,6 +290,28 @@ pub extern "C" fn v8__Message__GetStackTrace(
   if this.is_null() {
     return ptr::null();
   }
+  let ctx = current_ctx();
+  if !ctx.is_null() {
+    let stack_ptr = unsafe {
+      JS_GetPropertyStr(ctx, jsval_of(this), MESSAGE_STACK_PTR_PROP.as_ptr())
+    };
+    if stack_ptr.tag != JS_TAG_EXCEPTION
+      && !jsv_is_undefined(&stack_ptr)
+      && !jsv_is_null(&stack_ptr)
+    {
+      let mut raw: i64 = 0;
+      let ok = unsafe { JS_ToInt64(ctx, &mut raw, stack_ptr) };
+      unsafe { JS_FreeValue(ctx, stack_ptr) };
+      if ok >= 0 && raw != 0 {
+        return raw as *const StackTrace;
+      }
+    } else {
+      unsafe { JS_FreeValue(ctx, stack_ptr) };
+      if stack_ptr.tag == JS_TAG_EXCEPTION {
+        unsafe { clear_pending(ctx) };
+      }
+    }
+  }
   intern_dup::<StackTrace>(current_ctx(), jsval_of(this))
 }
 
@@ -266,6 +341,8 @@ struct QjsStackFrame {
   url: Option<std::string::String>,
   func: Option<std::string::String>,
   is_user: bool,
+  script_id: int,
+  source: Option<std::string::String>,
 }
 
 struct QjsStackTrace {
@@ -275,6 +352,141 @@ struct QjsStackTrace {
 thread_local! {
   static LAST_STACK: std::cell::Cell<*mut QjsStackTrace> =
     const { std::cell::Cell::new(ptr::null_mut()) };
+}
+
+unsafe fn set_message_str_prop(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  name: &std::ffi::CStr,
+  value: &str,
+) {
+  let v = unsafe {
+    JS_NewStringLen(ctx, value.as_ptr() as *const c_char, value.len())
+  };
+  unsafe { JS_SetPropertyStr(ctx, obj, name.as_ptr(), v) };
+}
+
+pub(crate) unsafe fn set_message_text_verbatim(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  value: &str,
+) {
+  unsafe { set_message_str_prop(ctx, obj, MESSAGE_TEXT_PROP, value) };
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      obj,
+      MESSAGE_TEXT_VERBATIM_PROP.as_ptr(),
+      JS_NewBool(ctx, 1),
+    )
+  };
+}
+
+pub(crate) unsafe fn set_message_source_line(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  value: &str,
+) {
+  unsafe { set_message_str_prop(ctx, obj, MESSAGE_SOURCE_LINE_PROP, value) };
+}
+
+unsafe fn set_message_int_prop(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  name: &std::ffi::CStr,
+  value: i32,
+) {
+  let v = unsafe { JS_NewInt32(ctx, value) };
+  unsafe { JS_SetPropertyStr(ctx, obj, name.as_ptr(), v) };
+}
+
+pub(crate) unsafe fn notify_message_listeners(
+  ctx: *mut JSContext,
+  resource_name: Option<&str>,
+  source: &str,
+) {
+  let iso = current_iso();
+  if ctx.is_null() || iso.is_null() {
+    return;
+  }
+  let listeners = iso_state(iso).message_listeners.clone();
+  if listeners.is_empty() {
+    return;
+  }
+  let Some(exc) = (unsafe { peek_pending(ctx) }) else {
+    return;
+  };
+
+  let message = unsafe { JS_NewObject(ctx) };
+  if message.tag == JS_TAG_EXCEPTION {
+    unsafe { clear_pending(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return;
+  }
+
+  let mut exc_len = 0usize;
+  let exc_str = unsafe { JS_ToCStringLen(ctx, &mut exc_len, exc) };
+  if !exc_str.is_null() {
+    let bytes =
+      unsafe { std::slice::from_raw_parts(exc_str as *const u8, exc_len) };
+    let text = std::string::String::from_utf8_lossy(bytes);
+    unsafe { set_message_str_prop(ctx, message, MESSAGE_TEXT_PROP, &text) };
+    unsafe { JS_FreeCString(ctx, exc_str) };
+  } else {
+    unsafe { clear_pending(ctx) };
+    unsafe { set_message_str_prop(ctx, message, MESSAGE_TEXT_PROP, "") };
+  }
+
+  let source_line = source.lines().next().unwrap_or(source);
+  let resource = resource_name.unwrap_or("<eval>");
+  unsafe {
+    set_message_str_prop(ctx, message, c"fileName", resource);
+    set_message_str_prop(ctx, message, MESSAGE_SOURCE_LINE_PROP, source_line);
+    set_message_int_prop(ctx, message, c"lineNumber", 1);
+    set_message_int_prop(ctx, message, c"columnNumber", 0);
+    set_message_int_prop(ctx, message, c"endColumn", 1);
+    set_message_int_prop(ctx, message, c"startPosition", 0);
+    set_message_int_prop(ctx, message, c"endPosition", 1);
+    set_message_int_prop(ctx, message, c"wasmFunctionIndex", -1);
+    set_message_int_prop(ctx, message, c"errorLevel", 0);
+  }
+
+  let trace = Box::into_raw(Box::new(QjsStackTrace {
+    frames: vec![QjsStackFrame {
+      line: 1,
+      col: 1,
+      url: None,
+      func: None,
+      is_user: true,
+      script_id: 4,
+      source: Some(source.to_string()),
+    }],
+  }));
+  LAST_STACK.with(|cell| {
+    let prev = cell.replace(trace);
+    if !prev.is_null() {
+      unsafe { drop(Box::from_raw(prev)) };
+    }
+  });
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      message,
+      MESSAGE_STACK_PTR_PROP.as_ptr(),
+      JS_NewInt64(ctx, trace as i64),
+    )
+  };
+
+  let msg_h = intern::<Message>(message);
+  let exc_h = intern::<Value>(exc);
+  for callback in listeners {
+    let (Some(message), Some(exception)) =
+      (crate::Local::from_raw(msg_h), crate::Local::from_raw(exc_h))
+    else {
+      continue;
+    };
+    unsafe { callback(message, exception) };
+  }
 }
 
 unsafe fn current_backtrace_string(ctx: *mut JSContext) -> std::string::String {
@@ -317,6 +529,8 @@ fn parse_qjs_backtrace(raw: &str) -> Vec<QjsStackFrame> {
     }
     if let Some(rest) = ln.strip_prefix("at ") {
       ln = rest;
+    } else if !ln.contains('@') {
+      continue;
     }
     // `<func> (<loc>)` or just `<loc>`.
     let (func, loc) = match (ln.find('('), ln.strip_suffix(')')) {
@@ -330,6 +544,9 @@ fn parse_qjs_backtrace(raw: &str) -> Vec<QjsStackFrame> {
       }
     };
     let (url, line_no, col_no) = parse_loc(loc);
+    if url == "native" {
+      continue;
+    }
     let has_url = !url.is_empty() && url != "<anonymous>";
     frames.push(QjsStackFrame {
       line: line_no,
@@ -337,6 +554,8 @@ fn parse_qjs_backtrace(raw: &str) -> Vec<QjsStackFrame> {
       url: has_url.then(|| url.to_string()),
       func: (!func.is_empty()).then(|| func.to_string()),
       is_user: has_url,
+      script_id: 0,
+      source: None,
     });
   }
   frames
@@ -392,7 +611,7 @@ pub extern "C" fn v8__StackTrace__CurrentStackTrace(
   isolate: *mut RealIsolate,
   frame_limit: int,
 ) -> *const StackTrace {
-  let _ = (isolate, frame_limit);
+  let _ = isolate;
   LAST_STACK.with(|cell| {
     let prev = cell.replace(ptr::null_mut());
     if !prev.is_null() {
@@ -404,7 +623,8 @@ pub extern "C" fn v8__StackTrace__CurrentStackTrace(
     return ptr::null();
   }
   let raw = unsafe { current_backtrace_string(ctx) };
-  let frames = parse_qjs_backtrace(&raw);
+  let mut frames = parse_qjs_backtrace(&raw);
+  frames.truncate(frame_limit.max(0) as usize);
   let boxed = Box::into_raw(Box::new(QjsStackTrace { frames }));
   LAST_STACK.with(|cell| cell.set(boxed));
   boxed as *const StackTrace
@@ -724,6 +944,7 @@ pub extern "C" fn v8__TryCatch__CONSTRUCT(
   buf: *mut usize,
   isolate: *mut RealIsolate,
 ) {
+  TRY_CATCH_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
   unsafe {
     *buf.add(0) = isolate as usize;
     *buf.add(1) = 0;
@@ -756,6 +977,7 @@ pub extern "C" fn v8__TryCatch__DESTRUCT(this: *mut usize) {
   if this.is_null() {
     return;
   }
+  TRY_CATCH_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
   unsafe {
     let rethrow = *this.add(1) != 0;
 
@@ -804,7 +1026,9 @@ pub extern "C" fn v8__TryCatch__Reset(this: *mut TryCatch) {
     return;
   }
   unsafe {
-    *(this as *mut usize).add(1) = 0;
+    if *(this as *const usize).add(1) != 0 {
+      return;
+    }
     clear_pending(tc_ctx(this as *const TryCatch));
   }
 }
@@ -815,10 +1039,12 @@ pub extern "C" fn v8__TryCatch__ReThrow(this: *mut TryCatch) -> *const Value {
     return ptr::null();
   }
   unsafe {
-    *(this as *mut usize).add(1) = 1;
     let ctx = tc_ctx(this as *const TryCatch);
     match peek_pending(ctx) {
-      Some(exc) => intern::<Value>(exc),
+      Some(exc) => {
+        *(this as *mut usize).add(1) = 1;
+        intern::<Value>(exc)
+      }
       None => ptr::null(),
     }
   }
@@ -846,8 +1072,24 @@ pub extern "C" fn v8__Message__GetSourceLine(
   this: *const Message,
   context: *const Context,
 ) -> *const String {
-  let _ = (this, context);
-  ptr::null()
+  let ctx = ctx_of(context);
+  let ctx = if ctx.is_null() { current_ctx() } else { ctx };
+  if ctx.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let Some(source_line) =
+    (unsafe { read_str_prop(ctx, jsval_of(this), MESSAGE_SOURCE_LINE_PROP) })
+  else {
+    return ptr::null();
+  };
+  let v = unsafe {
+    JS_NewStringLen(
+      ctx,
+      source_line.as_ptr() as *const c_char,
+      source_line.len(),
+    )
+  };
+  intern::<String>(v)
 }
 
 #[unsafe(no_mangle)]
@@ -868,10 +1110,30 @@ pub extern "C" fn v8__StackFrame__GetFunctionName(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Exception__CaptureStackTrace(
-  _context: *const std::os::raw::c_void,
-  _object: *const std::os::raw::c_void,
+  context: *const std::os::raw::c_void,
+  object: *const std::os::raw::c_void,
 ) -> crate::support::MaybeBool {
-  crate::support::MaybeBool::Nothing
+  let ctx = ctx_of(context as *const Context);
+  if ctx.is_null() || object.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let obj = jsval_of(object as *const Value);
+  if !jsv_is_object(&obj) {
+    return MaybeBool::Nothing;
+  }
+  let stack = unsafe { current_backtrace_string(ctx) };
+  let value = unsafe {
+    JS_NewStringLen(ctx, stack.as_ptr() as *const c_char, stack.len())
+  };
+  if value.tag == JS_TAG_EXCEPTION {
+    return MaybeBool::Nothing;
+  }
+  let rc = unsafe { JS_SetPropertyStr(ctx, obj, c"stack".as_ptr(), value) };
+  if rc < 0 {
+    unsafe { clear_pending(ctx) };
+    return MaybeBool::JustFalse;
+  }
+  MaybeBool::JustTrue
 }
 
 #[unsafe(no_mangle)]
@@ -883,37 +1145,72 @@ pub extern "C" fn v8__Exception__GetStackTrace(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Message__ErrorLevel(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return 0;
+  }
+  unsafe {
+    read_num_prop(ctx, jsval_of(this as *const Message), b"errorLevel\0", 0)
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Message__GetEndColumn(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return 0;
+  }
+  unsafe {
+    read_num_prop(ctx, jsval_of(this as *const Message), b"endColumn\0", 0)
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Message__GetEndPosition(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return 0;
+  }
+  unsafe {
+    read_num_prop(ctx, jsval_of(this as *const Message), b"endPosition\0", 0)
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Message__GetStartPosition(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return 0;
+  }
+  unsafe {
+    read_num_prop(ctx, jsval_of(this as *const Message), b"startPosition\0", 0)
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Message__GetWasmFunctionIndex(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return -1;
+  }
+  unsafe {
+    read_num_prop(
+      ctx,
+      jsval_of(this as *const Message),
+      b"wasmFunctionIndex\0",
+      -1,
+    )
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -932,30 +1229,58 @@ pub extern "C" fn v8__Message__IsSharedCrossOrigin(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Promise__HasHandler(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  if this.is_null() {
+    return false;
+  }
+
+  let data =
+    unsafe { JS_GetOpaque(jsval_of(this as *const Promise), JS_CLASS_PROMISE) };
+  if data.is_null() {
+    return false;
+  }
+
+  unsafe { (*(data as *const QjsPromiseData)).is_handled }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackFrame__GetScriptId(
-  _this: *const std::os::raw::c_void,
+  this: *const StackFrame,
 ) -> crate::support::int {
-  0
+  if this.is_null() {
+    return 0;
+  }
+  unsafe { (*(this as *const QjsStackFrame)).script_id }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackFrame__GetScriptNameOrSourceURL(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  v8__StackFrame__GetScriptName(this as *const StackFrame)
+    as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackFrame__GetScriptSource(
-  _this: *const std::os::raw::c_void,
+  this: *const StackFrame,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  if this.is_null() {
+    return std::ptr::null();
+  }
+  let frame = unsafe { &*(this as *const QjsStackFrame) };
+  let Some(source) = frame.source.as_deref() else {
+    return std::ptr::null();
+  };
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return std::ptr::null();
+  }
+  let v = unsafe {
+    JS_NewStringLen(ctx, source.as_ptr() as *const c_char, source.len())
+  };
+  intern::<String>(v) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]
@@ -983,15 +1308,52 @@ pub extern "C" fn v8__StackFrame__IsWasm(
 pub extern "C" fn v8__StackTrace__CurrentScriptNameOrSourceURL(
   _isolate: *mut std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  let Some(name) = super::core::current_script_name_or_source_url() else {
+    return ptr::null();
+  };
+  let v =
+    unsafe { JS_NewStringLen(ctx, name.as_ptr() as *const c_char, name.len()) };
+  if v.tag == JS_TAG_EXCEPTION {
+    return ptr::null();
+  }
+  intern::<String>(v) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TryCatch__StackTrace(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  this: *const TryCatch,
+  _context: *const Context,
+) -> *const Value {
+  if this.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    let ctx = tc_ctx(this);
+    if ctx.is_null() || !JS_HasException(ctx) {
+      return ptr::null();
+    }
+
+    let exc = JS_GetException(ctx);
+    let stack = JS_GetPropertyStr(ctx, exc, c"stack".as_ptr());
+    if stack.tag == JS_TAG_EXCEPTION {
+      clear_pending(ctx);
+      JS_Throw(ctx, JS_DupValue(ctx, exc));
+      JS_FreeValue(ctx, exc);
+      return ptr::null();
+    }
+
+    JS_Throw(ctx, JS_DupValue(ctx, exc));
+    JS_FreeValue(ctx, exc);
+    if jsv_is_undefined(&stack) || jsv_is_null(&stack) {
+      JS_FreeValue(ctx, stack);
+      return ptr::null();
+    }
+    intern::<Value>(stack)
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,8 +1383,6 @@ pub extern "C" fn v8__TryCatch__StackTrace(
 // construct columns are moved from the call `(` back to the `new` keyword
 // (recovered from the source line registered at eval time).
 // ---------------------------------------------------------------------------
-
-use std::os::raw::c_int;
 
 thread_local! {
   static PREPARE_STACK_ACTIVE: std::cell::Cell<bool> =
@@ -1116,6 +1476,21 @@ unsafe fn read_str_prop(
     return None;
   }
   let out = unsafe { js_string_value(ctx, v) };
+  unsafe { JS_FreeValue(ctx, v) };
+  out
+}
+
+unsafe fn read_bool_prop(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: &std::ffi::CStr,
+) -> bool {
+  let v = unsafe { JS_GetPropertyStr(ctx, obj, prop.as_ptr()) };
+  if v.tag == JS_TAG_EXCEPTION {
+    unsafe { clear_pending(ctx) };
+    return false;
+  }
+  let out = unsafe { JS_ToBool(ctx, v) != 0 };
   unsafe { JS_FreeValue(ctx, v) };
   out
 }
@@ -1509,26 +1884,6 @@ unsafe fn source_mapped_stack(
   let cb = PREPARE_STACK_TRACE_CB.with(|c| c.get())?;
   if ctx.is_null() {
     return None;
-  }
-  // QuickJS builds `.stack` EAGERLY at throw time; V8 defers to the first
-  // `.stack` read. An exception thrown while the embedder is still
-  // initializing would reach its callback before any state pointer exists
-  // (deno_core's prepare_stack_trace_callback does Rc::from_raw on embedder
-  // slot 0 unconditionally). V8 can't call the callback in that window —
-  // match it: decline until the embedder stores something in slot 0
-  // (raw slot 1; slot 0 is the rusty_v8 annex).
-  {
-    let iso = super::core::current_iso();
-    if iso.is_null()
-      || super::core::iso_state(iso)
-        .data_slots
-        .get(1)
-        .copied()
-        .unwrap_or(std::ptr::null_mut())
-        .is_null()
-    {
-      return None;
-    }
   }
   let sites = unsafe { build_callsites(ctx, frames) }?;
 

@@ -31,12 +31,16 @@ use crate::quickjs::core::{
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::{
-  Context, Data, External, Function, FunctionCallback, FunctionCallbackInfo,
-  FunctionTemplate, Name, Object, ObjectTemplate, PropertyAttribute,
-  RealIsolate, Signature, String, Value,
+  Array, Boolean, Context, Data, External, Function, FunctionCallback,
+  FunctionCallbackInfo, FunctionTemplate, Integer, Intrinsic, Local, Name,
+  Object, ObjectTemplate, PropertyAttribute, PropertyDescriptor, RealIsolate,
+  Signature, String, Value,
 };
-use std::os::raw::{c_char, c_int, c_void};
+use std::mem::MaybeUninit;
+use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::ptr;
+use std::ptr::NonNull;
+use std::slice;
 
 unsafe extern "C" {
 
@@ -49,11 +53,14 @@ unsafe extern "C" {
   fn JS_NewObjectClass(ctx: *mut JSContext, class_id: c_int) -> JSValue;
   fn JS_SetOpaque(obj: JSValue, opaque: *mut c_void);
   fn JS_GetOpaque(obj: JSValue, class_id: JSClassID) -> *mut c_void;
+  fn JS_GetAnyOpaque(obj: JSValue, class_id: *mut JSClassID) -> *mut c_void;
   fn JS_SetPrototype(
     ctx: *mut JSContext,
     obj: JSValue,
     proto: JSValue,
   ) -> c_int;
+  fn JS_PreventExtensions(ctx: *mut JSContext, obj: JSValue) -> c_int;
+  fn JS_IsStrictEqual(ctx: *mut JSContext, op1: JSValue, op2: JSValue) -> bool;
 
   fn JS_DefinePropertyValueStr(
     ctx: *mut JSContext,
@@ -64,6 +71,12 @@ unsafe extern "C" {
   ) -> c_int;
 
   fn JS_ValueToAtom(ctx: *mut JSContext, val: JSValue) -> JSAtom;
+  fn JS_DupAtom(ctx: *mut JSContext, v: JSAtom) -> JSAtom;
+  fn JS_GetProperty(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: JSAtom,
+  ) -> JSValue;
   fn JS_DefinePropertyValue(
     ctx: *mut JSContext,
     this_obj: JSValue,
@@ -71,9 +84,107 @@ unsafe extern "C" {
     val: JSValue,
     flags: c_int,
   ) -> c_int;
+  fn JS_DefineProperty(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: JSAtom,
+    val: JSValue,
+    getter: JSValue,
+    setter: JSValue,
+    flags: c_int,
+  ) -> c_int;
+  fn JS_GetOwnPropertyNames(
+    ctx: *mut JSContext,
+    ptab: *mut *mut JSPropertyEnum,
+    plen: *mut u32,
+    obj: JSValue,
+    flags: c_int,
+  ) -> c_int;
+  fn JS_FreePropertyEnum(
+    ctx: *mut JSContext,
+    tab: *mut JSPropertyEnum,
+    len: u32,
+  );
+  fn JS_GetLength(ctx: *mut JSContext, obj: JSValue, pres: *mut i64) -> c_int;
+  fn JS_AtomToCStringLen(
+    ctx: *mut JSContext,
+    plen: *mut usize,
+    atom: JSAtom,
+  ) -> *const c_char;
 }
 
 type JSClassFinalizer = unsafe extern "C" fn(rt: *mut JSRuntime, val: JSValue);
+
+#[repr(C)]
+struct JSPropertyDescriptorQjs {
+  flags: c_int,
+  value: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+}
+
+#[repr(C)]
+struct JSClassExoticMethods {
+  get_own_property: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      desc: *mut JSPropertyDescriptorQjs,
+      obj: JSValue,
+      prop: JSAtom,
+    ) -> c_int,
+  >,
+  get_own_property_names: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      ptab: *mut *mut JSPropertyEnum,
+      plen: *mut u32,
+      obj: JSValue,
+    ) -> c_int,
+  >,
+  delete_property: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      obj: JSValue,
+      prop: JSAtom,
+    ) -> c_int,
+  >,
+  define_own_property: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      obj: JSValue,
+      prop: JSAtom,
+      val: JSValue,
+      getter: JSValue,
+      setter: JSValue,
+      flags: c_int,
+    ) -> c_int,
+  >,
+  has_property: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      obj: JSValue,
+      prop: JSAtom,
+    ) -> c_int,
+  >,
+  get_property: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      obj: JSValue,
+      prop: JSAtom,
+      receiver: JSValue,
+    ) -> JSValue,
+  >,
+  set_property: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      obj: JSValue,
+      prop: JSAtom,
+      value: JSValue,
+      receiver: JSValue,
+      flags: c_int,
+    ) -> c_int,
+  >,
+}
 
 #[repr(C)]
 struct JSClassDef {
@@ -81,7 +192,7 @@ struct JSClassDef {
   finalizer: Option<JSClassFinalizer>,
   gc_mark: *const c_void,
   call: *const c_void,
-  exotic: *const c_void,
+  exotic: *const JSClassExoticMethods,
 }
 
 #[repr(C)]
@@ -119,24 +230,68 @@ struct FnTemplate {
   proto: *mut ObjTemplate,
   instance: *mut ObjTemplate,
   parent: *const FnTemplate,
+  signature: *const FnTemplate,
 
   props: Vec<(JSValue, JSValue, u32)>,
   accessors: Vec<TemplAccessor>,
 
   cached_proto: JSValue,
+  fast_overloads: Vec<RawCFunction>,
 }
 
 struct TemplAccessor {
   key: JSValue,
   getter: *const FnTemplate,
   setter: *const FnTemplate,
+  native_getter: Option<crate::AccessorNameGetterCallback>,
+  native_setter: Option<crate::AccessorNameSetterCallback>,
+  data: JSValue,
   attr: u32,
+}
+
+struct NamedHandler {
+  getter: Option<crate::NamedPropertyGetterCallback>,
+  setter: Option<crate::NamedPropertySetterCallback>,
+  query: Option<crate::NamedPropertyQueryCallback>,
+  deleter: Option<crate::NamedPropertyDeleterCallback>,
+  enumerator: Option<crate::NamedPropertyEnumeratorCallback>,
+  definer: Option<crate::NamedPropertyDefinerCallback>,
+  descriptor: Option<crate::NamedPropertyDescriptorCallback>,
+  data: JSValue,
+  owner_ctx: *mut JSContext,
+  non_masking: bool,
+  only_intercept_strings: bool,
+}
+
+struct IndexedHandler {
+  getter: Option<crate::IndexedPropertyGetterCallback>,
+  setter: Option<crate::IndexedPropertySetterCallback>,
+  query: Option<crate::IndexedPropertyQueryCallback>,
+  deleter: Option<crate::IndexedPropertyDeleterCallback>,
+  enumerator: Option<crate::IndexedPropertyEnumeratorCallback>,
+  definer: Option<crate::IndexedPropertyDefinerCallback>,
+  descriptor: Option<crate::IndexedPropertyDescriptorCallback>,
+  data: JSValue,
+  owner_ctx: *mut JSContext,
+  non_masking: bool,
+}
+
+struct NamedHandlerInstance {
+  named_handler: Option<NamedHandler>,
+  indexed_handler: Option<IndexedHandler>,
+}
+
+struct SignatureInfo {
+  templ: *const FnTemplate,
 }
 
 struct ObjTemplate {
   internal_field_count: i32,
   props: Vec<(JSValue, JSValue, u32)>,
   accessors: Vec<TemplAccessor>,
+  named_handler: Option<NamedHandler>,
+  indexed_handler: Option<IndexedHandler>,
+  immutable_proto: bool,
 
   parent_fn: *const FnTemplate,
 }
@@ -148,10 +303,28 @@ impl ObjTemplate {
       internal_field_count: 0,
       props: Vec::new(),
       accessors: Vec::new(),
+      named_handler: None,
+      indexed_handler: None,
+      immutable_proto: false,
       parent_fn: std::ptr::null(),
     }
   }
 }
+
+#[repr(C)]
+struct JSPropertyEnum {
+  is_enumerable: bool,
+  atom: JSAtom,
+}
+
+const JS_GPN_STRING_MASK_QJS: c_int = 1 << 0;
+const JS_PROP_HAS_CONFIGURABLE_QJS: c_int = 1 << 8;
+const JS_PROP_HAS_WRITABLE_QJS: c_int = 1 << 9;
+const JS_PROP_HAS_ENUMERABLE_QJS: c_int = 1 << 10;
+const JS_PROP_HAS_GET_QJS: c_int = 1 << 11;
+const JS_PROP_HAS_SET_QJS: c_int = 1 << 12;
+const JS_PROP_HAS_VALUE_QJS: c_int = 1 << 13;
+const JS_PROP_NO_EXOTIC_QJS: c_int = 1 << 17;
 
 struct DispatchEntry {
   callback: FunctionCallback,
@@ -159,11 +332,88 @@ struct DispatchEntry {
   data: JSValue,
 
   instance: *const ObjTemplate,
+  signature: *const FnTemplate,
+  fast_overloads: Vec<RawCFunction>,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawCTypeInfo {
+  type_: u8,
+  flags_: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawCFunctionInfo {
+  return_info_: RawCTypeInfo,
+  repr_: u8,
+  arg_count_: c_uint,
+  arg_info_: *const RawCTypeInfo,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct RawCFunction {
+  address_: *const c_void,
+  type_info_: *const RawCFunctionInfo,
+}
+
+const CTYPE_VOID: u8 = 0;
+const CTYPE_UINT32: u8 = 4;
+const CTYPE_UINT64: u8 = 6;
+const CTYPE_POINTER: u8 = 9;
+const CTYPE_V8_VALUE: u8 = 10;
+const CTYPE_SEQ_ONE_BYTE_STRING: u8 = 11;
+const CTYPE_CALLBACK_OPTIONS: u8 = 255;
+const INT64_REPR_BIGINT: u8 = 1;
+
+fn copy_fast_overloads(
+  c_functions: *const crate::fast_api::CFunction,
+  c_functions_len: usize,
+) -> Vec<RawCFunction> {
+  if c_functions.is_null() || c_functions_len == 0 {
+    return Vec::new();
+  }
+  unsafe {
+    slice::from_raw_parts(c_functions as *const RawCFunction, c_functions_len)
+      .to_vec()
+  }
 }
 
 thread_local! {
     static DISPATCH: std::cell::RefCell<Vec<DispatchEntry>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static SNAPSHOT_FUNCTIONS: std::cell::RefCell<
+      std::collections::HashMap<usize, SnapshotFunctionInfo>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static NAMED_GETTER_DISPATCH: std::cell::RefCell<Vec<NamedGetterEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    static GLOBAL_DEFINE_DISPATCH: std::cell::RefCell<Vec<*const GlobalDefineEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotFunctionInfo {
+  pub callback: FunctionCallback,
+  pub data_external: Option<*mut c_void>,
+  pub length: i32,
+  pub constructable: bool,
+}
+
+#[derive(Clone, Copy)]
+struct NamedGetterEntry {
+  getter: crate::NamedPropertyGetterCallback,
+  data: JSValue,
+  owner_ctx: *mut JSContext,
+  atom: JSAtom,
+}
+
+struct GlobalDefineEntry {
+  original: JSValue,
+  object_ctor: JSValue,
+  global: JSValue,
+  handler: NamedHandler,
 }
 
 pub(crate) mod timing {
@@ -227,6 +477,8 @@ fn register_dispatch(
   callback: FunctionCallback,
   data: JSValue,
   instance: *const ObjTemplate,
+  signature: *const FnTemplate,
+  fast_overloads: Vec<RawCFunction>,
 ) -> c_int {
   DISPATCH.with(|t| {
     let mut t = t.borrow_mut();
@@ -235,6 +487,8 @@ fn register_dispatch(
       callback,
       data,
       instance,
+      signature,
+      fast_overloads,
     });
     idx
   })
@@ -242,13 +496,1504 @@ fn register_dispatch(
 
 fn lookup_dispatch(
   idx: c_int,
-) -> Option<(FunctionCallback, JSValue, *const ObjTemplate)> {
+) -> Option<(
+  FunctionCallback,
+  JSValue,
+  *const ObjTemplate,
+  *const FnTemplate,
+  Vec<RawCFunction>,
+)> {
   DISPATCH.with(|t| {
-    t.borrow()
-      .get(idx as usize)
-      .map(|e| (e.callback, e.data, e.instance))
+    t.borrow().get(idx as usize).map(|e| {
+      (
+        e.callback,
+        e.data,
+        e.instance,
+        e.signature,
+        e.fast_overloads.clone(),
+      )
+    })
   })
 }
+
+fn register_named_getter(
+  ctx: *mut JSContext,
+  handler: &NamedHandler,
+  atom: JSAtom,
+) -> c_int {
+  let Some(getter) = handler.getter else {
+    return 0;
+  };
+  NAMED_GETTER_DISPATCH.with(|d| {
+    let mut d = d.borrow_mut();
+    let idx = d.len() as c_int;
+    d.push(NamedGetterEntry {
+      getter,
+      data: unsafe { JS_DupValue(ctx, handler.data) },
+      owner_ctx: handler.owner_ctx,
+      atom: unsafe { JS_DupAtom(ctx, atom) },
+    });
+    idx
+  })
+}
+
+fn lookup_named_getter(idx: c_int) -> Option<NamedGetterEntry> {
+  NAMED_GETTER_DISPATCH.with(|d| d.borrow().get(idx as usize).copied())
+}
+
+fn register_global_define(entry: GlobalDefineEntry) -> c_int {
+  GLOBAL_DEFINE_DISPATCH.with(|d| {
+    let mut d = d.borrow_mut();
+    let idx = d.len() as c_int;
+    d.push(Box::into_raw(Box::new(entry)));
+    idx
+  })
+}
+
+fn lookup_global_define(idx: c_int) -> Option<&'static GlobalDefineEntry> {
+  GLOBAL_DEFINE_DISPATCH.with(|d| {
+    d.borrow()
+      .get(idx as usize)
+      .copied()
+      .filter(|ptr| !ptr.is_null())
+      .map(|ptr| unsafe { &*ptr })
+  })
+}
+
+unsafe fn materialize_named_handler_data(
+  ctx: *mut JSContext,
+  entry: NamedGetterEntry,
+) -> (JSValue, bool) {
+  if entry.owner_ctx.is_null() || entry.owner_ctx == ctx {
+    return (entry.data, false);
+  }
+
+  let obj = unsafe { JS_NewObject(ctx) };
+  let value =
+    unsafe { JS_GetProperty(entry.owner_ctx, entry.data, entry.atom) };
+  if value.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(entry.owner_ctx) };
+    unsafe { JS_FreeValue(entry.owner_ctx, exc) };
+    return (obj, true);
+  }
+  unsafe {
+    JS_DefinePropertyValue(
+      ctx,
+      obj,
+      entry.atom,
+      value,
+      JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE,
+    );
+  }
+  (obj, true)
+}
+
+#[inline]
+fn intercepted_yes<T>(v: &T) -> bool {
+  let raw = unsafe { std::mem::transmute_copy::<_, u32>(v) };
+  raw == 0
+}
+
+fn clone_named_handler(
+  ctx: *mut JSContext,
+  handler: &NamedHandler,
+) -> NamedHandler {
+  let data = if jsv_is_undefined(&handler.data) {
+    jsv_undefined()
+  } else {
+    unsafe { JS_DupValue(ctx, handler.data) }
+  };
+  NamedHandler {
+    getter: handler.getter,
+    setter: handler.setter,
+    query: handler.query,
+    deleter: handler.deleter,
+    enumerator: handler.enumerator,
+    definer: handler.definer,
+    descriptor: handler.descriptor,
+    data,
+    owner_ctx: handler.owner_ctx,
+    non_masking: handler.non_masking,
+    only_intercept_strings: handler.only_intercept_strings,
+  }
+}
+
+fn clone_indexed_handler(
+  ctx: *mut JSContext,
+  handler: &IndexedHandler,
+) -> IndexedHandler {
+  let data = if jsv_is_undefined(&handler.data) {
+    jsv_undefined()
+  } else {
+    unsafe { JS_DupValue(ctx, handler.data) }
+  };
+  IndexedHandler {
+    getter: handler.getter,
+    setter: handler.setter,
+    query: handler.query,
+    deleter: handler.deleter,
+    enumerator: handler.enumerator,
+    definer: handler.definer,
+    descriptor: handler.descriptor,
+    data,
+    owner_ctx: handler.owner_ctx,
+    non_masking: handler.non_masking,
+  }
+}
+
+fn new_object_for_template(
+  ctx: *mut JSContext,
+  templ: &ObjTemplate,
+) -> JSValue {
+  if templ.named_handler.is_none() && templ.indexed_handler.is_none() {
+    return unsafe { JS_NewObject(ctx) };
+  }
+  let cid = named_handler_class_id_current();
+  if cid == 0 {
+    return unsafe { JS_NewObject(ctx) };
+  }
+  let obj = unsafe { JS_NewObjectClass(ctx, cid as c_int) };
+  if jsv_is_exception(&obj) {
+    return obj;
+  }
+  let inst = Box::new(NamedHandlerInstance {
+    named_handler: templ
+      .named_handler
+      .as_ref()
+      .map(|handler| clone_named_handler(ctx, handler)),
+    indexed_handler: templ
+      .indexed_handler
+      .as_ref()
+      .map(|handler| clone_indexed_handler(ctx, handler)),
+  });
+  unsafe { JS_SetOpaque(obj, Box::into_raw(inst) as *mut c_void) };
+  obj
+}
+
+fn named_handler_class_id_current() -> JSClassID {
+  let iso = current_iso();
+  if iso.is_null() {
+    return 0;
+  }
+  iso_state(iso).named_handler_class_id
+}
+
+unsafe fn named_handler_from_obj<'a>(
+  obj: JSValue,
+) -> Option<&'a mut NamedHandlerInstance> {
+  let cid = named_handler_class_id_current();
+  if cid == 0 {
+    return None;
+  }
+  let ptr = unsafe { JS_GetOpaque(obj, cid) as *mut NamedHandlerInstance };
+  if ptr.is_null() {
+    None
+  } else {
+    Some(unsafe { &mut *ptr })
+  }
+}
+
+unsafe fn atom_to_u32_index(ctx: *mut JSContext, atom: JSAtom) -> Option<u32> {
+  let mut len = 0_usize;
+  let ptr = unsafe { JS_AtomToCStringLen(ctx, &mut len, atom) };
+  if ptr.is_null() || len == 0 {
+    if !ptr.is_null() {
+      unsafe { JS_FreeCString(ctx, ptr) };
+    }
+    return None;
+  }
+
+  let bytes = unsafe { slice::from_raw_parts(ptr as *const u8, len) };
+  let mut out = 0_u64;
+  let mut ok = true;
+  if len > 1 && bytes[0] == b'0' {
+    ok = false;
+  }
+  if ok {
+    for &b in bytes {
+      if !b.is_ascii_digit() {
+        ok = false;
+        break;
+      }
+      out = out * 10 + u64::from(b - b'0');
+      if out >= u64::from(u32::MAX) {
+        ok = false;
+        break;
+      }
+    }
+  }
+  unsafe { JS_FreeCString(ctx, ptr) };
+  if ok { Some(out as u32) } else { None }
+}
+
+unsafe fn restore_callback_handles(iso: *mut RealIsolate, saved_depth: usize) {
+  if iso.is_null() {
+    return;
+  }
+  let st = iso_state(iso);
+  while st.handles.len() > saved_depth {
+    if let Some(slot) = st.handles.pop() {
+      unsafe {
+        JS_FreeValue(st.ctx, *slot);
+        drop(Box::from_raw(slot));
+      }
+    }
+  }
+}
+
+unsafe fn call_named_getter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  handler: &NamedHandler,
+  getter: crate::NamedPropertyGetterCallback,
+) -> (c_int, JSValue) {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Value>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let Some(key_handle) = NonNull::new(key_handle as *mut Name) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    unsafe { restore_callback_handles(iso, saved_depth) };
+    return (0, jsv_undefined());
+  };
+  let intercepted =
+    unsafe { (getter)(crate::SealedLocal(key_handle), prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    (-1, jsv_exception())
+  } else if intercepted_yes(&intercepted) {
+    let value = if jsv_is_undefined(&ret) {
+      jsv_undefined()
+    } else {
+      unsafe { JS_DupValue(ctx, ret) }
+    };
+    (1, value)
+  } else {
+    (0, jsv_undefined())
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_named_query(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  handler: &NamedHandler,
+  query: crate::NamedPropertyQueryCallback,
+) -> (c_int, c_int) {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Integer>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let Some(key_handle) = NonNull::new(key_handle as *mut Name) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    unsafe { restore_callback_handles(iso, saved_depth) };
+    return (0, 0);
+  };
+  let intercepted =
+    unsafe { (query)(crate::SealedLocal(key_handle), prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let mut attr = 0;
+  let result = if unsafe { JS_HasException(ctx) } {
+    (-1, 0)
+  } else if intercepted_yes(&intercepted) {
+    if !jsv_is_undefined(&ret) && unsafe { JS_ToInt32(ctx, &mut attr, ret) } < 0
+    {
+      (-1, 0)
+    } else {
+      (1, attr)
+    }
+  } else {
+    (0, 0)
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_named_setter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  value: JSValue,
+  handler: &NamedHandler,
+  setter: crate::NamedPropertySetterCallback,
+) -> c_int {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info =
+    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let value_handle = intern_dup::<Value>(ctx, value);
+  let (Some(key_handle), Some(value_handle)) = (
+    NonNull::new(key_handle as *mut Name),
+    NonNull::new(value_handle as *mut Value),
+  ) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    unsafe { restore_callback_handles(iso, saved_depth) };
+    return 0;
+  };
+  let intercepted = unsafe {
+    (setter)(
+      crate::SealedLocal(key_handle),
+      crate::SealedLocal(value_handle),
+      prop_info,
+    )
+  };
+
+  let _info = unsafe { Box::from_raw(info_ptr) };
+  let result = if unsafe { JS_HasException(ctx) } {
+    -1
+  } else if intercepted_yes(&intercepted) {
+    1
+  } else {
+    0
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_named_deleter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  handler: &NamedHandler,
+  deleter: crate::NamedPropertyDeleterCallback,
+) -> c_int {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Boolean>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let Some(key_handle) = NonNull::new(key_handle as *mut Name) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    unsafe { restore_callback_handles(iso, saved_depth) };
+    return 0;
+  };
+  let intercepted =
+    unsafe { (deleter)(crate::SealedLocal(key_handle), prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    -1
+  } else if intercepted_yes(&intercepted) {
+    if jsv_is_undefined(&ret) {
+      1
+    } else {
+      unsafe { JS_ToBool(ctx, ret) }
+    }
+  } else {
+    0
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_named_enumerator(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  handler: &NamedHandler,
+  enumerator: crate::NamedPropertyEnumeratorCallback,
+) -> JSValue {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Array>;
+
+  unsafe { (enumerator)(prop_info) };
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    jsv_exception()
+  } else if jsv_is_undefined(&ret) {
+    jsv_undefined()
+  } else {
+    unsafe { JS_DupValue(ctx, ret) }
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn construct_property_descriptor_for_callback(
+  ctx: *mut JSContext,
+  out: *mut PropertyDescriptor,
+  val: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+  flags: c_int,
+) {
+  if flags & JS_PROP_HAS_GET_QJS != 0 || flags & JS_PROP_HAS_SET_QJS != 0 {
+    let get_handle = intern_dup::<Value>(ctx, getter);
+    let set_handle = intern_dup::<Value>(ctx, setter);
+    unsafe {
+      super::property::v8__PropertyDescriptor__CONSTRUCT__Get_Set(
+        out, get_handle, set_handle,
+      );
+    }
+  } else if flags & JS_PROP_HAS_VALUE_QJS != 0 {
+    let value_handle = intern_dup::<Value>(ctx, val);
+    if flags & JS_PROP_HAS_WRITABLE_QJS != 0 {
+      unsafe {
+        super::property::v8__PropertyDescriptor__CONSTRUCT__Value_Writable(
+          out,
+          value_handle,
+          flags & JS_PROP_WRITABLE != 0,
+        );
+      }
+    } else {
+      unsafe {
+        super::property::v8__PropertyDescriptor__CONSTRUCT__Value(
+          out,
+          value_handle,
+        );
+      }
+    }
+  } else {
+    unsafe { super::property::v8__PropertyDescriptor__CONSTRUCT(out) };
+  }
+
+  if flags & JS_PROP_HAS_ENUMERABLE_QJS != 0 {
+    unsafe {
+      super::property::v8__PropertyDescriptor__set_enumerable(
+        out,
+        flags & JS_PROP_ENUMERABLE != 0,
+      );
+    }
+  }
+  if flags & JS_PROP_HAS_CONFIGURABLE_QJS != 0 {
+    unsafe {
+      super::property::v8__PropertyDescriptor__set_configurable(
+        out,
+        flags & JS_PROP_CONFIGURABLE != 0,
+      );
+    }
+  }
+}
+
+unsafe fn call_named_definer(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  val: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+  flags: c_int,
+  handler: &NamedHandler,
+  definer: crate::NamedPropertyDefinerCallback,
+) -> c_int {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info =
+    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let Some(key_handle) = NonNull::new(key_handle as *mut Name) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    unsafe { restore_callback_handles(iso, saved_depth) };
+    return 0;
+  };
+  let mut pd = MaybeUninit::<PropertyDescriptor>::zeroed();
+  unsafe {
+    construct_property_descriptor_for_callback(
+      ctx,
+      pd.as_mut_ptr(),
+      val,
+      getter,
+      setter,
+      flags,
+    )
+  };
+  let intercepted = unsafe {
+    (definer)(crate::SealedLocal(key_handle), pd.as_ptr(), prop_info)
+  };
+  unsafe { super::property::v8__PropertyDescriptor__DESTRUCT(pd.as_mut_ptr()) };
+
+  let _info = unsafe { Box::from_raw(info_ptr) };
+  let result = if unsafe { JS_HasException(ctx) } {
+    -1
+  } else if intercepted_yes(&intercepted) {
+    1
+  } else {
+    0
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_indexed_getter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  index: u32,
+  handler: &IndexedHandler,
+  getter: crate::IndexedPropertyGetterCallback,
+) -> (c_int, JSValue) {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Value>;
+
+  let intercepted = unsafe { (getter)(index, prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    (-1, jsv_exception())
+  } else if intercepted_yes(&intercepted) {
+    let value = if jsv_is_undefined(&ret) {
+      jsv_undefined()
+    } else {
+      unsafe { JS_DupValue(ctx, ret) }
+    };
+    (1, value)
+  } else {
+    (0, jsv_undefined())
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_indexed_query(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  index: u32,
+  handler: &IndexedHandler,
+  query: crate::IndexedPropertyQueryCallback,
+) -> (c_int, c_int) {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Integer>;
+
+  let intercepted = unsafe { (query)(index, prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let mut attr = 0;
+  let result = if unsafe { JS_HasException(ctx) } {
+    (-1, 0)
+  } else if intercepted_yes(&intercepted) {
+    if !jsv_is_undefined(&ret) && unsafe { JS_ToInt32(ctx, &mut attr, ret) } < 0
+    {
+      (-1, 0)
+    } else {
+      (1, attr)
+    }
+  } else {
+    (0, 0)
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_indexed_setter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  index: u32,
+  value: JSValue,
+  handler: &IndexedHandler,
+  setter: crate::IndexedPropertySetterCallback,
+) -> c_int {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info =
+    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+
+  let value_handle = intern_dup::<Value>(ctx, value);
+  let Some(value_handle) = NonNull::new(value_handle as *mut Value) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    unsafe { restore_callback_handles(iso, saved_depth) };
+    return 0;
+  };
+  let intercepted =
+    unsafe { (setter)(index, crate::SealedLocal(value_handle), prop_info) };
+
+  let _info = unsafe { Box::from_raw(info_ptr) };
+  let result = if unsafe { JS_HasException(ctx) } {
+    -1
+  } else if intercepted_yes(&intercepted) {
+    1
+  } else {
+    0
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_indexed_deleter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  index: u32,
+  handler: &IndexedHandler,
+  deleter: crate::IndexedPropertyDeleterCallback,
+) -> (c_int, c_int) {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Boolean>;
+
+  let intercepted = unsafe { (deleter)(index, prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    (-1, 0)
+  } else if intercepted_yes(&intercepted) {
+    let ok = if jsv_is_undefined(&ret) {
+      1
+    } else {
+      unsafe { JS_ToBool(ctx, ret) }
+    };
+    (1, ok)
+  } else {
+    (0, 1)
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_indexed_enumerator(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  handler: &IndexedHandler,
+  enumerator: crate::IndexedPropertyEnumeratorCallback,
+) -> JSValue {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Array>;
+
+  unsafe { (enumerator)(prop_info) };
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    jsv_exception()
+  } else if jsv_is_undefined(&ret) {
+    jsv_undefined()
+  } else {
+    unsafe { JS_DupValue(ctx, ret) }
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_indexed_definer(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  index: u32,
+  val: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+  flags: c_int,
+  handler: &IndexedHandler,
+  definer: crate::IndexedPropertyDefinerCallback,
+) -> c_int {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info =
+    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+
+  let mut pd = MaybeUninit::<PropertyDescriptor>::zeroed();
+  unsafe {
+    construct_property_descriptor_for_callback(
+      ctx,
+      pd.as_mut_ptr(),
+      val,
+      getter,
+      setter,
+      flags,
+    )
+  };
+  let intercepted = unsafe { (definer)(index, pd.as_ptr(), prop_info) };
+  unsafe { super::property::v8__PropertyDescriptor__DESTRUCT(pd.as_mut_ptr()) };
+
+  let _info = unsafe { Box::from_raw(info_ptr) };
+  let result = if unsafe { JS_HasException(ctx) } {
+    -1
+  } else if intercepted_yes(&intercepted) {
+    1
+  } else {
+    0
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+fn attr_to_descriptor_flags(attr: c_int) -> c_int {
+  let mut flags = 0;
+  if attr & 1 == 0 {
+    flags |= JS_PROP_WRITABLE;
+  }
+  if attr & 2 == 0 {
+    flags |= JS_PROP_ENUMERABLE;
+  }
+  if attr & 4 == 0 {
+    flags |= JS_PROP_CONFIGURABLE;
+  }
+  flags
+}
+
+unsafe fn fill_desc_from_query(
+  ctx: *mut JSContext,
+  desc: *mut JSPropertyDescriptorQjs,
+  attr: c_int,
+) {
+  if desc.is_null() {
+    return;
+  }
+  unsafe {
+    (*desc).flags = attr_to_descriptor_flags(attr);
+    (*desc).value = jsv_undefined();
+    (*desc).getter = jsv_undefined();
+    (*desc).setter = jsv_undefined();
+  }
+  let _ = ctx;
+}
+
+unsafe fn fill_desc_from_descriptor_object(
+  ctx: *mut JSContext,
+  desc: *mut JSPropertyDescriptorQjs,
+  obj: JSValue,
+) -> c_int {
+  if desc.is_null() {
+    return 1;
+  }
+  let value = unsafe { JS_GetPropertyStr(ctx, obj, c"value".as_ptr()) };
+  if jsv_is_exception(&value) {
+    return -1;
+  }
+  let enumerable =
+    unsafe { JS_GetPropertyStr(ctx, obj, c"enumerable".as_ptr()) };
+  if jsv_is_exception(&enumerable) {
+    unsafe { JS_FreeValue(ctx, value) };
+    return -1;
+  }
+  let configurable =
+    unsafe { JS_GetPropertyStr(ctx, obj, c"configurable".as_ptr()) };
+  if jsv_is_exception(&configurable) {
+    unsafe {
+      JS_FreeValue(ctx, value);
+      JS_FreeValue(ctx, enumerable);
+    }
+    return -1;
+  }
+  let writable = unsafe { JS_GetPropertyStr(ctx, obj, c"writable".as_ptr()) };
+  if jsv_is_exception(&writable) {
+    unsafe {
+      JS_FreeValue(ctx, value);
+      JS_FreeValue(ctx, enumerable);
+      JS_FreeValue(ctx, configurable);
+    }
+    return -1;
+  }
+
+  let mut flags = 0;
+  if unsafe { JS_ToBool(ctx, enumerable) } != 0 {
+    flags |= JS_PROP_ENUMERABLE;
+  }
+  if unsafe { JS_ToBool(ctx, configurable) } != 0 {
+    flags |= JS_PROP_CONFIGURABLE;
+  }
+  if unsafe { JS_ToBool(ctx, writable) } != 0 {
+    flags |= JS_PROP_WRITABLE;
+  }
+  unsafe {
+    JS_FreeValue(ctx, enumerable);
+    JS_FreeValue(ctx, configurable);
+    JS_FreeValue(ctx, writable);
+    (*desc).flags = flags;
+    (*desc).value = value;
+    (*desc).getter = jsv_undefined();
+    (*desc).setter = jsv_undefined();
+  }
+  1
+}
+
+unsafe fn enumerator_contains_property(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: JSAtom,
+  handler: &NamedHandler,
+  enumerator: crate::NamedPropertyEnumeratorCallback,
+) -> c_int {
+  let arr = unsafe { call_named_enumerator(ctx, obj, handler, enumerator) };
+  if jsv_is_exception(&arr) {
+    return -1;
+  }
+  if jsv_is_undefined(&arr) {
+    return 0;
+  }
+  let mut len: i64 = 0;
+  if unsafe { JS_GetLength(ctx, arr, &mut len) } < 0 || len <= 0 {
+    unsafe { JS_FreeValue(ctx, arr) };
+    return 0;
+  }
+  let mut found = false;
+  for i in 0..(len.min(u32::MAX as i64) as u32) {
+    let item = unsafe { JS_GetPropertyUint32(ctx, arr, i) };
+    if jsv_is_exception(&item) {
+      unsafe { JS_FreeValue(ctx, arr) };
+      return -1;
+    }
+    let atom = unsafe { JS_ValueToAtom(ctx, item) };
+    unsafe { JS_FreeValue(ctx, item) };
+    if atom == prop {
+      found = true;
+    }
+    if atom != 0 {
+      unsafe { JS_FreeAtom(ctx, atom) };
+    }
+    if found {
+      break;
+    }
+  }
+  unsafe { JS_FreeValue(ctx, arr) };
+  if found { 1 } else { 0 }
+}
+
+unsafe fn indexed_enumerator_contains_property(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: JSAtom,
+  handler: &IndexedHandler,
+  enumerator: crate::IndexedPropertyEnumeratorCallback,
+) -> c_int {
+  let arr = unsafe { call_indexed_enumerator(ctx, obj, handler, enumerator) };
+  if jsv_is_exception(&arr) {
+    return -1;
+  }
+  if jsv_is_undefined(&arr) {
+    return 0;
+  }
+  let mut len: i64 = 0;
+  if unsafe { JS_GetLength(ctx, arr, &mut len) } < 0 || len <= 0 {
+    unsafe { JS_FreeValue(ctx, arr) };
+    return 0;
+  }
+  let mut found = false;
+  for i in 0..(len.min(u32::MAX as i64) as u32) {
+    let item = unsafe { JS_GetPropertyUint32(ctx, arr, i) };
+    if jsv_is_exception(&item) {
+      unsafe { JS_FreeValue(ctx, arr) };
+      return -1;
+    }
+    let atom = unsafe { JS_ValueToAtom(ctx, item) };
+    unsafe { JS_FreeValue(ctx, item) };
+    if atom == prop {
+      found = true;
+    }
+    if atom != 0 {
+      unsafe { JS_FreeAtom(ctx, atom) };
+    }
+    if found {
+      break;
+    }
+  }
+  unsafe { JS_FreeValue(ctx, arr) };
+  if found { 1 } else { 0 }
+}
+
+unsafe extern "C" fn named_handler_get_own_property(
+  ctx: *mut JSContext,
+  desc: *mut JSPropertyDescriptorQjs,
+  obj: JSValue,
+  prop: JSAtom,
+) -> c_int {
+  let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
+    return 0;
+  };
+  if let (Some(index), Some(handler)) = (
+    unsafe { atom_to_u32_index(ctx, prop) },
+    inst.indexed_handler.as_ref(),
+  ) {
+    if let Some(descriptor) = handler.descriptor {
+      let (state, value) =
+        unsafe { call_indexed_getter(ctx, obj, index, handler, descriptor) };
+      if state < 0 {
+        return -1;
+      }
+      if state > 0 {
+        let rc = unsafe { fill_desc_from_descriptor_object(ctx, desc, value) };
+        unsafe { JS_FreeValue(ctx, value) };
+        return rc;
+      }
+    }
+
+    if let Some(query) = handler.query {
+      let (state, attr) =
+        unsafe { call_indexed_query(ctx, obj, index, handler, query) };
+      if state < 0 {
+        return -1;
+      }
+      if state > 0 {
+        unsafe { fill_desc_from_query(ctx, desc, attr) };
+        return 1;
+      }
+    }
+
+    if let Some(enumerator) = handler.enumerator {
+      let state = unsafe {
+        indexed_enumerator_contains_property(
+          ctx, obj, prop, handler, enumerator,
+        )
+      };
+      if state < 0 {
+        return -1;
+      }
+      if state > 0 {
+        if !desc.is_null() {
+          unsafe {
+            (*desc).flags =
+              JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE;
+            (*desc).value = jsv_undefined();
+            (*desc).getter = jsv_undefined();
+            (*desc).setter = jsv_undefined();
+          }
+        }
+        return 1;
+      }
+    }
+  }
+
+  let Some(handler) = inst.named_handler.as_ref() else {
+    return 0;
+  };
+
+  if let Some(descriptor) = handler.descriptor {
+    let (state, value) =
+      unsafe { call_named_getter(ctx, obj, prop, handler, descriptor) };
+    if state < 0 {
+      return -1;
+    }
+    if state > 0 {
+      let rc = unsafe { fill_desc_from_descriptor_object(ctx, desc, value) };
+      unsafe { JS_FreeValue(ctx, value) };
+      return rc;
+    }
+  }
+
+  if let Some(query) = handler.query {
+    let (state, attr) =
+      unsafe { call_named_query(ctx, obj, prop, handler, query) };
+    if state < 0 {
+      return -1;
+    }
+    if state > 0 {
+      unsafe { fill_desc_from_query(ctx, desc, attr) };
+      return 1;
+    }
+  }
+
+  if let Some(enumerator) = handler.enumerator {
+    let state = unsafe {
+      enumerator_contains_property(ctx, obj, prop, handler, enumerator)
+    };
+    if state < 0 {
+      return -1;
+    }
+    if state > 0 {
+      if !desc.is_null() {
+        unsafe {
+          (*desc).flags =
+            JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE;
+          (*desc).value = jsv_undefined();
+          (*desc).getter = jsv_undefined();
+          (*desc).setter = jsv_undefined();
+        }
+      }
+      return 1;
+    }
+  }
+
+  0
+}
+
+unsafe extern "C" fn named_handler_get_property(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: JSAtom,
+  receiver: JSValue,
+) -> JSValue {
+  let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
+    return jsv_undefined();
+  };
+
+  if let (Some(index), Some(handler)) = (
+    unsafe { atom_to_u32_index(ctx, prop) },
+    inst.indexed_handler.as_ref(),
+  ) {
+    if let Some(getter) = handler.getter {
+      let (state, value) =
+        unsafe { call_indexed_getter(ctx, receiver, index, handler, getter) };
+      if state < 0 {
+        return jsv_exception();
+      }
+      if state > 0 {
+        return value;
+      }
+    }
+  }
+
+  if let Some(handler) = inst.named_handler.as_ref() {
+    if let Some(getter) = handler.getter {
+      let (state, value) =
+        unsafe { call_named_getter(ctx, receiver, prop, handler, getter) };
+      if state < 0 {
+        return jsv_exception();
+      }
+      if state > 0 {
+        return value;
+      }
+    }
+  }
+
+  jsv_undefined()
+}
+
+unsafe extern "C" fn named_handler_set_property(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: JSAtom,
+  value: JSValue,
+  receiver: JSValue,
+  _flags: c_int,
+) -> c_int {
+  let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
+    return 0;
+  };
+
+  if let (Some(index), Some(handler)) = (
+    unsafe { atom_to_u32_index(ctx, prop) },
+    inst.indexed_handler.as_ref(),
+  ) {
+    if let Some(setter) = handler.setter {
+      let state = unsafe {
+        call_indexed_setter(ctx, receiver, index, value, handler, setter)
+      };
+      if state != 0 {
+        return state;
+      }
+    }
+  }
+
+  if let Some(handler) = inst.named_handler.as_ref() {
+    if let Some(setter) = handler.setter {
+      let state = unsafe {
+        call_named_setter(ctx, receiver, prop, value, handler, setter)
+      };
+      if state != 0 {
+        return state;
+      }
+    }
+  }
+  unsafe {
+    JS_DefinePropertyValue(
+      ctx,
+      receiver,
+      prop,
+      JS_DupValue(ctx, value),
+      JS_PROP_C_W_E,
+    )
+  }
+}
+
+unsafe extern "C" fn named_handler_delete_property(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: JSAtom,
+) -> c_int {
+  let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
+    return 1;
+  };
+
+  if let (Some(index), Some(handler)) = (
+    unsafe { atom_to_u32_index(ctx, prop) },
+    inst.indexed_handler.as_ref(),
+  ) {
+    if let Some(deleter) = handler.deleter {
+      let (state, ok) =
+        unsafe { call_indexed_deleter(ctx, obj, index, handler, deleter) };
+      if state < 0 {
+        return -1;
+      }
+      if state > 0 {
+        return ok;
+      }
+    }
+  }
+
+  if let Some(handler) = inst.named_handler.as_ref() {
+    if let Some(deleter) = handler.deleter {
+      let state =
+        unsafe { call_named_deleter(ctx, obj, prop, handler, deleter) };
+      if state < 0 {
+        return -1;
+      }
+      if state > 0 {
+        return 1;
+      }
+    }
+  }
+
+  1
+}
+
+unsafe extern "C" fn named_handler_get_own_property_names(
+  ctx: *mut JSContext,
+  ptab: *mut *mut JSPropertyEnum,
+  plen: *mut u32,
+  obj: JSValue,
+) -> c_int {
+  if ptab.is_null() || plen.is_null() {
+    return 0;
+  }
+  unsafe {
+    *ptab = ptr::null_mut();
+    *plen = 0;
+  }
+  let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
+    return 0;
+  };
+  let arr = if let Some(handler) = inst.indexed_handler.as_ref() {
+    if let Some(enumerator) = handler.enumerator {
+      unsafe { call_indexed_enumerator(ctx, obj, handler, enumerator) }
+    } else if let Some(handler) = inst.named_handler.as_ref() {
+      if let Some(enumerator) = handler.enumerator {
+        unsafe { call_named_enumerator(ctx, obj, handler, enumerator) }
+      } else {
+        return 0;
+      }
+    } else {
+      return 0;
+    }
+  } else if let Some(handler) = inst.named_handler.as_ref() {
+    if let Some(enumerator) = handler.enumerator {
+      unsafe { call_named_enumerator(ctx, obj, handler, enumerator) }
+    } else {
+      return 0;
+    }
+  } else {
+    return 0;
+  };
+  if jsv_is_exception(&arr) {
+    return -1;
+  }
+  if jsv_is_undefined(&arr) {
+    return 0;
+  }
+
+  let mut len: i64 = 0;
+  if unsafe { JS_GetLength(ctx, arr, &mut len) } < 0 || len <= 0 {
+    unsafe { JS_FreeValue(ctx, arr) };
+    return 0;
+  }
+  let count = len.min(u32::MAX as i64) as u32;
+  let bytes = count as usize * std::mem::size_of::<JSPropertyEnum>();
+  let tab = unsafe { js_malloc(ctx, bytes) as *mut JSPropertyEnum };
+  if tab.is_null() {
+    unsafe { JS_FreeValue(ctx, arr) };
+    return -1;
+  }
+  let mut written = 0_u32;
+  for i in 0..count {
+    let item = unsafe { JS_GetPropertyUint32(ctx, arr, i) };
+    if jsv_is_exception(&item) {
+      unsafe {
+        JS_FreeValue(ctx, arr);
+        js_free(ctx, tab as *mut c_void);
+      }
+      return -1;
+    }
+    let atom = unsafe { JS_ValueToAtom(ctx, item) };
+    unsafe { JS_FreeValue(ctx, item) };
+    if atom == 0 {
+      continue;
+    }
+    unsafe {
+      (*tab.add(written as usize)).is_enumerable = true;
+      (*tab.add(written as usize)).atom = atom;
+    }
+    written += 1;
+  }
+  unsafe {
+    JS_FreeValue(ctx, arr);
+    *ptab = tab;
+    *plen = written;
+  }
+  0
+}
+
+unsafe extern "C" fn named_handler_define_own_property(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: JSAtom,
+  val: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+  flags: c_int,
+) -> c_int {
+  let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
+    return 0;
+  };
+
+  if let (Some(index), Some(handler)) = (
+    unsafe { atom_to_u32_index(ctx, prop) },
+    inst.indexed_handler.as_ref(),
+  ) {
+    if let Some(definer) = handler.definer {
+      let state = unsafe {
+        call_indexed_definer(
+          ctx, obj, index, val, getter, setter, flags, handler, definer,
+        )
+      };
+      if state != 0 {
+        return state;
+      }
+    }
+  }
+
+  if let Some(handler) = inst.named_handler.as_ref() {
+    if let Some(definer) = handler.definer {
+      let state = unsafe {
+        call_named_definer(
+          ctx, obj, prop, val, getter, setter, flags, handler, definer,
+        )
+      };
+      if state != 0 {
+        return state;
+      }
+    }
+  }
+  unsafe {
+    JS_DefineProperty(
+      ctx,
+      obj,
+      prop,
+      JS_DupValue(ctx, val),
+      JS_DupValue(ctx, getter),
+      JS_DupValue(ctx, setter),
+      flags | JS_PROP_NO_EXOTIC_QJS,
+    )
+  }
+}
+
+static NAMED_HANDLER_EXOTIC: JSClassExoticMethods = JSClassExoticMethods {
+  get_own_property: Some(named_handler_get_own_property),
+  get_own_property_names: Some(named_handler_get_own_property_names),
+  delete_property: Some(named_handler_delete_property),
+  define_own_property: Some(named_handler_define_own_property),
+  has_property: None,
+  get_property: Some(named_handler_get_property),
+  set_property: Some(named_handler_set_property),
+};
 
 unsafe fn dispatch(
   ctx: *mut JSContext,
@@ -346,6 +2091,371 @@ unsafe fn dispatch(
   result
 }
 
+unsafe fn try_fast_dispatch(
+  ctx: *mut JSContext,
+  fast_overloads: &[RawCFunction],
+  data: JSValue,
+  this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> Option<JSValue> {
+  if fast_overloads.is_empty() || unsafe { fast_api_next_call_count(ctx) } <= 0
+  {
+    return None;
+  }
+
+  for overload in fast_overloads {
+    if let Some(result) =
+      unsafe { call_fast_overload(ctx, overload, data, this_val, argc, argv) }
+    {
+      unsafe { consume_fast_api_next_call(ctx) };
+      return Some(result);
+    }
+  }
+  None
+}
+
+unsafe fn fast_api_next_call_count(ctx: *mut JSContext) -> i32 {
+  if ctx.is_null() {
+    return 0;
+  }
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let value = unsafe {
+    JS_GetPropertyStr(ctx, global, c"__v8x_fast_api_next_call".as_ptr())
+  };
+  unsafe { JS_FreeValue(ctx, global) };
+  if value.tag == JS_TAG_EXCEPTION {
+    unsafe {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    return 0;
+  }
+  let mut count = 0;
+  if unsafe { JS_ToInt32(ctx, &mut count, value) } < 0 {
+    unsafe {
+      JS_FreeValue(ctx, value);
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    return 0;
+  }
+  unsafe { JS_FreeValue(ctx, value) };
+  count
+}
+
+unsafe fn consume_fast_api_next_call(ctx: *mut JSContext) {
+  let count = unsafe { fast_api_next_call_count(ctx) };
+  if count <= 0 || ctx.is_null() {
+    return;
+  }
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      global,
+      c"__v8x_fast_api_next_call".as_ptr(),
+      JS_NewInt32(ctx, count - 1),
+    );
+    JS_FreeValue(ctx, global);
+  }
+}
+
+unsafe fn call_fast_overload(
+  ctx: *mut JSContext,
+  overload: &RawCFunction,
+  data: JSValue,
+  this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> Option<JSValue> {
+  if overload.address_.is_null() || overload.type_info_.is_null() {
+    return None;
+  }
+  let info = unsafe { &*overload.type_info_ };
+  let arg_count = info.arg_count_ as usize;
+  if arg_count == 0 || info.arg_info_.is_null() {
+    return None;
+  }
+  let has_options = unsafe {
+    (*info.arg_info_.add(arg_count - 1)).type_ == CTYPE_CALLBACK_OPTIONS
+  };
+  let effective_arg_count = if has_options {
+    arg_count - 1
+  } else {
+    arg_count
+  };
+  if effective_arg_count != argc.max(0) as usize + 1 {
+    return None;
+  }
+
+  let mut arg_types = Vec::with_capacity(effective_arg_count);
+  for i in 0..effective_arg_count {
+    arg_types.push(unsafe { (*info.arg_info_.add(i)).type_ });
+  }
+  if arg_types.first().copied() != Some(CTYPE_V8_VALUE) {
+    return None;
+  }
+
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+
+  let recv = unsafe { fast_local_object(ctx, this_val) };
+  let mut options = unsafe { fast_options(ctx, iso, data) };
+  let options_ptr =
+    &mut options as *mut crate::fast_api::FastApiCallbackOptions<'static>;
+
+  let result =
+    match (info.return_info_.type_, arg_types.as_slice(), has_options) {
+      (CTYPE_UINT32, [CTYPE_V8_VALUE, CTYPE_UINT32, CTYPE_UINT32], true) => {
+        let a = unsafe { fast_u32(ctx, js_argv(argc, argv, 0)?)? };
+        let b = unsafe { fast_u32(ctx, js_argv(argc, argv, 1)?)? };
+        let f: unsafe fn(
+          Local<'static, Object>,
+          u32,
+          u32,
+          *mut crate::fast_api::FastApiCallbackOptions<'static>,
+        ) -> u32 = unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewUint32(ctx, f(recv, a, b, options_ptr)) }
+      }
+      (CTYPE_VOID, [CTYPE_V8_VALUE, CTYPE_V8_VALUE], false) => {
+        let value = unsafe { fast_local_value(ctx, js_argv(argc, argv, 0)?) };
+        let f: unsafe fn(Local<'static, Object>, Local<'static, Value>) =
+          unsafe { std::mem::transmute(overload.address_) };
+        unsafe { f(recv, value) };
+        jsv_undefined()
+      }
+      (
+        CTYPE_UINT32,
+        [CTYPE_V8_VALUE, CTYPE_UINT32, CTYPE_UINT32, CTYPE_V8_VALUE],
+        false,
+      ) => {
+        let a = unsafe { fast_u32(ctx, js_argv(argc, argv, 0)?)? };
+        let b = unsafe { fast_u32(ctx, js_argv(argc, argv, 1)?)? };
+        let value = unsafe { fast_local_value(ctx, js_argv(argc, argv, 2)?) };
+        let f: unsafe fn(
+          Local<'static, Object>,
+          u32,
+          u32,
+          Local<'static, Value>,
+        ) -> u32 = unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewUint32(ctx, f(recv, a, b, value)) }
+      }
+      (CTYPE_UINT32, [CTYPE_V8_VALUE, CTYPE_V8_VALUE], false) => {
+        let value = unsafe { fast_local_value(ctx, js_argv(argc, argv, 0)?) };
+        let f: unsafe fn(Local<'static, Object>, Local<'static, Value>) -> u32 =
+          unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewUint32(ctx, f(recv, value)) }
+      }
+      (CTYPE_UINT32, [CTYPE_V8_VALUE], false) => {
+        let f: unsafe fn(Local<'static, Object>) -> u32 =
+          unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewUint32(ctx, f(recv)) }
+      }
+      (CTYPE_VOID, [CTYPE_V8_VALUE, CTYPE_UINT32], false) => {
+        let a = unsafe { fast_u32(ctx, js_argv(argc, argv, 0)?)? };
+        let f: unsafe fn(Local<'static, Object>, u32) =
+          unsafe { std::mem::transmute(overload.address_) };
+        unsafe { f(recv, a) };
+        jsv_undefined()
+      }
+      (CTYPE_VOID, [CTYPE_V8_VALUE, CTYPE_UINT32, CTYPE_UINT32], false) => {
+        let a = unsafe { fast_u32(ctx, js_argv(argc, argv, 0)?)? };
+        let b = unsafe { fast_u32(ctx, js_argv(argc, argv, 1)?)? };
+        let f: unsafe fn(Local<'static, Object>, u32, u32) =
+          unsafe { std::mem::transmute(overload.address_) };
+        unsafe { f(recv, a, b) };
+        jsv_undefined()
+      }
+      (CTYPE_VOID, [CTYPE_V8_VALUE], true) => {
+        let f: unsafe fn(
+          Local<'static, Object>,
+          *mut crate::fast_api::FastApiCallbackOptions<'static>,
+        ) = unsafe { std::mem::transmute(overload.address_) };
+        unsafe { f(recv, options_ptr) };
+        jsv_undefined()
+      }
+      (CTYPE_UINT32, [CTYPE_V8_VALUE, CTYPE_SEQ_ONE_BYTE_STRING], false) => {
+        let (string, cstr) =
+          unsafe { fast_one_byte_string(ctx, js_argv(argc, argv, 0)?)? };
+        let f: unsafe fn(
+          Local<'static, Object>,
+          *const crate::fast_api::FastApiOneByteString,
+        ) -> u32 = unsafe { std::mem::transmute(overload.address_) };
+        let out = unsafe { f(recv, &*string) };
+        unsafe { JS_FreeCString(ctx, cstr) };
+        unsafe { JS_NewUint32(ctx, out) }
+      }
+      (CTYPE_UINT64, [CTYPE_V8_VALUE, CTYPE_UINT64, CTYPE_UINT64], false) => {
+        let a = unsafe { fast_u64(ctx, js_argv(argc, argv, 0)?, info.repr_)? };
+        let b = unsafe { fast_u64(ctx, js_argv(argc, argv, 1)?, info.repr_)? };
+        let f: unsafe fn(Local<'static, Object>, u64, u64) -> u64 =
+          unsafe { std::mem::transmute(overload.address_) };
+        let out = unsafe { f(recv, a, b) };
+        if info.repr_ == INT64_REPR_BIGINT {
+          unsafe { JS_NewBigUint64(ctx, out) }
+        } else {
+          unsafe { JS_NewFloat64(ctx, out as f64) }
+        }
+      }
+      (CTYPE_POINTER, [CTYPE_V8_VALUE, CTYPE_POINTER], false) => {
+        let ptr = unsafe { fast_pointer_arg(js_argv(argc, argv, 0)?)? };
+        let f: unsafe fn(Local<'static, Object>, *mut c_void) -> *mut c_void =
+          unsafe { std::mem::transmute(overload.address_) };
+        let out = unsafe { f(recv, ptr) };
+        if out.is_null() {
+          jsv_null()
+        } else {
+          make_external_jsvalue(iso, ctx, out)
+        }
+      }
+      _ => {
+        unsafe { restore_handle_depth(iso, saved_depth) };
+        return None;
+      }
+    };
+
+  let result = if unsafe { JS_HasException(ctx) } {
+    jsv_exception()
+  } else {
+    result
+  };
+  unsafe { restore_handle_depth(iso, saved_depth) };
+  Some(result)
+}
+
+unsafe fn restore_handle_depth(iso: *mut RealIsolate, saved_depth: usize) {
+  if iso.is_null() {
+    return;
+  }
+  let st = iso_state(iso);
+  while st.handles.len() > saved_depth {
+    if let Some(slot) = st.handles.pop() {
+      unsafe {
+        JS_FreeValue(st.ctx, *slot);
+        drop(Box::from_raw(slot));
+      }
+    }
+  }
+}
+
+unsafe fn js_argv(
+  argc: c_int,
+  argv: *mut JSValue,
+  index: usize,
+) -> Option<JSValue> {
+  if argv.is_null() || index >= argc.max(0) as usize {
+    return None;
+  }
+  Some(unsafe { *argv.add(index) })
+}
+
+unsafe fn fast_local_value(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> Local<'static, Value> {
+  let handle = intern_dup::<Value>(ctx, value);
+  unsafe { Local::from_raw_unchecked(handle) }
+}
+
+unsafe fn fast_local_object(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> Local<'static, Object> {
+  let handle = intern_dup::<Object>(ctx, value);
+  unsafe { Local::from_raw_unchecked(handle) }
+}
+
+unsafe fn fast_options(
+  ctx: *mut JSContext,
+  iso: *mut RealIsolate,
+  data: JSValue,
+) -> crate::fast_api::FastApiCallbackOptions<'static> {
+  crate::fast_api::FastApiCallbackOptions {
+    isolate: iso,
+    data: unsafe { fast_local_value(ctx, data) },
+  }
+}
+
+unsafe fn fast_u32(ctx: *mut JSContext, value: JSValue) -> Option<u32> {
+  let mut out = 0i32;
+  if unsafe { JS_ToInt32(ctx, &mut out, value) } < 0 {
+    unsafe {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    None
+  } else {
+    Some(out as u32)
+  }
+}
+
+unsafe extern "C" {
+  fn JS_ToBigUint64(ctx: *mut JSContext, pres: *mut u64, val: JSValue)
+  -> c_int;
+}
+
+unsafe fn fast_u64(
+  ctx: *mut JSContext,
+  value: JSValue,
+  repr: u8,
+) -> Option<u64> {
+  if repr == INT64_REPR_BIGINT {
+    let mut out = 0u64;
+    if unsafe { JS_ToBigUint64(ctx, &mut out, value) } < 0 {
+      unsafe {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+      }
+      return None;
+    }
+    Some(out)
+  } else {
+    let mut out = 0f64;
+    if unsafe { JS_ToFloat64(ctx, &mut out, value) } < 0 {
+      unsafe {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+      }
+      return None;
+    }
+    Some(out as u64)
+  }
+}
+
+unsafe fn fast_pointer_arg(value: JSValue) -> Option<*mut c_void> {
+  if jsv_is_null(&value) || jsv_is_undefined(&value) {
+    return Some(ptr::null_mut());
+  }
+  external_pointer_from_value(value)
+}
+
+unsafe fn fast_one_byte_string(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> Option<(Box<crate::fast_api::FastApiOneByteString>, *const c_char)> {
+  let mut len = 0usize;
+  let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, value) };
+  if cstr.is_null() {
+    unsafe {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    return None;
+  }
+  Some((
+    Box::new(crate::fast_api::FastApiOneByteString {
+      data: cstr,
+      length: len as u32,
+    }),
+    cstr,
+  ))
+}
+
 pub(crate) unsafe fn call_callback_for_wasm(
   ctx: *mut JSContext,
   callback: FunctionCallback,
@@ -366,6 +2476,46 @@ pub(crate) unsafe fn call_callback_for_wasm(
   }
 }
 
+fn receiver_matches_signature(
+  ctx: *mut JSContext,
+  recv: JSValue,
+  signature: *const FnTemplate,
+) -> bool {
+  if signature.is_null() {
+    return true;
+  }
+  if ctx.is_null() || !jsv_is_object(&recv) {
+    return false;
+  }
+
+  let expected = unsafe { build_prototype_object(ctx, signature) };
+  if !jsv_is_object(&expected) {
+    return false;
+  }
+
+  let mut current = unsafe { JS_DupValue(ctx, recv) };
+  for _ in 0..64 {
+    if unsafe { JS_IsStrictEqual(ctx, current, expected) } {
+      unsafe { JS_FreeValue(ctx, current) };
+      return true;
+    }
+
+    let next = unsafe { JS_GetPrototype(ctx, current) };
+    unsafe { JS_FreeValue(ctx, current) };
+    if next.tag == JS_TAG_EXCEPTION {
+      return false;
+    }
+    if !jsv_is_object(&next) {
+      unsafe { JS_FreeValue(ctx, next) };
+      return false;
+    }
+    current = next;
+  }
+
+  unsafe { JS_FreeValue(ctx, current) };
+  false
+}
+
 unsafe extern "C" fn fn_trampoline(
   ctx: *mut JSContext,
   this_val: JSValue,
@@ -373,9 +2523,19 @@ unsafe extern "C" fn fn_trampoline(
   argv: *mut JSValue,
   magic: c_int,
 ) -> JSValue {
-  let Some((callback, data, _instance)) = lookup_dispatch(magic) else {
+  let Some((callback, data, _instance, signature, fast_overloads)) =
+    lookup_dispatch(magic)
+  else {
     return jsv_undefined();
   };
+  if !receiver_matches_signature(ctx, this_val, signature) {
+    return unsafe { JS_ThrowTypeError(ctx, c"Illegal invocation".as_ptr()) };
+  }
+  if let Some(result) = unsafe {
+    try_fast_dispatch(ctx, &fast_overloads, data, this_val, argc, argv)
+  } {
+    return result;
+  }
   unsafe {
     dispatch(
       ctx,
@@ -397,7 +2557,9 @@ unsafe extern "C" fn fn_construct_trampoline(
   argv: *mut JSValue,
   magic: c_int,
 ) -> JSValue {
-  let Some((callback, data, instance)) = lookup_dispatch(magic) else {
+  let Some((callback, data, instance, _signature, _fast_overloads)) =
+    lookup_dispatch(magic)
+  else {
     return unsafe { JS_NewObject(ctx) };
   };
 
@@ -416,7 +2578,15 @@ unsafe extern "C" fn fn_construct_trampoline(
     };
   }
 
-  let this = unsafe { JS_NewObject(ctx) };
+  let this = if !instance.is_null() {
+    let t = unsafe { &*instance };
+    new_object_for_template(ctx, t)
+  } else {
+    unsafe { JS_NewObject(ctx) }
+  };
+  if jsv_is_exception(&this) {
+    return this;
+  }
   unsafe {
     let proto = JS_GetPropertyStr(ctx, new_target, c"prototype".as_ptr());
     if std::env::var_os("QJS_DEBUG_TMPL").is_some() {
@@ -445,6 +2615,9 @@ unsafe extern "C" fn fn_construct_trampoline(
       this,
       t.internal_field_count,
     );
+    if !t.parent_fn.is_null() {
+      super::object::mark_api_wrapper_for_value(this);
+    }
     apply_props(ctx, this, &t.props);
     apply_accessors(ctx, this, &t.accessors);
   }
@@ -464,6 +2637,471 @@ unsafe extern "C" fn fn_construct_trampoline(
     unsafe { JS_FreeValue(ctx, r) };
     this
   };
+  result
+}
+
+unsafe extern "C" fn named_getter_trampoline(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+  magic: c_int,
+) -> JSValue {
+  let Some(entry) = lookup_named_getter(magic) else {
+    return jsv_undefined();
+  };
+
+  if !entry.owner_ctx.is_null()
+    && entry.owner_ctx != ctx
+    && !super::misc::contexts_share_security_token(ctx, entry.owner_ctx)
+  {
+    return unsafe { JS_ThrowTypeError(ctx, c"no access".as_ptr()) };
+  }
+
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let (callback_data, free_callback_data) =
+    unsafe { materialize_named_handler_data(ctx, entry) };
+
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: callback_data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Value>;
+
+  let key = unsafe { JS_AtomToValue(ctx, entry.atom) };
+  let key_handle = intern::<Name>(key);
+  let Some(key_handle) = NonNull::new(key_handle as *mut Name) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    return jsv_undefined();
+  };
+  let intercepted =
+    unsafe { (entry.getter)(crate::SealedLocal(key_handle), prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let intercepted = unsafe { std::mem::transmute_copy::<_, u32>(&intercepted) };
+  let result = if unsafe { JS_HasException(ctx) } {
+    jsv_exception()
+  } else if intercepted == 0 {
+    if jsv_is_undefined(&ret) {
+      jsv_undefined()
+    } else {
+      unsafe { JS_DupValue(ctx, ret) }
+    }
+  } else {
+    jsv_undefined()
+  };
+
+  if !iso.is_null() {
+    let st = iso_state(iso);
+    while st.handles.len() > saved_depth {
+      if let Some(slot) = st.handles.pop() {
+        unsafe {
+          JS_FreeValue(st.ctx, *slot);
+          drop(Box::from_raw(slot));
+        }
+      }
+    }
+  }
+  if free_callback_data {
+    unsafe { JS_FreeValue(ctx, callback_data) };
+  }
+
+  result
+}
+
+struct ParsedDefineDescriptor {
+  value: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+  flags: c_int,
+}
+
+unsafe fn free_parsed_define_descriptor(
+  ctx: *mut JSContext,
+  desc: ParsedDefineDescriptor,
+) {
+  unsafe {
+    JS_FreeValue(ctx, desc.value);
+    JS_FreeValue(ctx, desc.getter);
+    JS_FreeValue(ctx, desc.setter);
+  }
+}
+
+unsafe fn parse_descriptor_bool(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  name: *const c_char,
+  has_flag: c_int,
+  value_flag: c_int,
+  flags: &mut c_int,
+) -> c_int {
+  let has = unsafe { JS_HasPropertyStr(ctx, obj, name) };
+  if has <= 0 {
+    return has;
+  }
+  let value = unsafe { JS_GetPropertyStr(ctx, obj, name) };
+  if jsv_is_exception(&value) {
+    return -1;
+  }
+  *flags |= has_flag;
+  if unsafe { JS_ToBool(ctx, value) } != 0 {
+    *flags |= value_flag;
+  }
+  unsafe { JS_FreeValue(ctx, value) };
+  0
+}
+
+unsafe fn parse_define_descriptor(
+  ctx: *mut JSContext,
+  desc_obj: JSValue,
+) -> Option<ParsedDefineDescriptor> {
+  let mut desc = ParsedDefineDescriptor {
+    value: jsv_undefined(),
+    getter: jsv_undefined(),
+    setter: jsv_undefined(),
+    flags: 0,
+  };
+
+  let has_value =
+    unsafe { JS_HasPropertyStr(ctx, desc_obj, c"value".as_ptr()) };
+  if has_value < 0 {
+    return None;
+  }
+  if has_value > 0 {
+    let value = unsafe { JS_GetPropertyStr(ctx, desc_obj, c"value".as_ptr()) };
+    if jsv_is_exception(&value) {
+      return None;
+    }
+    desc.value = value;
+    desc.flags |= JS_PROP_HAS_VALUE_QJS;
+  }
+
+  let has_get = unsafe { JS_HasPropertyStr(ctx, desc_obj, c"get".as_ptr()) };
+  if has_get < 0 {
+    unsafe { free_parsed_define_descriptor(ctx, desc) };
+    return None;
+  }
+  if has_get > 0 {
+    let getter = unsafe { JS_GetPropertyStr(ctx, desc_obj, c"get".as_ptr()) };
+    if jsv_is_exception(&getter) {
+      unsafe { free_parsed_define_descriptor(ctx, desc) };
+      return None;
+    }
+    desc.getter = getter;
+    desc.flags |= JS_PROP_HAS_GET_QJS;
+  }
+
+  let has_set = unsafe { JS_HasPropertyStr(ctx, desc_obj, c"set".as_ptr()) };
+  if has_set < 0 {
+    unsafe { free_parsed_define_descriptor(ctx, desc) };
+    return None;
+  }
+  if has_set > 0 {
+    let setter = unsafe { JS_GetPropertyStr(ctx, desc_obj, c"set".as_ptr()) };
+    if jsv_is_exception(&setter) {
+      unsafe { free_parsed_define_descriptor(ctx, desc) };
+      return None;
+    }
+    desc.setter = setter;
+    desc.flags |= JS_PROP_HAS_SET_QJS;
+  }
+
+  if unsafe {
+    parse_descriptor_bool(
+      ctx,
+      desc_obj,
+      c"enumerable".as_ptr(),
+      JS_PROP_HAS_ENUMERABLE_QJS,
+      JS_PROP_ENUMERABLE,
+      &mut desc.flags,
+    )
+  } < 0
+  {
+    unsafe { free_parsed_define_descriptor(ctx, desc) };
+    return None;
+  }
+  if unsafe {
+    parse_descriptor_bool(
+      ctx,
+      desc_obj,
+      c"configurable".as_ptr(),
+      JS_PROP_HAS_CONFIGURABLE_QJS,
+      JS_PROP_CONFIGURABLE,
+      &mut desc.flags,
+    )
+  } < 0
+  {
+    unsafe { free_parsed_define_descriptor(ctx, desc) };
+    return None;
+  }
+  if unsafe {
+    parse_descriptor_bool(
+      ctx,
+      desc_obj,
+      c"writable".as_ptr(),
+      JS_PROP_HAS_WRITABLE_QJS,
+      JS_PROP_WRITABLE,
+      &mut desc.flags,
+    )
+  } < 0
+  {
+    unsafe { free_parsed_define_descriptor(ctx, desc) };
+    return None;
+  }
+
+  Some(desc)
+}
+
+unsafe extern "C" fn global_define_property_trampoline(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  magic: c_int,
+) -> JSValue {
+  let Some(entry) = lookup_global_define(magic) else {
+    return jsv_exception();
+  };
+
+  if argc >= 3 && !argv.is_null() {
+    let target = unsafe { *argv };
+    let desc_obj = unsafe { *argv.add(2) };
+    if unsafe { JS_IsStrictEqual(ctx, target, entry.global) }
+      && jsv_is_object(&desc_obj)
+    {
+      let atom = unsafe { JS_ValueToAtom(ctx, *argv.add(1)) };
+      if atom == 0 && unsafe { JS_HasException(ctx) } {
+        return jsv_exception();
+      }
+
+      let Some(desc) = (unsafe { parse_define_descriptor(ctx, desc_obj) })
+      else {
+        unsafe { JS_FreeAtom(ctx, atom) };
+        return jsv_exception();
+      };
+
+      let mut intercepted = false;
+      if desc.flags & JS_PROP_HAS_VALUE_QJS != 0 {
+        if let Some(setter) = entry.handler.setter {
+          let state = unsafe {
+            call_named_setter(
+              ctx,
+              target,
+              atom,
+              desc.value,
+              &entry.handler,
+              setter,
+            )
+          };
+          if state < 0 {
+            unsafe {
+              JS_FreeAtom(ctx, atom);
+              free_parsed_define_descriptor(ctx, desc);
+            }
+            return jsv_exception();
+          }
+          intercepted |= state > 0;
+        }
+      }
+
+      if let Some(definer) = entry.handler.definer {
+        let state = unsafe {
+          call_named_definer(
+            ctx,
+            target,
+            atom,
+            desc.value,
+            desc.getter,
+            desc.setter,
+            desc.flags,
+            &entry.handler,
+            definer,
+          )
+        };
+        if state < 0 {
+          unsafe {
+            JS_FreeAtom(ctx, atom);
+            free_parsed_define_descriptor(ctx, desc);
+          }
+          return jsv_exception();
+        }
+        intercepted |= state > 0;
+      }
+
+      unsafe {
+        JS_FreeAtom(ctx, atom);
+        free_parsed_define_descriptor(ctx, desc);
+      }
+
+      if intercepted {
+        return unsafe { JS_DupValue(ctx, target) };
+      }
+    }
+  }
+
+  unsafe {
+    JS_Call(
+      ctx,
+      entry.original,
+      entry.object_ctor,
+      argc,
+      if argc > 0 { argv } else { ptr::null_mut() },
+    )
+  }
+}
+
+pub(crate) unsafe fn call_accessor_name_getter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  data: JSValue,
+  getter: crate::AccessorNameGetterCallback,
+) -> JSValue {
+  if ctx.is_null() {
+    return jsv_undefined();
+  }
+
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Value>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let Some(key_handle) = NonNull::new(key_handle as *mut Name) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    return jsv_undefined();
+  };
+  unsafe { (getter)(crate::SealedLocal(key_handle), prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    jsv_exception()
+  } else if jsv_is_undefined(&ret) {
+    jsv_undefined()
+  } else {
+    unsafe { JS_DupValue(ctx, ret) }
+  };
+
+  if !iso.is_null() {
+    let st = iso_state(iso);
+    while st.handles.len() > saved_depth {
+      if let Some(slot) = st.handles.pop() {
+        unsafe {
+          JS_FreeValue(st.ctx, *slot);
+          drop(Box::from_raw(slot));
+        }
+      }
+    }
+  }
+
+  result
+}
+
+pub(crate) unsafe fn call_accessor_name_setter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  value: JSValue,
+  data: JSValue,
+  setter: crate::AccessorNameSetterCallback,
+) -> JSValue {
+  if ctx.is_null() {
+    return jsv_undefined();
+  }
+
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info =
+    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let value_handle = intern_dup::<Value>(ctx, value);
+  let (Some(key_handle), Some(value_handle)) = (
+    NonNull::new(key_handle as *mut Name),
+    NonNull::new(value_handle as *mut Value),
+  ) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    return jsv_undefined();
+  };
+  unsafe {
+    (setter)(
+      crate::SealedLocal(key_handle),
+      crate::SealedLocal(value_handle),
+      prop_info,
+    )
+  };
+
+  let _info = unsafe { Box::from_raw(info_ptr) };
+  let result = if unsafe { JS_HasException(ctx) } {
+    jsv_exception()
+  } else {
+    jsv_undefined()
+  };
+
+  if !iso.is_null() {
+    let st = iso_state(iso);
+    while st.handles.len() > saved_depth {
+      if let Some(slot) = st.handles.pop() {
+        unsafe {
+          JS_FreeValue(st.ctx, *slot);
+          drop(Box::from_raw(slot));
+        }
+      }
+    }
+  }
+
   result
 }
 
@@ -496,6 +3134,57 @@ unsafe fn make_cfunc_magic(
   }
 }
 
+unsafe extern "C" fn native_function_to_string(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
+  let name = unsafe { JS_GetPropertyStr(ctx, this_val, c"name".as_ptr()) };
+  let name_text = if jsv_is_string(&name) {
+    let cstr = unsafe { JS_ToCString(ctx, name) };
+    let text = if cstr.is_null() {
+      std::string::String::new()
+    } else {
+      unsafe { std::ffi::CStr::from_ptr(cstr) }
+        .to_string_lossy()
+        .into_owned()
+    };
+    if !cstr.is_null() {
+      unsafe { JS_FreeCString(ctx, cstr) };
+    }
+    text
+  } else {
+    std::string::String::new()
+  };
+  unsafe { JS_FreeValue(ctx, name) };
+
+  let text = if name_text.is_empty() {
+    "function () { [native code] }".to_owned()
+  } else {
+    format!("function {name_text}() {{ [native code] }}")
+  };
+  unsafe { JS_NewStringLen(ctx, text.as_ptr() as *const c_char, text.len()) }
+}
+
+unsafe fn install_native_function_to_string(
+  ctx: *mut JSContext,
+  function: JSValue,
+) {
+  let to_string = unsafe {
+    JS_NewCFunction(ctx, native_function_to_string, c"toString".as_ptr(), 0)
+  };
+  unsafe {
+    JS_DefinePropertyValueStr(
+      ctx,
+      function,
+      c"toString".as_ptr(),
+      to_string,
+      JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE,
+    );
+  }
+}
+
 pub(crate) unsafe fn make_function_len(
   ctx: *mut JSContext,
   callback: FunctionCallback,
@@ -511,6 +3200,8 @@ pub(crate) unsafe fn make_function_len(
       length,
       construct,
       ptr::null(),
+      ptr::null(),
+      Vec::new(),
     )
   }
 }
@@ -522,13 +3213,21 @@ unsafe fn make_function_len_with_instance(
   length: i32,
   construct: bool,
   instance: *const ObjTemplate,
+  signature: *const FnTemplate,
+  fast_overloads: Vec<RawCFunction>,
 ) -> JSValue {
   let data_owned = if jsv_is_undefined(&data) {
     jsv_undefined()
   } else {
     unsafe { JS_DupValue(ctx, data) }
   };
-  let magic = register_dispatch(callback, data_owned, instance);
+  let magic = register_dispatch(
+    callback,
+    data_owned,
+    instance,
+    signature,
+    fast_overloads,
+  );
   let cproto = if construct {
     JS_CFUNC_CONSTRUCTOR_OR_FUNC_MAGIC
   } else {
@@ -539,9 +3238,12 @@ unsafe fn make_function_len_with_instance(
   } else {
     fn_trampoline
   };
-  unsafe {
+  let f = unsafe {
     make_cfunc_magic(ctx, tramp, ptr::null(), length.max(0), cproto, magic)
-  }
+  };
+  record_snapshot_function(f, callback, data, length, construct);
+  unsafe { install_native_function_to_string(ctx, f) };
+  f
 }
 
 const JS_CFUNC_CONSTRUCTOR_MAGIC: c_int = 3;
@@ -552,7 +3254,50 @@ fn cbinfo<'a>(this: *const FunctionCallbackInfo) -> &'a mut CbInfo {
   unsafe { &mut *(this as *mut CbInfo) }
 }
 
+unsafe fn prop_cbinfo<'a>(this: *const c_void) -> Option<&'a mut CbInfo> {
+  if this.is_null() {
+    return None;
+  }
+  let info_ptr = unsafe { *(this as *const *mut c_void) as *mut CbInfo };
+  if info_ptr.is_null() {
+    None
+  } else {
+    Some(unsafe { &mut *info_ptr })
+  }
+}
+
+fn property_return_scratch() -> usize {
+  thread_local! {
+      static SCRATCH: std::cell::UnsafeCell<JSValue> =
+          const { std::cell::UnsafeCell::new(JSValue {
+              u: JSValueUnion { int32: 0 },
+              tag: JS_TAG_UNDEFINED,
+          }) };
+  }
+  SCRATCH.with(|s| s.get() as usize)
+}
+
 unsafe extern "C" fn ext_finalize(_rt: *mut JSRuntime, _val: JSValue) {}
+
+unsafe extern "C" fn named_handler_finalize(rt: *mut JSRuntime, val: JSValue) {
+  let mut class_id: JSClassID = 0;
+  let ptr =
+    unsafe { JS_GetAnyOpaque(val, &mut class_id) as *mut NamedHandlerInstance };
+  if ptr.is_null() {
+    return;
+  }
+  let inst = unsafe { Box::from_raw(ptr) };
+  if let Some(handler) = inst.named_handler {
+    if !jsv_is_undefined(&handler.data) {
+      unsafe { JS_FreeValueRT(rt, handler.data) };
+    }
+  }
+  if let Some(handler) = inst.indexed_handler {
+    if !jsv_is_undefined(&handler.data) {
+      unsafe { JS_FreeValueRT(rt, handler.data) };
+    }
+  }
+}
 
 fn external_values()
 -> &'static std::sync::Mutex<std::collections::HashMap<usize, usize>> {
@@ -562,9 +3307,143 @@ fn external_values()
   T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+#[derive(Clone)]
+struct FunctionScriptInfo {
+  line: crate::support::int,
+  column: crate::support::int,
+  script_id: crate::support::int,
+  resource_name: Option<std::string::String>,
+  source_map_url: Option<std::string::String>,
+}
+
+#[repr(C)]
+struct RawScriptOrigin {
+  resource_name: usize,
+  source_map_url: usize,
+  script_id: crate::support::int,
+}
+
+thread_local! {
+  static FUNCTION_SCRIPT_INFO: std::cell::RefCell<
+    std::collections::HashMap<usize, FunctionScriptInfo>,
+  > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 #[inline]
 fn external_key(v: JSValue) -> usize {
   jsv_get_ptr(&v) as usize
+}
+
+#[inline]
+fn function_key(v: JSValue) -> usize {
+  jsv_get_ptr(&v) as usize
+}
+
+fn external_pointer_from_value(v: JSValue) -> Option<*mut c_void> {
+  if !jsv_is_object(&v) {
+    return None;
+  }
+  if let Some(value) = external_values()
+    .lock()
+    .unwrap()
+    .get(&external_key(v))
+    .copied()
+  {
+    return Some(value as *mut c_void);
+  }
+  let cid = ext_class_id_current();
+  if cid == 0 {
+    return None;
+  }
+  let opaque = unsafe { JS_GetOpaque(v, cid) };
+  if opaque.is_null() { None } else { Some(opaque) }
+}
+
+fn record_snapshot_function(
+  function: JSValue,
+  callback: FunctionCallback,
+  data: JSValue,
+  length: i32,
+  constructable: bool,
+) {
+  let key = function_key(function);
+  if key == 0 {
+    return;
+  }
+  SNAPSHOT_FUNCTIONS.with(|m| {
+    m.borrow_mut().insert(
+      key,
+      SnapshotFunctionInfo {
+        callback,
+        data_external: external_pointer_from_value(data),
+        length,
+        constructable,
+      },
+    );
+  });
+}
+
+pub(crate) fn snapshot_function_info(
+  function: JSValue,
+) -> Option<SnapshotFunctionInfo> {
+  let key = function_key(function);
+  if key == 0 {
+    return None;
+  }
+  SNAPSHOT_FUNCTIONS.with(|m| m.borrow().get(&key).copied())
+}
+
+pub(crate) fn record_function_script_position(
+  function: JSValue,
+  line: crate::support::int,
+  column: crate::support::int,
+  script_id: crate::support::int,
+  resource_name: Option<std::string::String>,
+  source_map_url: Option<std::string::String>,
+) {
+  let key = function_key(function);
+  if key == 0 {
+    return;
+  }
+  FUNCTION_SCRIPT_INFO.with(|m| {
+    m.borrow_mut().insert(
+      key,
+      FunctionScriptInfo {
+        line,
+        column,
+        script_id,
+        resource_name,
+        source_map_url,
+      },
+    );
+  });
+}
+
+fn function_script_info(
+  this: *const std::os::raw::c_void,
+) -> Option<FunctionScriptInfo> {
+  if this.is_null() {
+    return None;
+  }
+  let key = function_key(jsval_of(this as *const Function));
+  if key == 0 {
+    return None;
+  }
+  FUNCTION_SCRIPT_INFO.with(|m| m.borrow().get(&key).cloned())
+}
+
+fn origin_string_slot(ctx: *mut JSContext, text: &str) -> usize {
+  if ctx.is_null() {
+    return 0;
+  }
+  let value =
+    unsafe { JS_NewStringLen(ctx, text.as_ptr() as *const c_char, text.len()) };
+  if value.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return 0;
+  }
+  intern::<Value>(value) as usize
 }
 
 /// Allocate a class id and register the `v8::External` class on `rt`. Must be
@@ -583,6 +3462,23 @@ pub(crate) fn register_external_class(rt: *mut JSRuntime) -> JSClassID {
     gc_mark: ptr::null(),
     call: ptr::null(),
     exotic: ptr::null(),
+  };
+  unsafe { JS_NewClass(rt, id, &def) };
+  id
+}
+
+/// Register the custom class used by `ObjectTemplate::set_named_property_handler`.
+/// Like `v8::External`, this must happen before the first context is created so
+/// QuickJS sizes every context's class-prototype table correctly.
+pub(crate) fn register_named_handler_class(rt: *mut JSRuntime) -> JSClassID {
+  let mut id: JSClassID = 0;
+  let id = unsafe { JS_NewClassID(rt, &mut id) };
+  let def = JSClassDef {
+    class_name: c"v8x_named_handler".as_ptr(),
+    finalizer: Some(named_handler_finalize),
+    gc_mark: ptr::null(),
+    call: ptr::null(),
+    exotic: &NAMED_HANDLER_EXOTIC,
   };
   unsafe { JS_NewClass(rt, id, &def) };
   id
@@ -1028,8 +3924,8 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-#[derive(Clone, Copy)]
-enum TemplKind {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TemplKind {
   Func,
   Obj,
 }
@@ -1045,6 +3941,13 @@ pub(crate) fn is_template_ptr(p: *const c_void) -> bool {
     return false;
   }
   TEMPLATES.with(|t| t.borrow().contains_key(&(p as usize)))
+}
+
+pub(crate) fn template_kind(p: *const c_void) -> Option<TemplKind> {
+  if p.is_null() {
+    return None;
+  }
+  TEMPLATES.with(|t| t.borrow().get(&(p as usize)).copied())
 }
 
 fn with_template_props(
@@ -1115,6 +4018,7 @@ fn own_template_value(ctx: *mut JSContext, v: JSValue) -> JSValue {
 }
 
 const JS_TAG_TEMPLATE: i64 = 0x7633;
+const JS_TAG_INTRINSIC: i64 = 0x7634;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionTemplate__New(
@@ -1128,15 +4032,15 @@ pub extern "C" fn v8__FunctionTemplate__New(
   c_functions: *const crate::fast_api::CFunction,
   c_functions_len: usize,
 ) -> *const FunctionTemplate {
-  let _ = (
-    isolate,
-    signature_or_null,
-    side_effect_type,
-    c_functions,
-    c_functions_len,
-  );
+  let _ = (isolate, side_effect_type);
+  let fast_overloads = copy_fast_overloads(c_functions, c_functions_len);
   let constructable =
     matches!(constructor_behavior, crate::ConstructorBehavior::Allow);
+  let signature = if signature_or_null.is_null() {
+    ptr::null()
+  } else {
+    unsafe { (*(signature_or_null as *const SignatureInfo)).templ }
+  };
 
   let data = {
     let ctx = current_ctx();
@@ -1151,12 +4055,18 @@ pub extern "C" fn v8__FunctionTemplate__New(
     internal_field_count: 0,
     props: Vec::new(),
     accessors: Vec::new(),
+    named_handler: None,
+    indexed_handler: None,
+    immutable_proto: false,
     parent_fn: ptr::null(),
   }));
   let instance = Box::into_raw(Box::new(ObjTemplate {
     internal_field_count: 0,
     props: Vec::new(),
     accessors: Vec::new(),
+    named_handler: None,
+    indexed_handler: None,
+    immutable_proto: false,
     parent_fn: ptr::null(),
   }));
   register_template(proto as usize, TemplKind::Obj);
@@ -1170,9 +4080,11 @@ pub extern "C" fn v8__FunctionTemplate__New(
     proto,
     instance,
     parent: ptr::null(),
+    signature,
     props: Vec::new(),
     accessors: Vec::new(),
     cached_proto: jsv_undefined(),
+    fast_overloads,
   }));
   unsafe { (*instance).parent_fn = t };
   register_template(t as usize, TemplKind::Func);
@@ -1207,9 +4119,11 @@ pub(crate) fn tape_make_template(
     proto,
     instance,
     parent: ptr::null(),
+    signature: ptr::null(),
     props: Vec::new(),
     accessors: Vec::new(),
     cached_proto: jsv_undefined(),
+    fast_overloads: Vec::new(),
   }));
   unsafe { (*instance).parent_fn = t };
   register_template(t as usize, TemplKind::Func);
@@ -1237,8 +4151,10 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
       t.callback,
       t.data,
       t.length,
-      t.constructable,
+      t.constructable && t.signature.is_null(),
       t.instance,
+      t.signature,
+      t.fast_overloads.clone(),
     )
   };
 
@@ -1288,6 +4204,9 @@ unsafe fn build_prototype_object(
   if jsv_is_object(&t.cached_proto) {
     return t.cached_proto;
   }
+  if let Some(proto) = template_prototype_override(ctx, t) {
+    return proto;
+  }
   let _tm = timing::now();
   let proto_obj = unsafe { JS_NewObject(ctx) };
   let proto = unsafe { &*t.proto };
@@ -1334,11 +4253,14 @@ fn apply_props(
       continue;
     }
 
-    let value = materialize_template_value(ctx, value);
+    let (value, owned_value) = materialize_template_value(ctx, value);
     let v = unsafe { JS_DupValue(ctx, value) };
     unsafe {
       JS_DefinePropertyValue(ctx, obj, atom, v, prop_flags_from_attr(attr));
       JS_FreeAtom(ctx, atom);
+      if owned_value {
+        JS_FreeValue(ctx, value);
+      }
     }
   }
 }
@@ -1357,7 +4279,17 @@ fn prop_flags_from_attr(attr: u32) -> c_int {
   flags
 }
 
-fn materialize_template_value(ctx: *mut JSContext, value: JSValue) -> JSValue {
+fn materialize_template_value(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> (JSValue, bool) {
+  if value.tag == JS_TAG_INTRINSIC {
+    let intrinsic = unsafe { value.u.int32 };
+    return (materialize_intrinsic(ctx, intrinsic), true);
+  }
+  if value.tag != JS_TAG_TEMPLATE {
+    return (value, false);
+  }
   let raw = unsafe { value.u.ptr } as usize;
   let kind = TEMPLATES.with(|t| t.borrow().get(&raw).copied());
   match kind {
@@ -1366,17 +4298,165 @@ fn materialize_template_value(ctx: *mut JSContext, value: JSValue) -> JSValue {
         raw as *const FunctionTemplate,
         ctx as *const Context,
       );
-      if f.is_null() { value } else { jsval_of(f) }
+      if f.is_null() {
+        (value, false)
+      } else {
+        (jsval_of(f), false)
+      }
     }
     Some(TemplKind::Obj) => {
       let o = v8__ObjectTemplate__NewInstance(
         raw as *const ObjectTemplate,
         ctx as *const Context,
       );
-      if o.is_null() { value } else { jsval_of(o) }
+      if o.is_null() {
+        (value, false)
+      } else {
+        (jsval_of(o), false)
+      }
     }
-    None => value,
+    None => (value, false),
   }
+}
+
+fn materialize_intrinsic(ctx: *mut JSContext, intrinsic: i32) -> JSValue {
+  match intrinsic {
+    x if x == Intrinsic::ArrayPrototype as i32 => {
+      global_prototype(ctx, c"Array".as_ptr())
+    }
+    x if x == Intrinsic::ArrayProtoEntries as i32 => {
+      global_prototype_property(ctx, c"Array".as_ptr(), c"entries".as_ptr())
+    }
+    x if x == Intrinsic::ArrayProtoForEach as i32 => {
+      global_prototype_property(ctx, c"Array".as_ptr(), c"forEach".as_ptr())
+    }
+    x if x == Intrinsic::ArrayProtoKeys as i32 => {
+      global_prototype_property(ctx, c"Array".as_ptr(), c"keys".as_ptr())
+    }
+    x if x == Intrinsic::ArrayProtoValues as i32 => {
+      global_prototype_property(ctx, c"Array".as_ptr(), c"values".as_ptr())
+    }
+    x if x == Intrinsic::ErrorPrototype as i32 => {
+      global_prototype(ctx, c"Error".as_ptr())
+    }
+    x if x == Intrinsic::ObjProtoValueOf as i32 => {
+      global_prototype_property(ctx, c"Object".as_ptr(), c"valueOf".as_ptr())
+    }
+    _ => jsv_undefined(),
+  }
+}
+
+fn global_prototype(ctx: *mut JSContext, ctor_name: *const c_char) -> JSValue {
+  if ctx.is_null() {
+    return jsv_undefined();
+  }
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let ctor = JS_GetPropertyStr(ctx, global, ctor_name);
+    JS_FreeValue(ctx, global);
+    if !jsv_is_object(&ctor) {
+      if ctor.tag != JS_TAG_EXCEPTION {
+        JS_FreeValue(ctx, ctor);
+      }
+      return jsv_undefined();
+    }
+    let proto = JS_GetPropertyStr(ctx, ctor, c"prototype".as_ptr());
+    JS_FreeValue(ctx, ctor);
+    if proto.tag == JS_TAG_EXCEPTION {
+      jsv_undefined()
+    } else {
+      proto
+    }
+  }
+}
+
+fn global_prototype_property(
+  ctx: *mut JSContext,
+  ctor_name: *const c_char,
+  prop_name: *const c_char,
+) -> JSValue {
+  let proto = global_prototype(ctx, ctor_name);
+  if !jsv_is_object(&proto) {
+    return jsv_undefined();
+  }
+  unsafe {
+    let value = JS_GetPropertyStr(ctx, proto, prop_name);
+    JS_FreeValue(ctx, proto);
+    if value.tag == JS_TAG_EXCEPTION {
+      jsv_undefined()
+    } else {
+      value
+    }
+  }
+}
+
+fn template_prototype_override(
+  ctx: *mut JSContext,
+  t: &mut FnTemplate,
+) -> Option<JSValue> {
+  for idx in 0..t.props.len() {
+    let (key, value, _) = t.props[idx];
+    if !template_key_is(ctx, key, b"prototype") {
+      continue;
+    }
+
+    let (proto, owned_proto) = materialize_template_value(ctx, value);
+    if jsv_is_object(&proto) {
+      let cached = if owned_proto {
+        proto
+      } else {
+        unsafe { JS_DupValue(ctx, proto) }
+      };
+      t.cached_proto = cached;
+      return Some(cached);
+    }
+    if owned_proto {
+      unsafe { JS_FreeValue(ctx, proto) };
+    }
+  }
+  None
+}
+
+fn template_key_is(ctx: *mut JSContext, key: JSValue, expected: &[u8]) -> bool {
+  if ctx.is_null() {
+    return false;
+  }
+  let mut len = 0usize;
+  let s = unsafe { JS_ToCStringLen(ctx, &mut len, key) };
+  if s.is_null() {
+    return false;
+  }
+  let ok = unsafe { slice::from_raw_parts(s as *const u8, len) } == expected;
+  unsafe { JS_FreeCString(ctx, s) };
+  ok
+}
+
+fn intrinsic_template_value(intrinsic: Intrinsic) -> JSValue {
+  make_value(
+    JS_TAG_INTRINSIC,
+    JSValueUnion {
+      int32: intrinsic as i32,
+    },
+  )
+}
+
+fn store_intrinsic_template_property(
+  this: *const crate::Template,
+  key: *const Name,
+  intrinsic: Intrinsic,
+  attr: PropertyAttribute,
+) {
+  if this.is_null() {
+    return;
+  }
+
+  let raw = this as *const c_void as usize;
+  let ctx = current_ctx();
+  let key_owned = own_template_value(ctx, jsval_of(key));
+  let stored = intrinsic_template_value(intrinsic);
+  with_template_props(raw, |props| {
+    props.push((key_owned, stored, attr.as_u32_lenient()));
+  });
 }
 
 #[unsafe(no_mangle)]
@@ -1448,6 +4528,9 @@ pub extern "C" fn v8__ObjectTemplate__New(
     internal_field_count: 0,
     props: Vec::new(),
     accessors: Vec::new(),
+    named_handler: None,
+    indexed_handler: None,
+    immutable_proto: false,
     parent_fn: templ as *const FnTemplate,
   }));
   register_template(t as usize, TemplKind::Obj);
@@ -1464,9 +4547,12 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
     return ptr::null();
   }
   let _tm = timing::now();
-  let obj = unsafe { JS_NewObject(ctx) };
   if !this.is_null() {
     let t = unsafe { &*(this as *const ObjTemplate) };
+    let obj = new_object_for_template(ctx, t);
+    if jsv_is_exception(&obj) {
+      return ptr::null();
+    }
     super::object::set_internal_field_count_for_value(
       obj,
       t.internal_field_count,
@@ -1480,12 +4566,142 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
       let dup = unsafe { JS_DupValue(ctx, proto_obj) };
       unsafe { JS_SetPrototype(ctx, obj, dup) };
       unsafe { JS_FreeValue(ctx, dup) };
+      super::object::mark_api_wrapper_for_value(obj);
     }
     apply_props(ctx, obj, &t.props);
     apply_accessors(ctx, obj, &t.accessors);
+    if t.immutable_proto {
+      unsafe { JS_PreventExtensions(ctx, obj) };
+    }
+    timing::add(&timing::NEWINST_N, &timing::NEWINST_T, _tm);
+    return intern::<Object>(obj);
   }
   timing::add(&timing::NEWINST_N, &timing::NEWINST_T, _tm);
+  let obj = unsafe { JS_NewObject(ctx) };
   intern::<Object>(obj)
+}
+
+fn install_named_global_handler(
+  ctx: *mut JSContext,
+  global: JSValue,
+  handler: &NamedHandler,
+) {
+  install_global_define_property_handler(ctx, global, handler);
+
+  if handler.getter.is_none() || jsv_is_undefined(&handler.data) {
+    return;
+  }
+
+  let mut tab: *mut JSPropertyEnum = ptr::null_mut();
+  let mut len: u32 = 0;
+  let rc = unsafe {
+    JS_GetOwnPropertyNames(
+      ctx,
+      &mut tab,
+      &mut len,
+      handler.data,
+      JS_GPN_STRING_MASK_QJS,
+    )
+  };
+  if rc < 0 {
+    return;
+  }
+
+  for i in 0..len {
+    let atom = unsafe { (*tab.add(i as usize)).atom };
+    let has = unsafe { JS_HasProperty(ctx, global, atom) };
+    if has != 0 {
+      continue;
+    }
+
+    let magic = register_named_getter(ctx, handler, atom);
+    let getter = unsafe {
+      make_cfunc_magic(
+        ctx,
+        named_getter_trampoline,
+        ptr::null(),
+        0,
+        JS_CFUNC_GENERIC_MAGIC,
+        magic,
+      )
+    };
+    unsafe {
+      JS_DefinePropertyGetSet(
+        ctx,
+        global,
+        atom,
+        getter,
+        jsv_undefined(),
+        JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE,
+      );
+    }
+  }
+
+  unsafe { JS_FreePropertyEnum(ctx, tab, len) };
+}
+
+fn install_global_define_property_handler(
+  ctx: *mut JSContext,
+  global: JSValue,
+  handler: &NamedHandler,
+) {
+  if handler.setter.is_none() && handler.definer.is_none() {
+    return;
+  }
+
+  unsafe {
+    let object_ctor = JS_GetPropertyStr(ctx, global, c"Object".as_ptr());
+    if !jsv_is_object(&object_ctor) {
+      JS_FreeValue(ctx, object_ctor);
+      return;
+    }
+    let original =
+      JS_GetPropertyStr(ctx, object_ctor, c"defineProperty".as_ptr());
+    if !jsv_is_object(&original) {
+      JS_FreeValue(ctx, original);
+      JS_FreeValue(ctx, object_ctor);
+      return;
+    }
+
+    let magic = register_global_define(GlobalDefineEntry {
+      original,
+      object_ctor,
+      global: JS_DupValue(ctx, global),
+      handler: clone_named_handler(ctx, handler),
+    });
+    let wrapper = make_cfunc_magic(
+      ctx,
+      global_define_property_trampoline,
+      c"defineProperty".as_ptr(),
+      3,
+      JS_CFUNC_GENERIC_MAGIC,
+      magic,
+    );
+    JS_SetPropertyStr(ctx, object_ctor, c"defineProperty".as_ptr(), wrapper);
+  }
+}
+
+pub(crate) fn apply_object_template_to_global(
+  ctx: *mut JSContext,
+  global: JSValue,
+  templ: *const ObjectTemplate,
+) {
+  if ctx.is_null() || templ.is_null() {
+    return;
+  }
+  let t = unsafe { &*(templ as *const ObjTemplate) };
+  super::object::set_internal_field_count_for_value(
+    global,
+    t.internal_field_count,
+  );
+  apply_props(ctx, global, &t.props);
+  apply_accessors(ctx, global, &t.accessors);
+  if let Some(handler) = &t.named_handler {
+    install_named_global_handler(ctx, global, handler);
+  }
+  if t.immutable_proto {
+    unsafe { JS_PreventExtensions(ctx, global) };
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1507,6 +4723,9 @@ pub extern "C" fn v8__ObjectTemplate__SetAccessorProperty(
     key: key_owned,
     getter: getter as *const FnTemplate,
     setter: setter as *const FnTemplate,
+    native_getter: None,
+    native_setter: None,
+    data: jsv_undefined(),
     attr: attr.as_u32_lenient(),
   });
 }
@@ -1539,26 +4758,29 @@ fn apply_accessors(
       if jsv_is_undefined(&acc.key) {
         continue;
       }
+      if let Some(native_getter) = acc.native_getter {
+        let _ = super::object::define_native_accessor_value(
+          ctx,
+          obj,
+          acc.key,
+          native_getter,
+          acc.native_setter,
+          acc.data,
+          acc.attr,
+          false,
+        );
+        continue;
+      }
       let desc = JS_NewObject(ctx);
       if !acc.getter.is_null() {
-        let gf = v8__FunctionTemplate__GetFunction(
-          acc.getter as *const FunctionTemplate,
-          ctx as *const Context,
-        );
-        if !gf.is_null() {
-          let v = JS_DupValue(ctx, jsval_of(gf));
-          JS_SetPropertyStr(ctx, desc, c"get".as_ptr(), v);
-        }
+        let t = &*acc.getter;
+        let gf = make_function_len(ctx, t.callback, t.data, t.length, false);
+        JS_SetPropertyStr(ctx, desc, c"get".as_ptr(), gf);
       }
       if !acc.setter.is_null() {
-        let sf = v8__FunctionTemplate__GetFunction(
-          acc.setter as *const FunctionTemplate,
-          ctx as *const Context,
-        );
-        if !sf.is_null() {
-          let v = JS_DupValue(ctx, jsval_of(sf));
-          JS_SetPropertyStr(ctx, desc, c"set".as_ptr(), v);
-        }
+        let t = &*acc.setter;
+        let sf = make_function_len(ctx, t.callback, t.data, t.length, false);
+        JS_SetPropertyStr(ctx, desc, c"set".as_ptr(), sf);
       }
 
       let enumerable = (acc.attr & 2) == 0;
@@ -1604,8 +4826,16 @@ pub extern "C" fn v8__ObjectTemplate__SetIndexedPropertyHandler(
   data_or_null: *const Value,
   flags: crate::PropertyHandlerFlags,
 ) {
-  let _ = (
-    this,
+  if this.is_null() {
+    return;
+  }
+  let data = if data_or_null.is_null() {
+    jsv_undefined()
+  } else {
+    own_template_value(current_ctx(), jsval_of(data_or_null))
+  };
+  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  t.indexed_handler = Some(IndexedHandler {
     getter,
     setter,
     query,
@@ -1613,9 +4843,10 @@ pub extern "C" fn v8__ObjectTemplate__SetIndexedPropertyHandler(
     enumerator,
     definer,
     descriptor,
-    data_or_null,
-    flags,
-  );
+    data,
+    owner_ctx: current_ctx(),
+    non_masking: flags.is_non_masking(),
+  });
 }
 
 #[unsafe(no_mangle)]
@@ -1643,8 +4874,16 @@ pub extern "C" fn v8__ObjectTemplate__SetNamedPropertyHandler(
   data_or_null: *const Value,
   flags: crate::PropertyHandlerFlags,
 ) {
-  let _ = (
-    this,
+  if this.is_null() {
+    return;
+  }
+  let data = if data_or_null.is_null() {
+    jsv_undefined()
+  } else {
+    own_template_value(current_ctx(), jsval_of(data_or_null))
+  };
+  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  t.named_handler = Some(NamedHandler {
     getter,
     setter,
     query,
@@ -1652,16 +4891,20 @@ pub extern "C" fn v8__ObjectTemplate__SetNamedPropertyHandler(
     enumerator,
     definer,
     descriptor,
-    data_or_null,
-    flags,
-  );
+    data,
+    owner_ctx: current_ctx(),
+    non_masking: flags.is_non_masking(),
+    only_intercept_strings: flags.is_only_intercept_strings(),
+  });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__PropertyCallbackInfo__GetIsolate(
-  _this: *const c_void,
+  this: *const c_void,
 ) -> *mut RealIsolate {
-  current_iso()
+  unsafe { prop_cbinfo(this) }
+    .map(|info| info.isolate)
+    .unwrap_or_else(current_iso)
 }
 
 #[unsafe(no_mangle)]
@@ -1669,16 +4912,11 @@ pub extern "C" fn v8__PropertyCallbackInfo__GetReturnValue(
   this: *const c_void,
 ) -> usize {
   if this.is_null() {
-    thread_local! {
-        static SCRATCH: std::cell::UnsafeCell<JSValue> =
-            const { std::cell::UnsafeCell::new(JSValue {
-                u: JSValueUnion { int32: 0 },
-                tag: JS_TAG_UNDEFINED,
-            }) };
-    }
-    return SCRATCH.with(|s| s.get() as usize);
+    return property_return_scratch();
   }
-  let info = cbinfo(this as *const FunctionCallbackInfo);
+  let Some(info) = (unsafe { prop_cbinfo(this) }) else {
+    return property_return_scratch();
+  };
   (&mut *info.return_slot as *mut JSValue) as usize
 }
 
@@ -1689,7 +4927,9 @@ pub extern "C" fn v8__PropertyCallbackInfo__Holder(
   if this.is_null() {
     return ptr::null();
   }
-  let info = cbinfo(this as *const FunctionCallbackInfo);
+  let Some(info) = (unsafe { prop_cbinfo(this) }) else {
+    return ptr::null();
+  };
   intern_dup::<Object>(info.ctx, info.this)
 }
 
@@ -1710,9 +4950,12 @@ pub extern "C" fn v8__PropertyCallbackInfo__ShouldThrowOnError(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionCallbackInfo__IsConstructCall(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  if this.is_null() {
+    return false;
+  }
+  cbinfo(this as *const FunctionCallbackInfo).is_construct
 }
 
 #[unsafe(no_mangle)]
@@ -1732,43 +4975,97 @@ pub extern "C" fn v8__FunctionTemplate__SetAccessorProperty(
     key: key_owned,
     getter: getter as *const FnTemplate,
     setter: setter as *const FnTemplate,
+    native_getter: None,
+    native_setter: None,
+    data: jsv_undefined(),
     attr: attr.as_u32_lenient(),
   });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__GetName(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  if this.is_null() {
+    let empty = unsafe { JS_NewStringLen(ctx, c"".as_ptr(), 0) };
+    return intern::<String>(empty) as *const std::os::raw::c_void;
+  }
+
+  let name = unsafe {
+    JS_GetPropertyStr(ctx, jsval_of(this as *const Function), c"name".as_ptr())
+  };
+  if jsv_is_string(&name) {
+    return intern::<String>(name) as *const std::os::raw::c_void;
+  }
+  unsafe { JS_FreeValue(ctx, name) };
+  let empty = unsafe { JS_NewStringLen(ctx, c"".as_ptr(), 0) };
+  intern::<String>(empty) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__GetScriptColumnNumber(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  function_script_info(this)
+    .map(|info| info.column)
+    .unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__GetScriptLineNumber(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  function_script_info(this)
+    .map(|info| info.line)
+    .unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__GetScriptOrigin(
-  _this: *const std::os::raw::c_void,
-  _out: *mut std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
+  out: *mut std::os::raw::c_void,
 ) {
+  if out.is_null() {
+    return;
+  }
+  unsafe {
+    ptr::write_bytes(
+      out as *mut u8,
+      0u8,
+      std::mem::size_of::<crate::ScriptOrigin>(),
+    );
+  }
+  let Some(info) = function_script_info(this) else {
+    return;
+  };
+  let ctx = current_ctx();
+  let raw = out as *mut RawScriptOrigin;
+  unsafe {
+    (*raw).script_id = info.script_id;
+  }
+  if let Some(resource_name) = info.resource_name.as_deref() {
+    unsafe {
+      (*raw).resource_name = origin_string_slot(ctx, resource_name);
+    }
+  }
+  if let Some(source_map_url) = info.source_map_url.as_deref() {
+    unsafe {
+      (*raw).source_map_url = origin_string_slot(ctx, source_map_url);
+    }
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__ScriptId(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  function_script_info(this)
+    .map(|info| info.script_id)
+    .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
@@ -1784,54 +5081,105 @@ pub extern "C" fn v8__ObjectTemplate__InternalFieldCount(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ObjectTemplate__SetImmutableProto(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) {
+  if this.is_null() {
+    return;
+  }
+  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  t.immutable_proto = true;
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ObjectTemplate__SetNativeDataProperty(
-  _this: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
-  _getter: *const std::os::raw::c_void,
-  _setter: *const std::os::raw::c_void,
-  _data_or_null: *const std::os::raw::c_void,
-  _attr: crate::PropertyAttribute,
+  this: *const std::os::raw::c_void,
+  key: *const std::os::raw::c_void,
+  getter: crate::AccessorNameGetterCallback,
+  setter: Option<crate::AccessorNameSetterCallback>,
+  data_or_null: *const std::os::raw::c_void,
+  attr: crate::PropertyAttribute,
 ) {
+  if this.is_null() || key.is_null() {
+    return;
+  }
+  let ctx = current_ctx();
+  let key_owned = own_template_value(ctx, jsval_of(key));
+  let data = if data_or_null.is_null() {
+    jsv_undefined()
+  } else {
+    own_template_value(ctx, jsval_of(data_or_null))
+  };
+  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  t.accessors.push(TemplAccessor {
+    key: key_owned,
+    getter: ptr::null(),
+    setter: ptr::null(),
+    native_getter: Some(getter),
+    native_setter: setter,
+    data,
+    attr: attr.as_u32_lenient(),
+  });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__PropertyCallbackInfo__Data(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let Some(info) = (unsafe { prop_cbinfo(this) }) else {
+    return std::ptr::null();
+  };
+  intern_dup::<Value>(info.ctx, info.data) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ReturnValue__Value__Get(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let slot = unsafe { rv_slot(this as *mut RawReturnValue) };
+  if slot.is_null() {
+    return ptr::null();
+  }
+  let value = unsafe { *slot };
+  intern_dup::<Value>(current_ctx(), value) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ReturnValue__Value__SetEmptyString(
-  _this: *mut std::os::raw::c_void,
+  this: *mut std::os::raw::c_void,
 ) {
+  let slot = unsafe { rv_slot(this as *mut RawReturnValue) };
+  let ctx = current_ctx();
+  if !slot.is_null() && !ctx.is_null() {
+    unsafe {
+      *slot = JS_NewStringLen(ctx, c"".as_ptr(), 0);
+    }
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Signature__New(
   _isolate: *mut std::os::raw::c_void,
-  _templ: *const std::os::raw::c_void,
+  templ: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  if templ.is_null() {
+    return std::ptr::null();
+  }
+  Box::into_raw(Box::new(SignatureInfo {
+    templ: templ as *const FnTemplate,
+  })) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Template__SetIntrinsicDataProperty(
-  _this: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
-  _intrinsic: crate::Intrinsic,
-  _attr: crate::PropertyAttribute,
+  this: *const std::os::raw::c_void,
+  key: *const std::os::raw::c_void,
+  intrinsic: crate::Intrinsic,
+  attr: crate::PropertyAttribute,
 ) {
+  store_intrinsic_template_property(
+    this as *const crate::Template,
+    key as *const Name,
+    intrinsic,
+    attr,
+  );
 }

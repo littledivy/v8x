@@ -21,12 +21,14 @@
 
 #![allow(non_snake_case)]
 
-use crate::quickjs::core::{ctx_of, current_ctx, intern, intern_dup, jsval_of};
+use crate::quickjs::core::{
+  ctx_of, current_ctx, intern, intern_dup, is_interned_handle, jsval_of,
+};
 use crate::quickjs::quickjs_sys::*;
 use crate::support::Maybe;
 use crate::{
-  BigInt, Boolean, Context, Integer, Number, Object, RealIsolate,
-  String as V8String, Value,
+  BigInt, Boolean, Context, Int32, Integer, Number, Object, RealIsolate,
+  String as V8String, Uint32, Value,
 };
 use std::os::raw::c_char;
 use std::ptr;
@@ -44,6 +46,8 @@ unsafe extern "C" {
   ) -> std::os::raw::c_int;
 
   fn JS_GetTypedArrayType(obj: JSValue) -> std::os::raw::c_int;
+
+  fn JS_IsError(val: JSValue) -> bool;
 }
 
 const JS_TYPED_ARRAY_UINT8C: i32 = 0;
@@ -58,6 +62,10 @@ const JS_TYPED_ARRAY_BIG_UINT64: i32 = 8;
 const JS_TYPED_ARRAY_FLOAT16: i32 = 9;
 const JS_TYPED_ARRAY_FLOAT32: i32 = 10;
 const JS_TYPED_ARRAY_FLOAT64: i32 = 11;
+const QUICKJS_ATOMICS_WAIT_ERROR: &[u8] =
+  b"TypeError: cannot block in this thread";
+const V8_ATOMICS_WAIT_ERROR: &[u8] =
+  b"TypeError: Atomics.wait cannot be called in this context";
 
 #[repr(C)]
 struct MaybeMirror<T> {
@@ -543,7 +551,29 @@ pub extern "C" fn v8__Value__StrictEquals(
   if c.is_null() || this.is_null() || that.is_null() {
     return false;
   }
-  unsafe { JS_IsStrictEqual(c, jsval_of(this), jsval_of(that)) }
+  let this_smi_zero = is_smi_zero(this);
+  let that_smi_zero = is_smi_zero(that);
+  if this_smi_zero || that_smi_zero {
+    if this_smi_zero && that_smi_zero {
+      return true;
+    }
+    let other = if this_smi_zero { that } else { this };
+    let other = jsval_of(other);
+    return jsv_is_number(&other) && num_of(&other) == 0.0;
+  }
+  let a = jsval_of(this);
+  let b = jsval_of(that);
+  if jsv_is_number(&a) && jsv_is_number(&b) {
+    let na = num_of(&a);
+    let nb = num_of(&b);
+    return !na.is_nan() && !nb.is_nan() && na == nb;
+  }
+  unsafe { JS_IsStrictEqual(c, a, b) }
+}
+
+#[inline]
+fn is_smi_zero<T>(p: *const T) -> bool {
+  !p.is_null() && !is_interned_handle(p) && unsafe { *(p as *const usize) == 0 }
 }
 
 #[unsafe(no_mangle)]
@@ -874,7 +904,18 @@ pub extern "C" fn v8__Value__ToString(
     unsafe { JS_FreeValue(ctx, exc) };
     return ptr::null();
   }
-  let s = unsafe { JS_NewStringLen(ctx, cstr, len) };
+  let text = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+  let s = if unsafe { JS_IsError(v) } && text == QUICKJS_ATOMICS_WAIT_ERROR {
+    unsafe {
+      JS_NewStringLen(
+        ctx,
+        V8_ATOMICS_WAIT_ERROR.as_ptr() as *const c_char,
+        V8_ATOMICS_WAIT_ERROR.len(),
+      )
+    }
+  } else {
+    unsafe { JS_NewStringLen(ctx, cstr, len) }
+  };
   unsafe { JS_FreeCString(ctx, cstr) };
   if s.tag == JS_TAG_EXCEPTION {
     return ptr::null();
@@ -891,32 +932,122 @@ pub extern "C" fn v8__Value__ToString(
 // ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__GetHash(
-  _this: *const std::os::raw::c_void,
-) -> u32 {
-  0
+pub extern "C" fn v8__Value__GetHash(this: *const Value) -> u32 {
+  if this.is_null() {
+    return 0;
+  }
+
+  let v = jsval_of(this);
+  if jsv_is_object(&v) {
+    return super::object::v8__Object__GetIdentityHash(this as *const Object)
+      as u32;
+  }
+  if jsv_is_string(&v) || jsv_is_symbol(&v) {
+    return super::object::v8__Name__GetIdentityHash(this as *const crate::Name)
+      as u32;
+  }
+  if jsv_is_number(&v) {
+    let bits = match v.tag {
+      JS_TAG_INT => unsafe { (v.u.int32 as f64).to_bits() },
+      JS_TAG_FLOAT64 => unsafe {
+        let n = v.u.float64;
+        if n == 0.0 {
+          0
+        } else if n.is_nan() {
+          f64::NAN.to_bits()
+        } else {
+          n.to_bits()
+        }
+      },
+      _ => 0,
+    };
+    return hash_payload(0x6e75_6d62_6572, bits);
+  }
+  if jsv_is_bigint(&v) {
+    let ctx = current_ctx();
+    if !ctx.is_null() {
+      let mut len = 0usize;
+      let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, v) };
+      if !cstr.is_null() {
+        let bytes =
+          unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+        let hash = hash_bytes(0x6269_6769_6e74, bytes);
+        unsafe { JS_FreeCString(ctx, cstr) };
+        return hash;
+      }
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+    }
+  }
+
+  let payload = match v.tag {
+    JS_TAG_BOOL => unsafe { v.u.int32 as u64 },
+    JS_TAG_NULL | JS_TAG_UNDEFINED | JS_TAG_UNINITIALIZED
+    | JS_TAG_CATCH_OFFSET | JS_TAG_EXCEPTION => 0,
+    _ => jsv_get_ptr(&v) as u64,
+  };
+  hash_payload(v.tag as u64, payload)
+}
+
+fn hash_payload(seed: u64, payload: u64) -> u32 {
+  let mut x = payload ^ seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+  x ^= x >> 33;
+  x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+  x ^= x >> 33;
+  x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+  x ^= x >> 33;
+  x as u32
+}
+
+fn hash_bytes(seed: u64, bytes: &[u8]) -> u32 {
+  let mut h = seed ^ (bytes.len() as u64).wrapping_mul(0x9e37_79b9);
+  for &b in bytes {
+    h ^= b as u64;
+    h = h.wrapping_mul(0x100_0000_01b3);
+  }
+  hash_payload(seed, h)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToDetailString(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  this: *const Value,
+  context: *const Context,
+) -> *const V8String {
+  v8__Value__ToString(this, context)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToInt32(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  this: *const Value,
+  context: *const Context,
+) -> *const Int32 {
+  let c = ctx_of(context);
+  if c.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let mut out: i32 = 0;
+  if unsafe { JS_ToInt32(c, &mut out, jsval_of(this)) } < 0 {
+    let exc = unsafe { JS_GetException(c) };
+    unsafe { JS_FreeValue(c, exc) };
+    return ptr::null();
+  }
+  intern::<Int32>(unsafe { JS_NewInt32(c, out) })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToUint32(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  this: *const Value,
+  context: *const Context,
+) -> *const Uint32 {
+  let c = ctx_of(context);
+  if c.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let mut out: i32 = 0;
+  if unsafe { JS_ToInt32(c, &mut out, jsval_of(this)) } < 0 {
+    let exc = unsafe { JS_GetException(c) };
+    unsafe { JS_FreeValue(c, exc) };
+    return ptr::null();
+  }
+  intern::<Uint32>(unsafe { JS_NewUint32(c, out as u32) })
 }

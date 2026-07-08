@@ -21,7 +21,7 @@ We track two suites per backend (6 cells total):
 | suite | what runs |
 |---|---|
 | `rusty_v8` | vendored `vendor/rusty_v8/tests/*.rs`, unmodified, vs our shim |
-| `deno_core` | `cargo test -p deno_core` in a patched deno checkout |
+| `deno_core` | `cargo nextest run -p deno_core` in a patched deno checkout |
 
 (The full-deno node-compat + unit suites are dropped for now to keep CI cheap;
 they can be re-added to `config.json` later — `run.mjs` still supports them.)
@@ -88,7 +88,7 @@ sed "s#/Users/divy/gh/v82jsc#$PWD#g" tools/deno/deno-jsc-integration.patch | git
 # select your backend's v8 features in the patch's [patch.crates-io] v8 line:
 perl -0pi -e 's/"engine_jsc", "vendor_jsc"/"quickjs"/g' ../deno/Cargo.toml   # example
 
-# runs `cargo test -p deno_core` against our shim (no full deno binary):
+# runs `cargo nextest run -p deno_core` against our shim (no full deno binary):
 node tests/harness/run.mjs deno_core quickjs --deno-dir=../deno
 ```
 

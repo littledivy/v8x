@@ -2,13 +2,15 @@
 
 use crate::binding::memory_span_t;
 use crate::quickjs::core::{
-  ctx_of, current_ctx, current_iso, intern, iso_state, jsval_of,
+  adjust_external_memory, ctx_of, current_ctx, current_iso, intern, iso_state,
+  jsval_of,
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::support::{MaybeBool, SharedPtrBase, SharedRef, UniquePtr, long};
 use crate::{
-  ArrayBuffer, ArrayBufferView, BackingStore, BackingStoreDeleterCallback,
-  Context, DataView, RealIsolate, SharedArrayBuffer, Value,
+  Allocator, ArrayBuffer, ArrayBufferView, BackingStore,
+  BackingStoreDeleterCallback, Context, DataView, RealIsolate,
+  SharedArrayBuffer, Value,
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -52,6 +54,40 @@ fn registry_remove(key: usize, inner: *mut BsInner) {
     if v.is_empty() {
       map.remove(&key);
     }
+  }
+}
+
+fn owner_registry() -> &'static Mutex<HashMap<usize, usize>> {
+  static REG: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+  REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn owner_add(key: usize, inner: *mut BsInner) {
+  if key == 0 {
+    return;
+  }
+  owner_registry().lock().unwrap().insert(key, inner as usize);
+}
+
+fn owner_get(key: usize) -> *mut BsInner {
+  if key == 0 {
+    return ptr::null_mut();
+  }
+  owner_registry()
+    .lock()
+    .unwrap()
+    .get(&key)
+    .copied()
+    .unwrap_or(0) as *mut BsInner
+}
+
+fn owner_remove(key: usize, inner: *mut BsInner) {
+  if key == 0 {
+    return;
+  }
+  let mut map = owner_registry().lock().unwrap();
+  if map.get(&key).copied() == Some(inner as usize) {
+    map.remove(&key);
   }
 }
 
@@ -115,6 +151,7 @@ unsafe extern "C" {
     pbytes_per_element: *mut usize,
   ) -> JSValue;
   fn JS_GetTypedArrayType(obj: JSValue) -> i32;
+  fn JS_IsStrictEqual(ctx: *mut JSContext, op1: JSValue, op2: JSValue) -> bool;
 }
 
 unsafe extern "C" {
@@ -128,14 +165,24 @@ struct BsInner {
   data: *mut c_void,
   byte_length: usize,
   is_shared: bool,
+  is_resizable_by_user_javascript: bool,
 
   deleter: BackingStoreDeleterCallback,
   deleter_data: *mut c_void,
 
   owns_malloc: bool,
 
+  allocator: SharedPtrBase<Allocator>,
+  allocator_isolate: *mut RealIsolate,
+
   retained_ctx: *mut JSContext,
   retained_val: JSValue,
+}
+
+struct AllocatorBuffer {
+  isolate: *mut RealIsolate,
+  allocator: *mut crate::array_buffer::Allocator,
+  byte_length: usize,
 }
 
 unsafe extern "C" fn noop_deleter(
@@ -154,14 +201,37 @@ impl BsInner {
     deleter_data: *mut c_void,
     owns_malloc: bool,
   ) -> *mut BsInner {
-    Box::into_raw(Box::new(BsInner {
-      refcount: AtomicUsize::new(1),
+    BsInner::boxed_with_allocator(
       data,
       byte_length,
       is_shared,
       deleter,
       deleter_data,
       owns_malloc,
+      Default::default(),
+    )
+  }
+
+  fn boxed_with_allocator(
+    data: *mut c_void,
+    byte_length: usize,
+    is_shared: bool,
+    deleter: BackingStoreDeleterCallback,
+    deleter_data: *mut c_void,
+    owns_malloc: bool,
+    allocator: SharedPtrBase<Allocator>,
+  ) -> *mut BsInner {
+    Box::into_raw(Box::new(BsInner {
+      refcount: AtomicUsize::new(1),
+      data,
+      byte_length,
+      is_shared,
+      is_resizable_by_user_javascript: false,
+      deleter,
+      deleter_data,
+      owns_malloc,
+      allocator,
+      allocator_isolate: ptr::null_mut(),
       retained_ctx: ptr::null_mut(),
       retained_val: jsv_undefined(),
     }))
@@ -187,10 +257,25 @@ impl BsInner {
     if ptr.is_null() {
       return;
     }
-    registry_remove(unsafe { (*ptr).data } as usize, ptr);
+    let key = unsafe { (*ptr).data } as usize;
+    owner_remove(key, ptr);
+    registry_remove(key, ptr);
     let b = unsafe { Box::from_raw(ptr) };
     if !b.data.is_null() {
-      if b.owns_malloc {
+      let allocator = super::allocator::allocator_shared_get(&b.allocator);
+      if !allocator.is_null() {
+        if !b.allocator_isolate.is_null()
+          && super::allocator::allocator_is_rust(allocator)
+        {
+          iso_state(b.allocator_isolate)
+            .pending_array_buffer_frees
+            .push((allocator, b.data, b.byte_length));
+        } else {
+          unsafe {
+            super::allocator::allocator_free(allocator, b.data, b.byte_length)
+          };
+        }
+      } else if b.owns_malloc {
         unsafe { free(b.data) };
       } else {
         unsafe { (b.deleter)(b.data, b.byte_length, b.deleter_data) };
@@ -249,15 +334,45 @@ fn backing_store_for_buffer(
 ) -> SharedRef<BackingStore> {
   let mut len: usize = 0;
   let data = unsafe { JS_GetArrayBuffer(ctx, &mut len, buf) } as *mut c_void;
+
+  let owner = owner_get(data as usize);
+  if !owner.is_null() {
+    unsafe { (*owner).refcount.fetch_add(1, Ordering::SeqCst) };
+    return make_shared_ref(owner);
+  }
+
   let inner =
     BsInner::boxed(data, len, false, noop_deleter, ptr::null_mut(), false);
 
   unsafe {
+    (*inner).is_resizable_by_user_javascript =
+      is_resizable_by_user_javascript(ctx, buf, false);
     (*inner).retained_ctx = ctx;
     (*inner).retained_val = JS_DupValue(ctx, buf);
   }
   registry_add(data as usize, inner);
   make_shared_ref(inner)
+}
+
+unsafe fn is_resizable_by_user_javascript(
+  ctx: *mut JSContext,
+  buf: JSValue,
+  is_shared: bool,
+) -> bool {
+  let prop_name = if is_shared {
+    c"growable".as_ptr()
+  } else {
+    c"resizable".as_ptr()
+  };
+  let prop = unsafe { JS_GetPropertyStr(ctx, buf, prop_name) };
+  if prop.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return false;
+  }
+  let resizable = unsafe { JS_ToBool(ctx, prop) } != 0;
+  unsafe { JS_FreeValue(ctx, prop) };
+  resizable
 }
 
 unsafe fn read_len_prop(
@@ -317,7 +432,38 @@ unsafe extern "C" fn bs_free_func(
   }
   if unsafe { (*inner).refcount.fetch_sub(1, Ordering::SeqCst) } == 1 {
     unsafe { BsInner::destroy(inner) };
+  } else {
+    unsafe {
+      (*inner).allocator_isolate = ptr::null_mut();
+    }
   }
+}
+
+fn detach_key_matches(
+  ctx: *mut JSContext,
+  buf: JSValue,
+  key: *const Value,
+) -> bool {
+  let has_key =
+    unsafe { JS_GetPropertyStr(ctx, buf, c"__v8x_detach_key_set".as_ptr()) };
+  let must_match = unsafe { JS_ToBool(ctx, has_key) } != 0;
+  unsafe { JS_FreeValue(ctx, has_key) };
+  if !must_match {
+    return true;
+  }
+  if key.is_null() {
+    return false;
+  }
+
+  let expected =
+    unsafe { JS_GetPropertyStr(ctx, buf, c"__v8x_detach_key".as_ptr()) };
+  if expected.tag == JS_TAG_EXCEPTION {
+    unsafe { JS_FreeValue(ctx, expected) };
+    return false;
+  }
+  let ok = unsafe { JS_IsStrictEqual(ctx, expected, jsval_of(key)) };
+  unsafe { JS_FreeValue(ctx, expected) };
+  ok
 }
 
 unsafe extern "C" fn malloc_free_func(
@@ -327,6 +473,211 @@ unsafe extern "C" fn malloc_free_func(
 ) {
   if !ptr.is_null() {
     unsafe { free(ptr) };
+  }
+}
+
+unsafe extern "C" fn allocator_free_func(
+  _rt: *mut JSRuntime,
+  opaque: *mut c_void,
+  ptr: *mut c_void,
+) {
+  if opaque.is_null() {
+    return;
+  }
+  let buf = unsafe { Box::from_raw(opaque as *mut AllocatorBuffer) };
+  if !buf.isolate.is_null() {
+    iso_state(buf.isolate).pending_array_buffer_frees.push((
+      buf.allocator,
+      ptr,
+      buf.byte_length,
+    ));
+    return;
+  }
+  unsafe {
+    super::allocator::allocator_free(buf.allocator, ptr, buf.byte_length);
+  }
+}
+
+fn allocator_for_isolate(
+  isolate: *mut RealIsolate,
+) -> *mut crate::array_buffer::Allocator {
+  if isolate.is_null() {
+    return ptr::null_mut();
+  }
+  let st = iso_state(isolate);
+  super::allocator::allocator_shared_get(&st.array_buffer_allocator)
+}
+
+fn maybe_collect_external_array_buffers(isolate: *mut RealIsolate) {
+  if isolate.is_null() {
+    return;
+  }
+  let st = iso_state(isolate);
+  if st.external_memory.load(Ordering::SeqCst) > 64 * 1024 * 1024 {
+    unsafe { JS_RunGC(st.rt) };
+    release_pending_allocator_buffers(isolate);
+  }
+}
+
+pub(crate) fn release_pending_allocator_buffers(isolate: *mut RealIsolate) {
+  if isolate.is_null() {
+    return;
+  }
+  let pending =
+    std::mem::take(&mut iso_state(isolate).pending_array_buffer_frees);
+  let mut released = 0usize;
+  for (allocator, data, byte_length) in pending {
+    unsafe {
+      super::allocator::allocator_free(allocator, data, byte_length);
+    }
+    released = released.saturating_add(byte_length);
+  }
+  if released != 0 {
+    adjust_external_memory(iso_state(isolate), -(released as i64));
+  }
+}
+
+fn new_array_buffer_value(
+  ctx: *mut JSContext,
+  isolate: *mut RealIsolate,
+  byte_length: usize,
+) -> JSValue {
+  let allocator_shared = if isolate.is_null() {
+    SharedPtrBase::<Allocator>::default()
+  } else {
+    super::allocator::allocator_shared_copy(
+      &iso_state(isolate).array_buffer_allocator,
+    )
+  };
+  let allocator = super::allocator::allocator_shared_get(&allocator_shared);
+  let allocator_is_rust = super::allocator::allocator_is_rust(allocator);
+  if allocator_is_rust {
+    maybe_collect_external_array_buffers(isolate);
+  }
+  let data = if allocator.is_null() {
+    if byte_length == 0 {
+      ptr::null_mut()
+    } else {
+      unsafe { calloc(byte_length, 1) }
+    }
+  } else {
+    unsafe {
+      super::allocator::allocator_allocate(allocator, byte_length, true)
+    }
+  };
+  if data.is_null() && byte_length != 0 {
+    return unsafe { JS_ThrowOutOfMemory(ctx) };
+  }
+
+  let inner = BsInner::boxed_with_allocator(
+    data,
+    byte_length,
+    false,
+    noop_deleter,
+    ptr::null_mut(),
+    allocator.is_null(),
+    allocator_shared,
+  );
+  if allocator_is_rust {
+    unsafe {
+      (*inner).allocator_isolate = isolate;
+    }
+  }
+  let obj = unsafe {
+    JS_NewArrayBuffer(
+      ctx,
+      data as *mut u8,
+      byte_length,
+      Some(bs_free_func),
+      inner as *mut c_void,
+      false,
+    )
+  };
+  if obj.tag == JS_TAG_EXCEPTION {
+    unsafe { bs_free_func(ptr::null_mut(), inner as *mut c_void, data) };
+    return obj;
+  }
+  owner_add(data as usize, inner);
+  if allocator_is_rust && !isolate.is_null() {
+    adjust_external_memory(iso_state(isolate), byte_length as i64);
+  }
+  obj
+}
+
+unsafe extern "C" fn allocator_array_buffer_constructor(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  argc: std::os::raw::c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  let mut byte_length: i64 = 0;
+  if argc > 0 && !argv.is_null() {
+    if unsafe { JS_ToInt64(ctx, &mut byte_length, *argv) } < 0 {
+      return jsv_exception();
+    }
+  }
+  if byte_length < 0 {
+    return unsafe {
+      JS_ThrowRangeError(ctx, c"Invalid ArrayBuffer length".as_ptr())
+    };
+  }
+  new_array_buffer_value(ctx, current_iso(), byte_length as usize)
+}
+
+pub(crate) fn install_array_buffer_constructor(
+  isolate: *mut RealIsolate,
+  ctx: *mut JSContext,
+  global: JSValue,
+) {
+  let allocator = allocator_for_isolate(isolate);
+  if !super::allocator::allocator_is_rust(allocator) {
+    return;
+  }
+  unsafe {
+    let original = JS_GetPropertyStr(ctx, global, c"ArrayBuffer".as_ptr());
+    if original.tag == JS_TAG_EXCEPTION {
+      return;
+    }
+
+    let wrapper = JS_NewCFunction2(
+      ctx,
+      allocator_array_buffer_constructor,
+      c"ArrayBuffer".as_ptr(),
+      1,
+      JS_CFUNC_CONSTRUCTOR,
+      0,
+    );
+    if wrapper.tag == JS_TAG_EXCEPTION {
+      JS_FreeValue(ctx, original);
+      return;
+    }
+
+    let prototype = JS_GetPropertyStr(ctx, original, c"prototype".as_ptr());
+    if prototype.tag != JS_TAG_EXCEPTION {
+      let prototype_for_constructor = JS_DupValue(ctx, prototype);
+      JS_SetPropertyStr(ctx, wrapper, c"prototype".as_ptr(), prototype);
+      JS_SetPropertyStr(
+        ctx,
+        prototype_for_constructor,
+        c"constructor".as_ptr(),
+        JS_DupValue(ctx, wrapper),
+      );
+      JS_FreeValue(ctx, prototype_for_constructor);
+    }
+
+    let is_view = JS_GetPropertyStr(ctx, original, c"isView".as_ptr());
+    if is_view.tag != JS_TAG_EXCEPTION {
+      JS_SetPropertyStr(ctx, wrapper, c"isView".as_ptr(), is_view);
+    }
+
+    JS_DefinePropertyValueStr(
+      ctx,
+      global,
+      c"ArrayBuffer".as_ptr(),
+      wrapper,
+      JS_PROP_C_W_E,
+    );
+    JS_FreeValue(ctx, original);
   }
 }
 
@@ -341,21 +692,7 @@ pub extern "C" fn v8__ArrayBuffer__New__with_byte_length(
     return ptr::null();
   }
 
-  let data = if byte_length == 0 {
-    ptr::null_mut()
-  } else {
-    unsafe { calloc(byte_length, 1) as *mut u8 }
-  };
-  let obj = unsafe {
-    JS_NewArrayBuffer(
-      ctx,
-      data,
-      byte_length,
-      Some(malloc_free_func),
-      ptr::null_mut(),
-      false,
-    )
-  };
+  let obj = new_array_buffer_value(ctx, isolate, byte_length);
   if obj.tag == JS_TAG_EXCEPTION {
     return ptr::null();
   }
@@ -417,6 +754,7 @@ pub extern "C" fn v8__ArrayBuffer__New__with_backing_store(
     unsafe { bs_free_func(ptr::null_mut(), inner as *mut c_void, data) };
     return ptr::null();
   }
+  owner_add(data as usize, inner);
   intern::<ArrayBuffer>(obj)
 }
 
@@ -513,12 +851,14 @@ pub extern "C" fn v8__ArrayBuffer__Detach(
   this: *const ArrayBuffer,
   key: *const Value,
 ) -> MaybeBool {
-  let _ = key;
   let ctx = current_ctx();
   if ctx.is_null() || this.is_null() {
     return MaybeBool::Nothing;
   }
   let buf = jsval_of(this);
+  if !detach_key_matches(ctx, buf, key) {
+    return MaybeBool::Nothing;
+  }
   // Steal the bytes for any outstanding alias backing stores before QuickJS frees
   // them: get_backing_store()-then-detach() (deno's transferable path) otherwise
   // leaves the SharedRef deno keeps pointing at freed QuickJS heap — fatal once
@@ -619,7 +959,7 @@ pub extern "C" fn v8__BackingStore__IsShared(
 pub extern "C" fn v8__BackingStore__IsResizableByUserJavaScript(
   this: *const BackingStore,
 ) -> bool {
-  false
+  bs_inner(this).is_some_and(|b| b.is_resizable_by_user_javascript)
 }
 
 #[unsafe(no_mangle)]
@@ -833,7 +1173,10 @@ pub extern "C" fn v8__SharedArrayBuffer__New__with_backing_store(
     return ptr::null();
   }
   let (data, len) = unsafe { ((*inner).data, (*inner).byte_length) };
-  unsafe { (*inner).refcount.fetch_add(1, Ordering::SeqCst) };
+  unsafe {
+    (*inner).is_shared = true;
+    (*inner).refcount.fetch_add(1, Ordering::SeqCst);
+  }
   let obj = unsafe {
     JS_NewArrayBuffer(
       ctx,
@@ -841,13 +1184,14 @@ pub extern "C" fn v8__SharedArrayBuffer__New__with_backing_store(
       len,
       Some(bs_free_func),
       inner as *mut c_void,
-      false,
+      true,
     )
   };
   if obj.tag == JS_TAG_EXCEPTION {
     unsafe { bs_free_func(ptr::null_mut(), inner as *mut c_void, data) };
     return ptr::null();
   }
+  owner_add(data as usize, inner);
   intern::<SharedArrayBuffer>(obj)
 }
 
@@ -1064,7 +1408,26 @@ pub extern "C" fn v8__ArrayBuffer__SetDetachKey(
   this: *const ArrayBuffer,
   key: *const Value,
 ) {
-  let _ = (this, key);
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() || key.is_null() {
+    return;
+  }
+  unsafe {
+    JS_DefinePropertyValueStr(
+      ctx,
+      jsval_of(this),
+      c"__v8x_detach_key".as_ptr(),
+      JS_DupValue(ctx, jsval_of(key)),
+      JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE,
+    );
+    JS_DefinePropertyValueStr(
+      ctx,
+      jsval_of(this),
+      c"__v8x_detach_key_set".as_ptr(),
+      JS_NewBool(ctx, 1),
+      JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE,
+    );
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1079,38 +1442,51 @@ pub extern "C" fn std__shared_ptr__v8__BackingStore__use_count(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBuffer__Allocator__NewRustAllocator(
-  handle: *const c_void,
-  vtable: *const crate::array_buffer::RustAllocatorVtable<c_void>,
-) -> *mut crate::array_buffer::Allocator {
-  if !vtable.is_null() {
-    unsafe { ((*vtable).drop)(handle) };
-  }
-  Box::into_raw(Box::new(0u8)) as *mut crate::array_buffer::Allocator
+pub extern "C" fn v8__SharedArrayBuffer__NewBackingStore__with_byte_length(
+  _isolate: *mut RealIsolate,
+  byte_length: usize,
+) -> *mut BackingStore {
+  BsInner::new_allocated(byte_length, true) as *mut BackingStore
 }
-
-// ---------------------------------------------------------------------------
-// Link-stubs for v8 C-ABI symbols that `test_api.rs` references but this
-// backend doesn't implement yet. Each returns a benign default
-// (null / 0 / false / `Nothing`) so the target LINKS and the many tests that
-// don't touch these paths run; tests that do exercise them fail gracefully
-// without crashing. Promote individual stubs to real implementations over time.
-// ---------------------------------------------------------------------------
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SharedArrayBuffer__NewBackingStore__with_data(
-  _data: *mut std::os::raw::c_void,
-  _byte_length: usize,
-  _deleter: *const std::os::raw::c_void,
-  _deleter_data: *mut std::os::raw::c_void,
-) -> *mut std::os::raw::c_void {
-  std::ptr::null_mut()
+  data: *mut c_void,
+  byte_length: usize,
+  deleter: BackingStoreDeleterCallback,
+  deleter_data: *mut c_void,
+) -> *mut BackingStore {
+  BsInner::boxed(data, byte_length, true, deleter, deleter_data, false)
+    as *mut BackingStore
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SharedArrayBuffer__New__with_byte_length(
-  _isolate: *mut std::os::raw::c_void,
-  _byte_length: usize,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  isolate: *mut RealIsolate,
+  byte_length: usize,
+) -> *const SharedArrayBuffer {
+  let st = iso_state(isolate);
+  let ctx = st.contexts.last().copied().unwrap_or(st.ctx);
+  if ctx.is_null() {
+    return ptr::null();
+  }
+
+  let inner = BsInner::new_allocated(byte_length, true);
+  let data = unsafe { (*inner).data };
+  let obj = unsafe {
+    JS_NewArrayBuffer(
+      ctx,
+      data as *mut u8,
+      byte_length,
+      Some(bs_free_func),
+      inner as *mut c_void,
+      true,
+    )
+  };
+  if obj.tag == JS_TAG_EXCEPTION {
+    unsafe { bs_free_func(ptr::null_mut(), inner as *mut c_void, data) };
+    return ptr::null();
+  }
+  owner_add(data as usize, inner);
+  intern::<SharedArrayBuffer>(obj)
 }

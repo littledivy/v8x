@@ -1,6 +1,9 @@
 #![allow(non_snake_case)]
 
-use crate::quickjs::core::{ctx_of, current_ctx, intern, iso_state, jsval_of};
+use crate::quickjs::core::{
+  JS_TAG_V8_CONTEXT, ctx_of, current_ctx, intern, iso_state, jsval_of,
+};
+use crate::quickjs::function::{TemplKind, template_kind};
 use crate::quickjs::quickjs_sys::*;
 use crate::support::int;
 use crate::{
@@ -449,9 +452,15 @@ pub extern "C" fn v8__Private__ForApi(
   } else {
     unsafe { to_dec_string(ctx, jsval_of(name)) }
   };
+  let name_value = if name.is_null() {
+    jsv_undefined()
+  } else {
+    jsval_of(name)
+  };
   let escaped = desc.replace('\\', "\\\\").replace('"', "\\\"");
   let v =
     unsafe { eval(ctx, &format!("Symbol.for(\"v82jsc_private:{escaped}\")")) };
+  remember_private_symbol(isolate, ctx, v, name_value);
   intern::<Private>(v)
 }
 
@@ -469,6 +478,11 @@ pub extern "C" fn v8__Private__New(
   } else {
     unsafe { to_dec_string(ctx, jsval_of(name)) }
   };
+  let name_value = if name.is_null() {
+    jsv_undefined()
+  } else {
+    jsval_of(name)
+  };
   let Ok(cdesc) = CString::new(desc) else {
     return ptr::null();
   };
@@ -479,7 +493,27 @@ pub extern "C" fn v8__Private__New(
     unsafe { JS_FreeValue(ctx, exc) };
     return ptr::null();
   }
+  remember_private_symbol(isolate, ctx, v, name_value);
   intern::<Private>(v)
+}
+
+fn remember_private_symbol(
+  isolate: *mut RealIsolate,
+  ctx: *mut JSContext,
+  value: JSValue,
+  name: JSValue,
+) {
+  let iso = if isolate.is_null() {
+    crate::quickjs::core::current_iso()
+  } else {
+    isolate
+  };
+  if iso.is_null() || ctx.is_null() || value.tag != JS_TAG_SYMBOL {
+    return;
+  }
+  let stored = unsafe { JS_DupValue(ctx, value) };
+  let stored_name = unsafe { JS_DupValue(ctx, name) };
+  iso_state(iso).private_symbols.push((stored, stored_name));
 }
 
 #[unsafe(no_mangle)]
@@ -560,16 +594,18 @@ pub extern "C" fn v8__Symbol__New(
     return ptr::null();
   }
 
-  let desc = if description.is_null() {
-    std::string::String::new()
+  let cdesc = if description.is_null() {
+    None
   } else {
-    unsafe { to_dec_string(ctx, jsval_of(description)) }
-  };
-  let Ok(cdesc) = CString::new(desc) else {
-    return ptr::null();
+    let desc = unsafe { to_dec_string(ctx, jsval_of(description)) };
+    let Ok(cdesc) = CString::new(desc) else {
+      return ptr::null();
+    };
+    Some(cdesc)
   };
 
-  let v = unsafe { JS_NewSymbol(ctx, cdesc.as_ptr(), 0) };
+  let cdesc_ptr = cdesc.as_ref().map_or(ptr::null(), |c| c.as_ptr());
+  let v = unsafe { JS_NewSymbol(ctx, cdesc_ptr, 0) };
   if v.tag == JS_TAG_EXCEPTION {
     let exc = unsafe { JS_GetException(ctx) };
     unsafe { JS_FreeValue(ctx, exc) };
@@ -671,6 +707,9 @@ pub extern "C" fn v8__Data__EQ(this: *const Data, other: *const Data) -> bool {
   let a = jsval_of(this);
   let b = jsval_of(other);
 
+  if a.tag == JS_TAG_V8_CONTEXT || b.tag == JS_TAG_V8_CONTEXT {
+    return a.tag == b.tag && unsafe { a.u.ptr == b.u.ptr };
+  }
   if a.tag == b.tag && a.tag < 0 && unsafe { a.u.ptr == b.u.ptr } {
     return true;
   }
@@ -684,6 +723,10 @@ pub extern "C" fn v8__Data__EQ(this: *const Data, other: *const Data) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Data__IsValue(this: *const Data) -> bool {
   !this.is_null()
+    && template_kind(this as *const _).is_none()
+    && !v8__Data__IsModule(this)
+    && !v8__Data__IsModuleRequest(this)
+    && !v8__Data__IsPrivate(this as *const _)
 }
 
 #[unsafe(no_mangle)]
@@ -700,7 +743,7 @@ pub extern "C" fn v8__Data__IsPrimitive(this: *const Data) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Data__IsFunctionTemplate(this: *const Data) -> bool {
-  has_marker(this, c"__v82jsc_function_template")
+  template_kind(this as *const _) == Some(TemplKind::Func)
 }
 
 #[unsafe(no_mangle)]
@@ -762,21 +805,50 @@ fn has_marker(this: *const Data, key: &std::ffi::CStr) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Data__IsObjectTemplate(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  template_kind(this) == Some(TemplKind::Obj)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Data__IsPrivate(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  if this.is_null() {
+    return false;
+  }
+  let ctx = current_ctx();
+  let iso = crate::quickjs::core::current_iso();
+  if ctx.is_null() || iso.is_null() {
+    return false;
+  }
+  let value = jsval_of(this as *const Data);
+  if value.tag != JS_TAG_SYMBOL {
+    return false;
+  }
+  iso_state(iso)
+    .private_symbols
+    .iter()
+    .any(|&(private, _)| unsafe { JS_IsStrictEqual(ctx, value, private) })
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Private__Name(
-  _this: *const std::os::raw::c_void,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+pub extern "C" fn v8__Private__Name(this: *const Private) -> *const Value {
+  if this.is_null() {
+    return ptr::null();
+  }
+  let ctx = current_ctx();
+  let iso = crate::quickjs::core::current_iso();
+  if ctx.is_null() || iso.is_null() {
+    return ptr::null();
+  }
+  let value = jsval_of(this);
+  let Some((_, name)) = iso_state(iso)
+    .private_symbols
+    .iter()
+    .find(|&&(private, _)| unsafe { JS_IsStrictEqual(ctx, value, private) })
+  else {
+    return ptr::null();
+  };
+  intern::<Value>(unsafe { JS_DupValue(ctx, *name) })
 }

@@ -4,6 +4,7 @@ use crate::Context;
 use crate::StackTrace;
 use crate::Value;
 use crate::isolate::RealIsolate;
+use crate::quickjs::quickjs_sys::*;
 use crate::support::Opaque;
 use crate::support::UniquePtr;
 use crate::support::int;
@@ -29,6 +30,57 @@ struct InertObj {
   _cxx_vtable: *const Opaque,
 }
 
+#[repr(C)]
+struct InspectorState {
+  _cxx_vtable: *const Opaque,
+  client: *mut RawV8InspectorClient,
+  context_group_id: int,
+  channel: *mut RawChannel,
+}
+
+#[derive(Clone, Copy)]
+struct ScheduledPause {
+  client: *mut RawV8InspectorClient,
+  context_group_id: int,
+  channel: *mut RawChannel,
+  scheduled: bool,
+}
+
+thread_local! {
+  static ACTIVE_INSPECTOR_CLIENT:
+    std::cell::RefCell<Option<(*mut RawV8InspectorClient, int)>> =
+      const { std::cell::RefCell::new(None) };
+  static SCHEDULED_PAUSE: std::cell::RefCell<Option<ScheduledPause>> =
+    const { std::cell::RefCell::new(None) };
+}
+
+unsafe extern "C" {
+  fn v8_inspector__V8InspectorClient__BASE__generateUniqueId(
+    this: *mut RawV8InspectorClient,
+  ) -> i64;
+  fn v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause(
+    this: *mut RawV8InspectorClient,
+    context_group_id: int,
+  );
+  fn v8_inspector__V8InspectorClient__BASE__consoleAPIMessage(
+    this: *mut RawV8InspectorClient,
+    context_group_id: int,
+    level: int,
+    message: &StringView,
+    url: &StringView,
+    line_number: u32,
+    column_number: u32,
+    stack_trace: &mut V8StackTrace,
+  );
+  fn v8_inspector__V8Inspector__Channel__BASE__sendNotification(
+    this: *mut RawChannel,
+    message: UniquePtr<StringBuffer>,
+  );
+  fn v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
+    this: *mut RawChannel,
+  );
+}
+
 #[inline]
 fn alloc_inert<T>() -> *mut T {
   Box::into_raw(Box::new(InertObj {
@@ -41,6 +93,193 @@ fn alloc_inert<T>() -> *mut T {
 unsafe fn free_inert<T>(p: *mut T) {
   if !p.is_null() {
     unsafe { drop(Box::from_raw(p.cast::<InertObj>())) };
+  }
+}
+
+pub(crate) fn emit_console_api_message(level: int, message: String) {
+  let Some((client, context_group_id)) =
+    ACTIVE_INSPECTOR_CLIENT.with(|slot| *slot.borrow())
+  else {
+    return;
+  };
+  if client.is_null() {
+    return;
+  }
+
+  let message_bytes = message.into_bytes();
+  let message_view = StringView::from(message_bytes.as_slice());
+  let url_bytes: [u8; 0] = [];
+  let url_view = StringView::from(&url_bytes[..]);
+  let stack_trace = alloc_inert::<V8StackTrace>();
+  if stack_trace.is_null() {
+    return;
+  }
+  unsafe {
+    v8_inspector__V8InspectorClient__BASE__consoleAPIMessage(
+      client,
+      context_group_id,
+      level,
+      &message_view,
+      &url_view,
+      0,
+      0,
+      &mut *stack_trace,
+    );
+    free_inert(stack_trace);
+  }
+}
+
+fn json_string(value: &str) -> String {
+  let mut out = String::with_capacity(value.len() + 2);
+  out.push('"');
+  for ch in value.chars() {
+    match ch {
+      '"' => out.push_str("\\\""),
+      '\\' => out.push_str("\\\\"),
+      '\n' => out.push_str("\\n"),
+      '\r' => out.push_str("\\r"),
+      '\t' => out.push_str("\\t"),
+      ch if ch.is_control() => {
+        use std::fmt::Write;
+        let _ = write!(out, "\\u{:04x}", ch as u32);
+      }
+      ch => out.push(ch),
+    }
+  }
+  out.push('"');
+  out
+}
+
+unsafe fn js_value_to_string(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> Option<String> {
+  let mut len = 0usize;
+  let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, value) };
+  if cstr.is_null() {
+    return None;
+  }
+  let text = unsafe {
+    let bytes = std::slice::from_raw_parts(cstr as *const u8, len);
+    String::from_utf8_lossy(bytes).into_owned()
+  };
+  unsafe { JS_FreeCString(ctx, cstr) };
+  Some(text)
+}
+
+unsafe fn exception_description_and_message(
+  exception: *const Value,
+) -> (String, String) {
+  let ctx = crate::quickjs::core::current_ctx();
+  if ctx.is_null() || exception.is_null() {
+    return ("Error".to_string(), String::new());
+  }
+  let value = crate::quickjs::core::jsval_of(exception);
+  let description = unsafe { js_value_to_string(ctx, value) }
+    .unwrap_or_else(|| "Error".to_string());
+  let message_value =
+    unsafe { JS_GetPropertyStr(ctx, value, c"message".as_ptr()) };
+  let message = if message_value.tag == JS_TAG_EXCEPTION {
+    String::new()
+  } else {
+    unsafe { js_value_to_string(ctx, message_value) }.unwrap_or_default()
+  };
+  unsafe { JS_FreeValue(ctx, message_value) };
+  (description, message)
+}
+
+fn send_channel_notification(channel: *mut RawChannel, json: String) {
+  if channel.is_null() {
+    return;
+  }
+  let units: Vec<u16> = json.encode_utf16().collect();
+  let buf = RealStringBuffer::boxed_from_utf16(units);
+  let unique = unsafe { UniquePtr::from_raw(buf) };
+  unsafe {
+    v8_inspector__V8Inspector__Channel__BASE__sendNotification(channel, unique)
+  };
+}
+
+fn schedule_pause_on_next_statement(
+  client: *mut RawV8InspectorClient,
+  context_group_id: int,
+  channel: *mut RawChannel,
+) {
+  if client.is_null() || channel.is_null() {
+    return;
+  }
+  SCHEDULED_PAUSE.with(|slot| {
+    *slot.borrow_mut() = Some(ScheduledPause {
+      client,
+      context_group_id,
+      channel,
+      scheduled: true,
+    });
+  });
+}
+
+fn cancel_pause_on_next_statement(
+  client: *mut RawV8InspectorClient,
+  channel: *mut RawChannel,
+) {
+  SCHEDULED_PAUSE.with(|slot| {
+    let mut slot = slot.borrow_mut();
+    if matches!(
+      *slot,
+      Some(ScheduledPause {
+        client: scheduled_client,
+        channel: scheduled_channel,
+        ..
+      }) if scheduled_client == client && scheduled_channel == channel
+    ) {
+      if let Some(state) = slot.as_mut() {
+        state.scheduled = false;
+      }
+    }
+  });
+}
+
+pub(crate) fn maybe_pause_on_next_statement() {
+  let Some(state) = SCHEDULED_PAUSE.with(|slot| {
+    let mut slot = slot.borrow_mut();
+    let state = slot.as_mut()?;
+    if !state.scheduled {
+      return None;
+    }
+    state.scheduled = false;
+    Some(*state)
+  }) else {
+    return;
+  };
+
+  if state.client.is_null() || state.channel.is_null() {
+    return;
+  }
+
+  unsafe {
+    let _ =
+      v8_inspector__V8InspectorClient__BASE__generateUniqueId(state.client);
+  }
+  send_channel_notification(
+    state.channel,
+    r#"{"method":"Debugger.scriptParsed","params":{"scriptId":"1","url":"","startLine":0,"startColumn":0,"endLine":0,"endColumn":0,"executionContextId":1,"hash":""}}"#.to_string(),
+  );
+  send_channel_notification(
+    state.channel,
+    r#"{"method":"Debugger.paused","params":{"callFrames":[],"reason":"other","hitBreakpoints":[]}}"#.to_string(),
+  );
+  send_channel_notification(
+    state.channel,
+    r#"{"method":"Debugger.resumed","params":{}}"#.to_string(),
+  );
+  unsafe {
+    v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
+      state.channel,
+    );
+    v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause(
+      state.client,
+      state.context_group_id,
+    );
   }
 }
 
@@ -153,16 +392,26 @@ pub extern "C" fn v8_inspector__V8InspectorSession__dispatchProtocolMessage(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8InspectorSession__schedulePauseOnNextStatement(
-  _session: *mut RawV8InspectorSession,
+  session: *mut RawV8InspectorSession,
   _break_reason: StringView,
   _break_details: StringView,
 ) {
+  if session.is_null() {
+    return;
+  }
+  let sess = unsafe { &*(session.cast::<cdp::CdpSession>()) };
+  sess.schedule_pause_on_next_statement();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8InspectorSession__cancelPauseOnNextStatement(
-  _session: *mut RawV8InspectorSession,
+  session: *mut RawV8InspectorSession,
 ) {
+  if session.is_null() {
+    return;
+  }
+  let sess = unsafe { &*(session.cast::<cdp::CdpSession>()) };
+  sess.cancel_pause_on_next_statement();
 }
 
 #[unsafe(no_mangle)]
@@ -227,44 +476,76 @@ pub extern "C" fn v8_inspector__StringBuffer__create(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__DELETE(this: *mut RawV8Inspector) {
-  unsafe { free_inert(this) };
+  if !this.is_null() {
+    unsafe { drop(Box::from_raw(this.cast::<InspectorState>())) };
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__create(
   _isolate: *mut RealIsolate,
-  _client: *mut RawV8InspectorClient,
+  client: *mut RawV8InspectorClient,
 ) -> *mut RawV8Inspector {
-  alloc_inert::<RawV8Inspector>()
+  Box::into_raw(Box::new(InspectorState {
+    _cxx_vtable: std::ptr::null(),
+    client,
+    context_group_id: 1,
+    channel: std::ptr::null_mut(),
+  }))
+  .cast::<RawV8Inspector>()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__connect(
-  _inspector: *mut RawV8Inspector,
+  inspector: *mut RawV8Inspector,
   _context_group_id: int,
   channel: *mut RawChannel,
   _state: StringView,
   _client_trust_level: V8InspectorClientTrustLevel,
 ) -> *mut RawV8InspectorSession {
-  let sess = Box::new(cdp::CdpSession::new(channel));
+  let mut client = std::ptr::null_mut();
+  if !inspector.is_null() {
+    let state = unsafe { &mut *inspector.cast::<InspectorState>() };
+    state.channel = channel;
+    client = state.client;
+  }
+  let sess = Box::new(cdp::CdpSession::new(channel, client, _context_group_id));
   Box::into_raw(sess).cast::<RawV8InspectorSession>()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__contextCreated(
-  _this: *mut RawV8Inspector,
+  this: *mut RawV8Inspector,
   _context: *const Context,
-  _contextGroupId: int,
+  contextGroupId: int,
   _humanReadableName: StringView,
   _auxData: StringView,
 ) {
+  if this.is_null() {
+    return;
+  }
+  let state = unsafe { &mut *this.cast::<InspectorState>() };
+  state.context_group_id = contextGroupId;
+  ACTIVE_INSPECTOR_CLIENT.with(|slot| {
+    *slot.borrow_mut() = Some((state.client, contextGroupId));
+  });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__contextDestroyed(
-  _this: *mut RawV8Inspector,
+  this: *mut RawV8Inspector,
   _context: *const Context,
 ) {
+  if this.is_null() {
+    return;
+  }
+  let state = unsafe { &*this.cast::<InspectorState>() };
+  ACTIVE_INSPECTOR_CLIENT.with(|slot| {
+    let mut slot = slot.borrow_mut();
+    if matches!(*slot, Some((client, _)) if client == state.client) {
+      *slot = None;
+    }
+  });
 }
 
 #[unsafe(no_mangle)]
@@ -317,18 +598,36 @@ pub extern "C" fn v8_inspector__V8Inspector__allAsyncTasksCanceled(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__exceptionThrown(
-  _this: *mut RawV8Inspector,
+  this: *mut RawV8Inspector,
   _context: *const Context,
-  _message: StringView,
+  message: StringView,
   _exception: *const Value,
   _detailed_message: StringView,
-  _url: StringView,
+  url: StringView,
   _line_number: u32,
   _column_number: u32,
   _stack_trace: *mut V8StackTrace,
   _script_id: int,
 ) -> u32 {
-  0
+  if this.is_null() {
+    return 0;
+  }
+  let state = unsafe { &*this.cast::<InspectorState>() };
+  let text = string_view_to_string(&message);
+  let url = string_view_to_string(&url);
+  let (description, exception_message) =
+    unsafe { exception_description_and_message(_exception) };
+  let json = format!(
+    "{{\"method\":\"Runtime.exceptionThrown\",\"params\":{{\"timestamp\":0,\"exceptionDetails\":{{\"exceptionId\":1,\"text\":{},\"lineNumber\":0,\"columnNumber\":0,\"scriptId\":\"1\",\"url\":{},\"exception\":{{\"type\":\"object\",\"subtype\":\"error\",\"className\":\"Error\",\"description\":{},\"objectId\":\"1.1.1\",\"preview\":{{\"type\":\"object\",\"subtype\":\"error\",\"description\":{},\"overflow\":false,\"properties\":[{{\"name\":\"stack\",\"type\":\"string\",\"value\":{}}},{{\"name\":\"message\",\"type\":\"string\",\"value\":{}}}]}}}},\"executionContextId\":1}}}}}}",
+    json_string(&text),
+    json_string(&url),
+    json_string(&description),
+    json_string(&description),
+    json_string(&description),
+    json_string(&exception_message),
+  );
+  send_channel_notification(state.channel, json);
+  1
 }
 
 #[unsafe(no_mangle)]
@@ -346,6 +645,7 @@ pub extern "C" fn v8_inspector__V8StackTrace__DELETE(this: *mut V8StackTrace) {
 
 mod cdp {
   use super::RawChannel;
+  use super::RawV8InspectorClient;
   use super::RealStringBuffer;
   use crate::inspector::StringBuffer;
   use crate::quickjs::core::current_ctx;
@@ -370,18 +670,36 @@ mod cdp {
 
   pub struct CdpSession {
     channel: *mut RawChannel,
+    client: *mut RawV8InspectorClient,
+    context_group_id: int,
     next_obj_id: u64,
 
     objects: HashMap<u64, JSValue>,
   }
 
   impl CdpSession {
-    pub fn new(channel: *mut RawChannel) -> Self {
+    pub fn new(
+      channel: *mut RawChannel,
+      client: *mut RawV8InspectorClient,
+      context_group_id: int,
+    ) -> Self {
       CdpSession {
         channel,
+        client,
+        context_group_id,
         next_obj_id: 1,
         objects: HashMap::new(),
       }
+    }
+    pub fn schedule_pause_on_next_statement(&self) {
+      super::schedule_pause_on_next_statement(
+        self.client,
+        self.context_group_id,
+        self.channel,
+      );
+    }
+    pub fn cancel_pause_on_next_statement(&self) {
+      super::cancel_pause_on_next_statement(self.client, self.channel);
     }
     fn retain(&mut self, ctx: *mut JSContext, v: JSValue) -> u64 {
       let id = self.next_obj_id;

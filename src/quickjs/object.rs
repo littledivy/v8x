@@ -20,9 +20,10 @@ use super::core::{
 use super::quickjs_sys::*;
 use crate::support::{Maybe, MaybeBool, int};
 use crate::{
-  Array, Context, IndexFilter, KeyCollectionMode, KeyConversionMode, Name,
-  Object, Private, PropertyAttribute, PropertyDescriptor, PropertyFilter,
-  RealIsolate, String as V8String, Value,
+  AccessorNameGetterCallback, AccessorNameSetterCallback, Array, Context,
+  IndexFilter, KeyCollectionMode, KeyConversionMode, Name, Object, Private,
+  PropertyAttribute, PropertyDescriptor, PropertyFilter, RealIsolate,
+  String as V8String, Value,
 };
 use std::os::raw::{c_char, c_int};
 use std::ptr;
@@ -54,6 +55,7 @@ unsafe extern "C" {
   ) -> c_int;
   fn JS_GetLength(ctx: *mut JSContext, obj: JSValue, pres: *mut i64) -> c_int;
   fn JS_ToBool(ctx: *mut JSContext, val: JSValue) -> c_int;
+  fn JS_IsStrictEqual(ctx: *mut JSContext, op1: JSValue, op2: JSValue) -> bool;
   fn JS_GetOwnPropertyNames(
     ctx: *mut JSContext,
     ptab: *mut *mut JSPropertyEnum,
@@ -66,6 +68,7 @@ unsafe extern "C" {
     tab: *mut JSPropertyEnum,
     len: u32,
   );
+  fn JS_DupAtom(ctx: *mut JSContext, v: JSAtom) -> JSAtom;
 }
 
 #[repr(C)]
@@ -122,10 +125,210 @@ fn attr_to_jsprop(attr: u32) -> c_int {
   flags
 }
 
+#[inline]
+unsafe fn clear_exception(ctx: *mut JSContext) {
+  let exc = unsafe { JS_GetException(ctx) };
+  unsafe { JS_FreeValue(ctx, exc) };
+}
+
 const JS_PROP_HAS_CONFIGURABLE: c_int = 1 << 8;
 const JS_PROP_HAS_WRITABLE: c_int = 1 << 9;
 const JS_PROP_HAS_ENUMERABLE: c_int = 1 << 10;
 const JS_PROP_HAS_VALUE: c_int = 1 << 13;
+
+#[derive(Clone, Copy)]
+struct ObjectAccessorEntry {
+  getter: AccessorNameGetterCallback,
+  setter: Option<AccessorNameSetterCallback>,
+  data: JSValue,
+  atom: JSAtom,
+  attr: u32,
+  lazy: bool,
+}
+
+thread_local! {
+    static OBJECT_ACCESSORS: std::cell::RefCell<Vec<ObjectAccessorEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn register_object_accessor(
+  ctx: *mut JSContext,
+  atom: JSAtom,
+  getter: AccessorNameGetterCallback,
+  setter: Option<AccessorNameSetterCallback>,
+  data: JSValue,
+  attr: u32,
+  lazy: bool,
+) -> c_int {
+  let data = if jsv_is_undefined(&data) {
+    jsv_undefined()
+  } else {
+    unsafe { JS_DupValue(ctx, data) }
+  };
+  let atom = unsafe { JS_DupAtom(ctx, atom) };
+  OBJECT_ACCESSORS.with(|entries| {
+    let mut entries = entries.borrow_mut();
+    let magic = entries.len() as c_int;
+    entries.push(ObjectAccessorEntry {
+      getter,
+      setter,
+      data,
+      atom,
+      attr,
+      lazy,
+    });
+    magic
+  })
+}
+
+fn lookup_object_accessor(magic: c_int) -> Option<ObjectAccessorEntry> {
+  if magic < 0 {
+    return None;
+  }
+  OBJECT_ACCESSORS.with(|entries| entries.borrow().get(magic as usize).copied())
+}
+
+unsafe fn object_accessor_cfunc(
+  ctx: *mut JSContext,
+  trampoline: unsafe extern "C" fn(
+    *mut JSContext,
+    JSValue,
+    c_int,
+    *mut JSValue,
+    c_int,
+  ) -> JSValue,
+  magic: c_int,
+) -> JSValue {
+  let f = unsafe {
+    std::mem::transmute::<
+      unsafe extern "C" fn(
+        *mut JSContext,
+        JSValue,
+        c_int,
+        *mut JSValue,
+        c_int,
+      ) -> JSValue,
+      JSCFunction,
+    >(trampoline)
+  };
+  unsafe {
+    JS_NewCFunction2(ctx, f, ptr::null(), 0, JS_CFUNC_GENERIC_MAGIC, magic)
+  }
+}
+
+unsafe extern "C" fn object_accessor_getter_trampoline(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+  magic: c_int,
+) -> JSValue {
+  let Some(entry) = lookup_object_accessor(magic) else {
+    return jsv_undefined();
+  };
+  let result = unsafe {
+    super::function::call_accessor_name_getter(
+      ctx,
+      this_val,
+      entry.atom,
+      entry.data,
+      entry.getter,
+    )
+  };
+  if entry.lazy && !jsv_is_exception(&result) {
+    let value = unsafe { JS_DupValue(ctx, result) };
+    let _ = unsafe {
+      JS_DefinePropertyValue(
+        ctx,
+        this_val,
+        entry.atom,
+        value,
+        attr_to_jsprop(entry.attr),
+      )
+    };
+  }
+  result
+}
+
+unsafe extern "C" fn object_accessor_setter_trampoline(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  magic: c_int,
+) -> JSValue {
+  let Some(entry) = lookup_object_accessor(magic) else {
+    return jsv_undefined();
+  };
+  let Some(setter) = entry.setter else {
+    return jsv_undefined();
+  };
+  let value = if argc > 0 && !argv.is_null() {
+    unsafe { *argv }
+  } else {
+    jsv_undefined()
+  };
+  unsafe {
+    super::function::call_accessor_name_setter(
+      ctx, this_val, entry.atom, value, entry.data, setter,
+    )
+  }
+}
+
+#[inline]
+fn accessor_attr_to_jsprop(attr: u32) -> c_int {
+  let mut flags = JS_PROP_THROW;
+  if attr & 2 == 0 {
+    flags |= JS_PROP_ENUMERABLE;
+  }
+  if attr & 4 == 0 {
+    flags |= JS_PROP_CONFIGURABLE;
+  }
+  flags
+}
+
+pub(crate) fn define_native_accessor_value(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  key: JSValue,
+  getter: AccessorNameGetterCallback,
+  setter: Option<AccessorNameSetterCallback>,
+  data: JSValue,
+  attr: u32,
+  lazy: bool,
+) -> c_int {
+  if ctx.is_null() || !jsv_is_object(&obj) {
+    return -1;
+  }
+  let atom = unsafe { JS_ValueToAtom(ctx, key) };
+  if atom == 0 {
+    return -1;
+  }
+  let magic =
+    register_object_accessor(ctx, atom, getter, setter, data, attr, lazy);
+  let get = unsafe {
+    object_accessor_cfunc(ctx, object_accessor_getter_trampoline, magic)
+  };
+  let set = if setter.is_some() && attr & 1 == 0 {
+    unsafe {
+      object_accessor_cfunc(ctx, object_accessor_setter_trampoline, magic)
+    }
+  } else {
+    jsv_undefined()
+  };
+  let r = unsafe {
+    JS_DefinePropertyGetSet(
+      ctx,
+      obj,
+      atom,
+      get,
+      set,
+      accessor_attr_to_jsprop(attr),
+    )
+  };
+  unsafe { JS_FreeAtom(ctx, atom) };
+  r
+}
 
 #[inline]
 fn read_attr(attr: &PropertyAttribute) -> u32 {
@@ -534,6 +737,176 @@ pub extern "C" fn v8__Object__HasOwnProperty(
   just_bool(found)
 }
 
+unsafe fn atom_to_path_segment(
+  ctx: *mut JSContext,
+  atom: JSAtom,
+) -> Option<String> {
+  let key = unsafe { JS_AtomToString(ctx, atom) };
+  if key.tag == JS_TAG_EXCEPTION {
+    return None;
+  }
+  let cstr = unsafe { JS_ToCString(ctx, key) };
+  let out = if cstr.is_null() {
+    None
+  } else {
+    Some(
+      unsafe { std::ffi::CStr::from_ptr(cstr) }
+        .to_string_lossy()
+        .into_owned(),
+    )
+  };
+  if !cstr.is_null() {
+    unsafe { JS_FreeCString(ctx, cstr) };
+  }
+  unsafe { JS_FreeValue(ctx, key) };
+  out
+}
+
+unsafe fn find_inferred_constructor_path(
+  ctx: *mut JSContext,
+  object: JSValue,
+  target: JSValue,
+  prefix: &str,
+  depth: u8,
+  visited: &mut std::collections::HashSet<usize>,
+) -> Option<String> {
+  if depth > 3 || !jsv_is_object(&object) {
+    return None;
+  }
+  if !visited.insert(jsv_get_ptr(&object) as usize) {
+    return None;
+  }
+
+  let mut tab: *mut JSPropertyEnum = ptr::null_mut();
+  let mut len: u32 = 0;
+  let rc = unsafe {
+    JS_GetOwnPropertyNames(
+      ctx,
+      &mut tab,
+      &mut len,
+      object,
+      JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY,
+    )
+  };
+  if rc < 0 {
+    return None;
+  }
+
+  let mut found = None;
+  unsafe {
+    for i in 0..len as usize {
+      let atom = (*tab.add(i)).atom;
+      let Some(segment) = atom_to_path_segment(ctx, atom) else {
+        continue;
+      };
+      if segment.is_empty() {
+        continue;
+      }
+      let path = if prefix.is_empty() {
+        segment
+      } else {
+        format!("{prefix}.{segment}")
+      };
+      let value = JS_GetProperty(ctx, object, atom);
+      if value.tag == JS_TAG_EXCEPTION {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        continue;
+      }
+      if JS_IsStrictEqual(ctx, value, target) {
+        JS_FreeValue(ctx, value);
+        found = Some(path);
+        break;
+      }
+      if jsv_is_object(&value) && !JS_IsFunction(ctx, value) {
+        found = find_inferred_constructor_path(
+          ctx,
+          value,
+          target,
+          &path,
+          depth + 1,
+          visited,
+        );
+        if found.is_some() {
+          JS_FreeValue(ctx, value);
+          break;
+        }
+      }
+      JS_FreeValue(ctx, value);
+    }
+    JS_FreePropertyEnum(ctx, tab, len);
+  }
+  found
+}
+
+unsafe fn inferred_constructor_name(
+  ctx: *mut JSContext,
+  ctor: JSValue,
+) -> JSValue {
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let mut visited = std::collections::HashSet::new();
+  let path = unsafe {
+    find_inferred_constructor_path(ctx, global, ctor, "", 0, &mut visited)
+  };
+  unsafe { JS_FreeValue(ctx, global) };
+  if let Some(path) = path {
+    unsafe { JS_NewStringLen(ctx, path.as_ptr() as *const c_char, path.len()) }
+  } else {
+    jsv_null()
+  }
+}
+
+unsafe fn has_own_property_atom(
+  ctx: *mut JSContext,
+  object: JSValue,
+  want: JSAtom,
+) -> bool {
+  let mut tab: *mut JSPropertyEnum = ptr::null_mut();
+  let mut len: u32 = 0;
+  let rc = unsafe {
+    JS_GetOwnPropertyNames(ctx, &mut tab, &mut len, object, JS_GPN_STRING_MASK)
+  };
+  if rc < 0 {
+    return false;
+  }
+
+  let mut found = false;
+  unsafe {
+    for i in 0..len as usize {
+      if (*tab.add(i)).atom == want {
+        found = true;
+        break;
+      }
+    }
+    JS_FreePropertyEnum(ctx, tab, len);
+  }
+  found
+}
+
+unsafe fn constructor_from_prototype_chain(
+  ctx: *mut JSContext,
+  object: JSValue,
+  ctor_atom: JSAtom,
+) -> JSValue {
+  let mut proto = unsafe { JS_GetPrototype(ctx, object) };
+  let mut depth = 0;
+  while jsv_is_object(&proto) && depth < 64 {
+    if unsafe { has_own_property_atom(ctx, proto, ctor_atom) } {
+      let ctor = unsafe { JS_GetProperty(ctx, proto, ctor_atom) };
+      unsafe { JS_FreeValue(ctx, proto) };
+      return ctor;
+    }
+    let next = unsafe { JS_GetPrototype(ctx, proto) };
+    unsafe { JS_FreeValue(ctx, proto) };
+    proto = next;
+    depth += 1;
+  }
+  if proto.tag == JS_TAG_EXCEPTION {
+    return proto;
+  }
+  unsafe { JS_FreeValue(ctx, proto) };
+  unsafe { JS_GetProperty(ctx, object, ctor_atom) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetConstructorName(
   this: *const Object,
@@ -552,7 +925,7 @@ pub extern "C" fn v8__Object__GetConstructorName(
       }
     };
     let ctor_atom = JS_NewAtom(ctx, c"constructor".as_ptr());
-    let ctor = JS_GetProperty(ctx, jsval_of(this), ctor_atom);
+    let ctor = constructor_from_prototype_chain(ctx, jsval_of(this), ctor_atom);
     JS_FreeAtom(ctx, ctor_atom);
     if ctor.tag == JS_TAG_EXCEPTION {
       drain_exc();
@@ -565,16 +938,33 @@ pub extern "C" fn v8__Object__GetConstructorName(
     let name_atom = JS_NewAtom(ctx, c"name".as_ptr());
     let name = JS_GetProperty(ctx, ctor, name_atom);
     JS_FreeAtom(ctx, name_atom);
-    JS_FreeValue(ctx, ctor);
     if name.tag == JS_TAG_EXCEPTION {
       drain_exc();
+      JS_FreeValue(ctx, ctor);
       return fallback();
     }
     if !jsv_is_string(&name) {
       JS_FreeValue(ctx, name);
+      JS_FreeValue(ctx, ctor);
       return fallback();
     }
+    let cstr = JS_ToCString(ctx, name);
+    let is_empty =
+      cstr.is_null() || std::ffi::CStr::from_ptr(cstr).to_bytes().is_empty();
+    if !cstr.is_null() {
+      JS_FreeCString(ctx, cstr);
+    }
+    if is_empty {
+      let inferred = inferred_constructor_name(ctx, ctor);
+      if jsv_is_string(&inferred) {
+        JS_FreeValue(ctx, name);
+        JS_FreeValue(ctx, ctor);
+        return intern::<V8String>(inferred);
+      }
+      JS_FreeValue(ctx, inferred);
+    }
 
+    JS_FreeValue(ctx, ctor);
     intern::<V8String>(name)
   }
 }
@@ -609,7 +999,14 @@ pub extern "C" fn v8__Object__GetOwnPropertyNames(
   filter: PropertyFilter,
   key_conversion: KeyConversionMode,
 ) -> *const Array {
-  property_names_array(this, context, gpn_from_filter(&filter))
+  property_names_array_filtered(
+    this,
+    context,
+    gpn_from_filter(&filter),
+    false,
+    false,
+    key_conversion,
+  )
 }
 
 #[unsafe(no_mangle)]
@@ -621,14 +1018,15 @@ pub extern "C" fn v8__Object__GetPropertyNames(
   index_filter: IndexFilter,
   key_conversion: KeyConversionMode,
 ) -> *const Array {
-  let _ = (mode, key_conversion);
-
+  let include_prototypes = matches!(mode, KeyCollectionMode::IncludePrototypes);
   let skip_indices = index_filter as u32 == 1;
   property_names_array_filtered(
     this,
     context,
     gpn_from_filter(&property_filter),
     skip_indices,
+    include_prototypes,
+    key_conversion,
   )
 }
 
@@ -655,14 +1053,6 @@ fn read_filter(f: &PropertyFilter) -> u32 {
   unsafe { *(f as *const PropertyFilter as *const u32) }
 }
 
-fn property_names_array(
-  this: *const Object,
-  context: *const Context,
-  gpn_flags: c_int,
-) -> *const Array {
-  property_names_array_filtered(this, context, gpn_flags, false)
-}
-
 const JS_ATOM_TAG_INT: u32 = 1 << 31;
 
 fn property_names_array_filtered(
@@ -670,41 +1060,116 @@ fn property_names_array_filtered(
   context: *const Context,
   gpn_flags: c_int,
   skip_indices: bool,
+  include_prototypes: bool,
+  key_conversion: KeyConversionMode,
 ) -> *const Array {
   let ctx = ctx_of(context);
   if ctx.is_null() || this.is_null() {
     return ptr::null();
   }
-  let mut tab: *mut JSPropertyEnum = ptr::null_mut();
-  let mut len: u32 = 0;
-  let rc = unsafe {
-    JS_GetOwnPropertyNames(ctx, &mut tab, &mut len, jsval_of(this), gpn_flags)
-  };
-  if rc < 0 {
-    return ptr::null();
-  }
 
   let arr = unsafe { JS_NewArray(ctx) };
   if arr.tag == JS_TAG_EXCEPTION {
-    unsafe { JS_FreePropertyEnum(ctx, tab, len) };
     return ptr::null();
   }
+  let mut seen = std::collections::HashSet::new();
+  let mut out = 0u32;
+
   unsafe {
-    let mut out = 0u32;
+    let mut object = JS_DupValue(ctx, jsval_of(this));
+    loop {
+      if object.tag != JS_TAG_OBJECT {
+        JS_FreeValue(ctx, object);
+        break;
+      }
+      if !append_own_property_names(
+        ctx,
+        object,
+        gpn_flags,
+        skip_indices,
+        key_conversion,
+        arr,
+        &mut out,
+        &mut seen,
+      ) {
+        JS_FreeValue(ctx, object);
+        JS_FreeValue(ctx, arr);
+        return ptr::null();
+      }
+      if !include_prototypes {
+        JS_FreeValue(ctx, object);
+        break;
+      }
+      let prototype = JS_GetPrototype(ctx, object);
+      JS_FreeValue(ctx, object);
+      if prototype.tag == JS_TAG_EXCEPTION {
+        JS_FreeValue(ctx, arr);
+        return ptr::null();
+      }
+      object = prototype;
+    }
+  }
+  intern::<Array>(arr)
+}
+
+unsafe fn append_own_property_names(
+  ctx: *mut JSContext,
+  object: JSValue,
+  gpn_flags: c_int,
+  skip_indices: bool,
+  key_conversion: KeyConversionMode,
+  arr: JSValue,
+  out: &mut u32,
+  seen: &mut std::collections::HashSet<JSAtom>,
+) -> bool {
+  let mut tab: *mut JSPropertyEnum = ptr::null_mut();
+  let mut len: u32 = 0;
+  let rc = unsafe {
+    JS_GetOwnPropertyNames(ctx, &mut tab, &mut len, object, gpn_flags)
+  };
+  if rc < 0 {
+    return false;
+  }
+
+  let mut ok = true;
+  unsafe {
     for i in 0..len as usize {
       let atom = (*tab.add(i)).atom;
-
-      if skip_indices && (atom & JS_ATOM_TAG_INT) != 0 {
+      let is_index = (atom & JS_ATOM_TAG_INT) != 0;
+      if skip_indices || key_conversion as u32 == 2 {
+        if is_index {
+          continue;
+        }
+      }
+      if !seen.insert(atom) {
         continue;
       }
 
-      let key_val = JS_AtomToValue(ctx, atom);
-      JS_SetPropertyUint32(ctx, arr, out, key_val);
-      out += 1;
+      let key_val = if is_index && key_conversion as u32 == 0 {
+        JS_AtomToString(ctx, atom)
+      } else if is_index {
+        let index = atom & !JS_ATOM_TAG_INT;
+        if index <= i32::MAX as u32 {
+          jsv_int32(index as i32)
+        } else {
+          jsv_float64(index as f64)
+        }
+      } else {
+        JS_AtomToValue(ctx, atom)
+      };
+      if key_val.tag == JS_TAG_EXCEPTION {
+        ok = false;
+        break;
+      }
+      if JS_SetPropertyUint32(ctx, arr, *out, key_val) < 0 {
+        ok = false;
+        break;
+      }
+      *out += 1;
     }
     JS_FreePropertyEnum(ctx, tab, len);
   }
-  intern::<Array>(arr)
+  ok
 }
 
 #[unsafe(no_mangle)]
@@ -1095,33 +1560,23 @@ pub extern "C" fn v8__Object__GetPropertyAttributes(
   key: *const Value,
   out: *mut Maybe<PropertyAttribute>,
 ) {
-  if out.is_null() {
+  let ctx = ctx_of(context);
+  if out.is_null() || ctx.is_null() || this.is_null() {
     return;
   }
-  let ctx = ctx_of(context);
-  let has = if ctx.is_null() || this.is_null() {
-    false
-  } else {
-    let atom = key_atom(ctx, key);
-    if atom == 0 {
-      false
-    } else {
-      let r = unsafe { JS_HasProperty(ctx, jsval_of(this), atom) };
-      unsafe { JS_FreeAtom(ctx, atom) };
-      r > 0
-    }
-  };
-  let m: Maybe<PropertyAttribute> = if has {
-    let mut tmp: Maybe<PropertyAttribute> = unsafe { std::mem::zeroed() };
 
-    unsafe {
-      *(&mut tmp as *mut Maybe<PropertyAttribute> as *mut bool) = true;
-    }
-    tmp
+  let atom = key_atom(ctx, key);
+  if atom == 0 {
+    unsafe { maybe_attr_none(out) };
+    return;
+  }
+  let r = unsafe { JS_HasProperty(ctx, jsval_of(this), atom) };
+  unsafe { JS_FreeAtom(ctx, atom) };
+  if r < 0 {
+    unsafe { maybe_attr_none(out) };
   } else {
-    unsafe { std::mem::zeroed() }
-  };
-  unsafe { ptr::write(out, m) };
+    unsafe { maybe_attr_set(out, 0) };
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1195,6 +1650,9 @@ thread_local! {
         std::collections::HashMap<(usize, u16), usize>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 
+    static API_WRAPPERS: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+
     static INTERNAL_FIELDS: std::cell::RefCell<
         std::collections::HashMap<usize, Vec<JSValue>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -1230,6 +1688,31 @@ pub(crate) fn set_internal_field_count_for_value(
   });
 }
 
+pub(crate) fn mark_api_wrapper_for_value(obj: JSValue) {
+  if !jsv_is_object(&obj) {
+    return;
+  }
+  let key = value_key(obj);
+  API_WRAPPERS.with(|t| {
+    t.borrow_mut().insert(key);
+  });
+}
+
+pub(crate) fn internal_field_count_for_value(
+  obj: JSValue,
+) -> crate::support::int {
+  if !jsv_is_object(&obj) {
+    return 0;
+  }
+  let key = value_key(obj);
+  INTERNAL_FIELDS.with(|t| {
+    t.borrow()
+      .get(&key)
+      .map(|fields| fields.len() as crate::support::int)
+      .unwrap_or(0)
+  })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__Wrap(
   _isolate: *const RealIsolate,
@@ -1244,6 +1727,10 @@ pub extern "C" fn v8__Object__Wrap(
   WRAP_TABLE.with(|t| {
     t.borrow_mut().insert((key, tag), value as usize);
   });
+  super::misc::cppgc_register_wrapper(
+    jsval_of(wrapper),
+    value as *const crate::binding::RustObj,
+  );
 }
 
 #[unsafe(no_mangle)]
@@ -1260,6 +1747,7 @@ pub extern "C" fn v8__Object__Unwrap(
     t.borrow()
       .get(&(key, tag))
       .map(|&p| p as *mut crate::binding::RustObj)
+      .filter(|&p| super::misc::cppgc_is_live_object(p))
       .unwrap_or(ptr::null_mut())
   })
 }
@@ -1270,7 +1758,8 @@ pub extern "C" fn v8__Object__IsApiWrapper(this: *const Object) -> bool {
     return false;
   }
   let key = wrap_key(this);
-  WRAP_TABLE.with(|t| t.borrow().keys().any(|(w, _)| *w == key))
+  API_WRAPPERS.with(|t| t.borrow().contains(&key))
+    || WRAP_TABLE.with(|t| t.borrow().keys().any(|(w, _)| *w == key))
 }
 
 // ---------------------------------------------------------------------------
@@ -1326,26 +1815,50 @@ pub extern "C" fn v8__Object__InternalFieldCount(
   if this.is_null() {
     return 0;
   }
-  let key = value_key(jsval_of(this));
-  INTERNAL_FIELDS.with(|t| {
-    t.borrow()
-      .get(&key)
-      .map(|fields| fields.len() as crate::support::int)
-      .unwrap_or(0)
-  })
+  internal_field_count_for_value(jsval_of(this))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetAccessor(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
-  _getter: *const std::os::raw::c_void,
-  _setter: *const std::os::raw::c_void,
-  _data_or_null: *const std::os::raw::c_void,
-  _attr: crate::PropertyAttribute,
+  this: *const std::os::raw::c_void,
+  context: *const std::os::raw::c_void,
+  key: *const std::os::raw::c_void,
+  getter: AccessorNameGetterCallback,
+  setter: Option<AccessorNameSetterCallback>,
+  data_or_null: *const std::os::raw::c_void,
+  attr: crate::PropertyAttribute,
 ) -> crate::support::MaybeBool {
-  crate::support::MaybeBool::Nothing
+  let ctx = ctx_of(context as *const Context);
+  if ctx.is_null() || this.is_null() || key.is_null() {
+    return crate::support::MaybeBool::Nothing;
+  }
+  let atom = key_atom(ctx, key);
+  if atom == 0 {
+    return crate::support::MaybeBool::Nothing;
+  }
+
+  let attr_bits = read_attr(&attr);
+  let data = if data_or_null.is_null() {
+    jsv_undefined()
+  } else {
+    jsval_of(data_or_null)
+  };
+  let r = define_native_accessor_value(
+    ctx,
+    jsval_of(this),
+    jsval_of(key),
+    getter,
+    setter,
+    data,
+    attr_bits,
+    false,
+  );
+  unsafe { JS_FreeAtom(ctx, atom) };
+  if r < 0 {
+    crate::support::MaybeBool::Nothing
+  } else {
+    crate::support::MaybeBool::JustTrue
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1405,39 +1918,196 @@ pub extern "C" fn v8__Object__SetInternalField(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetLazyDataProperty(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
-  _getter: *const std::os::raw::c_void,
-  _data_or_null: *const std::os::raw::c_void,
-  _attr: crate::PropertyAttribute,
+  this: *const std::os::raw::c_void,
+  context: *const std::os::raw::c_void,
+  key: *const std::os::raw::c_void,
+  getter: AccessorNameGetterCallback,
+  data_or_null: *const std::os::raw::c_void,
+  attr: crate::PropertyAttribute,
   _getter_side_effect_type: crate::SideEffectType,
   _setter_side_effect_type: crate::SideEffectType,
 ) -> crate::support::MaybeBool {
-  crate::support::MaybeBool::Nothing
+  let ctx = ctx_of(context as *const Context);
+  if ctx.is_null() || this.is_null() || key.is_null() {
+    return crate::support::MaybeBool::Nothing;
+  }
+  let atom = key_atom(ctx, key);
+  if atom == 0 {
+    return crate::support::MaybeBool::Nothing;
+  }
+
+  let attr_bits = read_attr(&attr);
+  let data = if data_or_null.is_null() {
+    jsv_undefined()
+  } else {
+    jsval_of(data_or_null)
+  };
+  let r = define_native_accessor_value(
+    ctx,
+    jsval_of(this),
+    jsval_of(key),
+    getter,
+    None,
+    data,
+    attr_bits,
+    true,
+  );
+  unsafe { JS_FreeAtom(ctx, atom) };
+  if r < 0 {
+    crate::support::MaybeBool::Nothing
+  } else {
+    crate::support::MaybeBool::JustTrue
+  }
+}
+
+fn regexp_flag_string(flags: crate::RegExpCreationFlags) -> String {
+  let mut out = String::new();
+  if flags.contains(crate::RegExpCreationFlags::GLOBAL) {
+    out.push('g');
+  }
+  if flags.contains(crate::RegExpCreationFlags::IGNORE_CASE) {
+    out.push('i');
+  }
+  if flags.contains(crate::RegExpCreationFlags::MULTILINE) {
+    out.push('m');
+  }
+  if flags.contains(crate::RegExpCreationFlags::STICKY) {
+    out.push('y');
+  }
+  if flags.contains(crate::RegExpCreationFlags::UNICODE) {
+    out.push('u');
+  }
+  if flags.contains(crate::RegExpCreationFlags::DOT_ALL) {
+    out.push('s');
+  }
+  if flags.contains(crate::RegExpCreationFlags::HAS_INDICES) {
+    out.push('d');
+  }
+  if flags.contains(crate::RegExpCreationFlags::UNICODE_SETS) {
+    out.push('v');
+  }
+  out
+}
+
+#[inline]
+fn ctx_from_raw_context(
+  context: *const std::os::raw::c_void,
+) -> *mut JSContext {
+  let ctx = ctx_of(context as *const Context);
+  if ctx.is_null() { current_ctx() } else { ctx }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__RegExp__Exec(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-  _subject: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
+  context: *const std::os::raw::c_void,
+  subject: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let ctx = ctx_from_raw_context(context);
+  if ctx.is_null() || this.is_null() || subject.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    let this_val = jsval_of(this as *const Value);
+    let exec = JS_GetPropertyStr(ctx, this_val, c"exec".as_ptr());
+    if exec.tag == JS_TAG_EXCEPTION {
+      clear_exception(ctx);
+      return ptr::null();
+    }
+    if !JS_IsFunction(ctx, exec) {
+      JS_FreeValue(ctx, exec);
+      return ptr::null();
+    }
+
+    let mut args = [JS_DupValue(ctx, jsval_of(subject as *const Value))];
+    let result = JS_Call(ctx, exec, this_val, 1, args.as_mut_ptr());
+    JS_FreeValue(ctx, exec);
+    JS_FreeValue(ctx, args[0]);
+    if result.tag == JS_TAG_EXCEPTION {
+      clear_exception(ctx);
+      return ptr::null();
+    }
+    if !jsv_is_object(&result) {
+      JS_FreeValue(ctx, result);
+      return ptr::null();
+    }
+    intern::<Object>(result) as *const std::os::raw::c_void
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__RegExp__GetSource(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    let source = JS_GetPropertyStr(
+      ctx,
+      jsval_of(this as *const Value),
+      c"source".as_ptr(),
+    );
+    if source.tag == JS_TAG_EXCEPTION {
+      clear_exception(ctx);
+      return ptr::null();
+    }
+    intern::<V8String>(source) as *const std::os::raw::c_void
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__RegExp__New(
-  _context: *const std::os::raw::c_void,
-  _pattern: *const std::os::raw::c_void,
-  _flags: crate::RegExpCreationFlags,
+  context: *const std::os::raw::c_void,
+  pattern: *const std::os::raw::c_void,
+  flags: crate::RegExpCreationFlags,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let ctx = ctx_from_raw_context(context);
+  if ctx.is_null() || pattern.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let ctor = JS_GetPropertyStr(ctx, global, c"RegExp".as_ptr());
+    JS_FreeValue(ctx, global);
+    if ctor.tag == JS_TAG_EXCEPTION {
+      clear_exception(ctx);
+      return ptr::null();
+    }
+    if !JS_IsConstructor(ctx, ctor) {
+      JS_FreeValue(ctx, ctor);
+      return ptr::null();
+    }
+
+    let flag_string = regexp_flag_string(flags);
+    let mut args = [
+      JS_DupValue(ctx, jsval_of(pattern as *const Value)),
+      JS_NewStringLen(
+        ctx,
+        flag_string.as_ptr() as *const c_char,
+        flag_string.len(),
+      ),
+    ];
+    if args[1].tag == JS_TAG_EXCEPTION {
+      clear_exception(ctx);
+      JS_FreeValue(ctx, args[0]);
+      JS_FreeValue(ctx, ctor);
+      return ptr::null();
+    }
+
+    let regexp = JS_CallConstructor(ctx, ctor, 2, args.as_mut_ptr());
+    JS_FreeValue(ctx, ctor);
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, args[1]);
+    if regexp.tag == JS_TAG_EXCEPTION {
+      clear_exception(ctx);
+      return ptr::null();
+    }
+    if !JS_IsRegExp(regexp) {
+      JS_FreeValue(ctx, regexp);
+      return ptr::null();
+    }
+    intern::<crate::RegExp>(regexp) as *const std::os::raw::c_void
+  }
 }

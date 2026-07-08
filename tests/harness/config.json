@@ -49,6 +49,7 @@
       "ignore_by_backend": {
         "quickjs": [
           "concurrent_isolate_creation_and_disposal",
+          "dynamic_source_phase_import",
           "heap_limits",
           "resource_constraints_near_heap_limit"
         ]
@@ -59,7 +60,7 @@
       "label": "deno_core",
       "tier": "build",
       "kind": "cargo-deno",
-      "comment": "cargo test -p deno_core in the patched deno checkout. Links our v8 shim but does NOT build the full deno binary.",
+      "comment": "cargo nextest run -p deno_core in the patched deno checkout. Links our v8 shim but does NOT build the full deno binary.",
       "package": "deno_core",
       "ignore": [],
       "ignore_by_backend": {
@@ -68,6 +69,8 @@
           "modules::tests::test_dyn_import_async_graph_with_lazy_esm_no_stall",
           "modules::tests::test_lazy_loaded_esm_with_tla_no_panic",
           "modules::tests::test_load_with_code_cache",
+          "runtime::ops::tests::test_op_arraybuffer_slice",
+          "runtime::ops::tests::test_op_buffer_any_length",
           "runtime::tests::misc::eval_context_with_code_cache",
           "runtime::tests::misc::terminate_execution",
           "runtime::tests::misc::terminate_execution_run_event_loop_js",

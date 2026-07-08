@@ -57,6 +57,37 @@ pub struct JSValue {
   pub tag: i64,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Default)]
+pub struct JSMemoryUsage {
+  pub malloc_size: i64,
+  pub malloc_limit: i64,
+  pub memory_used_size: i64,
+  pub malloc_count: i64,
+  pub memory_used_count: i64,
+  pub atom_count: i64,
+  pub atom_size: i64,
+  pub str_count: i64,
+  pub str_size: i64,
+  pub obj_count: i64,
+  pub obj_size: i64,
+  pub prop_count: i64,
+  pub prop_size: i64,
+  pub shape_count: i64,
+  pub shape_size: i64,
+  pub js_func_count: i64,
+  pub js_func_size: i64,
+  pub js_func_code_size: i64,
+  pub js_func_pc2line_count: i64,
+  pub js_func_pc2line_size: i64,
+  pub c_func_count: i64,
+  pub array_count: i64,
+  pub fast_array_count: i64,
+  pub fast_array_elements: i64,
+  pub binary_object_count: i64,
+  pub binary_object_size: i64,
+}
+
 impl JSValue {
   pub fn as_ptr(&self) -> *const Self {
     self as *const Self
@@ -250,6 +281,7 @@ unsafe extern "C" {
   pub fn JS_SetMemoryLimit(rt: *mut JSRuntime, limit: usize);
   pub fn JS_SetMaxStackSize(rt: *mut JSRuntime, stack_size: usize);
   pub fn JS_SetCanBlock(rt: *mut JSRuntime, can_block: bool);
+  pub fn JS_ComputeMemoryUsage(rt: *mut JSRuntime, usage: *mut JSMemoryUsage);
   pub fn JS_SetSharedArrayBufferFunctions(
     rt: *mut JSRuntime,
     sf: *const JSSharedArrayBufferFunctions,
@@ -358,6 +390,7 @@ unsafe extern "C" {
   ) -> JSValue;
 
   pub fn JS_IsArray(v: JSValue) -> bool;
+  pub fn JS_IsRegExp(v: JSValue) -> bool;
   pub fn JS_IsFunction(ctx: *mut JSContext, v: JSValue) -> bool;
   pub fn JS_IsConstructor(ctx: *mut JSContext, v: JSValue) -> bool;
   pub fn JS_GetPropertyStr(

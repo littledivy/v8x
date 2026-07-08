@@ -112,7 +112,7 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
-  # deno_core test suite per backend: clone+patch deno, `cargo test -p
+  # deno_core test suite per backend: clone+patch deno, `cargo nextest run -p
   # deno_core` against our v8 shim. No full deno binary (node-compat + unit are
   # dropped for now to keep CI cheap). macOS so the JSC backends link/JIT.
   # ---------------------------------------------------------------------------
@@ -148,6 +148,7 @@ jobs:
             git submodule update --init --depth 1 vendor/rusty_v8 vendor/quickjs-ng vendor/wamr
           fi
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       # deno_core::tests::test_rebuild_async_stubs shells out to a stock
       # `deno` CLI (and panics rather than skipping when it's absent); the
       # macos-15 image stopped shipping one.
@@ -197,14 +198,14 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      # deno_core test suite only — `cargo test -p deno_core`, no full deno
+      # deno_core test suite only — `cargo nextest run -p deno_core`, no full deno
       # binary (node-compat + unit are dropped for now to keep CI cheap).
       - name: Run deno_core suite (${{ matrix.backend }})
         env:
           PR: ${{ github.event_name == 'pull_request' && '--check' || '' }}
         run: |
           set -uo pipefail
-          # Same linker flags v82jsc/deno use; otherwise cargo test for
+          # Same linker flags v82jsc/deno use; otherwise cargo nextest for
           # deno_core picks up the deno repo's default -fuse-ld=lld (absent on
           # the runner) and fails with "invalid linker name".
           export RUSTFLAGS="-C link-arg=-fuse-ld=/usr/bin/ld -C link-arg=-L$(xcrun --show-sdk-path)/usr/lib"

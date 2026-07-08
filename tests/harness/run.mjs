@@ -10,7 +10,7 @@
 //   --update           rewrite the baseline to exactly the current pass set.
 //   --deno-dir=PATH    patched deno checkout (deno_core / deno-test suites).
 //   --deno-bin=PATH    built deno binary (deno-test suites).
-//   --skip-build       reuse already-built test binaries (cargo suites).
+//   --skip-build       reuse already-built test binaries (cargo-self suites).
 //
 // With neither --check nor --update it just runs + reports (informational).
 import fs from "node:fs";
@@ -25,6 +25,7 @@ import {
   loadConfig,
   parseJUnit,
   parseLibtest,
+  parseNextestJson,
   ratchet,
   run,
   saveBaseline,
@@ -364,14 +365,90 @@ async function runCargoSelf() {
 
 async function runCargoDeno() {
   const denoDir = reqDenoDir();
-  const bins = cargoBuild(["-p", s.package], denoDir, false);
-  if (!bins) {
-    console.error(`deno_core test build failed — counts as 0 passing`);
-    return finalize({ pass: new Set(), fail: new Set(), skip: new Set() });
+  ensureDenoV8Patch(denoDir);
+  const env = {
+    CARGO_TERM_COLOR: "never",
+    NEXTEST_EXPERIMENTAL_LIBTEST_JSON: "1",
+  };
+  if (needsCodesign) {
+    const list = run(
+      "cargo",
+      [
+        "nextest",
+        "list",
+        "-p",
+        s.package,
+        "--message-format",
+        "json",
+        "--list-type",
+        "binaries-only",
+        "--color",
+        "never",
+        "--no-pager",
+      ],
+      { cwd: denoDir, env, echo: false },
+    );
+    if (list.code !== 0) {
+      process.stderr.write(list.out);
+      console.error(`deno_core nextest list failed — counts as 0 passing`);
+      return finalize({ pass: new Set(), fail: new Set(), skip: new Set() });
+    }
+    for (const bin of nextestBinaryPaths(list.out)) codesign(bin);
   }
-  // Run from the crate dir so cwd-relative fixtures resolve.
-  const out = await runBins(bins, path.join(denoDir, "libs/core"));
-  return finalize(parseLibtest(out));
+
+  const skipArgs = [...IGNORE].flatMap((name) => ["--skip", name]);
+  const r = run(
+    "cargo",
+    [
+      "nextest",
+      "run",
+      "-p",
+      s.package,
+      "--message-format",
+      "libtest-json",
+      "--message-format-version",
+      "0.1",
+      "--no-fail-fast",
+      "--no-tests=pass",
+      "--color",
+      "never",
+      "--no-pager",
+      "--success-output",
+      "never",
+      "--failure-output",
+      "final",
+      "--status-level",
+      "none",
+      "--final-status-level",
+      "none",
+      ...(skipArgs.length ? ["--", ...skipArgs] : []),
+    ],
+    { cwd: denoDir, env, echo: false },
+  );
+  const parsed = parseNextestJson(r.out);
+  if (r.code !== 0 && parsed.pass.size + parsed.fail.size + parsed.skip.size === 0) {
+    process.stderr.write(r.out);
+  }
+  return finalize(parsed);
+}
+
+function nextestBinaryPaths(output) {
+  const bins = [];
+  for (const line of output.split("\n")) {
+    if (!line.startsWith("{")) continue;
+    let message;
+    try {
+      message = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    for (const binary of Object.values(message["rust-binaries"] || {})) {
+      if (binary && typeof binary["binary-path"] === "string") {
+        bins.push(binary["binary-path"]);
+      }
+    }
+  }
+  return bins;
 }
 
 function ensureIcuData() {
@@ -421,6 +498,24 @@ function discoverBins(depsDir, names) {
 
 function reqDenoDir() {
   return opt("deno-dir") || die("--deno-dir=PATH required for this suite");
+}
+
+function ensureDenoV8Patch(denoDir) {
+  const cargoToml = path.join(denoDir, "Cargo.toml");
+  const text = fs.existsSync(cargoToml) ? fs.readFileSync(cargoToml, "utf8") : "";
+  const patchedPaths = [];
+  const re = /^\s*v8\s*=\s*\{[^}]*\bpath\s*=\s*"([^"]+)"/gm;
+  for (let m; (m = re.exec(text)) !== null; ) {
+    patchedPaths.push(path.resolve(denoDir, m[1]));
+  }
+  if (!patchedPaths.some((p) => p === ROOT)) {
+    const found = patchedPaths.length ? patchedPaths.join(", ") : "none";
+    die(
+      `deno checkout is not patched to use this v8x checkout.\n` +
+        `expected [patch.crates-io] v8 path: ${ROOT}\n` +
+        `found v8 patch path(s): ${found}`,
+    );
+  }
 }
 
 // Resolve the engine's version string for the dashboard label. Runs inside the
