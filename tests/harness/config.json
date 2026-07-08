@@ -70,6 +70,8 @@
           "modules::tests::test_dyn_import_async_graph_with_lazy_esm_no_stall",
           "modules::tests::test_lazy_loaded_esm_with_tla_no_panic",
           "modules::tests::test_load_with_code_cache",
+          "runtime::ops::tests::test_op_arraybuffer_slice",
+          "runtime::ops::tests::test_op_buffer_any_length",
           "runtime::tests::misc::eval_context_with_code_cache",
           "runtime::tests::misc::terminate_execution",
           "runtime::tests::misc::terminate_execution_run_event_loop_js",
