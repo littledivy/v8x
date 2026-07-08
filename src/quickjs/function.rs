@@ -823,9 +823,54 @@ fn external_values()
   T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+#[derive(Clone, Copy)]
+struct FunctionScriptInfo {
+  line: crate::support::int,
+  column: crate::support::int,
+}
+
+thread_local! {
+  static FUNCTION_SCRIPT_INFO: std::cell::RefCell<
+    std::collections::HashMap<usize, FunctionScriptInfo>,
+  > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 #[inline]
 fn external_key(v: JSValue) -> usize {
   jsv_get_ptr(&v) as usize
+}
+
+#[inline]
+fn function_key(v: JSValue) -> usize {
+  jsv_get_ptr(&v) as usize
+}
+
+pub(crate) fn record_function_script_position(
+  function: JSValue,
+  line: crate::support::int,
+  column: crate::support::int,
+) {
+  let key = function_key(function);
+  if key == 0 {
+    return;
+  }
+  FUNCTION_SCRIPT_INFO.with(|m| {
+    m.borrow_mut()
+      .insert(key, FunctionScriptInfo { line, column });
+  });
+}
+
+fn function_script_info(
+  this: *const std::os::raw::c_void,
+) -> Option<FunctionScriptInfo> {
+  if this.is_null() {
+    return None;
+  }
+  let key = function_key(jsval_of(this as *const Function));
+  if key == 0 {
+    return None;
+  }
+  FUNCTION_SCRIPT_INFO.with(|m| m.borrow().get(&key).copied())
 }
 
 /// Allocate a class id and register the `v8::External` class on `rt`. Must be
@@ -2126,16 +2171,20 @@ pub extern "C" fn v8__Function__GetName(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__GetScriptColumnNumber(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  function_script_info(this)
+    .map(|info| info.column)
+    .unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__GetScriptLineNumber(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  function_script_info(this)
+    .map(|info| info.line)
+    .unwrap_or(-1)
 }
 
 #[unsafe(no_mangle)]

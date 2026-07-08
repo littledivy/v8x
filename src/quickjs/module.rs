@@ -2537,6 +2537,111 @@ pub extern "C" fn v8__Module__SourceOffsetToLocation(
   }
 }
 
+fn is_ascii_ident_start(b: u8) -> bool {
+  b == b'_' || b == b'$' || b.is_ascii_alphabetic()
+}
+
+fn is_ascii_ident_continue(b: u8) -> bool {
+  is_ascii_ident_start(b) || b.is_ascii_digit()
+}
+
+fn skip_ascii_ws<'a>(rest: &'a str, column: &mut usize) -> &'a str {
+  let skipped = rest.len() - rest.trim_start_matches([' ', '\t']).len();
+  *column += skipped;
+  &rest[skipped..]
+}
+
+fn exported_function_positions(
+  source: &str,
+) -> Vec<(std::string::String, int, int)> {
+  let mut out = Vec::new();
+  for (line, original) in source.lines().enumerate() {
+    let mut column =
+      original.len() - original.trim_start_matches([' ', '\t']).len();
+    let mut rest = &original[column..];
+
+    let Some(after_export) = rest.strip_prefix("export") else {
+      continue;
+    };
+    rest = after_export;
+    column += "export".len();
+    rest = skip_ascii_ws(rest, &mut column);
+
+    if let Some(after_default) = rest.strip_prefix("default") {
+      rest = after_default;
+      column += "default".len();
+      rest = skip_ascii_ws(rest, &mut column);
+    }
+
+    if let Some(after_async) = rest.strip_prefix("async") {
+      rest = after_async;
+      column += "async".len();
+      rest = skip_ascii_ws(rest, &mut column);
+    }
+
+    let Some(after_function) = rest.strip_prefix("function") else {
+      continue;
+    };
+    rest = after_function;
+    column += "function".len();
+    rest = skip_ascii_ws(rest, &mut column);
+
+    let Some(first) = rest.as_bytes().first().copied() else {
+      continue;
+    };
+    if !is_ascii_ident_start(first) {
+      continue;
+    }
+
+    let name_len = rest
+      .as_bytes()
+      .iter()
+      .copied()
+      .take_while(|b| is_ascii_ident_continue(*b))
+      .count();
+    if name_len == 0 {
+      continue;
+    }
+
+    out.push((
+      rest[..name_len].to_string(),
+      line as int,
+      (column + name_len) as int,
+    ));
+  }
+  out
+}
+
+unsafe fn annotate_namespace_function_positions(
+  ctx: *mut JSContext,
+  namespace: JSValue,
+  module: *const Module,
+) {
+  let Some(source_text) = with_module_state(module, |m| m.source_text.clone())
+  else {
+    return;
+  };
+  if source_text.is_empty() {
+    return;
+  }
+
+  for (name, line, column) in exported_function_positions(&source_text) {
+    let Ok(cname) = CString::new(name) else {
+      continue;
+    };
+    let value = unsafe { JS_GetPropertyStr(ctx, namespace, cname.as_ptr()) };
+    if value.tag == JS_TAG_EXCEPTION {
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+      continue;
+    }
+    if unsafe { JS_IsFunction(ctx, value) } {
+      super::function::record_function_script_position(value, line, column);
+    }
+    unsafe { JS_FreeValue(ctx, value) };
+  }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__GetModuleNamespace(
   this: *const Module,
@@ -2584,6 +2689,7 @@ pub extern "C" fn v8__Module__GetModuleNamespace(
   if !def.is_null() {
     let ns = unsafe { JS_GetModuleNamespace(ctx, def) };
     if ns.tag != JS_TAG_EXCEPTION {
+      unsafe { annotate_namespace_function_positions(ctx, ns, this) };
       return intern::<Value>(ns);
     }
     let exc = unsafe { JS_GetException(ctx) };
