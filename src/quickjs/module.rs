@@ -2209,8 +2209,8 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
   source: *mut Source,
   arguments_count: usize,
   arguments: *const *const V8String,
-  _context_extensions_count: usize,
-  _context_extensions: *const *const Object,
+  context_extensions_count: usize,
+  context_extensions: *const *const Object,
   _options: CompileOptions,
   _no_cache_reason: NoCacheReason,
 ) -> *const Function {
@@ -2241,7 +2241,36 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
     }
   }
 
-  let wrapped = format!("(function({}) {{\n{}\n}})", arg_names.join(","), body);
+  let mut extension_names: Vec<std::string::String> = Vec::new();
+  let has_extensions =
+    context_extensions_count > 0 && !context_extensions.is_null();
+  if has_extensions {
+    extension_names.reserve(context_extensions_count);
+    for i in 0..context_extensions_count {
+      extension_names.push(format!("__v8_ext{i}"));
+    }
+  }
+
+  let wrapped = if has_extensions {
+    let mut wrapped = format!("(function({}) {{\n", extension_names.join(","));
+    for name in &extension_names {
+      wrapped.push_str("with (");
+      wrapped.push_str(name);
+      wrapped.push_str(") {\n");
+    }
+    wrapped.push_str("return (function(");
+    wrapped.push_str(&arg_names.join(","));
+    wrapped.push_str(") {\n");
+    wrapped.push_str(&body);
+    wrapped.push_str("\n});\n");
+    for _ in &extension_names {
+      wrapped.push_str("}\n");
+    }
+    wrapped.push_str("})");
+    wrapped
+  } else {
+    format!("(function({}) {{\n{}\n}})", arg_names.join(","), body)
+  };
   let Ok(csrc) = CString::new(wrapped) else {
     unsafe {
       JS_ThrowTypeError(ctx, c"compile_function: NUL in source".as_ptr())
@@ -2257,7 +2286,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
     name
   })
   .unwrap_or_else(|_| CString::new("<function>").unwrap());
-  let result = unsafe {
+  let compiled = unsafe {
     JS_Eval(
       ctx,
       csrc.as_ptr(),
@@ -2266,7 +2295,42 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
       JS_EVAL_TYPE_GLOBAL,
     )
   };
-  if result.tag == JS_TAG_EXCEPTION {
+  if compiled.tag == JS_TAG_EXCEPTION {
+    return ptr::null();
+  }
+  let result = if has_extensions {
+    if unsafe { !JS_IsFunction(ctx, compiled) } {
+      unsafe { JS_FreeValue(ctx, compiled) };
+      return ptr::null();
+    }
+    let mut args: Vec<JSValue> = Vec::with_capacity(context_extensions_count);
+    for i in 0..context_extensions_count {
+      let extension = unsafe { *context_extensions.add(i) };
+      if extension.is_null() {
+        args.push(jsv_undefined());
+      } else {
+        args.push(jsval_of(extension));
+      }
+    }
+    let result = unsafe {
+      JS_Call(
+        ctx,
+        compiled,
+        jsv_undefined(),
+        args.len() as _,
+        args.as_mut_ptr(),
+      )
+    };
+    unsafe { JS_FreeValue(ctx, compiled) };
+    if result.tag == JS_TAG_EXCEPTION {
+      return ptr::null();
+    }
+    result
+  } else {
+    compiled
+  };
+  if unsafe { !JS_IsFunction(ctx, result) } {
+    unsafe { JS_FreeValue(ctx, result) };
     return ptr::null();
   }
   intern::<Function>(result)
