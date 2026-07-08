@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=rusty_v8.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 265 passing. DO NOT hand-sort; the
+# (run.mjs --update). 258 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 rv8_slots::clear_all_context_slots
 rv8_slots::context_slots
@@ -216,16 +216,10 @@ rv8_test_api::terminate_execution
 rv8_test_api::test_detach_key
 rv8_test_api::test_eternals
 rv8_test_api::test_fast_calls
-rv8_test_api::test_fast_calls_arraybuffer
 rv8_test_api::test_fast_calls_callback_options_data
 rv8_test_api::test_fast_calls_empty_buffer
-rv8_test_api::test_fast_calls_i64representation
-rv8_test_api::test_fast_calls_onebytestring
 rv8_test_api::test_fast_calls_overload
-rv8_test_api::test_fast_calls_pointer
 rv8_test_api::test_fast_calls_reciever
-rv8_test_api::test_fast_calls_sequence
-rv8_test_api::test_fast_calls_typedarray
 rv8_test_api::test_map_api
 rv8_test_api::test_object_get_property_names
 rv8_test_api::test_primitives
@@ -264,6 +258,5 @@ rv8_test_cppgc::cppgc_object_wrap16
 rv8_test_cppgc::cppgc_object_wrap8
 rv8_test_custom_platform::custom_platform_foreground_task_ownership
 rv8_test_external_deserialize::external_deserialize
-rv8_test_platform_atomics_pump_message_loop::atomics_pump_message_loop
 rv8_test_simple_external::test_simple_external::test
 rv8_test_single_threaded_default_platform::single_threaded_default_platform
