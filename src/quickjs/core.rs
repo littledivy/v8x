@@ -1734,8 +1734,14 @@ pub extern "C" fn v8__Script__Compile(
       let rewritten = std::str::from_utf8(source_bytes)
         .ok()
         .and_then(rewrite_script_source);
-      let (compile_ptr, compile_len) = match rewritten.as_ref() {
-        Some(text) => (text.as_ptr() as *const c_char, text.len()),
+      let rewritten_bytes = rewritten.as_ref().map(|text| {
+        let mut bytes = Vec::with_capacity(text.len() + 1);
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.push(0);
+        bytes
+      });
+      let (compile_ptr, compile_len) = match rewritten_bytes.as_ref() {
+        Some(bytes) => (bytes.as_ptr() as *const c_char, bytes.len() - 1),
         None => (cstr, len),
       };
       let url_ptr = match name.as_ref() {
