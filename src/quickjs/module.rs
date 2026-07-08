@@ -202,6 +202,7 @@ struct ModuleState {
 
   source_text: std::string::String,
   source_name: std::string::String,
+  script_id: int,
 
   // The `//# sourceMappingURL=` magic-comment value (if any), extracted from the
   // module source at compile time. deno reads it via
@@ -241,12 +242,18 @@ thread_local! {
 
     static SCRIPT_SOURCE_MAP_URLS: RefCell<HashMap<usize, std::string::String>> =
         RefCell::new(HashMap::new());
+
+    static MODULE_SCRIPT_IDS_BY_NAME: RefCell<HashMap<std::string::String, int>> =
+        RefCell::new(HashMap::new());
+
+    static NEXT_MODULE_SCRIPT_ID: std::cell::Cell<int> = const { std::cell::Cell::new(1) };
 }
 
 #[repr(C)]
 struct RawScriptOrigin {
   resource_name: usize,
   source_map_url: usize,
+  script_id: int,
 }
 
 #[repr(C)]
@@ -257,6 +264,33 @@ struct RawSource {
   resource_column_offset: int,
   resource_options: int,
   source_map_url: usize,
+}
+
+fn next_module_script_id() -> int {
+  NEXT_MODULE_SCRIPT_ID.with(|next| {
+    let id = next.get();
+    next.set(id.saturating_add(1).max(1));
+    id
+  })
+}
+
+fn assign_module_script_id(name: &str) -> int {
+  let id = next_module_script_id();
+  if !name.is_empty() {
+    MODULE_SCRIPT_IDS_BY_NAME.with(|m| {
+      m.borrow_mut().insert(name.to_string(), id);
+    });
+  }
+  id
+}
+
+fn module_script_id_for_name(name: &str) -> int {
+  if name.is_empty() {
+    return assign_module_script_id(name);
+  }
+  MODULE_SCRIPT_IDS_BY_NAME
+    .with(|m| m.borrow().get(name).copied())
+    .unwrap_or_else(|| assign_module_script_id(name))
 }
 
 thread_local! {
@@ -1397,6 +1431,7 @@ pub(crate) fn tape_make_module_handle(
     return this;
   }
   let source = lookup_module_source_by_name(name).unwrap_or_default();
+  let script_id = module_script_id_for_name(name);
   let def = MODULE_DEF_CACHE
     .with(|c| c.borrow().get(name).copied())
     .unwrap_or(0) as *mut JSModuleDef;
@@ -1420,6 +1455,7 @@ pub(crate) fn tape_make_module_handle(
       is_async: has_top_level_await(&source),
       source_text: source.clone(),
       source_name: name.to_string(),
+      script_id,
       source_map_url: None,
     },
   );
@@ -1446,6 +1482,8 @@ pub(crate) fn clear_thread_module_caches() {
   MODULE_WRAPPER_BY_NAME.with(|c| c.borrow_mut().clear());
   MAIN_MODULE_URL.with(|c| c.borrow_mut().take());
   PENDING_SOURCE_IMPORTS.with(|c| c.borrow_mut().clear());
+  MODULE_SCRIPT_IDS_BY_NAME.with(|c| c.borrow_mut().clear());
+  NEXT_MODULE_SCRIPT_ID.with(|c| c.set(1));
 }
 
 pub(crate) unsafe extern "C" fn module_normalize_callback(
@@ -1842,7 +1880,7 @@ pub extern "C" fn v8__ScriptOrigin__CONSTRUCT(
   _resource_line_offset: i32,
   _resource_column_offset: i32,
   _resource_is_shared_cross_origin: bool,
-  _script_id: i32,
+  script_id: i32,
   source_map_url: *const Value,
   _resource_is_opaque: bool,
   _is_wasm: bool,
@@ -1855,6 +1893,7 @@ pub extern "C" fn v8__ScriptOrigin__CONSTRUCT(
       let raw = buf as *mut RawScriptOrigin;
       (*raw).resource_name = resource_name as usize;
       (*raw).source_map_url = source_map_url as usize;
+      (*raw).script_id = script_id;
     }
   }
 }
@@ -2109,6 +2148,8 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   } else {
     specifier.clone()
   };
+  let source_map_url = unsafe { source_map_url_for_source(ctx, source, &text) };
+  let script_id = assign_module_script_id(&fname);
 
   let import_specifiers = parse_import_specifiers(&text);
   let spec_strs: Vec<std::string::String> =
@@ -2150,9 +2191,10 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
       source_imports,
       synthetic: false,
       is_async,
-      source_map_url: extract_source_mapping_url(&text),
       source_text: text,
       source_name: fname.clone(),
+      script_id,
+      source_map_url,
     },
   );
   // Map name -> this wrapper so deno's import.meta callback can be handed the
@@ -2617,7 +2659,15 @@ unsafe fn annotate_namespace_function_positions(
   namespace: JSValue,
   module: *const Module,
 ) {
-  let Some(source_text) = with_module_state(module, |m| m.source_text.clone())
+  let Some((source_text, source_name, script_id, source_map_url)) =
+    with_module_state(module, |m| {
+      (
+        m.source_text.clone(),
+        m.source_name.clone(),
+        m.script_id,
+        m.source_map_url.clone(),
+      )
+    })
   else {
     return;
   };
@@ -2636,7 +2686,14 @@ unsafe fn annotate_namespace_function_positions(
       continue;
     }
     if unsafe { JS_IsFunction(ctx, value) } {
-      super::function::record_function_script_position(value, line, column);
+      super::function::record_function_script_position(
+        value,
+        line,
+        column,
+        script_id,
+        (!source_name.is_empty()).then_some(source_name.clone()),
+        source_map_url.clone(),
+      );
     }
     unsafe { JS_FreeValue(ctx, value) };
   }
@@ -3333,6 +3390,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
       source_map_url: None,
       source_text: std::string::String::new(),
       source_name: std::string::String::new(),
+      script_id: assign_module_script_id(""),
     },
   );
   this
@@ -3670,28 +3728,41 @@ pub extern "C" fn v8__Module__IsSourceTextModule(
 pub extern "C" fn v8__Module__ScriptId(
   this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  // V8 script ids are small ints; any per-module stable value works. Derive
-  // one from the handle-state key so it survives instantiate/evaluate.
-  ((this as usize >> 4) & 0x3fff_ffff) as crate::support::int
+  with_module_state(this as *const Module, |m| m.script_id).unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptOrigin__ResourceName(
-  _origin: *const std::os::raw::c_void,
+  origin: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  if origin.is_null() {
+    return std::ptr::null();
+  }
+  unsafe {
+    (*(origin as *const RawScriptOrigin)).resource_name
+      as *const std::os::raw::c_void
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptOrigin__ScriptId(
-  _origin: *const std::os::raw::c_void,
+  origin: *const std::os::raw::c_void,
 ) -> i32 {
-  0
+  if origin.is_null() {
+    return 0;
+  }
+  unsafe { (*(origin as *const RawScriptOrigin)).script_id }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptOrigin__SourceMapUrl(
-  _origin: *const std::os::raw::c_void,
+  origin: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  if origin.is_null() {
+    return std::ptr::null();
+  }
+  unsafe {
+    (*(origin as *const RawScriptOrigin)).source_map_url
+      as *const std::os::raw::c_void
+  }
 }

@@ -823,10 +823,20 @@ fn external_values()
   T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FunctionScriptInfo {
   line: crate::support::int,
   column: crate::support::int,
+  script_id: crate::support::int,
+  resource_name: Option<std::string::String>,
+  source_map_url: Option<std::string::String>,
+}
+
+#[repr(C)]
+struct RawScriptOrigin {
+  resource_name: usize,
+  source_map_url: usize,
+  script_id: crate::support::int,
 }
 
 thread_local! {
@@ -849,14 +859,25 @@ pub(crate) fn record_function_script_position(
   function: JSValue,
   line: crate::support::int,
   column: crate::support::int,
+  script_id: crate::support::int,
+  resource_name: Option<std::string::String>,
+  source_map_url: Option<std::string::String>,
 ) {
   let key = function_key(function);
   if key == 0 {
     return;
   }
   FUNCTION_SCRIPT_INFO.with(|m| {
-    m.borrow_mut()
-      .insert(key, FunctionScriptInfo { line, column });
+    m.borrow_mut().insert(
+      key,
+      FunctionScriptInfo {
+        line,
+        column,
+        script_id,
+        resource_name,
+        source_map_url,
+      },
+    );
   });
 }
 
@@ -870,7 +891,21 @@ fn function_script_info(
   if key == 0 {
     return None;
   }
-  FUNCTION_SCRIPT_INFO.with(|m| m.borrow().get(&key).copied())
+  FUNCTION_SCRIPT_INFO.with(|m| m.borrow().get(&key).cloned())
+}
+
+fn origin_string_slot(ctx: *mut JSContext, text: &str) -> usize {
+  if ctx.is_null() {
+    return 0;
+  }
+  let value =
+    unsafe { JS_NewStringLen(ctx, text.as_ptr() as *const c_char, text.len()) };
+  if value.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return 0;
+  }
+  intern::<Value>(value) as usize
 }
 
 /// Allocate a class id and register the `v8::External` class on `rt`. Must be
@@ -2189,16 +2224,46 @@ pub extern "C" fn v8__Function__GetScriptLineNumber(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__GetScriptOrigin(
-  _this: *const std::os::raw::c_void,
-  _out: *mut std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
+  out: *mut std::os::raw::c_void,
 ) {
+  if out.is_null() {
+    return;
+  }
+  unsafe {
+    ptr::write_bytes(
+      out as *mut u8,
+      0u8,
+      std::mem::size_of::<crate::ScriptOrigin>(),
+    );
+  }
+  let Some(info) = function_script_info(this) else {
+    return;
+  };
+  let ctx = current_ctx();
+  let raw = out as *mut RawScriptOrigin;
+  unsafe {
+    (*raw).script_id = info.script_id;
+  }
+  if let Some(resource_name) = info.resource_name.as_deref() {
+    unsafe {
+      (*raw).resource_name = origin_string_slot(ctx, resource_name);
+    }
+  }
+  if let Some(source_map_url) = info.source_map_url.as_deref() {
+    unsafe {
+      (*raw).source_map_url = origin_string_slot(ctx, source_map_url);
+    }
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__ScriptId(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  function_script_info(this)
+    .map(|info| info.script_id)
+    .unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
