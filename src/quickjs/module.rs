@@ -381,9 +381,6 @@ thread_local! {
     static SOURCE_CB: std::cell::Cell<Option<ResolveSourceCallback<'static>>> =
         const { std::cell::Cell::new(None) };
 
-    static PENDING_SOURCE_IMPORTS: RefCell<
-        Vec<(*const Module, Vec<(u64, std::string::String)>)>,
-    > = const { RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn set_dynamic_import_callback(
@@ -1528,7 +1525,6 @@ pub(crate) fn clear_thread_module_caches() {
   RESOLVED_SPECIFIERS.with(|c| c.borrow_mut().clear());
   MODULE_WRAPPER_BY_NAME.with(|c| c.borrow_mut().clear());
   MAIN_MODULE_URL.with(|c| c.borrow_mut().take());
-  PENDING_SOURCE_IMPORTS.with(|c| c.borrow_mut().clear());
   MODULE_SCRIPT_IDS_BY_NAME.with(|c| c.borrow_mut().clear());
   NEXT_MODULE_SCRIPT_ID.with(|c| c.set(1));
 }
@@ -2252,11 +2248,6 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   let this = intern_module(handle_val);
   if this.is_null() {
     return ptr::null();
-  }
-  if !source_imports.is_empty() {
-    PENDING_SOURCE_IMPORTS.with(|p| {
-      p.borrow_mut().push((this, source_imports.clone()));
-    });
   }
   record_module_state(
     this,
@@ -3072,18 +3063,6 @@ pub extern "C" fn v8__Module__InstantiateModule(
   let ctx = ctx_of(context);
   if !ctx.is_null() {
     unsafe { build_resolution_map(ctx, context, cb, source_callback, this) };
-
-    if let Some(scb) = source_callback {
-      let pending: Vec<_> =
-        PENDING_SOURCE_IMPORTS.with(|p| p.borrow_mut().drain(..).collect());
-      for (referrer, imports) in pending {
-        for (id, spec) in &imports {
-          unsafe {
-            resolve_source_import(ctx, context, scb, referrer, *id, spec)
-          };
-        }
-      }
-    }
   }
 
   match with_module_state(this, |m| {
