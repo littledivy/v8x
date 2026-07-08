@@ -1820,7 +1820,7 @@ unsafe fn build_resolution_map(
   cb: ResolveModuleCallback,
   source_cb: Option<ResolveSourceCallback>,
   root: *const Module,
-) {
+) -> bool {
   use std::collections::HashSet;
   let mut visited: HashSet<usize> = HashSet::new();
   let mut stack: Vec<*const Module> = vec![root];
@@ -1860,7 +1860,7 @@ unsafe fn build_resolution_map(
         build_static_import_attrs(ctx, attr_pairs)
       });
       if spec_handle.is_null() || attrs_handle.is_null() {
-        continue;
+        return false;
       }
 
       let (
@@ -1875,13 +1875,16 @@ unsafe fn build_resolution_map(
         unsafe { crate::Local::from_raw(m) },
       )
       else {
-        continue;
+        return false;
       };
       let ret = unsafe { cb(ctx_local, spec_local, attrs_local, ref_local) };
 
+      if unsafe { JS_HasException(ctx) } {
+        return false;
+      }
       let resolved: *const Module = unsafe { std::mem::transmute(ret) };
       if resolved.is_null() {
-        continue;
+        return false;
       }
       if let Some(rname) =
         with_module_state(resolved, |st| st.module_name.clone())
@@ -1893,6 +1896,7 @@ unsafe fn build_resolution_map(
       }
     }
   }
+  true
 }
 
 unsafe fn resolve_source_import(
@@ -2909,12 +2913,47 @@ pub extern "C" fn v8__Module__GetModuleRequests(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__SourceOffsetToLocation(
-  _this: *const Module,
-  _offset: int,
+  this: *const Module,
+  offset: int,
   out: *mut Location,
 ) {
-  if !out.is_null() {
-    unsafe { ptr::write_bytes(out as *mut u8, 0u8, size_of::<Location>()) };
+  if out.is_null() {
+    return;
+  }
+
+  let source =
+    with_module_state(this, |m| m.source_text.clone()).unwrap_or_default();
+  let target = if offset <= 0 {
+    0
+  } else {
+    (offset as usize).min(source.len())
+  };
+  let bytes = source.as_bytes();
+  let mut line = 0i32;
+  let mut column = 0i32;
+  let mut i = 0usize;
+  while i < target {
+    match bytes[i] {
+      b'\n' => {
+        line += 1;
+        column = 0;
+      }
+      b'\r' => {
+        line += 1;
+        column = 0;
+        if i + 1 < target && bytes[i + 1] == b'\n' {
+          i += 1;
+        }
+      }
+      _ => column += 1,
+    }
+    i += 1;
+  }
+
+  unsafe {
+    let p = out as *mut i32;
+    *p = line;
+    *p.add(1) = column;
   }
 }
 
@@ -3266,7 +3305,10 @@ pub extern "C" fn v8__Module__InstantiateModule(
   }
   let ctx = ctx_of(context);
   if !ctx.is_null() {
-    unsafe { build_resolution_map(ctx, context, cb, source_callback, this) };
+    if !unsafe { build_resolution_map(ctx, context, cb, source_callback, this) }
+    {
+      return MaybeBool::Nothing;
+    }
   }
 
   match with_module_state(this, |m| {
