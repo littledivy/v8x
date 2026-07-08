@@ -808,10 +808,13 @@ unsafe extern "C" fn promise_rejection_tracker(
   let cb = PROMISE_REJECT_CB.with(|c| c.get());
   let Some(cb) = cb else { return };
 
-  let promise_h = intern_dup::<crate::Promise>(ctx, promise);
-  let reason_h = intern_dup::<Value>(ctx, reason);
-
   let event: usize = if is_handled != 0 { 1 } else { 0 };
+  let promise_h = intern_dup::<crate::Promise>(ctx, promise);
+  let reason_h = if event == 1 {
+    ptr::null()
+  } else {
+    intern_dup::<Value>(ctx, reason)
+  };
   let msg: [usize; 3] = [promise_h as usize, reason_h as usize, event];
   unsafe {
     cb(std::mem::transmute::<
