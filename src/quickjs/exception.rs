@@ -35,12 +35,31 @@ use crate::{
   Context, Function, Location, Message, Promise, PromiseResolver, RealIsolate,
   StackFrame, StackTrace, String, Value,
 };
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
 const MESSAGE_TEXT_PROP: &std::ffi::CStr = c"__v8qjs_message_text";
 const MESSAGE_SOURCE_LINE_PROP: &std::ffi::CStr = c"__v8qjs_source_line";
 const MESSAGE_STACK_PTR_PROP: &std::ffi::CStr = c"__v8qjs_stack_ptr";
+const JS_CLASS_PROMISE: JSClassID = 52;
+
+#[repr(C)]
+struct QjsListHead {
+  prev: *mut QjsListHead,
+  next: *mut QjsListHead,
+}
+
+#[repr(C)]
+struct QjsPromiseData {
+  promise_state: c_int,
+  promise_reactions: [QjsListHead; 2],
+  is_handled: bool,
+  promise_result: JSValue,
+}
+
+unsafe extern "C" {
+  fn JS_GetOpaque(obj: JSValue, class_id: JSClassID) -> *mut c_void;
+}
 
 thread_local! {
   static TRY_CATCH_DEPTH: std::cell::Cell<usize> =
@@ -1181,9 +1200,19 @@ pub extern "C" fn v8__Message__IsSharedCrossOrigin(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Promise__HasHandler(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  if this.is_null() {
+    return false;
+  }
+
+  let data =
+    unsafe { JS_GetOpaque(jsval_of(this as *const Promise), JS_CLASS_PROMISE) };
+  if data.is_null() {
+    return false;
+  }
+
+  unsafe { (*(data as *const QjsPromiseData)).is_handled }
 }
 
 #[unsafe(no_mangle)]
@@ -1325,8 +1354,6 @@ pub extern "C" fn v8__TryCatch__StackTrace(
 // construct columns are moved from the call `(` back to the `new` keyword
 // (recovered from the source line registered at eval time).
 // ---------------------------------------------------------------------------
-
-use std::os::raw::c_int;
 
 thread_local! {
   static PREPARE_STACK_ACTIVE: std::cell::Cell<bool> =

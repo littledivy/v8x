@@ -314,6 +314,54 @@ pub extern "C" fn v8__Context__SetAlignedPointerInEmbedderData(
 
 type JSPromiseHookType = i32;
 
+const PROMISE_REACTION_HOOK_SOURCE: &str = r#"
+(function(beforeHook, afterHook) {
+  var key = Symbol.for("v8x.quickjs.promiseHooks");
+  var state = globalThis[key];
+  if (!state) {
+    state = {};
+    state.originalThen = Promise.prototype.then;
+    state.before = void 0;
+    state.after = void 0;
+    state.busy = false;
+    Object.defineProperty(globalThis, key, { value: state });
+    Promise.prototype.then = function(onFulfilled, onRejected) {
+      var promise = this;
+      function callHook(hook) {
+        if (state.busy || typeof hook !== "function") return;
+        state.busy = true;
+        try {
+          hook(promise);
+        } catch (e) {
+        } finally {
+          state.busy = false;
+        }
+      }
+      function wrap(handler, isReject) {
+        var callable = typeof handler === "function";
+        return function(value) {
+          callHook(state.before);
+          try {
+            if (callable) return handler.call(this, value);
+            if (isReject) throw value;
+            return value;
+          } finally {
+            callHook(state.after);
+          }
+        };
+      }
+      return state.originalThen.call(
+        this,
+        wrap(onFulfilled, false),
+        wrap(onRejected, true)
+      );
+    };
+  }
+  state.before = typeof beforeHook === "function" ? beforeHook : void 0;
+  state.after = typeof afterHook === "function" ? afterHook : void 0;
+})
+"#;
+
 unsafe extern "C" {
   fn JS_SetPromiseHook(
     rt: *mut JSRuntime,
@@ -328,6 +376,45 @@ unsafe extern "C" {
     >,
     opaque: *mut c_void,
   );
+}
+
+unsafe fn install_promise_reaction_hooks(
+  ctx: *mut JSContext,
+  before_hook: JSValue,
+  after_hook: JSValue,
+) {
+  let Ok(source) = std::ffi::CString::new(PROMISE_REACTION_HOOK_SOURCE) else {
+    return;
+  };
+  let helper = unsafe {
+    JS_Eval(
+      ctx,
+      source.as_ptr(),
+      source.as_bytes().len(),
+      c"<v8-promise-hooks>".as_ptr(),
+      JS_EVAL_TYPE_GLOBAL,
+    )
+  };
+  if helper.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return;
+  }
+  if unsafe { !JS_IsFunction(ctx, helper) } {
+    unsafe { JS_FreeValue(ctx, helper) };
+    return;
+  }
+
+  let mut args = [before_hook, after_hook];
+  let ret =
+    unsafe { JS_Call(ctx, helper, jsv_undefined(), 2, args.as_mut_ptr()) };
+  unsafe { JS_FreeValue(ctx, helper) };
+  if ret.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+  } else {
+    unsafe { JS_FreeValue(ctx, ret) };
+  }
 }
 
 thread_local! {
@@ -431,6 +518,7 @@ pub extern "C" fn v8__Context__SetPromiseHooks(
     promote(after_hook),
     promote(resolve_hook),
   ];
+  unsafe { install_promise_reaction_hooks(ctx, new[1], new[2]) };
   let old = PROMISE_HOOKS.with(|h| h.replace(new));
   for v in old {
     if !jsv_is_undefined(&v) {
