@@ -652,6 +652,146 @@ unsafe extern "C" fn named_getter_trampoline(
   result
 }
 
+pub(crate) unsafe fn call_accessor_name_getter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  data: JSValue,
+  getter: crate::AccessorNameGetterCallback,
+) -> JSValue {
+  if ctx.is_null() {
+    return jsv_undefined();
+  }
+
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Value>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let Some(key_handle) = NonNull::new(key_handle as *mut Name) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    return jsv_undefined();
+  };
+  unsafe { (getter)(crate::SealedLocal(key_handle), prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    jsv_exception()
+  } else if jsv_is_undefined(&ret) {
+    jsv_undefined()
+  } else {
+    unsafe { JS_DupValue(ctx, ret) }
+  };
+
+  if !iso.is_null() {
+    let st = iso_state(iso);
+    while st.handles.len() > saved_depth {
+      if let Some(slot) = st.handles.pop() {
+        unsafe {
+          JS_FreeValue(st.ctx, *slot);
+          drop(Box::from_raw(slot));
+        }
+      }
+    }
+  }
+
+  result
+}
+
+pub(crate) unsafe fn call_accessor_name_setter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  value: JSValue,
+  data: JSValue,
+  setter: crate::AccessorNameSetterCallback,
+) -> JSValue {
+  if ctx.is_null() {
+    return jsv_undefined();
+  }
+
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info =
+    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let value_handle = intern_dup::<Value>(ctx, value);
+  let (Some(key_handle), Some(value_handle)) = (
+    NonNull::new(key_handle as *mut Name),
+    NonNull::new(value_handle as *mut Value),
+  ) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    return jsv_undefined();
+  };
+  unsafe {
+    (setter)(
+      crate::SealedLocal(key_handle),
+      crate::SealedLocal(value_handle),
+      prop_info,
+    )
+  };
+
+  let _info = unsafe { Box::from_raw(info_ptr) };
+  let result = if unsafe { JS_HasException(ctx) } {
+    jsv_exception()
+  } else {
+    jsv_undefined()
+  };
+
+  if !iso.is_null() {
+    let st = iso_state(iso);
+    while st.handles.len() > saved_depth {
+      if let Some(slot) = st.handles.pop() {
+        unsafe {
+          JS_FreeValue(st.ctx, *slot);
+          drop(Box::from_raw(slot));
+        }
+      }
+    }
+  }
+
+  result
+}
+
 unsafe fn make_cfunc_magic(
   ctx: *mut JSContext,
   trampoline: unsafe extern "C" fn(

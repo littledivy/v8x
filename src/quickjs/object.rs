@@ -20,9 +20,10 @@ use super::core::{
 use super::quickjs_sys::*;
 use crate::support::{Maybe, MaybeBool, int};
 use crate::{
-  Array, Context, IndexFilter, KeyCollectionMode, KeyConversionMode, Name,
-  Object, Private, PropertyAttribute, PropertyDescriptor, PropertyFilter,
-  RealIsolate, String as V8String, Value,
+  AccessorNameGetterCallback, AccessorNameSetterCallback, Array, Context,
+  IndexFilter, KeyCollectionMode, KeyConversionMode, Name, Object, Private,
+  PropertyAttribute, PropertyDescriptor, PropertyFilter, RealIsolate,
+  String as V8String, Value,
 };
 use std::os::raw::{c_char, c_int};
 use std::ptr;
@@ -67,6 +68,7 @@ unsafe extern "C" {
     tab: *mut JSPropertyEnum,
     len: u32,
   );
+  fn JS_DupAtom(ctx: *mut JSContext, v: JSAtom) -> JSAtom;
 }
 
 #[repr(C)]
@@ -133,6 +135,157 @@ const JS_PROP_HAS_CONFIGURABLE: c_int = 1 << 8;
 const JS_PROP_HAS_WRITABLE: c_int = 1 << 9;
 const JS_PROP_HAS_ENUMERABLE: c_int = 1 << 10;
 const JS_PROP_HAS_VALUE: c_int = 1 << 13;
+
+#[derive(Clone, Copy)]
+struct ObjectAccessorEntry {
+  getter: AccessorNameGetterCallback,
+  setter: Option<AccessorNameSetterCallback>,
+  data: JSValue,
+  atom: JSAtom,
+  attr: u32,
+  lazy: bool,
+}
+
+thread_local! {
+    static OBJECT_ACCESSORS: std::cell::RefCell<Vec<ObjectAccessorEntry>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn register_object_accessor(
+  ctx: *mut JSContext,
+  atom: JSAtom,
+  getter: AccessorNameGetterCallback,
+  setter: Option<AccessorNameSetterCallback>,
+  data_or_null: *const std::os::raw::c_void,
+  attr: PropertyAttribute,
+  lazy: bool,
+) -> c_int {
+  let data = if data_or_null.is_null() {
+    jsv_undefined()
+  } else {
+    unsafe { JS_DupValue(ctx, jsval_of(data_or_null)) }
+  };
+  let atom = unsafe { JS_DupAtom(ctx, atom) };
+  OBJECT_ACCESSORS.with(|entries| {
+    let mut entries = entries.borrow_mut();
+    let magic = entries.len() as c_int;
+    entries.push(ObjectAccessorEntry {
+      getter,
+      setter,
+      data,
+      atom,
+      attr: read_attr(&attr),
+      lazy,
+    });
+    magic
+  })
+}
+
+fn lookup_object_accessor(magic: c_int) -> Option<ObjectAccessorEntry> {
+  if magic < 0 {
+    return None;
+  }
+  OBJECT_ACCESSORS.with(|entries| entries.borrow().get(magic as usize).copied())
+}
+
+unsafe fn object_accessor_cfunc(
+  ctx: *mut JSContext,
+  trampoline: unsafe extern "C" fn(
+    *mut JSContext,
+    JSValue,
+    c_int,
+    *mut JSValue,
+    c_int,
+  ) -> JSValue,
+  magic: c_int,
+) -> JSValue {
+  let f = unsafe {
+    std::mem::transmute::<
+      unsafe extern "C" fn(
+        *mut JSContext,
+        JSValue,
+        c_int,
+        *mut JSValue,
+        c_int,
+      ) -> JSValue,
+      JSCFunction,
+    >(trampoline)
+  };
+  unsafe {
+    JS_NewCFunction2(ctx, f, ptr::null(), 0, JS_CFUNC_GENERIC_MAGIC, magic)
+  }
+}
+
+unsafe extern "C" fn object_accessor_getter_trampoline(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+  magic: c_int,
+) -> JSValue {
+  let Some(entry) = lookup_object_accessor(magic) else {
+    return jsv_undefined();
+  };
+  let result = unsafe {
+    super::function::call_accessor_name_getter(
+      ctx,
+      this_val,
+      entry.atom,
+      entry.data,
+      entry.getter,
+    )
+  };
+  if entry.lazy && !jsv_is_exception(&result) {
+    let value = unsafe { JS_DupValue(ctx, result) };
+    let _ = unsafe {
+      JS_DefinePropertyValue(
+        ctx,
+        this_val,
+        entry.atom,
+        value,
+        attr_to_jsprop(entry.attr),
+      )
+    };
+  }
+  result
+}
+
+unsafe extern "C" fn object_accessor_setter_trampoline(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  magic: c_int,
+) -> JSValue {
+  let Some(entry) = lookup_object_accessor(magic) else {
+    return jsv_undefined();
+  };
+  let Some(setter) = entry.setter else {
+    return jsv_undefined();
+  };
+  let value = if argc > 0 && !argv.is_null() {
+    unsafe { *argv }
+  } else {
+    jsv_undefined()
+  };
+  unsafe {
+    super::function::call_accessor_name_setter(
+      ctx, this_val, entry.atom, value, entry.data, setter,
+    )
+  }
+}
+
+#[inline]
+fn accessor_attr_to_jsprop(attr: u32) -> c_int {
+  let mut flags = JS_PROP_THROW;
+  if attr & 2 == 0 {
+    flags |= JS_PROP_ENUMERABLE;
+  }
+  if attr & 4 == 0 {
+    flags |= JS_PROP_CONFIGURABLE;
+  }
+  flags
+}
 
 #[inline]
 fn read_attr(attr: &PropertyAttribute) -> u32 {
@@ -1596,15 +1749,59 @@ pub extern "C" fn v8__Object__InternalFieldCount(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetAccessor(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
-  _getter: *const std::os::raw::c_void,
-  _setter: *const std::os::raw::c_void,
-  _data_or_null: *const std::os::raw::c_void,
-  _attr: crate::PropertyAttribute,
+  this: *const std::os::raw::c_void,
+  context: *const std::os::raw::c_void,
+  key: *const std::os::raw::c_void,
+  getter: AccessorNameGetterCallback,
+  setter: Option<AccessorNameSetterCallback>,
+  data_or_null: *const std::os::raw::c_void,
+  attr: crate::PropertyAttribute,
 ) -> crate::support::MaybeBool {
-  crate::support::MaybeBool::Nothing
+  let ctx = ctx_of(context as *const Context);
+  if ctx.is_null() || this.is_null() || key.is_null() {
+    return crate::support::MaybeBool::Nothing;
+  }
+  let atom = key_atom(ctx, key);
+  if atom == 0 {
+    return crate::support::MaybeBool::Nothing;
+  }
+
+  let attr_bits = read_attr(&attr);
+  let magic = register_object_accessor(
+    ctx,
+    atom,
+    getter,
+    setter,
+    data_or_null,
+    attr,
+    false,
+  );
+  let get = unsafe {
+    object_accessor_cfunc(ctx, object_accessor_getter_trampoline, magic)
+  };
+  let set = if setter.is_some() && attr_bits & 1 == 0 {
+    unsafe {
+      object_accessor_cfunc(ctx, object_accessor_setter_trampoline, magic)
+    }
+  } else {
+    jsv_undefined()
+  };
+  let r = unsafe {
+    JS_DefinePropertyGetSet(
+      ctx,
+      jsval_of(this),
+      atom,
+      get,
+      set,
+      accessor_attr_to_jsprop(attr_bits),
+    )
+  };
+  unsafe { JS_FreeAtom(ctx, atom) };
+  if r < 0 {
+    crate::support::MaybeBool::Nothing
+  } else {
+    crate::support::MaybeBool::JustTrue
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1664,16 +1861,46 @@ pub extern "C" fn v8__Object__SetInternalField(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetLazyDataProperty(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
-  _getter: *const std::os::raw::c_void,
-  _data_or_null: *const std::os::raw::c_void,
-  _attr: crate::PropertyAttribute,
+  this: *const std::os::raw::c_void,
+  context: *const std::os::raw::c_void,
+  key: *const std::os::raw::c_void,
+  getter: AccessorNameGetterCallback,
+  data_or_null: *const std::os::raw::c_void,
+  attr: crate::PropertyAttribute,
   _getter_side_effect_type: crate::SideEffectType,
   _setter_side_effect_type: crate::SideEffectType,
 ) -> crate::support::MaybeBool {
-  crate::support::MaybeBool::Nothing
+  let ctx = ctx_of(context as *const Context);
+  if ctx.is_null() || this.is_null() || key.is_null() {
+    return crate::support::MaybeBool::Nothing;
+  }
+  let atom = key_atom(ctx, key);
+  if atom == 0 {
+    return crate::support::MaybeBool::Nothing;
+  }
+
+  let attr_bits = read_attr(&attr);
+  let magic =
+    register_object_accessor(ctx, atom, getter, None, data_or_null, attr, true);
+  let get = unsafe {
+    object_accessor_cfunc(ctx, object_accessor_getter_trampoline, magic)
+  };
+  let r = unsafe {
+    JS_DefinePropertyGetSet(
+      ctx,
+      jsval_of(this),
+      atom,
+      get,
+      jsv_undefined(),
+      accessor_attr_to_jsprop(attr_bits),
+    )
+  };
+  unsafe { JS_FreeAtom(ctx, atom) };
+  if r < 0 {
+    crate::support::MaybeBool::Nothing
+  } else {
+    crate::support::MaybeBool::JustTrue
+  }
 }
 
 fn regexp_flag_string(flags: crate::RegExpCreationFlags) -> String {
