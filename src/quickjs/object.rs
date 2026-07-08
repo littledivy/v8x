@@ -122,6 +122,12 @@ fn attr_to_jsprop(attr: u32) -> c_int {
   flags
 }
 
+#[inline]
+unsafe fn clear_exception(ctx: *mut JSContext) {
+  let exc = unsafe { JS_GetException(ctx) };
+  unsafe { JS_FreeValue(ctx, exc) };
+}
+
 const JS_PROP_HAS_CONFIGURABLE: c_int = 1 << 8;
 const JS_PROP_HAS_WRITABLE: c_int = 1 << 9;
 const JS_PROP_HAS_ENUMERABLE: c_int = 1 << 10;
@@ -1417,27 +1423,154 @@ pub extern "C" fn v8__Object__SetLazyDataProperty(
   crate::support::MaybeBool::Nothing
 }
 
+fn regexp_flag_string(flags: crate::RegExpCreationFlags) -> String {
+  let mut out = String::new();
+  if flags.contains(crate::RegExpCreationFlags::GLOBAL) {
+    out.push('g');
+  }
+  if flags.contains(crate::RegExpCreationFlags::IGNORE_CASE) {
+    out.push('i');
+  }
+  if flags.contains(crate::RegExpCreationFlags::MULTILINE) {
+    out.push('m');
+  }
+  if flags.contains(crate::RegExpCreationFlags::STICKY) {
+    out.push('y');
+  }
+  if flags.contains(crate::RegExpCreationFlags::UNICODE) {
+    out.push('u');
+  }
+  if flags.contains(crate::RegExpCreationFlags::DOT_ALL) {
+    out.push('s');
+  }
+  if flags.contains(crate::RegExpCreationFlags::HAS_INDICES) {
+    out.push('d');
+  }
+  if flags.contains(crate::RegExpCreationFlags::UNICODE_SETS) {
+    out.push('v');
+  }
+  out
+}
+
+#[inline]
+fn ctx_from_raw_context(
+  context: *const std::os::raw::c_void,
+) -> *mut JSContext {
+  let ctx = ctx_of(context as *const Context);
+  if ctx.is_null() { current_ctx() } else { ctx }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__RegExp__Exec(
-  _this: *const std::os::raw::c_void,
-  _context: *const std::os::raw::c_void,
-  _subject: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
+  context: *const std::os::raw::c_void,
+  subject: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let ctx = ctx_from_raw_context(context);
+  if ctx.is_null() || this.is_null() || subject.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    let this_val = jsval_of(this as *const Value);
+    let exec = JS_GetPropertyStr(ctx, this_val, c"exec".as_ptr());
+    if exec.tag == JS_TAG_EXCEPTION {
+      clear_exception(ctx);
+      return ptr::null();
+    }
+    if !JS_IsFunction(ctx, exec) {
+      JS_FreeValue(ctx, exec);
+      return ptr::null();
+    }
+
+    let mut args = [JS_DupValue(ctx, jsval_of(subject as *const Value))];
+    let result = JS_Call(ctx, exec, this_val, 1, args.as_mut_ptr());
+    JS_FreeValue(ctx, exec);
+    JS_FreeValue(ctx, args[0]);
+    if result.tag == JS_TAG_EXCEPTION {
+      clear_exception(ctx);
+      return ptr::null();
+    }
+    if !jsv_is_object(&result) {
+      JS_FreeValue(ctx, result);
+      return ptr::null();
+    }
+    intern::<Object>(result) as *const std::os::raw::c_void
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__RegExp__GetSource(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    let source = JS_GetPropertyStr(
+      ctx,
+      jsval_of(this as *const Value),
+      c"source".as_ptr(),
+    );
+    if source.tag == JS_TAG_EXCEPTION {
+      clear_exception(ctx);
+      return ptr::null();
+    }
+    intern::<V8String>(source) as *const std::os::raw::c_void
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__RegExp__New(
-  _context: *const std::os::raw::c_void,
-  _pattern: *const std::os::raw::c_void,
-  _flags: crate::RegExpCreationFlags,
+  context: *const std::os::raw::c_void,
+  pattern: *const std::os::raw::c_void,
+  flags: crate::RegExpCreationFlags,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let ctx = ctx_from_raw_context(context);
+  if ctx.is_null() || pattern.is_null() {
+    return ptr::null();
+  }
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let ctor = JS_GetPropertyStr(ctx, global, c"RegExp".as_ptr());
+    JS_FreeValue(ctx, global);
+    if ctor.tag == JS_TAG_EXCEPTION {
+      clear_exception(ctx);
+      return ptr::null();
+    }
+    if !JS_IsConstructor(ctx, ctor) {
+      JS_FreeValue(ctx, ctor);
+      return ptr::null();
+    }
+
+    let flag_string = regexp_flag_string(flags);
+    let mut args = [
+      JS_DupValue(ctx, jsval_of(pattern as *const Value)),
+      JS_NewStringLen(
+        ctx,
+        flag_string.as_ptr() as *const c_char,
+        flag_string.len(),
+      ),
+    ];
+    if args[1].tag == JS_TAG_EXCEPTION {
+      clear_exception(ctx);
+      JS_FreeValue(ctx, args[0]);
+      JS_FreeValue(ctx, ctor);
+      return ptr::null();
+    }
+
+    let regexp = JS_CallConstructor(ctx, ctor, 2, args.as_mut_ptr());
+    JS_FreeValue(ctx, ctor);
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, args[1]);
+    if regexp.tag == JS_TAG_EXCEPTION {
+      clear_exception(ctx);
+      return ptr::null();
+    }
+    if !JS_IsRegExp(regexp) {
+      JS_FreeValue(ctx, regexp);
+      return ptr::null();
+    }
+    intern::<crate::RegExp>(regexp) as *const std::os::raw::c_void
+  }
 }

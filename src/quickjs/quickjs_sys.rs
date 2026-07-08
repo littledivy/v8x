@@ -390,6 +390,7 @@ unsafe extern "C" {
   ) -> JSValue;
 
   pub fn JS_IsArray(v: JSValue) -> bool;
+  pub fn JS_IsRegExp(v: JSValue) -> bool;
   pub fn JS_IsFunction(ctx: *mut JSContext, v: JSValue) -> bool;
   pub fn JS_IsConstructor(ctx: *mut JSContext, v: JSValue) -> bool;
   pub fn JS_GetPropertyStr(
