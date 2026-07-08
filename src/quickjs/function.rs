@@ -31,10 +31,12 @@ use crate::quickjs::core::{
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::{
-  Context, Data, External, Function, FunctionCallback, FunctionCallbackInfo,
-  FunctionTemplate, Name, Object, ObjectTemplate, PropertyAttribute,
-  RealIsolate, Signature, String, Value,
+  Array, Boolean, Context, Data, External, Function, FunctionCallback,
+  FunctionCallbackInfo, FunctionTemplate, Integer, Name, Object,
+  ObjectTemplate, PropertyAttribute, PropertyDescriptor, RealIsolate,
+  Signature, String, Value,
 };
+use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::ptr::NonNull;
@@ -50,6 +52,7 @@ unsafe extern "C" {
   fn JS_NewObjectClass(ctx: *mut JSContext, class_id: c_int) -> JSValue;
   fn JS_SetOpaque(obj: JSValue, opaque: *mut c_void);
   fn JS_GetOpaque(obj: JSValue, class_id: JSClassID) -> *mut c_void;
+  fn JS_GetAnyOpaque(obj: JSValue, class_id: *mut JSClassID) -> *mut c_void;
   fn JS_SetPrototype(
     ctx: *mut JSContext,
     obj: JSValue,
@@ -79,6 +82,15 @@ unsafe extern "C" {
     val: JSValue,
     flags: c_int,
   ) -> c_int;
+  fn JS_DefineProperty(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: JSAtom,
+    val: JSValue,
+    getter: JSValue,
+    setter: JSValue,
+    flags: c_int,
+  ) -> c_int;
   fn JS_GetOwnPropertyNames(
     ctx: *mut JSContext,
     ptab: *mut *mut JSPropertyEnum,
@@ -91,9 +103,81 @@ unsafe extern "C" {
     tab: *mut JSPropertyEnum,
     len: u32,
   );
+  fn JS_GetLength(ctx: *mut JSContext, obj: JSValue, pres: *mut i64) -> c_int;
 }
 
 type JSClassFinalizer = unsafe extern "C" fn(rt: *mut JSRuntime, val: JSValue);
+
+#[repr(C)]
+struct JSPropertyDescriptorQjs {
+  flags: c_int,
+  value: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+}
+
+#[repr(C)]
+struct JSClassExoticMethods {
+  get_own_property: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      desc: *mut JSPropertyDescriptorQjs,
+      obj: JSValue,
+      prop: JSAtom,
+    ) -> c_int,
+  >,
+  get_own_property_names: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      ptab: *mut *mut JSPropertyEnum,
+      plen: *mut u32,
+      obj: JSValue,
+    ) -> c_int,
+  >,
+  delete_property: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      obj: JSValue,
+      prop: JSAtom,
+    ) -> c_int,
+  >,
+  define_own_property: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      obj: JSValue,
+      prop: JSAtom,
+      val: JSValue,
+      getter: JSValue,
+      setter: JSValue,
+      flags: c_int,
+    ) -> c_int,
+  >,
+  has_property: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      obj: JSValue,
+      prop: JSAtom,
+    ) -> c_int,
+  >,
+  get_property: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      obj: JSValue,
+      prop: JSAtom,
+      receiver: JSValue,
+    ) -> JSValue,
+  >,
+  set_property: Option<
+    unsafe extern "C" fn(
+      ctx: *mut JSContext,
+      obj: JSValue,
+      prop: JSAtom,
+      value: JSValue,
+      receiver: JSValue,
+      flags: c_int,
+    ) -> c_int,
+  >,
+}
 
 #[repr(C)]
 struct JSClassDef {
@@ -101,7 +185,7 @@ struct JSClassDef {
   finalizer: Option<JSClassFinalizer>,
   gc_mark: *const c_void,
   call: *const c_void,
-  exotic: *const c_void,
+  exotic: *const JSClassExoticMethods,
 }
 
 #[repr(C)]
@@ -158,8 +242,20 @@ struct TemplAccessor {
 
 struct NamedHandler {
   getter: Option<crate::NamedPropertyGetterCallback>,
+  setter: Option<crate::NamedPropertySetterCallback>,
+  query: Option<crate::NamedPropertyQueryCallback>,
+  deleter: Option<crate::NamedPropertyDeleterCallback>,
+  enumerator: Option<crate::NamedPropertyEnumeratorCallback>,
+  definer: Option<crate::NamedPropertyDefinerCallback>,
+  descriptor: Option<crate::NamedPropertyDescriptorCallback>,
   data: JSValue,
   owner_ctx: *mut JSContext,
+  non_masking: bool,
+  only_intercept_strings: bool,
+}
+
+struct NamedHandlerInstance {
+  handler: NamedHandler,
 }
 
 struct ObjTemplate {
@@ -193,6 +289,13 @@ struct JSPropertyEnum {
 }
 
 const JS_GPN_STRING_MASK_QJS: c_int = 1 << 0;
+const JS_PROP_HAS_CONFIGURABLE_QJS: c_int = 1 << 8;
+const JS_PROP_HAS_WRITABLE_QJS: c_int = 1 << 9;
+const JS_PROP_HAS_ENUMERABLE_QJS: c_int = 1 << 10;
+const JS_PROP_HAS_GET_QJS: c_int = 1 << 11;
+const JS_PROP_HAS_SET_QJS: c_int = 1 << 12;
+const JS_PROP_HAS_VALUE_QJS: c_int = 1 << 13;
+const JS_PROP_NO_EXOTIC_QJS: c_int = 1 << 17;
 
 struct DispatchEntry {
   callback: FunctionCallback,
@@ -353,6 +456,877 @@ unsafe fn materialize_named_handler_data(
   }
   (obj, true)
 }
+
+#[inline]
+fn intercepted_yes<T>(v: &T) -> bool {
+  let raw = unsafe { std::mem::transmute_copy::<_, u32>(v) };
+  raw == 0
+}
+
+fn clone_named_handler(
+  ctx: *mut JSContext,
+  handler: &NamedHandler,
+) -> NamedHandler {
+  let data = if jsv_is_undefined(&handler.data) {
+    jsv_undefined()
+  } else {
+    unsafe { JS_DupValue(ctx, handler.data) }
+  };
+  NamedHandler {
+    getter: handler.getter,
+    setter: handler.setter,
+    query: handler.query,
+    deleter: handler.deleter,
+    enumerator: handler.enumerator,
+    definer: handler.definer,
+    descriptor: handler.descriptor,
+    data,
+    owner_ctx: handler.owner_ctx,
+    non_masking: handler.non_masking,
+    only_intercept_strings: handler.only_intercept_strings,
+  }
+}
+
+fn new_object_for_template(
+  ctx: *mut JSContext,
+  templ: &ObjTemplate,
+) -> JSValue {
+  let Some(handler) = &templ.named_handler else {
+    return unsafe { JS_NewObject(ctx) };
+  };
+  let cid = named_handler_class_id_current();
+  if cid == 0 {
+    return unsafe { JS_NewObject(ctx) };
+  }
+  let obj = unsafe { JS_NewObjectClass(ctx, cid as c_int) };
+  if jsv_is_exception(&obj) {
+    return obj;
+  }
+  let inst = Box::new(NamedHandlerInstance {
+    handler: clone_named_handler(ctx, handler),
+  });
+  unsafe { JS_SetOpaque(obj, Box::into_raw(inst) as *mut c_void) };
+  obj
+}
+
+fn named_handler_class_id_current() -> JSClassID {
+  let iso = current_iso();
+  if iso.is_null() {
+    return 0;
+  }
+  iso_state(iso).named_handler_class_id
+}
+
+unsafe fn named_handler_from_obj<'a>(
+  obj: JSValue,
+) -> Option<&'a mut NamedHandlerInstance> {
+  let cid = named_handler_class_id_current();
+  if cid == 0 {
+    return None;
+  }
+  let ptr = unsafe { JS_GetOpaque(obj, cid) as *mut NamedHandlerInstance };
+  if ptr.is_null() {
+    None
+  } else {
+    Some(unsafe { &mut *ptr })
+  }
+}
+
+unsafe fn restore_callback_handles(iso: *mut RealIsolate, saved_depth: usize) {
+  if iso.is_null() {
+    return;
+  }
+  let st = iso_state(iso);
+  while st.handles.len() > saved_depth {
+    if let Some(slot) = st.handles.pop() {
+      unsafe {
+        JS_FreeValue(st.ctx, *slot);
+        drop(Box::from_raw(slot));
+      }
+    }
+  }
+}
+
+unsafe fn call_named_getter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  handler: &NamedHandler,
+  getter: crate::NamedPropertyGetterCallback,
+) -> (c_int, JSValue) {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Value>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let Some(key_handle) = NonNull::new(key_handle as *mut Name) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    unsafe { restore_callback_handles(iso, saved_depth) };
+    return (0, jsv_undefined());
+  };
+  let intercepted =
+    unsafe { (getter)(crate::SealedLocal(key_handle), prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    (-1, jsv_exception())
+  } else if intercepted_yes(&intercepted) {
+    let value = if jsv_is_undefined(&ret) {
+      jsv_undefined()
+    } else {
+      unsafe { JS_DupValue(ctx, ret) }
+    };
+    (1, value)
+  } else {
+    (0, jsv_undefined())
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_named_query(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  handler: &NamedHandler,
+  query: crate::NamedPropertyQueryCallback,
+) -> (c_int, c_int) {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Integer>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let Some(key_handle) = NonNull::new(key_handle as *mut Name) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    unsafe { restore_callback_handles(iso, saved_depth) };
+    return (0, 0);
+  };
+  let intercepted =
+    unsafe { (query)(crate::SealedLocal(key_handle), prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let mut attr = 0;
+  let result = if unsafe { JS_HasException(ctx) } {
+    (-1, 0)
+  } else if intercepted_yes(&intercepted) {
+    if !jsv_is_undefined(&ret) && unsafe { JS_ToInt32(ctx, &mut attr, ret) } < 0
+    {
+      (-1, 0)
+    } else {
+      (1, attr)
+    }
+  } else {
+    (0, 0)
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_named_setter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  value: JSValue,
+  handler: &NamedHandler,
+  setter: crate::NamedPropertySetterCallback,
+) -> c_int {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info =
+    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let value_handle = intern_dup::<Value>(ctx, value);
+  let (Some(key_handle), Some(value_handle)) = (
+    NonNull::new(key_handle as *mut Name),
+    NonNull::new(value_handle as *mut Value),
+  ) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    unsafe { restore_callback_handles(iso, saved_depth) };
+    return 0;
+  };
+  let intercepted = unsafe {
+    (setter)(
+      crate::SealedLocal(key_handle),
+      crate::SealedLocal(value_handle),
+      prop_info,
+    )
+  };
+
+  let _info = unsafe { Box::from_raw(info_ptr) };
+  let result = if unsafe { JS_HasException(ctx) } {
+    -1
+  } else if intercepted_yes(&intercepted) {
+    1
+  } else {
+    0
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_named_deleter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  handler: &NamedHandler,
+  deleter: crate::NamedPropertyDeleterCallback,
+) -> c_int {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Boolean>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let Some(key_handle) = NonNull::new(key_handle as *mut Name) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    unsafe { restore_callback_handles(iso, saved_depth) };
+    return 0;
+  };
+  let intercepted =
+    unsafe { (deleter)(crate::SealedLocal(key_handle), prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    -1
+  } else if intercepted_yes(&intercepted) {
+    if jsv_is_undefined(&ret) {
+      1
+    } else {
+      unsafe { JS_ToBool(ctx, ret) }
+    }
+  } else {
+    0
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_named_enumerator(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  handler: &NamedHandler,
+  enumerator: crate::NamedPropertyEnumeratorCallback,
+) -> JSValue {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Array>;
+
+  unsafe { (enumerator)(prop_info) };
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    jsv_exception()
+  } else if jsv_is_undefined(&ret) {
+    jsv_undefined()
+  } else {
+    unsafe { JS_DupValue(ctx, ret) }
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn construct_property_descriptor_for_callback(
+  ctx: *mut JSContext,
+  out: *mut PropertyDescriptor,
+  val: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+  flags: c_int,
+) {
+  if flags & JS_PROP_HAS_GET_QJS != 0 || flags & JS_PROP_HAS_SET_QJS != 0 {
+    let get_handle = intern_dup::<Value>(ctx, getter);
+    let set_handle = intern_dup::<Value>(ctx, setter);
+    unsafe {
+      super::property::v8__PropertyDescriptor__CONSTRUCT__Get_Set(
+        out, get_handle, set_handle,
+      );
+    }
+  } else if flags & JS_PROP_HAS_VALUE_QJS != 0 {
+    let value_handle = intern_dup::<Value>(ctx, val);
+    if flags & JS_PROP_HAS_WRITABLE_QJS != 0 {
+      unsafe {
+        super::property::v8__PropertyDescriptor__CONSTRUCT__Value_Writable(
+          out,
+          value_handle,
+          flags & JS_PROP_WRITABLE != 0,
+        );
+      }
+    } else {
+      unsafe {
+        super::property::v8__PropertyDescriptor__CONSTRUCT__Value(
+          out,
+          value_handle,
+        );
+      }
+    }
+  } else {
+    unsafe { super::property::v8__PropertyDescriptor__CONSTRUCT(out) };
+  }
+
+  if flags & JS_PROP_HAS_ENUMERABLE_QJS != 0 {
+    unsafe {
+      super::property::v8__PropertyDescriptor__set_enumerable(
+        out,
+        flags & JS_PROP_ENUMERABLE != 0,
+      );
+    }
+  }
+  if flags & JS_PROP_HAS_CONFIGURABLE_QJS != 0 {
+    unsafe {
+      super::property::v8__PropertyDescriptor__set_configurable(
+        out,
+        flags & JS_PROP_CONFIGURABLE != 0,
+      );
+    }
+  }
+}
+
+unsafe fn call_named_definer(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  atom: JSAtom,
+  val: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+  flags: c_int,
+  handler: &NamedHandler,
+  definer: crate::NamedPropertyDefinerCallback,
+) -> c_int {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info =
+    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+
+  let key = unsafe { JS_AtomToValue(ctx, atom) };
+  let key_handle = intern::<Name>(key);
+  let Some(key_handle) = NonNull::new(key_handle as *mut Name) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    unsafe { restore_callback_handles(iso, saved_depth) };
+    return 0;
+  };
+  let mut pd = MaybeUninit::<PropertyDescriptor>::zeroed();
+  unsafe {
+    construct_property_descriptor_for_callback(
+      ctx,
+      pd.as_mut_ptr(),
+      val,
+      getter,
+      setter,
+      flags,
+    )
+  };
+  let intercepted = unsafe {
+    (definer)(crate::SealedLocal(key_handle), pd.as_ptr(), prop_info)
+  };
+  unsafe { super::property::v8__PropertyDescriptor__DESTRUCT(pd.as_mut_ptr()) };
+
+  let _info = unsafe { Box::from_raw(info_ptr) };
+  let result = if unsafe { JS_HasException(ctx) } {
+    -1
+  } else if intercepted_yes(&intercepted) {
+    1
+  } else {
+    0
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+fn attr_to_descriptor_flags(attr: c_int) -> c_int {
+  let mut flags = 0;
+  if attr & 1 == 0 {
+    flags |= JS_PROP_WRITABLE;
+  }
+  if attr & 2 == 0 {
+    flags |= JS_PROP_ENUMERABLE;
+  }
+  if attr & 4 == 0 {
+    flags |= JS_PROP_CONFIGURABLE;
+  }
+  flags
+}
+
+unsafe fn fill_desc_from_query(
+  ctx: *mut JSContext,
+  desc: *mut JSPropertyDescriptorQjs,
+  attr: c_int,
+) {
+  if desc.is_null() {
+    return;
+  }
+  unsafe {
+    (*desc).flags = attr_to_descriptor_flags(attr);
+    (*desc).value = jsv_undefined();
+    (*desc).getter = jsv_undefined();
+    (*desc).setter = jsv_undefined();
+  }
+  let _ = ctx;
+}
+
+unsafe fn fill_desc_from_descriptor_object(
+  ctx: *mut JSContext,
+  desc: *mut JSPropertyDescriptorQjs,
+  obj: JSValue,
+) -> c_int {
+  if desc.is_null() {
+    return 1;
+  }
+  let value = unsafe { JS_GetPropertyStr(ctx, obj, c"value".as_ptr()) };
+  if jsv_is_exception(&value) {
+    return -1;
+  }
+  let enumerable =
+    unsafe { JS_GetPropertyStr(ctx, obj, c"enumerable".as_ptr()) };
+  if jsv_is_exception(&enumerable) {
+    unsafe { JS_FreeValue(ctx, value) };
+    return -1;
+  }
+  let configurable =
+    unsafe { JS_GetPropertyStr(ctx, obj, c"configurable".as_ptr()) };
+  if jsv_is_exception(&configurable) {
+    unsafe {
+      JS_FreeValue(ctx, value);
+      JS_FreeValue(ctx, enumerable);
+    }
+    return -1;
+  }
+  let writable = unsafe { JS_GetPropertyStr(ctx, obj, c"writable".as_ptr()) };
+  if jsv_is_exception(&writable) {
+    unsafe {
+      JS_FreeValue(ctx, value);
+      JS_FreeValue(ctx, enumerable);
+      JS_FreeValue(ctx, configurable);
+    }
+    return -1;
+  }
+
+  let mut flags = 0;
+  if unsafe { JS_ToBool(ctx, enumerable) } != 0 {
+    flags |= JS_PROP_ENUMERABLE;
+  }
+  if unsafe { JS_ToBool(ctx, configurable) } != 0 {
+    flags |= JS_PROP_CONFIGURABLE;
+  }
+  if unsafe { JS_ToBool(ctx, writable) } != 0 {
+    flags |= JS_PROP_WRITABLE;
+  }
+  unsafe {
+    JS_FreeValue(ctx, enumerable);
+    JS_FreeValue(ctx, configurable);
+    JS_FreeValue(ctx, writable);
+    (*desc).flags = flags;
+    (*desc).value = value;
+    (*desc).getter = jsv_undefined();
+    (*desc).setter = jsv_undefined();
+  }
+  1
+}
+
+unsafe fn enumerator_contains_property(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: JSAtom,
+  handler: &NamedHandler,
+  enumerator: crate::NamedPropertyEnumeratorCallback,
+) -> c_int {
+  let arr = unsafe { call_named_enumerator(ctx, obj, handler, enumerator) };
+  if jsv_is_exception(&arr) {
+    return -1;
+  }
+  if jsv_is_undefined(&arr) {
+    return 0;
+  }
+  let mut len: i64 = 0;
+  if unsafe { JS_GetLength(ctx, arr, &mut len) } < 0 || len <= 0 {
+    unsafe { JS_FreeValue(ctx, arr) };
+    return 0;
+  }
+  let mut found = false;
+  for i in 0..(len.min(u32::MAX as i64) as u32) {
+    let item = unsafe { JS_GetPropertyUint32(ctx, arr, i) };
+    if jsv_is_exception(&item) {
+      unsafe { JS_FreeValue(ctx, arr) };
+      return -1;
+    }
+    let atom = unsafe { JS_ValueToAtom(ctx, item) };
+    unsafe { JS_FreeValue(ctx, item) };
+    if atom == prop {
+      found = true;
+    }
+    if atom != 0 {
+      unsafe { JS_FreeAtom(ctx, atom) };
+    }
+    if found {
+      break;
+    }
+  }
+  unsafe { JS_FreeValue(ctx, arr) };
+  if found { 1 } else { 0 }
+}
+
+unsafe extern "C" fn named_handler_get_own_property(
+  ctx: *mut JSContext,
+  desc: *mut JSPropertyDescriptorQjs,
+  obj: JSValue,
+  prop: JSAtom,
+) -> c_int {
+  let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
+    return 0;
+  };
+  let handler = &inst.handler;
+
+  if let Some(descriptor) = handler.descriptor {
+    let (state, value) =
+      unsafe { call_named_getter(ctx, obj, prop, handler, descriptor) };
+    if state < 0 {
+      return -1;
+    }
+    if state > 0 {
+      let rc = unsafe { fill_desc_from_descriptor_object(ctx, desc, value) };
+      unsafe { JS_FreeValue(ctx, value) };
+      return rc;
+    }
+  }
+
+  if let Some(query) = handler.query {
+    let (state, attr) =
+      unsafe { call_named_query(ctx, obj, prop, handler, query) };
+    if state < 0 {
+      return -1;
+    }
+    if state > 0 {
+      unsafe { fill_desc_from_query(ctx, desc, attr) };
+      return 1;
+    }
+  }
+
+  if let Some(enumerator) = handler.enumerator {
+    let state = unsafe {
+      enumerator_contains_property(ctx, obj, prop, handler, enumerator)
+    };
+    if state < 0 {
+      return -1;
+    }
+    if state > 0 {
+      if !desc.is_null() {
+        unsafe {
+          (*desc).flags =
+            JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE;
+          (*desc).value = jsv_undefined();
+          (*desc).getter = jsv_undefined();
+          (*desc).setter = jsv_undefined();
+        }
+      }
+      return 1;
+    }
+  }
+
+  0
+}
+
+unsafe extern "C" fn named_handler_get_property(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: JSAtom,
+  receiver: JSValue,
+) -> JSValue {
+  let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
+    return jsv_undefined();
+  };
+  let Some(getter) = inst.handler.getter else {
+    return jsv_undefined();
+  };
+  let (state, value) =
+    unsafe { call_named_getter(ctx, receiver, prop, &inst.handler, getter) };
+  if state < 0 {
+    jsv_exception()
+  } else if state > 0 {
+    value
+  } else {
+    jsv_undefined()
+  }
+}
+
+unsafe extern "C" fn named_handler_set_property(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: JSAtom,
+  value: JSValue,
+  receiver: JSValue,
+  _flags: c_int,
+) -> c_int {
+  let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
+    return 0;
+  };
+  if let Some(setter) = inst.handler.setter {
+    let state = unsafe {
+      call_named_setter(ctx, receiver, prop, value, &inst.handler, setter)
+    };
+    if state != 0 {
+      return state;
+    }
+  }
+  unsafe {
+    JS_DefinePropertyValue(
+      ctx,
+      receiver,
+      prop,
+      JS_DupValue(ctx, value),
+      JS_PROP_C_W_E,
+    )
+  }
+}
+
+unsafe extern "C" fn named_handler_delete_property(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: JSAtom,
+) -> c_int {
+  let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
+    return 1;
+  };
+  let Some(deleter) = inst.handler.deleter else {
+    return 1;
+  };
+  let state =
+    unsafe { call_named_deleter(ctx, obj, prop, &inst.handler, deleter) };
+  if state < 0 {
+    -1
+  } else if state > 0 {
+    1
+  } else {
+    1
+  }
+}
+
+unsafe extern "C" fn named_handler_get_own_property_names(
+  ctx: *mut JSContext,
+  ptab: *mut *mut JSPropertyEnum,
+  plen: *mut u32,
+  obj: JSValue,
+) -> c_int {
+  if ptab.is_null() || plen.is_null() {
+    return 0;
+  }
+  unsafe {
+    *ptab = ptr::null_mut();
+    *plen = 0;
+  }
+  let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
+    return 0;
+  };
+  let Some(enumerator) = inst.handler.enumerator else {
+    return 0;
+  };
+  let arr =
+    unsafe { call_named_enumerator(ctx, obj, &inst.handler, enumerator) };
+  if jsv_is_exception(&arr) {
+    return -1;
+  }
+  if jsv_is_undefined(&arr) {
+    return 0;
+  }
+
+  let mut len: i64 = 0;
+  if unsafe { JS_GetLength(ctx, arr, &mut len) } < 0 || len <= 0 {
+    unsafe { JS_FreeValue(ctx, arr) };
+    return 0;
+  }
+  let count = len.min(u32::MAX as i64) as u32;
+  let bytes = count as usize * std::mem::size_of::<JSPropertyEnum>();
+  let tab = unsafe { js_malloc(ctx, bytes) as *mut JSPropertyEnum };
+  if tab.is_null() {
+    unsafe { JS_FreeValue(ctx, arr) };
+    return -1;
+  }
+  let mut written = 0_u32;
+  for i in 0..count {
+    let item = unsafe { JS_GetPropertyUint32(ctx, arr, i) };
+    if jsv_is_exception(&item) {
+      unsafe {
+        JS_FreeValue(ctx, arr);
+        js_free(ctx, tab as *mut c_void);
+      }
+      return -1;
+    }
+    let atom = unsafe { JS_ValueToAtom(ctx, item) };
+    unsafe { JS_FreeValue(ctx, item) };
+    if atom == 0 {
+      continue;
+    }
+    unsafe {
+      (*tab.add(written as usize)).is_enumerable = true;
+      (*tab.add(written as usize)).atom = atom;
+    }
+    written += 1;
+  }
+  unsafe {
+    JS_FreeValue(ctx, arr);
+    *ptab = tab;
+    *plen = written;
+  }
+  0
+}
+
+unsafe extern "C" fn named_handler_define_own_property(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: JSAtom,
+  val: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+  flags: c_int,
+) -> c_int {
+  let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
+    return 0;
+  };
+  if let Some(definer) = inst.handler.definer {
+    let state = unsafe {
+      call_named_definer(
+        ctx,
+        obj,
+        prop,
+        val,
+        getter,
+        setter,
+        flags,
+        &inst.handler,
+        definer,
+      )
+    };
+    if state != 0 {
+      return state;
+    }
+  }
+  unsafe {
+    JS_DefineProperty(
+      ctx,
+      obj,
+      prop,
+      JS_DupValue(ctx, val),
+      JS_DupValue(ctx, getter),
+      JS_DupValue(ctx, setter),
+      flags | JS_PROP_NO_EXOTIC_QJS,
+    )
+  }
+}
+
+static NAMED_HANDLER_EXOTIC: JSClassExoticMethods = JSClassExoticMethods {
+  get_own_property: Some(named_handler_get_own_property),
+  get_own_property_names: Some(named_handler_get_own_property_names),
+  delete_property: Some(named_handler_delete_property),
+  define_own_property: Some(named_handler_define_own_property),
+  has_property: None,
+  get_property: Some(named_handler_get_property),
+  set_property: Some(named_handler_set_property),
+};
 
 unsafe fn dispatch(
   ctx: *mut JSContext,
@@ -520,7 +1494,15 @@ unsafe extern "C" fn fn_construct_trampoline(
     };
   }
 
-  let this = unsafe { JS_NewObject(ctx) };
+  let this = if !instance.is_null() {
+    let t = unsafe { &*instance };
+    new_object_for_template(ctx, t)
+  } else {
+    unsafe { JS_NewObject(ctx) }
+  };
+  if jsv_is_exception(&this) {
+    return this;
+  }
   unsafe {
     let proto = JS_GetPropertyStr(ctx, new_target, c"prototype".as_ptr());
     if std::env::var_os("QJS_DEBUG_TMPL").is_some() {
@@ -958,6 +1940,19 @@ fn property_return_scratch() -> usize {
 
 unsafe extern "C" fn ext_finalize(_rt: *mut JSRuntime, _val: JSValue) {}
 
+unsafe extern "C" fn named_handler_finalize(rt: *mut JSRuntime, val: JSValue) {
+  let mut class_id: JSClassID = 0;
+  let ptr =
+    unsafe { JS_GetAnyOpaque(val, &mut class_id) as *mut NamedHandlerInstance };
+  if ptr.is_null() {
+    return;
+  }
+  let inst = unsafe { Box::from_raw(ptr) };
+  if !jsv_is_undefined(&inst.handler.data) {
+    unsafe { JS_FreeValueRT(rt, inst.handler.data) };
+  }
+}
+
 fn external_values()
 -> &'static std::sync::Mutex<std::collections::HashMap<usize, usize>> {
   static T: std::sync::OnceLock<
@@ -1067,6 +2062,23 @@ pub(crate) fn register_external_class(rt: *mut JSRuntime) -> JSClassID {
     gc_mark: ptr::null(),
     call: ptr::null(),
     exotic: ptr::null(),
+  };
+  unsafe { JS_NewClass(rt, id, &def) };
+  id
+}
+
+/// Register the custom class used by `ObjectTemplate::set_named_property_handler`.
+/// Like `v8::External`, this must happen before the first context is created so
+/// QuickJS sizes every context's class-prototype table correctly.
+pub(crate) fn register_named_handler_class(rt: *mut JSRuntime) -> JSClassID {
+  let mut id: JSClassID = 0;
+  let id = unsafe { JS_NewClassID(rt, &mut id) };
+  let def = JSClassDef {
+    class_name: c"v8x_named_handler".as_ptr(),
+    finalizer: Some(named_handler_finalize),
+    gc_mark: ptr::null(),
+    call: ptr::null(),
+    exotic: &NAMED_HANDLER_EXOTIC,
   };
   unsafe { JS_NewClass(rt, id, &def) };
   id
@@ -1961,9 +2973,12 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
     return ptr::null();
   }
   let _tm = timing::now();
-  let obj = unsafe { JS_NewObject(ctx) };
   if !this.is_null() {
     let t = unsafe { &*(this as *const ObjTemplate) };
+    let obj = new_object_for_template(ctx, t);
+    if jsv_is_exception(&obj) {
+      return ptr::null();
+    }
     super::object::set_internal_field_count_for_value(
       obj,
       t.internal_field_count,
@@ -1983,8 +2998,11 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
     if t.immutable_proto {
       unsafe { JS_PreventExtensions(ctx, obj) };
     }
+    timing::add(&timing::NEWINST_N, &timing::NEWINST_T, _tm);
+    return intern::<Object>(obj);
   }
   timing::add(&timing::NEWINST_N, &timing::NEWINST_T, _tm);
+  let obj = unsafe { JS_NewObject(ctx) };
   intern::<Object>(obj)
 }
 
@@ -2229,9 +3247,6 @@ pub extern "C" fn v8__ObjectTemplate__SetNamedPropertyHandler(
   data_or_null: *const Value,
   flags: crate::PropertyHandlerFlags,
 ) {
-  let _ = (
-    setter, query, deleter, enumerator, definer, descriptor, flags,
-  );
   if this.is_null() {
     return;
   }
@@ -2243,8 +3258,16 @@ pub extern "C" fn v8__ObjectTemplate__SetNamedPropertyHandler(
   let t = unsafe { &mut *(this as *mut ObjTemplate) };
   t.named_handler = Some(NamedHandler {
     getter,
+    setter,
+    query,
+    deleter,
+    enumerator,
+    definer,
+    descriptor,
     data,
     owner_ctx: current_ctx(),
+    non_masking: flags.is_non_masking(),
+    only_intercept_strings: flags.is_only_intercept_strings(),
   });
 }
 

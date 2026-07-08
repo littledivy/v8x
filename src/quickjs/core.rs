@@ -170,6 +170,10 @@ pub(crate) struct IsoState {
   // `JS_NewObjectClass(ctx, id)` read `class_proto[id]` out of bounds.
   pub ext_class_id: JSClassID,
 
+  // QuickJS class id for ObjectTemplate named-property-handler instances.
+  // It has the same registration timing constraint as `ext_class_id`.
+  pub named_handler_class_id: JSClassID,
+
   // Whether the bootstrap context (`ctx`) has been handed out by
   // `v8__Context__New`. QuickJS has one global object per JSContext, but
   // deno_core uses multiple v8::Contexts (notably during snapshot creation,
@@ -520,12 +524,14 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
       ptr::null_mut(),
     )
   };
-  // Register custom classes (currently just `v8::External`) on the runtime
+  // Register custom classes on the runtime
   // BEFORE creating the context, so the context's `class_proto` array is sized
   // to include them. Registering after `JS_NewContext` would leave
   // `JS_NewObjectClass` indexing `class_proto` out of bounds (heap overflow that
   // hands back a garbage prototype and later corrupts the GC heap).
   let ext_class_id = super::function::register_external_class(rt);
+  let named_handler_class_id =
+    super::function::register_named_handler_class(rt);
 
   let ctx = unsafe { JS_NewContext(rt) };
   assert!(!ctx.is_null(), "JS_NewContext failed");
@@ -551,6 +557,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     private_symbols: Vec::new(),
     data_slots: [ptr::null_mut(); 4],
     ext_class_id,
+    named_handler_class_id,
     main_ctx_claimed: false,
     extra_contexts: Vec::new(),
     ctx_data_counts: HashMap::new(),
