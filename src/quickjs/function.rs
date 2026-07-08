@@ -55,6 +55,7 @@ unsafe extern "C" {
     obj: JSValue,
     proto: JSValue,
   ) -> c_int;
+  fn JS_PreventExtensions(ctx: *mut JSContext, obj: JSValue) -> c_int;
 
   fn JS_DefinePropertyValueStr(
     ctx: *mut JSContext,
@@ -163,6 +164,7 @@ struct ObjTemplate {
   props: Vec<(JSValue, JSValue, u32)>,
   accessors: Vec<TemplAccessor>,
   named_handler: Option<NamedHandler>,
+  immutable_proto: bool,
 
   parent_fn: *const FnTemplate,
 }
@@ -175,6 +177,7 @@ impl ObjTemplate {
       props: Vec::new(),
       accessors: Vec::new(),
       named_handler: None,
+      immutable_proto: false,
       parent_fn: std::ptr::null(),
     }
   }
@@ -1364,6 +1367,7 @@ pub extern "C" fn v8__FunctionTemplate__New(
     props: Vec::new(),
     accessors: Vec::new(),
     named_handler: None,
+    immutable_proto: false,
     parent_fn: ptr::null(),
   }));
   let instance = Box::into_raw(Box::new(ObjTemplate {
@@ -1371,6 +1375,7 @@ pub extern "C" fn v8__FunctionTemplate__New(
     props: Vec::new(),
     accessors: Vec::new(),
     named_handler: None,
+    immutable_proto: false,
     parent_fn: ptr::null(),
   }));
   register_template(proto as usize, TemplKind::Obj);
@@ -1663,6 +1668,7 @@ pub extern "C" fn v8__ObjectTemplate__New(
     props: Vec::new(),
     accessors: Vec::new(),
     named_handler: None,
+    immutable_proto: false,
     parent_fn: templ as *const FnTemplate,
   }));
   register_template(t as usize, TemplKind::Obj);
@@ -1698,6 +1704,9 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
     }
     apply_props(ctx, obj, &t.props);
     apply_accessors(ctx, obj, &t.accessors);
+    if t.immutable_proto {
+      unsafe { JS_PreventExtensions(ctx, obj) };
+    }
   }
   timing::add(&timing::NEWINST_N, &timing::NEWINST_T, _tm);
   intern::<Object>(obj)
@@ -1777,6 +1786,9 @@ pub(crate) fn apply_object_template_to_global(
   apply_accessors(ctx, global, &t.accessors);
   if let Some(handler) = &t.named_handler {
     install_named_global_handler(ctx, global, handler);
+  }
+  if t.immutable_proto {
+    unsafe { JS_PreventExtensions(ctx, global) };
   }
 }
 
@@ -2080,8 +2092,13 @@ pub extern "C" fn v8__ObjectTemplate__InternalFieldCount(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ObjectTemplate__SetImmutableProto(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) {
+  if this.is_null() {
+    return;
+  }
+  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  t.immutable_proto = true;
 }
 
 #[unsafe(no_mangle)]
