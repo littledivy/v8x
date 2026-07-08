@@ -80,6 +80,15 @@ unsafe extern "C" {
     delegate: *mut CxxValueSerializerDelegate,
     message: *const V8String,
   );
+  fn v8__ValueSerializer__Delegate__HasCustomHostObject(
+    delegate: *mut CxxValueSerializerDelegate,
+    isolate: *mut RealIsolate,
+  ) -> bool;
+  fn v8__ValueSerializer__Delegate__IsHostObject(
+    delegate: *mut CxxValueSerializerDelegate,
+    isolate: *mut RealIsolate,
+    object: *const Object,
+  ) -> MaybeBool;
   fn v8__ValueSerializer__Delegate__GetSharedArrayBufferId(
     delegate: *mut CxxValueSerializerDelegate,
     isolate: *mut RealIsolate,
@@ -136,6 +145,47 @@ fn is_host_object(ctx: *mut JSContext, v: JSValue, brand: JSAtom) -> bool {
     && unsafe { JS_HasProperty(ctx, v, brand) } > 0
 }
 
+fn has_custom_host_objects(st: &SerState) -> bool {
+  if st.delegate.is_null() {
+    return false;
+  }
+  unsafe {
+    v8__ValueSerializer__Delegate__HasCustomHostObject(st.delegate, st.isolate)
+  }
+}
+
+fn is_custom_host_object(
+  st: &SerState,
+  ctx: *mut JSContext,
+  v: JSValue,
+  enabled: bool,
+) -> bool {
+  if !enabled || st.delegate.is_null() || !jsv_is_object(&v) {
+    return false;
+  }
+  let obj = intern::<Object>(unsafe { JS_DupValue(ctx, v) });
+  if obj.is_null() {
+    return false;
+  }
+  matches!(
+    unsafe {
+      v8__ValueSerializer__Delegate__IsHostObject(st.delegate, st.isolate, obj)
+    },
+    MaybeBool::JustTrue
+  )
+}
+
+fn is_serialized_host_object(
+  st: &SerState,
+  ctx: *mut JSContext,
+  v: JSValue,
+  brand: JSAtom,
+  custom_hosts: bool,
+) -> bool {
+  is_host_object(ctx, v, brand)
+    || is_custom_host_object(st, ctx, v, custom_hosts)
+}
+
 fn is_shared_array_buffer(ctx: *mut JSContext, v: JSValue) -> bool {
   if ctx.is_null() || !jsv_is_object(&v) {
     return false;
@@ -167,14 +217,15 @@ fn is_shared_array_buffer(ctx: *mut JSContext, v: JSValue) -> bool {
 
 /// Does the value graph contain a SharedArrayBuffer, transferred ArrayBuffer, or
 /// host object?
-/// Read-only (pure QuickJS, no delegate/scope machinery), so it is safe to run on
-/// every serialize; only walks arrays (host objects nested in plain objects need
-/// the not-yet-added object-enumeration path and stay on the default path).
+/// The common path stays read-only QuickJS state. When the delegate opts into
+/// custom host objects, this also asks the delegate whether each object should
+/// be serialized through `WriteHostObject`.
 fn graph_needs_walk(
   st: &SerState,
   ctx: *mut JSContext,
   v: JSValue,
   brand: JSAtom,
+  custom_hosts: bool,
   depth: u32,
 ) -> bool {
   if !jsv_is_object(&v) || depth > 200 {
@@ -184,7 +235,9 @@ fn graph_needs_walk(
     return true;
   }
   let ptr = unsafe { v.u.ptr } as usize;
-  if st.xfer_ab.contains_key(&ptr) || is_host_object(ctx, v, brand) {
+  if st.xfer_ab.contains_key(&ptr)
+    || is_serialized_host_object(st, ctx, v, brand, custom_hosts)
+  {
     return true;
   }
   if unsafe { JS_IsArray(v) } {
@@ -196,7 +249,7 @@ fn graph_needs_walk(
     }
     for i in 0..len.max(0) as u32 {
       let el = unsafe { JS_GetPropertyUint32(ctx, v, i) };
-      let hit = graph_needs_walk(st, ctx, el, brand, depth + 1);
+      let hit = graph_needs_walk(st, ctx, el, brand, custom_hosts, depth + 1);
       unsafe { JS_FreeValue(ctx, el) };
       if hit {
         return true;
@@ -207,7 +260,9 @@ fn graph_needs_walk(
   // Plain object: recurse own enumerable property values.
   let mut found = false;
   for_each_own(ctx, v, |_keyatom, propval| {
-    if !found && graph_needs_walk(st, ctx, propval, brand, depth + 1) {
+    if !found
+      && graph_needs_walk(st, ctx, propval, brand, custom_hosts, depth + 1)
+    {
       found = true;
     }
   });
@@ -421,12 +476,13 @@ pub extern "C" fn v8__ValueSerializer__WriteValue(
   // ArrayBuffer (JS_WriteObject throws on the detached buffer) or a host object
   // (MessagePort/CryptoKey — JS_WriteObject would dump it as a dead plain object).
   let brand = host_brand_atom(ctx);
-  let needs_walk = graph_needs_walk(st, ctx, v, brand, 0);
+  let custom_hosts = has_custom_host_objects(st);
+  let needs_walk = graph_needs_walk(st, ctx, v, brand, custom_hosts, 0);
   let ok = if !needs_walk {
     ser_blob(st, ctx, v, TAG_VALUE)
   } else {
     st.buf.push(TAG_GRAPH);
-    ser_rec(st, ctx, v, brand)
+    ser_rec(st, ctx, v, brand, custom_hosts)
   };
   if brand != 0 {
     unsafe { JS_FreeAtom(ctx, brand) };
@@ -555,6 +611,7 @@ fn ser_rec(
   ctx: *mut JSContext,
   v: JSValue,
   brand: JSAtom,
+  custom_hosts: bool,
 ) -> bool {
   if jsv_is_object(&v) {
     if is_shared_array_buffer(ctx, v) {
@@ -572,7 +629,7 @@ fn ser_rec(
       st.buf.extend_from_slice(&id.to_le_bytes());
       return true;
     }
-    if is_host_object(ctx, v, brand) {
+    if is_serialized_host_object(st, ctx, v, brand, custom_hosts) {
       st.buf.push(TAG_HOST);
       // Hand the host object to deno's delegate, which appends its index/value
       // to our buffer via our Write{Uint32,Value} fns.
@@ -598,7 +655,7 @@ fn ser_rec(
       st.buf.extend_from_slice(&len.to_le_bytes());
       for i in 0..len {
         let el = unsafe { JS_GetPropertyUint32(ctx, v, i) };
-        let ok = ser_rec(st, ctx, el, brand);
+        let ok = ser_rec(st, ctx, el, brand, custom_hosts);
         unsafe { JS_FreeValue(ctx, el) };
         if !ok {
           return false;
@@ -610,7 +667,7 @@ fn ser_rec(
     // own enumerable props so the nested host object is intercepted. Objects with
     // no such subtree fall through to an opaque JS_WriteObject leaf (full
     // fidelity — keeps property attributes, Map/Set, getters, etc.).
-    if graph_needs_walk(st, ctx, v, brand, 0) {
+    if graph_needs_walk(st, ctx, v, brand, custom_hosts, 0) {
       let mut count: u32 = 0;
       for_each_own(ctx, v, |_a, _val| count += 1);
       st.buf.push(TAG_OBJECT);
@@ -623,7 +680,7 @@ fn ser_rec(
         let keyval = unsafe { JS_AtomToValue(ctx, atom) };
         let kok = ser_blob(st, ctx, keyval, TAG_LEAF);
         unsafe { JS_FreeValue(ctx, keyval) };
-        if !kok || !ser_rec(st, ctx, propval, brand) {
+        if !kok || !ser_rec(st, ctx, propval, brand, custom_hosts) {
           ok = false;
         }
       });
