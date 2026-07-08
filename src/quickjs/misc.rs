@@ -1397,7 +1397,9 @@ pub extern "C" fn v8__Eternal__CONSTRUCT(this: *mut *const Data) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Eternal__DESTRUCT(_this: *mut *const Data) {}
+pub extern "C" fn v8__Eternal__DESTRUCT(this: *mut *const Data) {
+  v8__Eternal__Clear(this as *mut c_void);
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Eternal__Get(
@@ -1616,13 +1618,33 @@ pub extern "C" fn v8__CompiledWasmModule__SourceUrl(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Eternal__Clear(_this: *mut std::os::raw::c_void) {}
+pub extern "C" fn v8__Eternal__Clear(this: *mut std::os::raw::c_void) {
+  if this.is_null() {
+    return;
+  }
+  let slot = this as *mut *const Data;
+  let stored = unsafe { slot.read_unaligned() };
+  unsafe { slot.write_unaligned(ptr::null()) };
+  if stored.is_null() {
+    return;
+  }
+
+  let boxed = unsafe { Box::from_raw(stored as *mut JSValue) };
+  let ctx = current_ctx();
+  if !ctx.is_null() {
+    unsafe { JS_FreeValue(ctx, *boxed) };
+  }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Eternal__IsEmpty(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
-  false
+  if this.is_null() {
+    return true;
+  }
+  let slot = this as *const *const Data;
+  unsafe { slot.read_unaligned().is_null() }
 }
 
 #[unsafe(no_mangle)]
