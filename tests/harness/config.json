@@ -59,7 +59,7 @@
       "label": "deno_core",
       "tier": "build",
       "kind": "cargo-deno",
-      "comment": "cargo test -p deno_core in the patched deno checkout. Links our v8 shim but does NOT build the full deno binary.",
+      "comment": "cargo nextest run -p deno_core in the patched deno checkout. Links our v8 shim but does NOT build the full deno binary.",
       "package": "deno_core",
       "ignore": [],
       "ignore_by_backend": {

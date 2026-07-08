@@ -31,14 +31,15 @@ node tests/harness/run.mjs <suite> <backend> [flags]
   --update      rewrite the baseline to the current pass set
   --deno-dir=P  patched deno checkout (deno_core + deno-test suites)
   --deno-bin=P  built deno binary (deno-test suites)
-  --skip-build  reuse already-built cargo test binaries
+  --skip-build  reuse already-built cargo test binaries (cargo-self only)
 ```
 
 Suite kinds (`config.json`):
 - `cargo-self` (rusty_v8): each `[[test]]` target built **separately** so one
   unlinkable target scores 0 without zeroing the rest. Parsed from libtest text.
-- `cargo-deno` (deno_core): `cargo test -p deno_core` in the deno checkout; the
-  v8 backend comes from deno's `[patch.crates-io] v8` features (not our flags).
+- `cargo-deno` (deno_core): `cargo nextest run -p deno_core` in the deno
+  checkout; the v8 backend comes from deno's `[patch.crates-io] v8` features
+  (not our flags).
 - `deno-test` (built deno binary's `deno test --junit-path`, parsed from JUnit):
   supported by `run.mjs` but **not currently in `config.json`** — the full-deno
   node-compat + unit suites are dropped for now to keep CI cheap.

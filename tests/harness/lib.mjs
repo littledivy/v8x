@@ -160,6 +160,48 @@ export function parseLibtest(output) {
   return { pass, fail, skip };
 }
 
+// --- nextest JSON parser ----------------------------------------------------
+// `cargo nextest run --message-format libtest-json` emits newline-delimited JSON
+// records for test events. Unit-test names are shaped as
+// `<package>::<binary>$<test path>`; normalize them to the libtest baseline form
+// `<binary>::<test path>` so switching deno_core to nextest doesn't rename the
+// whole baseline.
+function normalizeNextestName(name) {
+  const clean = normalizeLibtestName(name);
+  const dollar = clean.indexOf("$");
+  if (dollar === -1) return clean;
+  const left = clean.slice(0, dollar);
+  const testPath = clean.slice(dollar + 1);
+  const binary = left.split("::").pop();
+  return binary ? `${binary}::${testPath}` : testPath;
+}
+
+export function parseNextestJson(output) {
+  const pass = new Set();
+  const fail = new Set();
+  const skip = new Set();
+  for (const line of output.split("\n")) {
+    if (!line.startsWith("{")) continue;
+    let event;
+    try {
+      event = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (event.type !== "test" || typeof event.name !== "string") continue;
+    const name = normalizeNextestName(event.name);
+    if (event.event === "ok") {
+      pass.add(name);
+      fail.delete(name);
+    } else if (event.event === "failed" || event.event === "timeout") {
+      if (!pass.has(name)) fail.add(name);
+    } else if (event.event === "ignored") {
+      skip.add(name);
+    }
+  }
+  return { pass, fail, skip };
+}
+
 // --- JUnit XML parser (deno test --junit-path) ------------------------------
 // Minimal: enough for deno's output. classname+name identify a case; a nested
 // <failure>/<error> (or skipped) marks the result.
