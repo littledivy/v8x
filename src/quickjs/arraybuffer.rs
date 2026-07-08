@@ -116,6 +116,7 @@ unsafe extern "C" {
     pbytes_per_element: *mut usize,
   ) -> JSValue;
   fn JS_GetTypedArrayType(obj: JSValue) -> i32;
+  fn JS_IsStrictEqual(ctx: *mut JSContext, op1: JSValue, op2: JSValue) -> bool;
 }
 
 unsafe extern "C" {
@@ -325,6 +326,33 @@ unsafe extern "C" fn bs_free_func(
   if unsafe { (*inner).refcount.fetch_sub(1, Ordering::SeqCst) } == 1 {
     unsafe { BsInner::destroy(inner) };
   }
+}
+
+fn detach_key_matches(
+  ctx: *mut JSContext,
+  buf: JSValue,
+  key: *const Value,
+) -> bool {
+  let has_key =
+    unsafe { JS_GetPropertyStr(ctx, buf, c"__v8x_detach_key_set".as_ptr()) };
+  let must_match = unsafe { JS_ToBool(ctx, has_key) } != 0;
+  unsafe { JS_FreeValue(ctx, has_key) };
+  if !must_match {
+    return true;
+  }
+  if key.is_null() {
+    return false;
+  }
+
+  let expected =
+    unsafe { JS_GetPropertyStr(ctx, buf, c"__v8x_detach_key".as_ptr()) };
+  if expected.tag == JS_TAG_EXCEPTION {
+    unsafe { JS_FreeValue(ctx, expected) };
+    return false;
+  }
+  let ok = unsafe { JS_IsStrictEqual(ctx, expected, jsval_of(key)) };
+  unsafe { JS_FreeValue(ctx, expected) };
+  ok
 }
 
 unsafe extern "C" fn malloc_free_func(
@@ -707,12 +735,14 @@ pub extern "C" fn v8__ArrayBuffer__Detach(
   this: *const ArrayBuffer,
   key: *const Value,
 ) -> MaybeBool {
-  let _ = key;
   let ctx = current_ctx();
   if ctx.is_null() || this.is_null() {
     return MaybeBool::Nothing;
   }
   let buf = jsval_of(this);
+  if !detach_key_matches(ctx, buf, key) {
+    return MaybeBool::Nothing;
+  }
   // Steal the bytes for any outstanding alias backing stores before QuickJS frees
   // them: get_backing_store()-then-detach() (deno's transferable path) otherwise
   // leaves the SharedRef deno keeps pointing at freed QuickJS heap — fatal once
@@ -1258,7 +1288,26 @@ pub extern "C" fn v8__ArrayBuffer__SetDetachKey(
   this: *const ArrayBuffer,
   key: *const Value,
 ) {
-  let _ = (this, key);
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() || key.is_null() {
+    return;
+  }
+  unsafe {
+    JS_DefinePropertyValueStr(
+      ctx,
+      jsval_of(this),
+      c"__v8x_detach_key".as_ptr(),
+      JS_DupValue(ctx, jsval_of(key)),
+      JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE,
+    );
+    JS_DefinePropertyValueStr(
+      ctx,
+      jsval_of(this),
+      c"__v8x_detach_key_set".as_ptr(),
+      JS_NewBool(ctx, 1),
+      JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE,
+    );
+  }
 }
 
 #[unsafe(no_mangle)]
