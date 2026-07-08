@@ -2615,6 +2615,9 @@ unsafe extern "C" fn fn_construct_trampoline(
       this,
       t.internal_field_count,
     );
+    if !t.parent_fn.is_null() {
+      super::object::mark_api_wrapper_for_value(this);
+    }
     apply_props(ctx, this, &t.props);
     apply_accessors(ctx, this, &t.accessors);
   }
@@ -4563,6 +4566,7 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
       let dup = unsafe { JS_DupValue(ctx, proto_obj) };
       unsafe { JS_SetPrototype(ctx, obj, dup) };
       unsafe { JS_FreeValue(ctx, dup) };
+      super::object::mark_api_wrapper_for_value(obj);
     }
     apply_props(ctx, obj, &t.props);
     apply_accessors(ctx, obj, &t.accessors);

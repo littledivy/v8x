@@ -16,6 +16,7 @@
 //! every JSValue through the QuickJS refcount helpers in `core`.
 #![allow(non_snake_case, unused)]
 
+use crate::binding::RustObj;
 use crate::quickjs::core::{
   PersistentHandle, adjust_external_memory, ctx_of, current_ctx, current_iso,
   intern, intern_dup, iso_state, jsval_of, release_external_string_memory,
@@ -23,7 +24,8 @@ use crate::quickjs::core::{
 use crate::quickjs::quickjs_sys::*;
 use crate::{Context, Data, Object, RealIsolate, String as V8String, Value};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::Ordering;
@@ -54,6 +56,12 @@ struct JSPropertyEnum {
 const JS_GPN_STRING_MASK: c_int = 1 << 0;
 const JS_GPN_SYMBOL_MASK: c_int = 1 << 1;
 const JS_GPN_ENUM_ONLY: c_int = 1 << 4;
+const JS_PROP_CONFIGURABLE_QJS: c_int = 1 << 0;
+const JS_PROP_WRITABLE_QJS: c_int = 1 << 1;
+const JS_PROP_HAS_CONFIGURABLE_QJS: c_int = 1 << 8;
+const JS_PROP_HAS_WRITABLE_QJS: c_int = 1 << 9;
+const JS_PROP_HAS_ENUMERABLE_QJS: c_int = 1 << 10;
+const JS_PROP_HAS_VALUE_QJS: c_int = 1 << 13;
 const HEAP_SNAPSHOT_MAX_DEPTH: usize = 5;
 const HEAP_SNAPSHOT_ARRAY_SAMPLE: u32 = 64;
 
@@ -70,6 +78,16 @@ unsafe extern "C" {
     this_obj: JSValue,
     prop: JSAtom,
   ) -> JSValue;
+  fn JS_DefinePropertyValueStr(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: *const c_char,
+    val: JSValue,
+    flags: c_int,
+  ) -> c_int;
+  fn rusty_v8_RustObj_trace(obj: *const RustObj, visitor: *mut c_void);
+  fn rusty_v8_RustObj_get_name(obj: *const RustObj) -> *const c_char;
+  fn rusty_v8_RustObj_drop(obj: *mut RustObj);
 }
 
 fn same_value_identity(a: JSValue, b: JSValue) -> bool {
@@ -221,81 +239,360 @@ pub extern "C" fn cppgc__heap__collect_garbage_for_testing(
   _heap: *mut c_void,
   _stack_state: u8,
 ) {
+  cppgc_collect_garbage();
 }
 
-// cppgc `Member<T>` / `WeakMember<T>` slots. NOTE: the bindgen-derived
-// `cppgc__Member_SIZE` is only **4 bytes** (compressed pointer), so we must
-// never write a raw 64-bit pointer into a member slot — that overflows the
-// inline `[u8; 4]` field and corrupts adjacent memory. We don't run a real
-// Oilpan GC, so members are inert: construct/destruct zero the 4-byte slot and
-// `Get` returns null (`Set`/`Assign` are no-ops). This keeps `test_cppgc`
-// *linking* and non-crashing; the GC-collection assertions in those tests need
-// a real cppgc heap and are expected to fail.
+#[derive(Clone, Copy)]
+struct CppGcObject {
+  ptr: usize,
+  size: usize,
+  align: usize,
+  wrapper_key: Option<usize>,
+}
+
+thread_local! {
+  static CPPGC_OBJECTS: std::cell::RefCell<Vec<CppGcObject>> =
+    const { std::cell::RefCell::new(Vec::new()) };
+  static CPPGC_MEMBERS: std::cell::RefCell<HashMap<usize, usize>> =
+    std::cell::RefCell::new(HashMap::new());
+  static CPPGC_WEAK_MEMBERS: std::cell::RefCell<HashMap<usize, usize>> =
+    std::cell::RefCell::new(HashMap::new());
+  static CPPGC_TRACE_MARKS: std::cell::Cell<*mut HashSet<usize>> =
+    const { std::cell::Cell::new(ptr::null_mut()) };
+}
+
+fn cppgc_member_construct(
+  members: &std::cell::RefCell<HashMap<usize, usize>>,
+  member: *mut c_void,
+  obj: *mut c_void,
+) {
+  if member.is_null() {
+    return;
+  }
+  unsafe { ptr::write_unaligned(member as *mut u32, 0) };
+  let key = member as usize;
+  if obj.is_null() {
+    members.borrow_mut().remove(&key);
+  } else {
+    members.borrow_mut().insert(key, obj as usize);
+  }
+}
+
+fn cppgc_member_get(
+  members: &std::cell::RefCell<HashMap<usize, usize>>,
+  member: *const c_void,
+) -> *mut c_void {
+  if member.is_null() {
+    return ptr::null_mut();
+  }
+  members
+    .borrow()
+    .get(&(member as usize))
+    .copied()
+    .map(|ptr| ptr as *mut c_void)
+    .unwrap_or(ptr::null_mut())
+}
+
+fn cppgc_mark_object(obj: *mut RustObj) {
+  if obj.is_null() {
+    return;
+  }
+  let ptr = obj as usize;
+  CPPGC_TRACE_MARKS.with(|marks| {
+    let marks_ptr = marks.get();
+    if marks_ptr.is_null() {
+      return;
+    }
+    let should_trace = unsafe {
+      let marks = &mut *marks_ptr;
+      marks.insert(ptr)
+    };
+    if should_trace {
+      let mut visitor = 0usize;
+      unsafe {
+        rusty_v8_RustObj_trace(
+          obj as *const RustObj,
+          &mut visitor as *mut _ as *mut c_void,
+        );
+      }
+    }
+  });
+}
+
+fn cppgc_mark_wrapper_key(wrapper_key: usize) -> bool {
+  let objects = CPPGC_OBJECTS.with(|objects| {
+    objects
+      .borrow()
+      .iter()
+      .filter(|object| object.wrapper_key == Some(wrapper_key))
+      .map(|object| object.ptr)
+      .collect::<Vec<_>>()
+  });
+  let found = !objects.is_empty();
+  for object in objects {
+    cppgc_mark_object(object as *mut RustObj);
+  }
+  found
+}
+
+fn cppgc_value_has_wrapper_marker(ctx: *mut JSContext, value: JSValue) -> bool {
+  if ctx.is_null() || !jsv_is_object(&value) {
+    return false;
+  }
+  let marker =
+    unsafe { JS_GetPropertyStr(ctx, value, c"__qjs_cppgc_wrapped".as_ptr()) };
+  if marker.tag == JS_TAG_EXCEPTION {
+    return false;
+  }
+  let marked = unsafe { JS_ToBool(ctx, marker) != 0 };
+  unsafe { JS_FreeValue(ctx, marker) };
+  marked
+}
+
+fn cppgc_mark_js_value(ctx: *mut JSContext, value: JSValue) -> bool {
+  if !jsv_is_object(&value) {
+    return false;
+  }
+  if !cppgc_value_has_wrapper_marker(ctx, value) {
+    return false;
+  }
+  let key = unsafe { value.u.ptr } as usize;
+  if key != 0 {
+    return cppgc_mark_wrapper_key(key);
+  }
+  false
+}
+
+unsafe fn cppgc_mark_js_graph(
+  ctx: *mut JSContext,
+  value: JSValue,
+  depth: usize,
+  seen_objects: &mut HashSet<usize>,
+) {
+  if ctx.is_null() || depth > HEAP_SNAPSHOT_MAX_DEPTH || !jsv_is_object(&value)
+  {
+    return;
+  }
+  let key = unsafe { value.u.ptr } as usize;
+  if key == 0 || !seen_objects.insert(key) {
+    return;
+  }
+
+  cppgc_mark_js_value(ctx, value);
+
+  let mut ptab: *mut JSPropertyEnum = ptr::null_mut();
+  let mut plen = 0u32;
+  let flags = JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_ENUM_ONLY;
+  let rc =
+    unsafe { JS_GetOwnPropertyNames(ctx, &mut ptab, &mut plen, value, flags) };
+  if rc != 0 || ptab.is_null() {
+    return;
+  }
+  for index in 0..plen as usize {
+    let atom = unsafe { (*ptab.add(index)).atom };
+    let property = unsafe { JS_GetProperty(ctx, value, atom) };
+    unsafe {
+      cppgc_mark_js_graph(ctx, property, depth + 1, seen_objects);
+      JS_FreeValue(ctx, property);
+      JS_FreeAtom(ctx, atom);
+    }
+  }
+  unsafe { js_free(ctx, ptab as *mut c_void) };
+}
+
+unsafe fn cppgc_mark_global_properties(ctx: *mut JSContext, global: JSValue) {
+  let mut ptab: *mut JSPropertyEnum = ptr::null_mut();
+  let mut plen = 0u32;
+  let flags = JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK | JS_GPN_ENUM_ONLY;
+  let rc =
+    unsafe { JS_GetOwnPropertyNames(ctx, &mut ptab, &mut plen, global, flags) };
+  if rc != 0 || ptab.is_null() {
+    return;
+  }
+  for index in 0..plen as usize {
+    let atom = unsafe { (*ptab.add(index)).atom };
+    let property = unsafe { JS_GetProperty(ctx, global, atom) };
+    cppgc_mark_js_value(ctx, property);
+    unsafe {
+      JS_FreeValue(ctx, property);
+      JS_FreeAtom(ctx, atom);
+    }
+  }
+  unsafe { js_free(ctx, ptab as *mut c_void) };
+}
+
+fn cppgc_mark_traced_reference(ref_: *const c_void) {
+  if ref_.is_null() {
+    return;
+  }
+  let slot = unsafe { (ref_ as *const usize).read_unaligned() };
+  if slot == 0 {
+    return;
+  }
+  let value = unsafe { *(slot as *const JSValue) };
+  let ctx = stable_ctx();
+  if ctx.is_null() {
+    return;
+  }
+  let mut seen_objects = HashSet::new();
+  unsafe { cppgc_mark_js_graph(ctx, value, 0, &mut seen_objects) };
+}
+
+fn cppgc_collect_garbage() {
+  let ctx = stable_ctx();
+  let mut marks = HashSet::new();
+  CPPGC_TRACE_MARKS.with(|trace_marks| {
+    let previous = trace_marks.replace(&mut marks);
+    if !ctx.is_null() {
+      unsafe {
+        let global = JS_GetGlobalObject(ctx);
+        cppgc_mark_global_properties(ctx, global);
+        JS_FreeValue(ctx, global);
+      }
+    }
+    trace_marks.set(previous);
+  });
+
+  let mut dropped = Vec::new();
+  CPPGC_OBJECTS.with(|objects| {
+    let mut objects = objects.borrow_mut();
+    let mut index = 0;
+    while index < objects.len() {
+      if marks.contains(&objects[index].ptr) {
+        index += 1;
+      } else {
+        dropped.push(objects.remove(index));
+      }
+    }
+  });
+
+  for object in dropped {
+    unsafe {
+      rusty_v8_RustObj_drop(object.ptr as *mut RustObj);
+      if let Ok(layout) =
+        std::alloc::Layout::from_size_align(object.size, object.align)
+      {
+        std::alloc::dealloc(object.ptr as *mut u8, layout);
+      }
+    }
+  }
+}
+
+pub(crate) fn cppgc_register_wrapper(wrapper: JSValue, value: *const RustObj) {
+  if value.is_null() || !jsv_is_object(&wrapper) {
+    return;
+  }
+  let ctx = stable_ctx();
+  if !ctx.is_null() {
+    let marker = unsafe { JS_NewBool(ctx, 1) };
+    let flags = JS_PROP_CONFIGURABLE_QJS
+      | JS_PROP_WRITABLE_QJS
+      | JS_PROP_HAS_CONFIGURABLE_QJS
+      | JS_PROP_HAS_WRITABLE_QJS
+      | JS_PROP_HAS_ENUMERABLE_QJS
+      | JS_PROP_HAS_VALUE_QJS;
+    unsafe {
+      JS_DefinePropertyValueStr(
+        ctx,
+        wrapper,
+        c"__qjs_cppgc_wrapped".as_ptr(),
+        marker,
+        flags,
+      );
+    }
+  }
+  let wrapper_key = unsafe { wrapper.u.ptr } as usize;
+  CPPGC_OBJECTS.with(|objects| {
+    if let Some(object) = objects
+      .borrow_mut()
+      .iter_mut()
+      .find(|object| object.ptr == value as usize)
+    {
+      object.wrapper_key = Some(wrapper_key);
+    }
+  });
+}
+
+pub(crate) fn cppgc_is_live_object(value: *mut RustObj) -> bool {
+  if value.is_null() {
+    return false;
+  }
+  CPPGC_OBJECTS.with(|objects| {
+    objects
+      .borrow()
+      .iter()
+      .any(|object| object.ptr == value as usize)
+  })
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__Member__CONSTRUCT(
   member: *mut c_void,
-  _obj: *mut c_void,
+  obj: *mut c_void,
 ) {
-  if !member.is_null() {
-    unsafe { ptr::write_unaligned(member as *mut u32, 0) };
-  }
+  CPPGC_MEMBERS.with(|members| cppgc_member_construct(members, member, obj));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__Member__DESTRUCT(member: *mut c_void) {
   if !member.is_null() {
     unsafe { ptr::write_unaligned(member as *mut u32, 0) };
+    CPPGC_MEMBERS.with(|members| {
+      members.borrow_mut().remove(&(member as usize));
+    });
   }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cppgc__Member__Get(_member: *const c_void) -> *mut c_void {
-  ptr::null_mut()
+pub extern "C" fn cppgc__Member__Get(member: *const c_void) -> *mut c_void {
+  CPPGC_MEMBERS.with(|members| cppgc_member_get(members, member))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cppgc__Member__Assign(
-  _member: *mut c_void,
-  _obj: *mut c_void,
-) {
+pub extern "C" fn cppgc__Member__Assign(member: *mut c_void, obj: *mut c_void) {
+  CPPGC_MEMBERS.with(|members| cppgc_member_construct(members, member, obj));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__WeakMember__CONSTRUCT(
   member: *mut c_void,
-  _obj: *mut c_void,
+  obj: *mut c_void,
 ) {
-  if !member.is_null() {
-    unsafe { ptr::write_unaligned(member as *mut u32, 0) };
-  }
+  CPPGC_WEAK_MEMBERS
+    .with(|members| cppgc_member_construct(members, member, obj));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__WeakMember__DESTRUCT(member: *mut c_void) {
   if !member.is_null() {
     unsafe { ptr::write_unaligned(member as *mut u32, 0) };
+    CPPGC_WEAK_MEMBERS.with(|members| {
+      members.borrow_mut().remove(&(member as usize));
+    });
   }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cppgc__WeakMember__Get(
-  _member: *const c_void,
-) -> *mut c_void {
-  ptr::null_mut()
+pub extern "C" fn cppgc__WeakMember__Get(member: *const c_void) -> *mut c_void {
+  CPPGC_WEAK_MEMBERS.with(|members| cppgc_member_get(members, member))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__WeakMember__Assign(
-  _member: *mut c_void,
-  _obj: *mut c_void,
+  member: *mut c_void,
+  obj: *mut c_void,
 ) {
+  CPPGC_WEAK_MEMBERS
+    .with(|members| cppgc_member_construct(members, member, obj));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__Visitor__Trace__Member(
   _visitor: *mut c_void,
-  _member: *const c_void,
+  member: *const c_void,
 ) {
+  let obj = CPPGC_MEMBERS.with(|members| cppgc_member_get(members, member));
+  cppgc_mark_object(obj as *mut RustObj);
 }
 
 #[unsafe(no_mangle)]
@@ -322,6 +619,7 @@ pub extern "C" fn v8__Isolate__RequestGarbageCollectionForTesting(
   if st.kept_objects_cleared && !st.rt.is_null() {
     unsafe { JS_RunGC(st.rt) };
   }
+  cppgc_collect_garbage();
   release_external_string_memory(st);
   let epilogue_callbacks = st.gc_epilogue_callbacks.clone();
   run_gc_callbacks(isolate, &epilogue_callbacks);
@@ -378,7 +676,18 @@ pub extern "C" fn cppgc__make_garbage_collectable(
   let Ok(layout) = std::alloc::Layout::from_size_align(size, align) else {
     return ptr::null_mut();
   };
-  unsafe { std::alloc::alloc_zeroed(layout) as *mut c_void }
+  let ptr = unsafe { std::alloc::alloc_zeroed(layout) as *mut c_void };
+  if !ptr.is_null() {
+    CPPGC_OBJECTS.with(|objects| {
+      objects.borrow_mut().push(CppGcObject {
+        ptr: ptr as usize,
+        size,
+        align,
+        wrapper_key: None,
+      });
+    });
+  }
+  ptr
 }
 
 #[unsafe(no_mangle)]
@@ -411,8 +720,9 @@ pub extern "C" fn cppgc__Persistent__Get(
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__Visitor__Trace__TracedReference(
   _visitor: *mut c_void,
-  _ref_: *const c_void,
+  ref_: *const c_void,
 ) {
+  cppgc_mark_traced_reference(ref_);
 }
 
 fn stable_ctx() -> *mut JSContext {
@@ -1387,8 +1697,6 @@ pub extern "C" fn v8__Date__ValueOf(this: *const crate::Date) -> f64 {
   }
 }
 
-use std::collections::HashMap;
-
 thread_local! {
     static EMBEDDER_DATA: std::cell::RefCell<HashMap<usize, Vec<JSValue>>> =
         std::cell::RefCell::new(HashMap::new());
@@ -1823,6 +2131,28 @@ unsafe fn collect_constructor_name(
   }
 }
 
+fn collect_cppgc_snapshot_names(
+  names: &mut Vec<String>,
+  seen_names: &mut HashSet<String>,
+) {
+  let objects = CPPGC_OBJECTS.with(|objects| {
+    objects
+      .borrow()
+      .iter()
+      .map(|object| object.ptr)
+      .collect::<Vec<_>>()
+  });
+  for object in objects {
+    let name = unsafe { rusty_v8_RustObj_get_name(object as *const RustObj) };
+    if name.is_null() {
+      continue;
+    }
+    if let Ok(name) = unsafe { CStr::from_ptr(name) }.to_str() {
+      push_snapshot_name(names, seen_names, name.to_owned());
+    }
+  }
+}
+
 unsafe fn collect_heap_snapshot_names(
   ctx: *mut JSContext,
   value: JSValue,
@@ -1948,6 +2278,7 @@ fn quickjs_heap_snapshot_json(isolate: *mut RealIsolate) -> Vec<u8> {
     );
     JS_FreeValue(ctx, global);
   }
+  collect_cppgc_snapshot_names(&mut names, &mut seen_names);
 
   let mut json =
     String::from("{\"snapshot\":{\"meta\":{}},\"nodes\":[],\"strings\":[");

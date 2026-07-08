@@ -1650,6 +1650,9 @@ thread_local! {
         std::collections::HashMap<(usize, u16), usize>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
 
+    static API_WRAPPERS: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+
     static INTERNAL_FIELDS: std::cell::RefCell<
         std::collections::HashMap<usize, Vec<JSValue>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -1685,6 +1688,16 @@ pub(crate) fn set_internal_field_count_for_value(
   });
 }
 
+pub(crate) fn mark_api_wrapper_for_value(obj: JSValue) {
+  if !jsv_is_object(&obj) {
+    return;
+  }
+  let key = value_key(obj);
+  API_WRAPPERS.with(|t| {
+    t.borrow_mut().insert(key);
+  });
+}
+
 pub(crate) fn internal_field_count_for_value(
   obj: JSValue,
 ) -> crate::support::int {
@@ -1714,6 +1727,10 @@ pub extern "C" fn v8__Object__Wrap(
   WRAP_TABLE.with(|t| {
     t.borrow_mut().insert((key, tag), value as usize);
   });
+  super::misc::cppgc_register_wrapper(
+    jsval_of(wrapper),
+    value as *const crate::binding::RustObj,
+  );
 }
 
 #[unsafe(no_mangle)]
@@ -1730,6 +1747,7 @@ pub extern "C" fn v8__Object__Unwrap(
     t.borrow()
       .get(&(key, tag))
       .map(|&p| p as *mut crate::binding::RustObj)
+      .filter(|&p| super::misc::cppgc_is_live_object(p))
       .unwrap_or(ptr::null_mut())
   })
 }
@@ -1740,7 +1758,8 @@ pub extern "C" fn v8__Object__IsApiWrapper(this: *const Object) -> bool {
     return false;
   }
   let key = wrap_key(this);
-  WRAP_TABLE.with(|t| t.borrow().keys().any(|(w, _)| *w == key))
+  API_WRAPPERS.with(|t| t.borrow().contains(&key))
+    || WRAP_TABLE.with(|t| t.borrow().keys().any(|(w, _)| *w == key))
 }
 
 // ---------------------------------------------------------------------------
