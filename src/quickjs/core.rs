@@ -47,7 +47,7 @@ use std::collections::HashMap;
 use std::os::raw::{c_int, c_void};
 use std::ptr;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 
 pub(crate) type WeakCallback = unsafe extern "C" fn(*const c_void);
 
@@ -218,6 +218,8 @@ pub(crate) struct IsoState {
 
   pub external_string_memory: AtomicI64,
 
+  pub bytecode_and_metadata_size: AtomicUsize,
+
   pub global_handles: AtomicI64,
 
   pub weak_handles: Vec<WeakHandle>,
@@ -318,6 +320,18 @@ pub(crate) fn release_external_string_memory(st: &IsoState) -> i64 {
     adjust_external_memory(st, -released);
   }
   released
+}
+
+#[inline]
+pub(crate) fn note_compiled_bytecode(
+  isolate: *mut RealIsolate,
+  source_len: usize,
+) {
+  if !isolate.is_null() {
+    iso_state(isolate)
+      .bytecode_and_metadata_size
+      .fetch_add(source_len.max(1), Ordering::SeqCst);
+  }
 }
 
 thread_local! {
@@ -599,6 +613,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     iso_added_contexts: 0,
     external_memory: AtomicI64::new(0),
     external_string_memory: AtomicI64::new(0),
+    bytecode_and_metadata_size: AtomicUsize::new(0),
     global_handles: AtomicI64::new(0),
     weak_handles: Vec::new(),
     kept_objects_cleared: false,
@@ -1391,6 +1406,7 @@ pub extern "C" fn v8__Script__Compile(
         stamp_syntax_error_location(ctx, name.as_ref());
         return ptr::null();
       }
+      note_compiled_bytecode(current_iso(), len);
       note_compilation_cache_miss();
       JS_FreeValue(ctx, compiled);
     }

@@ -1636,19 +1636,26 @@ pub extern "C" fn v8__Isolate__GetHeapSpaceStatistics(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetHeapCodeAndMetadataStatistics(
-  _isolate: *mut RealIsolate,
+  isolate: *mut RealIsolate,
   code_statistics: *mut crate::binding::v8__HeapCodeStatistics,
 ) -> bool {
+  if isolate.is_null() {
+    return false;
+  }
   if !code_statistics.is_null() {
+    let bytecode_size = iso_state(isolate)
+      .bytecode_and_metadata_size
+      .load(Ordering::SeqCst);
     unsafe {
       ptr::write_bytes(
         code_statistics as *mut u8,
         0,
         std::mem::size_of::<crate::binding::v8__HeapCodeStatistics>(),
       );
+      (*code_statistics).bytecode_and_metadata_size_ = bytecode_size;
     }
   }
-  false
+  true
 }
 
 #[unsafe(no_mangle)]

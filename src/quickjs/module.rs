@@ -37,7 +37,8 @@ use std::ptr;
 
 use crate::quickjs::core::{
   ctx_of, current_ctx, current_iso, intern, intern_ctx, intern_dup, iso_state,
-  jsval_of, note_compilation_cache_miss, record_script_host_defined_options,
+  jsval_of, note_compilation_cache_miss, note_compiled_bytecode,
+  record_script_host_defined_options,
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::{
@@ -2175,6 +2176,7 @@ pub extern "C" fn v8__ScriptCompiler__Compile(
     unsafe { JS_FreeValue(ctx, exc) };
     return ptr::null();
   }
+  note_compiled_bytecode(current_iso(), len);
   note_compilation_cache_miss();
   unsafe { JS_FreeValue(ctx, compiled) };
 
@@ -2471,6 +2473,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileUnboundScript(
     unsafe { JS_FreeValue(ctx, exc) };
     return ptr::null();
   }
+  note_compiled_bytecode(isolate, len);
   unsafe { JS_FreeValue(ctx, compiled) };
   record_script_source_map_url(src_val, source_map_url);
   intern_dup::<UnboundScript>(ctx, src_val)
