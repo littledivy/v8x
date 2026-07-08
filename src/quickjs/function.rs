@@ -337,10 +337,21 @@ struct DispatchEntry {
 thread_local! {
     static DISPATCH: std::cell::RefCell<Vec<DispatchEntry>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    static SNAPSHOT_FUNCTIONS: std::cell::RefCell<
+      std::collections::HashMap<usize, SnapshotFunctionInfo>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
     static NAMED_GETTER_DISPATCH: std::cell::RefCell<Vec<NamedGetterEntry>> =
         const { std::cell::RefCell::new(Vec::new()) };
     static GLOBAL_DEFINE_DISPATCH: std::cell::RefCell<Vec<*const GlobalDefineEntry>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotFunctionInfo {
+  pub callback: FunctionCallback,
+  pub data_external: Option<*mut c_void>,
+  pub length: i32,
+  pub constructable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2791,6 +2802,7 @@ unsafe fn make_function_len_with_instance(
   let f = unsafe {
     make_cfunc_magic(ctx, tramp, ptr::null(), length.max(0), cproto, magic)
   };
+  record_snapshot_function(f, callback, data, length, construct);
   unsafe { install_native_function_to_string(ctx, f) };
   f
 }
@@ -2886,6 +2898,60 @@ fn external_key(v: JSValue) -> usize {
 #[inline]
 fn function_key(v: JSValue) -> usize {
   jsv_get_ptr(&v) as usize
+}
+
+fn external_pointer_from_value(v: JSValue) -> Option<*mut c_void> {
+  if !jsv_is_object(&v) {
+    return None;
+  }
+  if let Some(value) = external_values()
+    .lock()
+    .unwrap()
+    .get(&external_key(v))
+    .copied()
+  {
+    return Some(value as *mut c_void);
+  }
+  let cid = ext_class_id_current();
+  if cid == 0 {
+    return None;
+  }
+  let opaque = unsafe { JS_GetOpaque(v, cid) };
+  if opaque.is_null() { None } else { Some(opaque) }
+}
+
+fn record_snapshot_function(
+  function: JSValue,
+  callback: FunctionCallback,
+  data: JSValue,
+  length: i32,
+  constructable: bool,
+) {
+  let key = function_key(function);
+  if key == 0 {
+    return;
+  }
+  SNAPSHOT_FUNCTIONS.with(|m| {
+    m.borrow_mut().insert(
+      key,
+      SnapshotFunctionInfo {
+        callback,
+        data_external: external_pointer_from_value(data),
+        length,
+        constructable,
+      },
+    );
+  });
+}
+
+pub(crate) fn snapshot_function_info(
+  function: JSValue,
+) -> Option<SnapshotFunctionInfo> {
+  let key = function_key(function);
+  if key == 0 {
+    return None;
+  }
+  SNAPSHOT_FUNCTIONS.with(|m| m.borrow().get(&key).copied())
 }
 
 pub(crate) fn record_function_script_position(

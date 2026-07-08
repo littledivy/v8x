@@ -326,14 +326,13 @@ pub extern "C" fn v8__Context__FromSnapshot(
   isolate: *mut RealIsolate,
   context_snapshot_index: usize,
   _global_object: *const Value,
-  _microtask_queue: *mut MicrotaskQueue,
+  microtask_queue: *mut MicrotaskQueue,
 ) -> *const Context {
-  let _ = context_snapshot_index;
-  if isolate.is_null() {
-    return ptr::null();
-  }
-  // No snapshot support on quickjs: the embedder falls back to New-init.
-  ptr::null()
+  super::core::context_from_snapshot(
+    isolate,
+    context_snapshot_index,
+    microtask_queue,
+  )
 }
 
 #[unsafe(no_mangle)]
@@ -341,14 +340,25 @@ pub extern "C" fn v8__Context__GetDataFromSnapshotOnce(
   this: *const Context,
   index: usize,
 ) -> *const Data {
-  let _ = index;
   let ctx = super::core::ctx_of(this);
   let iso = super::core::current_iso();
   if ctx.is_null() || iso.is_null() {
     return ptr::null();
   }
-  // No snapshot support on quickjs.
-  ptr::null()
+  let bytes = {
+    let st = super::core::iso_state(iso);
+    st.restored_context_data
+      .get_mut(&(ctx as usize))
+      .and_then(|slots| slots.get_mut(index))
+      .and_then(Option::take)
+  };
+  let Some(bytes) = bytes else {
+    return ptr::null();
+  };
+  let Some(value) = super::snapshot::deserialize_value(ctx, &bytes) else {
+    return ptr::null();
+  };
+  intern::<Data>(value)
 }
 
 /// Native `getContinuationPreservedEmbedderData` for the extras binding object.
@@ -1634,9 +1644,23 @@ pub extern "C" fn v8__Isolate__GetDataFromSnapshotOnce(
   if iso.is_null() {
     return ptr::null();
   }
-  let _ = index;
-  // No snapshot support on quickjs.
-  ptr::null()
+  let ctx = {
+    let st = iso_state(iso);
+    st.contexts.last().copied().unwrap_or(st.ctx)
+  };
+  let bytes = {
+    let st = iso_state(iso);
+    st.restored_isolate_data
+      .get_mut(index)
+      .and_then(Option::take)
+  };
+  let Some(bytes) = bytes else {
+    return ptr::null();
+  };
+  let Some(value) = super::snapshot::deserialize_value(ctx, &bytes) else {
+    return ptr::null();
+  };
+  intern::<Data>(value) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]

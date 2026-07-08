@@ -213,6 +213,14 @@ pub(crate) struct IsoState {
   pub ctx_data_counts: HashMap<usize, usize>,
   pub iso_data_count: usize,
   pub iso_added_contexts: usize,
+  pub snap_default_context: Option<usize>,
+  pub snap_contexts: Vec<usize>,
+  pub snap_isolate_data: Vec<Vec<u8>>,
+  pub snap_context_data: HashMap<usize, Vec<Vec<u8>>>,
+  pub restored_snapshot: Option<super::snapshot::SnapshotBlob>,
+  pub restored_isolate_data: Vec<Option<Vec<u8>>>,
+  pub restored_context_data: HashMap<usize, Vec<Option<Vec<u8>>>>,
+  pub external_references: Vec<usize>,
 
   pub external_memory: AtomicI64,
 
@@ -596,6 +604,13 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     let shared = shared as *const _ as *const SharedPtrBase<Allocator>;
     super::allocator::allocator_shared_copy(shared)
   };
+  let external_references =
+    super::snapshot::external_references_from_params(raw_params);
+  let restored_snapshot = super::snapshot::blob_from_params(raw_params);
+  let restored_isolate_data = restored_snapshot
+    .as_ref()
+    .map(|blob| blob.isolate_data.iter().cloned().map(Some).collect())
+    .unwrap_or_default();
   let state = Box::new(IsoState {
     rt,
     ctx,
@@ -611,6 +626,14 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     ctx_data_counts: HashMap::new(),
     iso_data_count: 0,
     iso_added_contexts: 0,
+    snap_default_context: None,
+    snap_contexts: Vec::new(),
+    snap_isolate_data: Vec::new(),
+    snap_context_data: HashMap::new(),
+    restored_snapshot,
+    restored_isolate_data,
+    restored_context_data: HashMap::new(),
+    external_references,
     external_memory: AtomicI64::new(0),
     external_string_memory: AtomicI64::new(0),
     bytecode_and_metadata_size: AtomicUsize::new(0),
@@ -927,10 +950,74 @@ pub extern "C" fn v8__Context__New(
 
   // Snapshot restore: every plain Context::New on a snapshot-backed isolate
   // materializes the snapshot's default context (matches V8 semantics).
+  if let Some(snapshot) = st
+    .restored_snapshot
+    .as_ref()
+    .and_then(|blob| blob.default_context.clone())
+  {
+    let external_references = st.external_references.clone();
+    super::snapshot::replay_context(
+      isolate,
+      ctx,
+      &snapshot,
+      &external_references,
+    );
+    st.restored_context_data.insert(
+      ctx as usize,
+      snapshot.context_data.iter().cloned().map(Some).collect(),
+    );
+  }
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
     eprintln!("[qjs snapshot] Context__New ctx={ctx:?}");
   }
 
+  intern_ctx(ctx)
+}
+
+pub(crate) fn context_from_snapshot(
+  isolate: *mut RealIsolate,
+  context_snapshot_index: usize,
+  microtask_queue: *mut MicrotaskQueue,
+) -> *const Context {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let st = iso_state(isolate);
+  let Some(snapshot) = st
+    .restored_snapshot
+    .as_ref()
+    .and_then(|blob| blob.contexts.get(context_snapshot_index).cloned())
+  else {
+    return ptr::null();
+  };
+  let ctx = if !st.main_ctx_claimed {
+    st.main_ctx_claimed = true;
+    st.ctx
+  } else {
+    let c = unsafe { JS_NewContext(st.rt) };
+    assert!(!c.is_null(), "JS_NewContext failed");
+    if std::env::var_os("QJS_NO_WASM").is_none() {
+      super::wasm::install_webassembly(c);
+    }
+    st.extra_contexts.push(c);
+    c
+  };
+  if !microtask_queue.is_null() {
+    st.context_microtask_queues
+      .insert(ctx as usize, microtask_queue as *mut MicrotaskQueue);
+  }
+  install_default_globals(isolate, ctx);
+  let external_references = st.external_references.clone();
+  super::snapshot::replay_context(
+    isolate,
+    ctx,
+    &snapshot,
+    &external_references,
+  );
+  st.restored_context_data.insert(
+    ctx as usize,
+    snapshot.context_data.iter().cloned().map(Some).collect(),
+  );
   intern_ctx(ctx)
 }
 

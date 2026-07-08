@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=rusty_v8.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 242 passing. DO NOT hand-sort; the
+# (run.mjs --update). 247 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 rv8_slots::clear_all_context_slots
 rv8_slots::context_slots
@@ -88,6 +88,7 @@ rv8_test_api::exception
 rv8_test_api::exception_thrown_but_continues_execution
 rv8_test_api::external_onebyte_string
 rv8_test_api::external_onebyte_string_frees_external_memory
+rv8_test_api::external_references
 rv8_test_api::external_strings
 rv8_test_api::external_twobyte_string
 rv8_test_api::external_twobyte_string_raw
@@ -156,6 +157,7 @@ rv8_test_api::microtask_queue_new
 rv8_test_api::microtasks
 rv8_test_api::module_evaluation
 rv8_test_api::module_instantiation_failures1
+rv8_test_api::module_snapshot
 rv8_test_api::no_internal_field
 rv8_test_api::no_source_map_comment
 rv8_test_api::object
@@ -197,6 +199,9 @@ rv8_test_api::set_idle
 rv8_test_api::set_promise_reject_callback
 rv8_test_api::shared_array_buffer
 rv8_test_api::shared_array_buffer_allocator
+rv8_test_api::snapshot_creator
+rv8_test_api::snapshot_creator_context_embedder_data
+rv8_test_api::snapshot_creator_multiple_contexts
 rv8_test_api::static_source_phase_import
 rv8_test_api::string_concat
 rv8_test_api::string_valueview

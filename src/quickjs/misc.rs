@@ -719,10 +719,43 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
   this: *mut c_void,
   _function_code_handling: u32,
 ) -> RawStartupDataAbi {
-  // No snapshot support on quickjs: hand back an inert non-null blob so
-  // rusty_v8 can distinguish successful creation from "no blob".
-  let _ = this;
-  let (data, raw_size) = super::snapshot::leak_blob(Box::new([0]));
+  let iso = creator_iso(this);
+  if iso.is_null() {
+    return RawStartupDataAbi {
+      data: ptr::null(),
+      raw_size: 0,
+    };
+  }
+  let st = crate::quickjs::core::iso_state(iso);
+  let default_context = st.snap_default_context.map(|ctx| {
+    let context_data =
+      st.snap_context_data.get(&ctx).cloned().unwrap_or_default();
+    super::snapshot::capture_context(
+      ctx as *mut JSContext,
+      &st.external_references,
+      &context_data,
+    )
+  });
+  let contexts = st
+    .snap_contexts
+    .iter()
+    .map(|ctx| {
+      let context_data =
+        st.snap_context_data.get(ctx).cloned().unwrap_or_default();
+      super::snapshot::capture_context(
+        *ctx as *mut JSContext,
+        &st.external_references,
+        &context_data,
+      )
+    })
+    .collect();
+  let blob = super::snapshot::SnapshotBlob {
+    default_context,
+    contexts,
+    isolate_data: st.snap_isolate_data.clone(),
+  };
+  let (data, raw_size) =
+    super::snapshot::leak_blob(super::snapshot::encode_blob(&blob));
   RawStartupDataAbi {
     data: data as *const c_char,
     raw_size,
@@ -739,6 +772,8 @@ pub extern "C" fn v8__SnapshotCreator__SetDefaultContext(
     return;
   }
   let qctx = ctx_of(context);
+  crate::quickjs::core::iso_state(iso).snap_default_context =
+    Some(qctx as usize);
 }
 
 #[unsafe(no_mangle)]
@@ -752,7 +787,8 @@ pub extern "C" fn v8__SnapshotCreator__AddContext(
   }
   let qctx = ctx_of(context);
   let st = crate::quickjs::core::iso_state(iso);
-  let n = st.iso_added_contexts;
+  let n = st.snap_contexts.len();
+  st.snap_contexts.push(qctx as usize);
   st.iso_added_contexts += 1;
   n
 }
@@ -770,7 +806,8 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_isolate(
   let bytes =
     super::snapshot::serialize_value(ctx, jsval_of(data)).unwrap_or_default();
   let st = crate::quickjs::core::iso_state(iso);
-  let n = st.iso_data_count;
+  let n = st.snap_isolate_data.len();
+  st.snap_isolate_data.push(bytes);
   st.iso_data_count += 1;
   n
 }
@@ -815,6 +852,10 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
   let n = st.ctx_data_counts.entry(ctx as usize).or_insert(0);
   let idx = *n;
   *n += 1;
+  st.snap_context_data
+    .entry(ctx as usize)
+    .or_default()
+    .push(bytes);
   idx
 }
 
