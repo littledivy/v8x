@@ -1,6 +1,8 @@
 #![allow(non_snake_case)]
 
-use crate::quickjs::core::{ctx_of, current_ctx, intern, iso_state, jsval_of};
+use crate::quickjs::core::{
+  JS_TAG_V8_CONTEXT, ctx_of, current_ctx, intern, iso_state, jsval_of,
+};
 use crate::quickjs::function::{TemplKind, template_kind};
 use crate::quickjs::quickjs_sys::*;
 use crate::support::int;
@@ -705,6 +707,9 @@ pub extern "C" fn v8__Data__EQ(this: *const Data, other: *const Data) -> bool {
   let a = jsval_of(this);
   let b = jsval_of(other);
 
+  if a.tag == JS_TAG_V8_CONTEXT || b.tag == JS_TAG_V8_CONTEXT {
+    return a.tag == b.tag && unsafe { a.u.ptr == b.u.ptr };
+  }
   if a.tag == b.tag && a.tag < 0 && unsafe { a.u.ptr == b.u.ptr } {
     return true;
   }
