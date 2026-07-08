@@ -1508,10 +1508,12 @@ pub extern "C" fn v8__Isolate__LowMemoryNotification(
   if isolate.is_null() {
     return;
   }
-  let st = iso_state(isolate);
-  if !st.rt.is_null() {
-    unsafe { JS_RunGC(st.rt) };
+  let rt = iso_state(isolate).rt;
+  if !rt.is_null() {
+    unsafe { JS_RunGC(rt) };
   }
+  super::arraybuffer::release_pending_allocator_buffers(isolate);
+  let st = iso_state(isolate);
   release_external_string_memory(st);
 }
 

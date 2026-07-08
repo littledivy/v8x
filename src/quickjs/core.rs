@@ -37,8 +37,10 @@
 #![allow(non_snake_case)]
 
 use super::quickjs_sys::*;
+use crate::support::SharedPtrBase;
 use crate::{
-  Context, Data, Object, Primitive, RealIsolate, String as V8String, Value,
+  Allocator, Context, Data, Object, Primitive, RealIsolate, String as V8String,
+  Value,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -213,6 +215,10 @@ pub(crate) struct IsoState {
   // uncatchable termination exception on the next safe point). An `AtomicBool`
   // because V8's terminate may be requested from another thread.
   pub terminating: std::sync::atomic::AtomicBool,
+
+  pub array_buffer_allocator: SharedPtrBase<Allocator>,
+
+  pub pending_array_buffer_frees: Vec<(*mut Allocator, *mut c_void, usize)>,
 }
 
 impl IsoState {
@@ -480,7 +486,7 @@ fn sab_funcs_table() -> *const JSSharedArrayBufferFunctions {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
+pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
@@ -519,6 +525,15 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
   if std::env::var_os("QJS_NO_WASM").is_none() {
     super::wasm::install_webassembly(ctx);
   }
+  let array_buffer_allocator = if params.is_null() {
+    SharedPtrBase::<Allocator>::default()
+  } else {
+    let params =
+      params as *const crate::isolate_create_params::raw::CreateParams;
+    let shared = unsafe { &(*params).array_buffer_allocator_shared };
+    let shared = shared as *const _ as *const SharedPtrBase<Allocator>;
+    super::allocator::allocator_shared_copy(shared)
+  };
   let state = Box::new(IsoState {
     rt,
     ctx,
@@ -544,6 +559,8 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     javascript_execution_disallow_scopes: Vec::new(),
     javascript_execution_allow_depth: 0,
     terminating: std::sync::atomic::AtomicBool::new(false),
+    array_buffer_allocator,
+    pending_array_buffer_frees: Vec::new(),
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;
   // Arm the interrupt handler so a runaway loop unwinds once
@@ -618,6 +635,11 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
     JS_FreeContext(st.ctx);
     if std::env::var_os("QJS_SKIP_FREE_RT").is_none() {
       JS_FreeRuntime(st.rt);
+    }
+    for (allocator, data, byte_length) in
+      std::mem::take(&mut st.pending_array_buffer_frees)
+    {
+      super::allocator::allocator_free(allocator, data, byte_length);
     }
   }
   // The module registries are thread-locals keyed by NAME or by pointers into
@@ -812,7 +834,7 @@ pub extern "C" fn v8__Context__New(
     st.extra_contexts.push(c);
     c
   };
-  install_default_globals(ctx);
+  install_default_globals(isolate, ctx);
 
   // Snapshot restore: every plain Context::New on a snapshot-backed isolate
   // materializes the snapshot's default context (matches V8 semantics).
@@ -823,7 +845,10 @@ pub extern "C" fn v8__Context__New(
   intern_ctx(ctx)
 }
 
-pub(crate) fn install_default_globals(ctx: *mut JSContext) {
+pub(crate) fn install_default_globals(
+  isolate: *mut RealIsolate,
+  ctx: *mut JSContext,
+) {
   if ctx.is_null() {
     return;
   }
@@ -857,6 +882,7 @@ pub(crate) fn install_default_globals(ctx: *mut JSContext) {
     if super::init::has_entropy_source() {
       install_entropy_math_random(ctx, global);
     }
+    super::arraybuffer::install_array_buffer_constructor(isolate, ctx, global);
     JS_FreeValue(ctx, global);
   }
   install_weakref_kept_object_shim(ctx);

@@ -1,13 +1,92 @@
-//! QuickJS-backed ArrayBuffer::Allocator placeholder shims.
-//!
-//! QuickJS manages ArrayBuffer memory internally, so the v8 allocator is a
-//! stateless sentinel. Needed because `CreateParams::default()` builds a
-//! default allocator shared_ptr. Mirrors the JSC backend's allocator.
+//! QuickJS-backed ArrayBuffer::Allocator shims.
 #![allow(non_snake_case)]
 
 use crate::Allocator;
+use crate::array_buffer::RustAllocatorVtable;
 use crate::support::{SharedPtrBase, UniquePtr, long};
+use std::ffi::c_void;
+use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+struct QjsArrayBufferAllocator {
+  handle: *const c_void,
+  vtable: *const RustAllocatorVtable<c_void>,
+}
+
+unsafe extern "C" {
+  fn calloc(count: usize, size: usize) -> *mut c_void;
+  fn free(ptr: *mut c_void);
+}
+
+#[inline]
+fn as_qjs_allocator(
+  ptr: *mut Allocator,
+) -> Option<&'static QjsArrayBufferAllocator> {
+  unsafe { (ptr as *const QjsArrayBufferAllocator).as_ref() }
+}
+
+#[inline]
+pub(crate) fn allocator_shared_copy(
+  ptr: *const SharedPtrBase<Allocator>,
+) -> SharedPtrBase<Allocator> {
+  std__shared_ptr__v8__ArrayBuffer__Allocator__COPY(ptr)
+}
+
+#[inline]
+pub(crate) fn allocator_shared_get(
+  ptr: *const SharedPtrBase<Allocator>,
+) -> *mut Allocator {
+  std__shared_ptr__v8__ArrayBuffer__Allocator__get(ptr)
+}
+
+#[inline]
+pub(crate) fn allocator_is_rust(ptr: *mut Allocator) -> bool {
+  as_qjs_allocator(ptr).is_some_and(|a| !a.vtable.is_null())
+}
+
+pub(crate) unsafe fn allocator_allocate(
+  ptr: *mut Allocator,
+  byte_length: usize,
+  zeroed: bool,
+) -> *mut c_void {
+  let Some(alloc) = as_qjs_allocator(ptr) else {
+    return ptr::null_mut();
+  };
+  if byte_length == 0 {
+    return ptr::null_mut();
+  }
+  if alloc.vtable.is_null() {
+    return unsafe { calloc(byte_length, 1) };
+  }
+
+  let handle = unsafe { &*(alloc.handle) };
+  if zeroed {
+    unsafe { ((*alloc.vtable).allocate)(handle, byte_length) }
+  } else {
+    unsafe { ((*alloc.vtable).allocate_uninitialized)(handle, byte_length) }
+  }
+}
+
+pub(crate) unsafe fn allocator_free(
+  ptr: *mut Allocator,
+  data: *mut c_void,
+  byte_length: usize,
+) {
+  if data.is_null() {
+    return;
+  }
+  let Some(alloc) = as_qjs_allocator(ptr) else {
+    unsafe { free(data) };
+    return;
+  };
+  if alloc.vtable.is_null() {
+    unsafe { free(data) };
+    return;
+  }
+
+  let handle = unsafe { &*(alloc.handle) };
+  unsafe { ((*alloc.vtable).free)(handle, data, byte_length) };
+}
 
 // The allocator `std::shared_ptr` is modelled with a real, atomically
 // refcounted control block so that `clone()` / drop behave like C++'s
@@ -44,13 +123,29 @@ unsafe fn write_words(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ArrayBuffer__Allocator__NewDefaultAllocator()
 -> *mut Allocator {
-  Box::into_raw(Box::new(0u8)) as *mut Allocator
+  Box::into_raw(Box::new(QjsArrayBufferAllocator {
+    handle: ptr::null(),
+    vtable: ptr::null(),
+  })) as *mut Allocator
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBuffer__Allocator__NewRustAllocator(
+  handle: *const c_void,
+  vtable: *const RustAllocatorVtable<c_void>,
+) -> *mut Allocator {
+  Box::into_raw(Box::new(QjsArrayBufferAllocator { handle, vtable }))
+    as *mut Allocator
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ArrayBuffer__Allocator__DELETE(this: *mut Allocator) {
-  if !this.is_null() {
-    unsafe { drop(Box::from_raw(this as *mut u8)) };
+  if this.is_null() {
+    return;
+  }
+  let alloc = unsafe { Box::from_raw(this as *mut QjsArrayBufferAllocator) };
+  if !alloc.vtable.is_null() {
+    unsafe { ((*alloc.vtable).drop)(alloc.handle) };
   }
 }
 
