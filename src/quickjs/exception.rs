@@ -39,6 +39,8 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
 const MESSAGE_TEXT_PROP: &std::ffi::CStr = c"__v8qjs_message_text";
+const MESSAGE_TEXT_VERBATIM_PROP: &std::ffi::CStr =
+  c"__v8qjs_message_text_verbatim";
 const MESSAGE_SOURCE_LINE_PROP: &std::ffi::CStr = c"__v8qjs_source_line";
 const MESSAGE_STACK_PTR_PROP: &std::ffi::CStr = c"__v8qjs_stack_ptr";
 const JS_CLASS_PROMISE: JSClassID = 52;
@@ -200,6 +202,9 @@ pub extern "C" fn v8__Message__Get(this: *const Message) -> *const String {
   }
   unsafe {
     let owned = read_str_prop(ctx, jsval_of(this), MESSAGE_TEXT_PROP);
+    let verbatim = unsafe {
+      read_bool_prop(ctx, jsval_of(this), MESSAGE_TEXT_VERBATIM_PROP)
+    };
     let mut len: usize = 0;
     let mut cstr_to_free: *const c_char = ptr::null();
     let bytes: &[u8] = if let Some(text) = owned.as_ref() {
@@ -212,7 +217,7 @@ pub extern "C" fn v8__Message__Get(this: *const Message) -> *const String {
       }
       std::slice::from_raw_parts(cstr_to_free as *const u8, len)
     };
-    let s = if bytes.starts_with(b"Uncaught ") {
+    let s = if verbatim || bytes.starts_with(b"Uncaught ") {
       JS_NewStringLen(ctx, bytes.as_ptr() as *const c_char, bytes.len())
     } else {
       let mut message = Vec::with_capacity(b"Uncaught ".len() + bytes.len());
@@ -359,6 +364,30 @@ unsafe fn set_message_str_prop(
     JS_NewStringLen(ctx, value.as_ptr() as *const c_char, value.len())
   };
   unsafe { JS_SetPropertyStr(ctx, obj, name.as_ptr(), v) };
+}
+
+pub(crate) unsafe fn set_message_text_verbatim(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  value: &str,
+) {
+  unsafe { set_message_str_prop(ctx, obj, MESSAGE_TEXT_PROP, value) };
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      obj,
+      MESSAGE_TEXT_VERBATIM_PROP.as_ptr(),
+      JS_NewBool(ctx, 1),
+    )
+  };
+}
+
+pub(crate) unsafe fn set_message_source_line(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  value: &str,
+) {
+  unsafe { set_message_str_prop(ctx, obj, MESSAGE_SOURCE_LINE_PROP, value) };
 }
 
 unsafe fn set_message_int_prop(
@@ -1447,6 +1476,21 @@ unsafe fn read_str_prop(
     return None;
   }
   let out = unsafe { js_string_value(ctx, v) };
+  unsafe { JS_FreeValue(ctx, v) };
+  out
+}
+
+unsafe fn read_bool_prop(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: &std::ffi::CStr,
+) -> bool {
+  let v = unsafe { JS_GetPropertyStr(ctx, obj, prop.as_ptr()) };
+  if v.tag == JS_TAG_EXCEPTION {
+    unsafe { clear_pending(ctx) };
+    return false;
+  }
+  let out = unsafe { JS_ToBool(ctx, v) != 0 };
   unsafe { JS_FreeValue(ctx, v) };
   out
 }

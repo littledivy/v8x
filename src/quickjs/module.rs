@@ -3939,7 +3939,7 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
   // Resolve `this` module's underlying QuickJS def. After evaluation the def is
   // recorded in ModuleState; fall back to the by-name cache for paths that only
   // populate it there.
-  let (def, source_name) = with_module_state(this, |m| {
+  let (def, source_name, source_text) = with_module_state(this, |m| {
     let def = if !m.module_def.is_null() {
       m.module_def
     } else {
@@ -3948,9 +3948,13 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
         .map(|d| d as *mut JSModuleDef)
         .unwrap_or(ptr::null_mut())
     };
-    (def, m.source_name.clone())
+    (def, m.source_name.clone(), m.source_text.clone())
   })
-  .unwrap_or((ptr::null_mut(), std::string::String::new()));
+  .unwrap_or((
+    ptr::null_mut(),
+    std::string::String::new(),
+    std::string::String::new(),
+  ));
 
   // Only a module still parked in EVALUATING_ASYNC has an unresolved top-level
   // await. A resolved TLA advances the module to EVALUATED; deno only reaches
@@ -3961,7 +3965,7 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
     return 0;
   }
 
-  let message = build_stalled_tla_message(ctx, &source_name);
+  let message = build_stalled_tla_message(ctx, &source_name, &source_text);
   if message.is_null() {
     return 0;
   }
@@ -3981,6 +3985,7 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
 fn build_stalled_tla_message(
   ctx: *mut JSContext,
   source_name: &str,
+  source_text: &str,
 ) -> *const Message {
   let factory_src = c"(file)=>{const o={fileName:file,lineNumber:1,columnNumber:0};o.toString=()=>\"Top-level await promise never resolved\";return o;}";
   let factory = unsafe {
@@ -4008,6 +4013,18 @@ fn build_stalled_tla_message(
     unsafe { JS_FreeValue(ctx, JS_GetException(ctx)) };
     return ptr::null();
   }
+  unsafe {
+    super::exception::set_message_text_verbatim(
+      ctx,
+      obj,
+      "Top-level await promise never resolved",
+    );
+    super::exception::set_message_source_line(
+      ctx,
+      obj,
+      source_text.lines().next().unwrap_or(source_text),
+    );
+  };
   intern::<Message>(obj)
 }
 
