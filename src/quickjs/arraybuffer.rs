@@ -1035,7 +1035,7 @@ pub extern "C" fn v8__SharedArrayBuffer__New__with_backing_store(
       len,
       Some(bs_free_func),
       inner as *mut c_void,
-      false,
+      true,
     )
   };
   if obj.tag == JS_TAG_EXCEPTION {
@@ -1272,28 +1272,51 @@ pub extern "C" fn std__shared_ptr__v8__BackingStore__use_count(
   unsafe { (*inner).refcount.load(Ordering::SeqCst) as long }
 }
 
-// ---------------------------------------------------------------------------
-// Link-stubs for v8 C-ABI symbols that `test_api.rs` references but this
-// backend doesn't implement yet. Each returns a benign default
-// (null / 0 / false / `Nothing`) so the target LINKS and the many tests that
-// don't touch these paths run; tests that do exercise them fail gracefully
-// without crashing. Promote individual stubs to real implementations over time.
-// ---------------------------------------------------------------------------
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__SharedArrayBuffer__NewBackingStore__with_byte_length(
+  _isolate: *mut RealIsolate,
+  byte_length: usize,
+) -> *mut BackingStore {
+  BsInner::new_allocated(byte_length, true) as *mut BackingStore
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SharedArrayBuffer__NewBackingStore__with_data(
-  _data: *mut std::os::raw::c_void,
-  _byte_length: usize,
-  _deleter: *const std::os::raw::c_void,
-  _deleter_data: *mut std::os::raw::c_void,
-) -> *mut std::os::raw::c_void {
-  std::ptr::null_mut()
+  data: *mut c_void,
+  byte_length: usize,
+  deleter: BackingStoreDeleterCallback,
+  deleter_data: *mut c_void,
+) -> *mut BackingStore {
+  BsInner::boxed(data, byte_length, true, deleter, deleter_data, false)
+    as *mut BackingStore
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SharedArrayBuffer__New__with_byte_length(
-  _isolate: *mut std::os::raw::c_void,
-  _byte_length: usize,
-) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  isolate: *mut RealIsolate,
+  byte_length: usize,
+) -> *const SharedArrayBuffer {
+  let st = iso_state(isolate);
+  let ctx = st.contexts.last().copied().unwrap_or(st.ctx);
+  if ctx.is_null() {
+    return ptr::null();
+  }
+
+  let inner = BsInner::new_allocated(byte_length, true);
+  let data = unsafe { (*inner).data };
+  let obj = unsafe {
+    JS_NewArrayBuffer(
+      ctx,
+      data as *mut u8,
+      byte_length,
+      Some(bs_free_func),
+      inner as *mut c_void,
+      true,
+    )
+  };
+  if obj.tag == JS_TAG_EXCEPTION {
+    unsafe { bs_free_func(ptr::null_mut(), inner as *mut c_void, data) };
+    return ptr::null();
+  }
+  intern::<SharedArrayBuffer>(obj)
 }
