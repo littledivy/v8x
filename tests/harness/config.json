@@ -44,13 +44,11 @@
         "rv8_test_concurrent_isolate_creation_and_disposal",
         "rv8_test_cppgc"
       ],
-      "ignore_comment": "quickjs-only quarantines: concurrent_isolate_creation_and_disposal has hit Linux CI SIGABRTs during isolate create/dispose stress, so keep it skipped until that shim race is fixed. heap_limits and resource_constraints_near_heap_limit rely on V8 near-heap-limit callbacks; quickjs currently does not fire them, so they run until OOM.",
+      "ignore_comment": "quickjs-only quarantine: concurrent_isolate_creation_and_disposal has hit Linux CI SIGABRTs during isolate create/dispose stress, so keep it skipped until that shim race is fixed.",
       "ignore": [],
       "ignore_by_backend": {
         "quickjs": [
-          "concurrent_isolate_creation_and_disposal",
-          "heap_limits",
-          "resource_constraints_near_heap_limit"
+          "concurrent_isolate_creation_and_disposal"
         ]
       }
     },
