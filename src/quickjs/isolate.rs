@@ -335,7 +335,15 @@ thread_local! {
   // and a re-entrancy guard.
   static PROMISE_HOOKS: std::cell::Cell<[JSValue; 4]> =
     std::cell::Cell::new([jsv_undefined(); 4]);
+  static PROMISE_HOOK_CB: std::cell::Cell<Option<crate::isolate::PromiseHook>> =
+    const { std::cell::Cell::new(None) };
   static PROMISE_HOOK_BUSY: std::cell::Cell<bool> = std::cell::Cell::new(false);
+}
+
+fn has_promise_hooks() -> bool {
+  let has_js_hook =
+    PROMISE_HOOKS.with(|h| h.get().iter().any(|v| !jsv_is_undefined(v)));
+  has_js_hook || PROMISE_HOOK_CB.with(|h| h.get().is_some())
 }
 
 unsafe extern "C" fn promise_hook_trampoline(
@@ -349,25 +357,46 @@ unsafe extern "C" fn promise_hook_trampoline(
   if idx >= 4 || ctx.is_null() {
     return;
   }
+  let v8_ty = match ty {
+    0 => crate::isolate::PromiseHookType::Init,
+    1 => crate::isolate::PromiseHookType::Before,
+    2 => crate::isolate::PromiseHookType::After,
+    3 => crate::isolate::PromiseHookType::Resolve,
+    _ => return,
+  };
   // Guard against a hook that itself creates/awaits promises recursing forever.
   if PROMISE_HOOK_BUSY.with(|b| b.get()) {
     return;
   }
+  let native_hook = PROMISE_HOOK_CB.with(|h| h.get());
   let f = PROMISE_HOOKS.with(|h| h.get()[idx]);
-  if jsv_is_undefined(&f) {
+  if native_hook.is_none() && jsv_is_undefined(&f) {
     return;
   }
   PROMISE_HOOK_BUSY.with(|b| b.set(true));
+  if let Some(hook) = native_hook {
+    let promise_h = intern_dup::<crate::Promise>(ctx, promise);
+    let parent_h = intern_dup::<Value>(ctx, parent);
+    unsafe {
+      hook(
+        v8_ty,
+        crate::Local::from_raw(promise_h).unwrap(),
+        crate::Local::from_raw(parent_h).unwrap(),
+      );
+    }
+  }
   // init (idx 0) also receives the parent promise.
-  let mut args = [promise, parent];
-  let argc = if idx == 0 { 2 } else { 1 };
-  let ret =
-    unsafe { JS_Call(ctx, f, jsv_undefined(), argc, args.as_mut_ptr()) };
-  if ret.tag == JS_TAG_EXCEPTION {
-    let exc = unsafe { JS_GetException(ctx) };
-    unsafe { JS_FreeValue(ctx, exc) };
-  } else {
-    unsafe { JS_FreeValue(ctx, ret) };
+  if !jsv_is_undefined(&f) {
+    let mut args = [promise, parent];
+    let argc = if idx == 0 { 2 } else { 1 };
+    let ret =
+      unsafe { JS_Call(ctx, f, jsv_undefined(), argc, args.as_mut_ptr()) };
+    if ret.tag == JS_TAG_EXCEPTION {
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+    } else {
+      unsafe { JS_FreeValue(ctx, ret) };
+    }
   }
   PROMISE_HOOK_BUSY.with(|b| b.set(false));
 }
@@ -408,12 +437,11 @@ pub extern "C" fn v8__Context__SetPromiseHooks(
       unsafe { JS_FreeValue(ctx, v) };
     }
   }
-  let any = new.iter().any(|v| !jsv_is_undefined(v));
   let rt = unsafe { JS_GetRuntime(ctx) };
   unsafe {
     JS_SetPromiseHook(
       rt,
-      if any {
+      if has_promise_hooks() {
         Some(promise_hook_trampoline)
       } else {
         None
@@ -1334,9 +1362,25 @@ pub extern "C" fn v8__Isolate__SetOOMErrorHandler(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetPromiseHook(
-  _isolate: *mut std::os::raw::c_void,
-  _hook: *const std::os::raw::c_void,
+  isolate: *mut RealIsolate,
+  hook: crate::isolate::PromiseHook,
 ) {
+  PROMISE_HOOK_CB.with(|h| h.set(Some(hook)));
+  let iso = if isolate.is_null() {
+    current_iso()
+  } else {
+    isolate
+  };
+  if iso.is_null() {
+    return;
+  }
+  let rt = iso_state(iso).rt;
+  if rt.is_null() {
+    return;
+  }
+  unsafe {
+    JS_SetPromiseHook(rt, Some(promise_hook_trampoline), ptr::null_mut());
+  }
 }
 
 #[unsafe(no_mangle)]
