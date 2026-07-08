@@ -948,12 +948,16 @@ pub(crate) fn install_default_globals(
     let absent = jsv_is_undefined(&existing) || existing.tag == JS_TAG_NULL;
     let console = if absent { JS_NewObject(ctx) } else { existing };
     if jsv_is_object(&console) {
-      let log = JS_GetPropertyStr(ctx, console, c"log".as_ptr());
-      let log_absent = jsv_is_undefined(&log) || log.tag == JS_TAG_NULL;
-      JS_FreeValue(ctx, log);
-      if log_absent {
-        let log_fn = JS_NewCFunction(ctx, qjs_console_log, c"log".as_ptr(), 0);
-        JS_SetPropertyStr(ctx, console, c"log".as_ptr(), log_fn);
+      for name in [c"log", c"error", c"trace"] {
+        let existing = JS_GetPropertyStr(ctx, console, name.as_ptr());
+        let method_absent =
+          jsv_is_undefined(&existing) || existing.tag == JS_TAG_NULL;
+        JS_FreeValue(ctx, existing);
+        if method_absent {
+          let function =
+            JS_NewCFunction(ctx, qjs_console_log, name.as_ptr(), 0);
+          JS_SetPropertyStr(ctx, console, name.as_ptr(), function);
+        }
       }
     }
     if absent {
@@ -1005,11 +1009,29 @@ unsafe extern "C" fn qjs_gc(
 }
 
 unsafe extern "C" fn qjs_console_log(
-  _ctx: *mut JSContext,
+  ctx: *mut JSContext,
   _this_val: JSValue,
-  _argc: c_int,
-  _argv: *mut JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
 ) -> JSValue {
+  let mut parts = Vec::new();
+  if !argv.is_null() {
+    for index in 0..argc.max(0) as usize {
+      let value = unsafe { *argv.add(index) };
+      let mut len = 0usize;
+      let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, value) };
+      if cstr.is_null() {
+        continue;
+      }
+      let part = unsafe {
+        let bytes = std::slice::from_raw_parts(cstr as *const u8, len);
+        String::from_utf8_lossy(bytes).into_owned()
+      };
+      unsafe { JS_FreeCString(ctx, cstr) };
+      parts.push(part);
+    }
+  }
+  super::inspector::emit_console_api_message(0, parts.join(" "));
   jsv_undefined()
 }
 

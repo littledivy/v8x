@@ -29,6 +29,32 @@ struct InertObj {
   _cxx_vtable: *const Opaque,
 }
 
+#[repr(C)]
+struct InspectorState {
+  _cxx_vtable: *const Opaque,
+  client: *mut RawV8InspectorClient,
+  context_group_id: int,
+}
+
+thread_local! {
+  static ACTIVE_INSPECTOR_CLIENT:
+    std::cell::RefCell<Option<(*mut RawV8InspectorClient, int)>> =
+      const { std::cell::RefCell::new(None) };
+}
+
+unsafe extern "C" {
+  fn v8_inspector__V8InspectorClient__BASE__consoleAPIMessage(
+    this: *mut RawV8InspectorClient,
+    context_group_id: int,
+    level: int,
+    message: &StringView,
+    url: &StringView,
+    line_number: u32,
+    column_number: u32,
+    stack_trace: &mut V8StackTrace,
+  );
+}
+
 #[inline]
 fn alloc_inert<T>() -> *mut T {
   Box::into_raw(Box::new(InertObj {
@@ -41,6 +67,39 @@ fn alloc_inert<T>() -> *mut T {
 unsafe fn free_inert<T>(p: *mut T) {
   if !p.is_null() {
     unsafe { drop(Box::from_raw(p.cast::<InertObj>())) };
+  }
+}
+
+pub(crate) fn emit_console_api_message(level: int, message: String) {
+  let Some((client, context_group_id)) =
+    ACTIVE_INSPECTOR_CLIENT.with(|slot| *slot.borrow())
+  else {
+    return;
+  };
+  if client.is_null() {
+    return;
+  }
+
+  let message_bytes = message.into_bytes();
+  let message_view = StringView::from(message_bytes.as_slice());
+  let url_bytes: [u8; 0] = [];
+  let url_view = StringView::from(&url_bytes[..]);
+  let stack_trace = alloc_inert::<V8StackTrace>();
+  if stack_trace.is_null() {
+    return;
+  }
+  unsafe {
+    v8_inspector__V8InspectorClient__BASE__consoleAPIMessage(
+      client,
+      context_group_id,
+      level,
+      &message_view,
+      &url_view,
+      0,
+      0,
+      &mut *stack_trace,
+    );
+    free_inert(stack_trace);
   }
 }
 
@@ -227,15 +286,22 @@ pub extern "C" fn v8_inspector__StringBuffer__create(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__DELETE(this: *mut RawV8Inspector) {
-  unsafe { free_inert(this) };
+  if !this.is_null() {
+    unsafe { drop(Box::from_raw(this.cast::<InspectorState>())) };
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__create(
   _isolate: *mut RealIsolate,
-  _client: *mut RawV8InspectorClient,
+  client: *mut RawV8InspectorClient,
 ) -> *mut RawV8Inspector {
-  alloc_inert::<RawV8Inspector>()
+  Box::into_raw(Box::new(InspectorState {
+    _cxx_vtable: std::ptr::null(),
+    client,
+    context_group_id: 1,
+  }))
+  .cast::<RawV8Inspector>()
 }
 
 #[unsafe(no_mangle)]
@@ -252,19 +318,37 @@ pub extern "C" fn v8_inspector__V8Inspector__connect(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__contextCreated(
-  _this: *mut RawV8Inspector,
+  this: *mut RawV8Inspector,
   _context: *const Context,
-  _contextGroupId: int,
+  contextGroupId: int,
   _humanReadableName: StringView,
   _auxData: StringView,
 ) {
+  if this.is_null() {
+    return;
+  }
+  let state = unsafe { &mut *this.cast::<InspectorState>() };
+  state.context_group_id = contextGroupId;
+  ACTIVE_INSPECTOR_CLIENT.with(|slot| {
+    *slot.borrow_mut() = Some((state.client, contextGroupId));
+  });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__contextDestroyed(
-  _this: *mut RawV8Inspector,
+  this: *mut RawV8Inspector,
   _context: *const Context,
 ) {
+  if this.is_null() {
+    return;
+  }
+  let state = unsafe { &*this.cast::<InspectorState>() };
+  ACTIVE_INSPECTOR_CLIENT.with(|slot| {
+    let mut slot = slot.borrow_mut();
+    if matches!(*slot, Some((client, _)) if client == state.client) {
+      *slot = None;
+    }
+  });
 }
 
 #[unsafe(no_mangle)]
