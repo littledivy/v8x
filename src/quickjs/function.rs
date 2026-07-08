@@ -40,6 +40,7 @@ use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::ptr::NonNull;
+use std::slice;
 
 unsafe extern "C" {
 
@@ -104,6 +105,11 @@ unsafe extern "C" {
     len: u32,
   );
   fn JS_GetLength(ctx: *mut JSContext, obj: JSValue, pres: *mut i64) -> c_int;
+  fn JS_AtomToCStringLen(
+    ctx: *mut JSContext,
+    plen: *mut usize,
+    atom: JSAtom,
+  ) -> *const c_char;
 }
 
 type JSClassFinalizer = unsafe extern "C" fn(rt: *mut JSRuntime, val: JSValue);
@@ -254,8 +260,22 @@ struct NamedHandler {
   only_intercept_strings: bool,
 }
 
+struct IndexedHandler {
+  getter: Option<crate::IndexedPropertyGetterCallback>,
+  setter: Option<crate::IndexedPropertySetterCallback>,
+  query: Option<crate::IndexedPropertyQueryCallback>,
+  deleter: Option<crate::IndexedPropertyDeleterCallback>,
+  enumerator: Option<crate::IndexedPropertyEnumeratorCallback>,
+  definer: Option<crate::IndexedPropertyDefinerCallback>,
+  descriptor: Option<crate::IndexedPropertyDescriptorCallback>,
+  data: JSValue,
+  owner_ctx: *mut JSContext,
+  non_masking: bool,
+}
+
 struct NamedHandlerInstance {
-  handler: NamedHandler,
+  named_handler: Option<NamedHandler>,
+  indexed_handler: Option<IndexedHandler>,
 }
 
 struct ObjTemplate {
@@ -263,6 +283,7 @@ struct ObjTemplate {
   props: Vec<(JSValue, JSValue, u32)>,
   accessors: Vec<TemplAccessor>,
   named_handler: Option<NamedHandler>,
+  indexed_handler: Option<IndexedHandler>,
   immutable_proto: bool,
 
   parent_fn: *const FnTemplate,
@@ -276,6 +297,7 @@ impl ObjTemplate {
       props: Vec::new(),
       accessors: Vec::new(),
       named_handler: None,
+      indexed_handler: None,
       immutable_proto: false,
       parent_fn: std::ptr::null(),
     }
@@ -487,13 +509,36 @@ fn clone_named_handler(
   }
 }
 
+fn clone_indexed_handler(
+  ctx: *mut JSContext,
+  handler: &IndexedHandler,
+) -> IndexedHandler {
+  let data = if jsv_is_undefined(&handler.data) {
+    jsv_undefined()
+  } else {
+    unsafe { JS_DupValue(ctx, handler.data) }
+  };
+  IndexedHandler {
+    getter: handler.getter,
+    setter: handler.setter,
+    query: handler.query,
+    deleter: handler.deleter,
+    enumerator: handler.enumerator,
+    definer: handler.definer,
+    descriptor: handler.descriptor,
+    data,
+    owner_ctx: handler.owner_ctx,
+    non_masking: handler.non_masking,
+  }
+}
+
 fn new_object_for_template(
   ctx: *mut JSContext,
   templ: &ObjTemplate,
 ) -> JSValue {
-  let Some(handler) = &templ.named_handler else {
+  if templ.named_handler.is_none() && templ.indexed_handler.is_none() {
     return unsafe { JS_NewObject(ctx) };
-  };
+  }
   let cid = named_handler_class_id_current();
   if cid == 0 {
     return unsafe { JS_NewObject(ctx) };
@@ -503,7 +548,14 @@ fn new_object_for_template(
     return obj;
   }
   let inst = Box::new(NamedHandlerInstance {
-    handler: clone_named_handler(ctx, handler),
+    named_handler: templ
+      .named_handler
+      .as_ref()
+      .map(|handler| clone_named_handler(ctx, handler)),
+    indexed_handler: templ
+      .indexed_handler
+      .as_ref()
+      .map(|handler| clone_indexed_handler(ctx, handler)),
   });
   unsafe { JS_SetOpaque(obj, Box::into_raw(inst) as *mut c_void) };
   obj
@@ -530,6 +582,39 @@ unsafe fn named_handler_from_obj<'a>(
   } else {
     Some(unsafe { &mut *ptr })
   }
+}
+
+unsafe fn atom_to_u32_index(ctx: *mut JSContext, atom: JSAtom) -> Option<u32> {
+  let mut len = 0_usize;
+  let ptr = unsafe { JS_AtomToCStringLen(ctx, &mut len, atom) };
+  if ptr.is_null() || len == 0 {
+    if !ptr.is_null() {
+      unsafe { JS_FreeCString(ctx, ptr) };
+    }
+    return None;
+  }
+
+  let bytes = unsafe { slice::from_raw_parts(ptr as *const u8, len) };
+  let mut out = 0_u64;
+  let mut ok = true;
+  if len > 1 && bytes[0] == b'0' {
+    ok = false;
+  }
+  if ok {
+    for &b in bytes {
+      if !b.is_ascii_digit() {
+        ok = false;
+        break;
+      }
+      out = out * 10 + u64::from(b - b'0');
+      if out >= u64::from(u32::MAX) {
+        ok = false;
+        break;
+      }
+    }
+  }
+  unsafe { JS_FreeCString(ctx, ptr) };
+  if ok { Some(out as u32) } else { None }
 }
 
 unsafe fn restore_callback_handles(iso: *mut RealIsolate, saved_depth: usize) {
@@ -939,6 +1024,300 @@ unsafe fn call_named_definer(
   result
 }
 
+unsafe fn call_indexed_getter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  index: u32,
+  handler: &IndexedHandler,
+  getter: crate::IndexedPropertyGetterCallback,
+) -> (c_int, JSValue) {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Value>;
+
+  let intercepted = unsafe { (getter)(index, prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    (-1, jsv_exception())
+  } else if intercepted_yes(&intercepted) {
+    let value = if jsv_is_undefined(&ret) {
+      jsv_undefined()
+    } else {
+      unsafe { JS_DupValue(ctx, ret) }
+    };
+    (1, value)
+  } else {
+    (0, jsv_undefined())
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_indexed_query(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  index: u32,
+  handler: &IndexedHandler,
+  query: crate::IndexedPropertyQueryCallback,
+) -> (c_int, c_int) {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Integer>;
+
+  let intercepted = unsafe { (query)(index, prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let mut attr = 0;
+  let result = if unsafe { JS_HasException(ctx) } {
+    (-1, 0)
+  } else if intercepted_yes(&intercepted) {
+    if !jsv_is_undefined(&ret) && unsafe { JS_ToInt32(ctx, &mut attr, ret) } < 0
+    {
+      (-1, 0)
+    } else {
+      (1, attr)
+    }
+  } else {
+    (0, 0)
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_indexed_setter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  index: u32,
+  value: JSValue,
+  handler: &IndexedHandler,
+  setter: crate::IndexedPropertySetterCallback,
+) -> c_int {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info =
+    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+
+  let value_handle = intern_dup::<Value>(ctx, value);
+  let Some(value_handle) = NonNull::new(value_handle as *mut Value) else {
+    let _ = unsafe { Box::from_raw(info_ptr) };
+    unsafe { restore_callback_handles(iso, saved_depth) };
+    return 0;
+  };
+  let intercepted =
+    unsafe { (setter)(index, crate::SealedLocal(value_handle), prop_info) };
+
+  let _info = unsafe { Box::from_raw(info_ptr) };
+  let result = if unsafe { JS_HasException(ctx) } {
+    -1
+  } else if intercepted_yes(&intercepted) {
+    1
+  } else {
+    0
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_indexed_deleter(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  index: u32,
+  handler: &IndexedHandler,
+  deleter: crate::IndexedPropertyDeleterCallback,
+) -> (c_int, c_int) {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Boolean>;
+
+  let intercepted = unsafe { (deleter)(index, prop_info) };
+
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    (-1, 0)
+  } else if intercepted_yes(&intercepted) {
+    let ok = if jsv_is_undefined(&ret) {
+      1
+    } else {
+      unsafe { JS_ToBool(ctx, ret) }
+    };
+    (1, ok)
+  } else {
+    (0, 1)
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_indexed_enumerator(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  handler: &IndexedHandler,
+  enumerator: crate::IndexedPropertyEnumeratorCallback,
+) -> JSValue {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Array>;
+
+  unsafe { (enumerator)(prop_info) };
+  let info = unsafe { Box::from_raw(info_ptr) };
+  let ret = *info.return_slot;
+  let result = if unsafe { JS_HasException(ctx) } {
+    jsv_exception()
+  } else if jsv_is_undefined(&ret) {
+    jsv_undefined()
+  } else {
+    unsafe { JS_DupValue(ctx, ret) }
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
+unsafe fn call_indexed_definer(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  index: u32,
+  val: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+  flags: c_int,
+  handler: &IndexedHandler,
+  definer: crate::IndexedPropertyDefinerCallback,
+) -> c_int {
+  let iso = current_iso();
+  let saved_depth = if iso.is_null() {
+    0
+  } else {
+    iso_state(iso).handles.len()
+  };
+  let info = Box::new(CbInfo {
+    isolate: iso,
+    ctx,
+    this: this_val,
+    data: handler.data,
+    new_target: jsv_undefined(),
+    is_construct: false,
+    args: Vec::new(),
+    return_slot: Box::new(jsv_undefined()),
+  });
+  let info_ptr = Box::into_raw(info);
+  let mut raw_info = info_ptr as *mut c_void;
+  let prop_info =
+    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+
+  let mut pd = MaybeUninit::<PropertyDescriptor>::zeroed();
+  unsafe {
+    construct_property_descriptor_for_callback(
+      ctx,
+      pd.as_mut_ptr(),
+      val,
+      getter,
+      setter,
+      flags,
+    )
+  };
+  let intercepted = unsafe { (definer)(index, pd.as_ptr(), prop_info) };
+  unsafe { super::property::v8__PropertyDescriptor__DESTRUCT(pd.as_mut_ptr()) };
+
+  let _info = unsafe { Box::from_raw(info_ptr) };
+  let result = if unsafe { JS_HasException(ctx) } {
+    -1
+  } else if intercepted_yes(&intercepted) {
+    1
+  } else {
+    0
+  };
+  unsafe { restore_callback_handles(iso, saved_depth) };
+  result
+}
+
 fn attr_to_descriptor_flags(attr: c_int) -> c_int {
   let mut flags = 0;
   if attr & 1 == 0 {
@@ -1071,6 +1450,48 @@ unsafe fn enumerator_contains_property(
   if found { 1 } else { 0 }
 }
 
+unsafe fn indexed_enumerator_contains_property(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  prop: JSAtom,
+  handler: &IndexedHandler,
+  enumerator: crate::IndexedPropertyEnumeratorCallback,
+) -> c_int {
+  let arr = unsafe { call_indexed_enumerator(ctx, obj, handler, enumerator) };
+  if jsv_is_exception(&arr) {
+    return -1;
+  }
+  if jsv_is_undefined(&arr) {
+    return 0;
+  }
+  let mut len: i64 = 0;
+  if unsafe { JS_GetLength(ctx, arr, &mut len) } < 0 || len <= 0 {
+    unsafe { JS_FreeValue(ctx, arr) };
+    return 0;
+  }
+  let mut found = false;
+  for i in 0..(len.min(u32::MAX as i64) as u32) {
+    let item = unsafe { JS_GetPropertyUint32(ctx, arr, i) };
+    if jsv_is_exception(&item) {
+      unsafe { JS_FreeValue(ctx, arr) };
+      return -1;
+    }
+    let atom = unsafe { JS_ValueToAtom(ctx, item) };
+    unsafe { JS_FreeValue(ctx, item) };
+    if atom == prop {
+      found = true;
+    }
+    if atom != 0 {
+      unsafe { JS_FreeAtom(ctx, atom) };
+    }
+    if found {
+      break;
+    }
+  }
+  unsafe { JS_FreeValue(ctx, arr) };
+  if found { 1 } else { 0 }
+}
+
 unsafe extern "C" fn named_handler_get_own_property(
   ctx: *mut JSContext,
   desc: *mut JSPropertyDescriptorQjs,
@@ -1080,7 +1501,62 @@ unsafe extern "C" fn named_handler_get_own_property(
   let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
     return 0;
   };
-  let handler = &inst.handler;
+  if let (Some(index), Some(handler)) = (
+    unsafe { atom_to_u32_index(ctx, prop) },
+    inst.indexed_handler.as_ref(),
+  ) {
+    if let Some(descriptor) = handler.descriptor {
+      let (state, value) =
+        unsafe { call_indexed_getter(ctx, obj, index, handler, descriptor) };
+      if state < 0 {
+        return -1;
+      }
+      if state > 0 {
+        let rc = unsafe { fill_desc_from_descriptor_object(ctx, desc, value) };
+        unsafe { JS_FreeValue(ctx, value) };
+        return rc;
+      }
+    }
+
+    if let Some(query) = handler.query {
+      let (state, attr) =
+        unsafe { call_indexed_query(ctx, obj, index, handler, query) };
+      if state < 0 {
+        return -1;
+      }
+      if state > 0 {
+        unsafe { fill_desc_from_query(ctx, desc, attr) };
+        return 1;
+      }
+    }
+
+    if let Some(enumerator) = handler.enumerator {
+      let state = unsafe {
+        indexed_enumerator_contains_property(
+          ctx, obj, prop, handler, enumerator,
+        )
+      };
+      if state < 0 {
+        return -1;
+      }
+      if state > 0 {
+        if !desc.is_null() {
+          unsafe {
+            (*desc).flags =
+              JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE | JS_PROP_WRITABLE;
+            (*desc).value = jsv_undefined();
+            (*desc).getter = jsv_undefined();
+            (*desc).setter = jsv_undefined();
+          }
+        }
+        return 1;
+      }
+    }
+  }
+
+  let Some(handler) = inst.named_handler.as_ref() else {
+    return 0;
+  };
 
   if let Some(descriptor) = handler.descriptor {
     let (state, value) =
@@ -1140,18 +1616,37 @@ unsafe extern "C" fn named_handler_get_property(
   let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
     return jsv_undefined();
   };
-  let Some(getter) = inst.handler.getter else {
-    return jsv_undefined();
-  };
-  let (state, value) =
-    unsafe { call_named_getter(ctx, receiver, prop, &inst.handler, getter) };
-  if state < 0 {
-    jsv_exception()
-  } else if state > 0 {
-    value
-  } else {
-    jsv_undefined()
+
+  if let (Some(index), Some(handler)) = (
+    unsafe { atom_to_u32_index(ctx, prop) },
+    inst.indexed_handler.as_ref(),
+  ) {
+    if let Some(getter) = handler.getter {
+      let (state, value) =
+        unsafe { call_indexed_getter(ctx, receiver, index, handler, getter) };
+      if state < 0 {
+        return jsv_exception();
+      }
+      if state > 0 {
+        return value;
+      }
+    }
   }
+
+  if let Some(handler) = inst.named_handler.as_ref() {
+    if let Some(getter) = handler.getter {
+      let (state, value) =
+        unsafe { call_named_getter(ctx, receiver, prop, handler, getter) };
+      if state < 0 {
+        return jsv_exception();
+      }
+      if state > 0 {
+        return value;
+      }
+    }
+  }
+
+  jsv_undefined()
 }
 
 unsafe extern "C" fn named_handler_set_property(
@@ -1165,12 +1660,29 @@ unsafe extern "C" fn named_handler_set_property(
   let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
     return 0;
   };
-  if let Some(setter) = inst.handler.setter {
-    let state = unsafe {
-      call_named_setter(ctx, receiver, prop, value, &inst.handler, setter)
-    };
-    if state != 0 {
-      return state;
+
+  if let (Some(index), Some(handler)) = (
+    unsafe { atom_to_u32_index(ctx, prop) },
+    inst.indexed_handler.as_ref(),
+  ) {
+    if let Some(setter) = handler.setter {
+      let state = unsafe {
+        call_indexed_setter(ctx, receiver, index, value, handler, setter)
+      };
+      if state != 0 {
+        return state;
+      }
+    }
+  }
+
+  if let Some(handler) = inst.named_handler.as_ref() {
+    if let Some(setter) = handler.setter {
+      let state = unsafe {
+        call_named_setter(ctx, receiver, prop, value, handler, setter)
+      };
+      if state != 0 {
+        return state;
+      }
     }
   }
   unsafe {
@@ -1192,18 +1704,37 @@ unsafe extern "C" fn named_handler_delete_property(
   let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
     return 1;
   };
-  let Some(deleter) = inst.handler.deleter else {
-    return 1;
-  };
-  let state =
-    unsafe { call_named_deleter(ctx, obj, prop, &inst.handler, deleter) };
-  if state < 0 {
-    -1
-  } else if state > 0 {
-    1
-  } else {
-    1
+
+  if let (Some(index), Some(handler)) = (
+    unsafe { atom_to_u32_index(ctx, prop) },
+    inst.indexed_handler.as_ref(),
+  ) {
+    if let Some(deleter) = handler.deleter {
+      let (state, ok) =
+        unsafe { call_indexed_deleter(ctx, obj, index, handler, deleter) };
+      if state < 0 {
+        return -1;
+      }
+      if state > 0 {
+        return ok;
+      }
+    }
   }
+
+  if let Some(handler) = inst.named_handler.as_ref() {
+    if let Some(deleter) = handler.deleter {
+      let state =
+        unsafe { call_named_deleter(ctx, obj, prop, handler, deleter) };
+      if state < 0 {
+        return -1;
+      }
+      if state > 0 {
+        return 1;
+      }
+    }
+  }
+
+  1
 }
 
 unsafe extern "C" fn named_handler_get_own_property_names(
@@ -1222,11 +1753,27 @@ unsafe extern "C" fn named_handler_get_own_property_names(
   let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
     return 0;
   };
-  let Some(enumerator) = inst.handler.enumerator else {
+  let arr = if let Some(handler) = inst.indexed_handler.as_ref() {
+    if let Some(enumerator) = handler.enumerator {
+      unsafe { call_indexed_enumerator(ctx, obj, handler, enumerator) }
+    } else if let Some(handler) = inst.named_handler.as_ref() {
+      if let Some(enumerator) = handler.enumerator {
+        unsafe { call_named_enumerator(ctx, obj, handler, enumerator) }
+      } else {
+        return 0;
+      }
+    } else {
+      return 0;
+    }
+  } else if let Some(handler) = inst.named_handler.as_ref() {
+    if let Some(enumerator) = handler.enumerator {
+      unsafe { call_named_enumerator(ctx, obj, handler, enumerator) }
+    } else {
+      return 0;
+    }
+  } else {
     return 0;
   };
-  let arr =
-    unsafe { call_named_enumerator(ctx, obj, &inst.handler, enumerator) };
   if jsv_is_exception(&arr) {
     return -1;
   }
@@ -1287,22 +1834,33 @@ unsafe extern "C" fn named_handler_define_own_property(
   let Some(inst) = (unsafe { named_handler_from_obj(obj) }) else {
     return 0;
   };
-  if let Some(definer) = inst.handler.definer {
-    let state = unsafe {
-      call_named_definer(
-        ctx,
-        obj,
-        prop,
-        val,
-        getter,
-        setter,
-        flags,
-        &inst.handler,
-        definer,
-      )
-    };
-    if state != 0 {
-      return state;
+
+  if let (Some(index), Some(handler)) = (
+    unsafe { atom_to_u32_index(ctx, prop) },
+    inst.indexed_handler.as_ref(),
+  ) {
+    if let Some(definer) = handler.definer {
+      let state = unsafe {
+        call_indexed_definer(
+          ctx, obj, index, val, getter, setter, flags, handler, definer,
+        )
+      };
+      if state != 0 {
+        return state;
+      }
+    }
+  }
+
+  if let Some(handler) = inst.named_handler.as_ref() {
+    if let Some(definer) = handler.definer {
+      let state = unsafe {
+        call_named_definer(
+          ctx, obj, prop, val, getter, setter, flags, handler, definer,
+        )
+      };
+      if state != 0 {
+        return state;
+      }
     }
   }
   unsafe {
@@ -1948,8 +2506,15 @@ unsafe extern "C" fn named_handler_finalize(rt: *mut JSRuntime, val: JSValue) {
     return;
   }
   let inst = unsafe { Box::from_raw(ptr) };
-  if !jsv_is_undefined(&inst.handler.data) {
-    unsafe { JS_FreeValueRT(rt, inst.handler.data) };
+  if let Some(handler) = inst.named_handler {
+    if !jsv_is_undefined(&handler.data) {
+      unsafe { JS_FreeValueRT(rt, handler.data) };
+    }
+  }
+  if let Some(handler) = inst.indexed_handler {
+    if !jsv_is_undefined(&handler.data) {
+      unsafe { JS_FreeValueRT(rt, handler.data) };
+    }
   }
 }
 
@@ -2655,6 +3220,7 @@ pub extern "C" fn v8__FunctionTemplate__New(
     props: Vec::new(),
     accessors: Vec::new(),
     named_handler: None,
+    indexed_handler: None,
     immutable_proto: false,
     parent_fn: ptr::null(),
   }));
@@ -2663,6 +3229,7 @@ pub extern "C" fn v8__FunctionTemplate__New(
     props: Vec::new(),
     accessors: Vec::new(),
     named_handler: None,
+    indexed_handler: None,
     immutable_proto: false,
     parent_fn: ptr::null(),
   }));
@@ -2956,6 +3523,7 @@ pub extern "C" fn v8__ObjectTemplate__New(
     props: Vec::new(),
     accessors: Vec::new(),
     named_handler: None,
+    indexed_handler: None,
     immutable_proto: false,
     parent_fn: templ as *const FnTemplate,
   }));
@@ -3208,8 +3776,16 @@ pub extern "C" fn v8__ObjectTemplate__SetIndexedPropertyHandler(
   data_or_null: *const Value,
   flags: crate::PropertyHandlerFlags,
 ) {
-  let _ = (
-    this,
+  if this.is_null() {
+    return;
+  }
+  let data = if data_or_null.is_null() {
+    jsv_undefined()
+  } else {
+    own_template_value(current_ctx(), jsval_of(data_or_null))
+  };
+  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  t.indexed_handler = Some(IndexedHandler {
     getter,
     setter,
     query,
@@ -3217,9 +3793,10 @@ pub extern "C" fn v8__ObjectTemplate__SetIndexedPropertyHandler(
     enumerator,
     definer,
     descriptor,
-    data_or_null,
-    flags,
-  );
+    data,
+    owner_ctx: current_ctx(),
+    non_masking: flags.is_non_masking(),
+  });
 }
 
 #[unsafe(no_mangle)]
