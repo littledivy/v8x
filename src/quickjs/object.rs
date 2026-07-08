@@ -615,7 +615,14 @@ pub extern "C" fn v8__Object__GetOwnPropertyNames(
   filter: PropertyFilter,
   key_conversion: KeyConversionMode,
 ) -> *const Array {
-  property_names_array(this, context, gpn_from_filter(&filter))
+  property_names_array_filtered(
+    this,
+    context,
+    gpn_from_filter(&filter),
+    false,
+    false,
+    key_conversion,
+  )
 }
 
 #[unsafe(no_mangle)]
@@ -627,14 +634,15 @@ pub extern "C" fn v8__Object__GetPropertyNames(
   index_filter: IndexFilter,
   key_conversion: KeyConversionMode,
 ) -> *const Array {
-  let _ = (mode, key_conversion);
-
+  let include_prototypes = matches!(mode, KeyCollectionMode::IncludePrototypes);
   let skip_indices = index_filter as u32 == 1;
   property_names_array_filtered(
     this,
     context,
     gpn_from_filter(&property_filter),
     skip_indices,
+    include_prototypes,
+    key_conversion,
   )
 }
 
@@ -661,14 +669,6 @@ fn read_filter(f: &PropertyFilter) -> u32 {
   unsafe { *(f as *const PropertyFilter as *const u32) }
 }
 
-fn property_names_array(
-  this: *const Object,
-  context: *const Context,
-  gpn_flags: c_int,
-) -> *const Array {
-  property_names_array_filtered(this, context, gpn_flags, false)
-}
-
 const JS_ATOM_TAG_INT: u32 = 1 << 31;
 
 fn property_names_array_filtered(
@@ -676,41 +676,116 @@ fn property_names_array_filtered(
   context: *const Context,
   gpn_flags: c_int,
   skip_indices: bool,
+  include_prototypes: bool,
+  key_conversion: KeyConversionMode,
 ) -> *const Array {
   let ctx = ctx_of(context);
   if ctx.is_null() || this.is_null() {
     return ptr::null();
   }
-  let mut tab: *mut JSPropertyEnum = ptr::null_mut();
-  let mut len: u32 = 0;
-  let rc = unsafe {
-    JS_GetOwnPropertyNames(ctx, &mut tab, &mut len, jsval_of(this), gpn_flags)
-  };
-  if rc < 0 {
-    return ptr::null();
-  }
 
   let arr = unsafe { JS_NewArray(ctx) };
   if arr.tag == JS_TAG_EXCEPTION {
-    unsafe { JS_FreePropertyEnum(ctx, tab, len) };
     return ptr::null();
   }
+  let mut seen = std::collections::HashSet::new();
+  let mut out = 0u32;
+
   unsafe {
-    let mut out = 0u32;
+    let mut object = JS_DupValue(ctx, jsval_of(this));
+    loop {
+      if object.tag != JS_TAG_OBJECT {
+        JS_FreeValue(ctx, object);
+        break;
+      }
+      if !append_own_property_names(
+        ctx,
+        object,
+        gpn_flags,
+        skip_indices,
+        key_conversion,
+        arr,
+        &mut out,
+        &mut seen,
+      ) {
+        JS_FreeValue(ctx, object);
+        JS_FreeValue(ctx, arr);
+        return ptr::null();
+      }
+      if !include_prototypes {
+        JS_FreeValue(ctx, object);
+        break;
+      }
+      let prototype = JS_GetPrototype(ctx, object);
+      JS_FreeValue(ctx, object);
+      if prototype.tag == JS_TAG_EXCEPTION {
+        JS_FreeValue(ctx, arr);
+        return ptr::null();
+      }
+      object = prototype;
+    }
+  }
+  intern::<Array>(arr)
+}
+
+unsafe fn append_own_property_names(
+  ctx: *mut JSContext,
+  object: JSValue,
+  gpn_flags: c_int,
+  skip_indices: bool,
+  key_conversion: KeyConversionMode,
+  arr: JSValue,
+  out: &mut u32,
+  seen: &mut std::collections::HashSet<JSAtom>,
+) -> bool {
+  let mut tab: *mut JSPropertyEnum = ptr::null_mut();
+  let mut len: u32 = 0;
+  let rc = unsafe {
+    JS_GetOwnPropertyNames(ctx, &mut tab, &mut len, object, gpn_flags)
+  };
+  if rc < 0 {
+    return false;
+  }
+
+  let mut ok = true;
+  unsafe {
     for i in 0..len as usize {
       let atom = (*tab.add(i)).atom;
-
-      if skip_indices && (atom & JS_ATOM_TAG_INT) != 0 {
+      let is_index = (atom & JS_ATOM_TAG_INT) != 0;
+      if skip_indices || key_conversion as u32 == 2 {
+        if is_index {
+          continue;
+        }
+      }
+      if !seen.insert(atom) {
         continue;
       }
 
-      let key_val = JS_AtomToValue(ctx, atom);
-      JS_SetPropertyUint32(ctx, arr, out, key_val);
-      out += 1;
+      let key_val = if is_index && key_conversion as u32 == 0 {
+        JS_AtomToString(ctx, atom)
+      } else if is_index {
+        let index = atom & !JS_ATOM_TAG_INT;
+        if index <= i32::MAX as u32 {
+          jsv_int32(index as i32)
+        } else {
+          jsv_float64(index as f64)
+        }
+      } else {
+        JS_AtomToValue(ctx, atom)
+      };
+      if key_val.tag == JS_TAG_EXCEPTION {
+        ok = false;
+        break;
+      }
+      if JS_SetPropertyUint32(ctx, arr, *out, key_val) < 0 {
+        ok = false;
+        break;
+      }
+      *out += 1;
     }
     JS_FreePropertyEnum(ctx, tab, len);
   }
-  intern::<Array>(arr)
+  ok
 }
 
 #[unsafe(no_mangle)]
