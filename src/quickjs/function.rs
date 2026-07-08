@@ -150,6 +150,9 @@ struct TemplAccessor {
   key: JSValue,
   getter: *const FnTemplate,
   setter: *const FnTemplate,
+  native_getter: Option<crate::AccessorNameGetterCallback>,
+  native_setter: Option<crate::AccessorNameSetterCallback>,
+  data: JSValue,
   attr: u32,
 }
 
@@ -2084,6 +2087,9 @@ pub extern "C" fn v8__ObjectTemplate__SetAccessorProperty(
     key: key_owned,
     getter: getter as *const FnTemplate,
     setter: setter as *const FnTemplate,
+    native_getter: None,
+    native_setter: None,
+    data: jsv_undefined(),
     attr: attr.as_u32_lenient(),
   });
 }
@@ -2116,26 +2122,29 @@ fn apply_accessors(
       if jsv_is_undefined(&acc.key) {
         continue;
       }
+      if let Some(native_getter) = acc.native_getter {
+        let _ = super::object::define_native_accessor_value(
+          ctx,
+          obj,
+          acc.key,
+          native_getter,
+          acc.native_setter,
+          acc.data,
+          acc.attr,
+          false,
+        );
+        continue;
+      }
       let desc = JS_NewObject(ctx);
       if !acc.getter.is_null() {
-        let gf = v8__FunctionTemplate__GetFunction(
-          acc.getter as *const FunctionTemplate,
-          ctx as *const Context,
-        );
-        if !gf.is_null() {
-          let v = JS_DupValue(ctx, jsval_of(gf));
-          JS_SetPropertyStr(ctx, desc, c"get".as_ptr(), v);
-        }
+        let t = &*acc.getter;
+        let gf = make_function_len(ctx, t.callback, t.data, t.length, false);
+        JS_SetPropertyStr(ctx, desc, c"get".as_ptr(), gf);
       }
       if !acc.setter.is_null() {
-        let sf = v8__FunctionTemplate__GetFunction(
-          acc.setter as *const FunctionTemplate,
-          ctx as *const Context,
-        );
-        if !sf.is_null() {
-          let v = JS_DupValue(ctx, jsval_of(sf));
-          JS_SetPropertyStr(ctx, desc, c"set".as_ptr(), v);
-        }
+        let t = &*acc.setter;
+        let sf = make_function_len(ctx, t.callback, t.data, t.length, false);
+        JS_SetPropertyStr(ctx, desc, c"set".as_ptr(), sf);
       }
 
       let enumerable = (acc.attr & 2) == 0;
@@ -2316,6 +2325,9 @@ pub extern "C" fn v8__FunctionTemplate__SetAccessorProperty(
     key: key_owned,
     getter: getter as *const FnTemplate,
     setter: setter as *const FnTemplate,
+    native_getter: None,
+    native_setter: None,
+    data: jsv_undefined(),
     attr: attr.as_u32_lenient(),
   });
 }
@@ -2430,13 +2442,33 @@ pub extern "C" fn v8__ObjectTemplate__SetImmutableProto(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ObjectTemplate__SetNativeDataProperty(
-  _this: *const std::os::raw::c_void,
-  _key: *const std::os::raw::c_void,
-  _getter: *const std::os::raw::c_void,
-  _setter: *const std::os::raw::c_void,
-  _data_or_null: *const std::os::raw::c_void,
-  _attr: crate::PropertyAttribute,
+  this: *const std::os::raw::c_void,
+  key: *const std::os::raw::c_void,
+  getter: crate::AccessorNameGetterCallback,
+  setter: Option<crate::AccessorNameSetterCallback>,
+  data_or_null: *const std::os::raw::c_void,
+  attr: crate::PropertyAttribute,
 ) {
+  if this.is_null() || key.is_null() {
+    return;
+  }
+  let ctx = current_ctx();
+  let key_owned = own_template_value(ctx, jsval_of(key));
+  let data = if data_or_null.is_null() {
+    jsv_undefined()
+  } else {
+    own_template_value(ctx, jsval_of(data_or_null))
+  };
+  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  t.accessors.push(TemplAccessor {
+    key: key_owned,
+    getter: ptr::null(),
+    setter: ptr::null(),
+    native_getter: Some(getter),
+    native_setter: setter,
+    data,
+    attr: attr.as_u32_lenient(),
+  });
 }
 
 #[unsafe(no_mangle)]

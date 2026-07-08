@@ -156,14 +156,14 @@ fn register_object_accessor(
   atom: JSAtom,
   getter: AccessorNameGetterCallback,
   setter: Option<AccessorNameSetterCallback>,
-  data_or_null: *const std::os::raw::c_void,
-  attr: PropertyAttribute,
+  data: JSValue,
+  attr: u32,
   lazy: bool,
 ) -> c_int {
-  let data = if data_or_null.is_null() {
+  let data = if jsv_is_undefined(&data) {
     jsv_undefined()
   } else {
-    unsafe { JS_DupValue(ctx, jsval_of(data_or_null)) }
+    unsafe { JS_DupValue(ctx, data) }
   };
   let atom = unsafe { JS_DupAtom(ctx, atom) };
   OBJECT_ACCESSORS.with(|entries| {
@@ -174,7 +174,7 @@ fn register_object_accessor(
       setter,
       data,
       atom,
-      attr: read_attr(&attr),
+      attr,
       lazy,
     });
     magic
@@ -285,6 +285,49 @@ fn accessor_attr_to_jsprop(attr: u32) -> c_int {
     flags |= JS_PROP_CONFIGURABLE;
   }
   flags
+}
+
+pub(crate) fn define_native_accessor_value(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  key: JSValue,
+  getter: AccessorNameGetterCallback,
+  setter: Option<AccessorNameSetterCallback>,
+  data: JSValue,
+  attr: u32,
+  lazy: bool,
+) -> c_int {
+  if ctx.is_null() || !jsv_is_object(&obj) {
+    return -1;
+  }
+  let atom = unsafe { JS_ValueToAtom(ctx, key) };
+  if atom == 0 {
+    return -1;
+  }
+  let magic =
+    register_object_accessor(ctx, atom, getter, setter, data, attr, lazy);
+  let get = unsafe {
+    object_accessor_cfunc(ctx, object_accessor_getter_trampoline, magic)
+  };
+  let set = if setter.is_some() && attr & 1 == 0 {
+    unsafe {
+      object_accessor_cfunc(ctx, object_accessor_setter_trampoline, magic)
+    }
+  } else {
+    jsv_undefined()
+  };
+  let r = unsafe {
+    JS_DefinePropertyGetSet(
+      ctx,
+      obj,
+      atom,
+      get,
+      set,
+      accessor_attr_to_jsprop(attr),
+    )
+  };
+  unsafe { JS_FreeAtom(ctx, atom) };
+  r
 }
 
 #[inline]
@@ -1767,35 +1810,21 @@ pub extern "C" fn v8__Object__SetAccessor(
   }
 
   let attr_bits = read_attr(&attr);
-  let magic = register_object_accessor(
+  let data = if data_or_null.is_null() {
+    jsv_undefined()
+  } else {
+    jsval_of(data_or_null)
+  };
+  let r = define_native_accessor_value(
     ctx,
-    atom,
+    jsval_of(this),
+    jsval_of(key),
     getter,
     setter,
-    data_or_null,
-    attr,
+    data,
+    attr_bits,
     false,
   );
-  let get = unsafe {
-    object_accessor_cfunc(ctx, object_accessor_getter_trampoline, magic)
-  };
-  let set = if setter.is_some() && attr_bits & 1 == 0 {
-    unsafe {
-      object_accessor_cfunc(ctx, object_accessor_setter_trampoline, magic)
-    }
-  } else {
-    jsv_undefined()
-  };
-  let r = unsafe {
-    JS_DefinePropertyGetSet(
-      ctx,
-      jsval_of(this),
-      atom,
-      get,
-      set,
-      accessor_attr_to_jsprop(attr_bits),
-    )
-  };
   unsafe { JS_FreeAtom(ctx, atom) };
   if r < 0 {
     crate::support::MaybeBool::Nothing
@@ -1880,21 +1909,21 @@ pub extern "C" fn v8__Object__SetLazyDataProperty(
   }
 
   let attr_bits = read_attr(&attr);
-  let magic =
-    register_object_accessor(ctx, atom, getter, None, data_or_null, attr, true);
-  let get = unsafe {
-    object_accessor_cfunc(ctx, object_accessor_getter_trampoline, magic)
+  let data = if data_or_null.is_null() {
+    jsv_undefined()
+  } else {
+    jsval_of(data_or_null)
   };
-  let r = unsafe {
-    JS_DefinePropertyGetSet(
-      ctx,
-      jsval_of(this),
-      atom,
-      get,
-      jsv_undefined(),
-      accessor_attr_to_jsprop(attr_bits),
-    )
-  };
+  let r = define_native_accessor_value(
+    ctx,
+    jsval_of(this),
+    jsval_of(key),
+    getter,
+    None,
+    data,
+    attr_bits,
+    true,
+  );
   unsafe { JS_FreeAtom(ctx, atom) };
   if r < 0 {
     crate::support::MaybeBool::Nothing
