@@ -334,6 +334,8 @@ fn parse_qjs_backtrace(raw: &str) -> Vec<QjsStackFrame> {
     }
     if let Some(rest) = ln.strip_prefix("at ") {
       ln = rest;
+    } else if !ln.contains('@') {
+      continue;
     }
     // `<func> (<loc>)` or just `<loc>`.
     let (func, loc) = match (ln.find('('), ln.strip_suffix(')')) {
@@ -347,6 +349,9 @@ fn parse_qjs_backtrace(raw: &str) -> Vec<QjsStackFrame> {
       }
     };
     let (url, line_no, col_no) = parse_loc(loc);
+    if url == "native" {
+      continue;
+    }
     let has_url = !url.is_empty() && url != "<anonymous>";
     frames.push(QjsStackFrame {
       line: line_no,
@@ -409,7 +414,7 @@ pub extern "C" fn v8__StackTrace__CurrentStackTrace(
   isolate: *mut RealIsolate,
   frame_limit: int,
 ) -> *const StackTrace {
-  let _ = (isolate, frame_limit);
+  let _ = isolate;
   LAST_STACK.with(|cell| {
     let prev = cell.replace(ptr::null_mut());
     if !prev.is_null() {
@@ -421,7 +426,8 @@ pub extern "C" fn v8__StackTrace__CurrentStackTrace(
     return ptr::null();
   }
   let raw = unsafe { current_backtrace_string(ctx) };
-  let frames = parse_qjs_backtrace(&raw);
+  let mut frames = parse_qjs_backtrace(&raw);
+  frames.truncate(frame_limit.max(0) as usize);
   let boxed = Box::into_raw(Box::new(QjsStackTrace { frames }));
   LAST_STACK.with(|cell| cell.set(boxed));
   boxed as *const StackTrace
