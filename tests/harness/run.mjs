@@ -52,11 +52,14 @@ const b = backend(cfg, backendId);
 // (no `<bin>::` prefix). They are skipped up-front so they never run (a hang
 // would block the binary; a crash would truncate it and make later tests'
 // outcomes order-dependent) AND excluded from pass/fail/baseline below, so the
-// cell is reproducible. From config `ignore` (all backends) + per-backend
-// `ignore_by_backend`.
+// cell is reproducible. From config `ignore` (all backends), per-backend
+// `ignore_by_backend`, and per-backend/per-arch `ignore_by_backend_arch`.
+const archIgnore =
+  ((s.ignore_by_backend_arch || {})[backendId] || {})[os.arch()] || [];
 const IGNORE = new Set([
   ...(s.ignore || []),
   ...((s.ignore_by_backend || {})[backendId] || []),
+  ...archIgnore,
 ]);
 const isMac = os.platform() === "darwin";
 const needsCodesign = isMac && b.os === "macos"; // JSC JIT entitlements
@@ -555,12 +558,22 @@ function engineVersion() {
 // Drop quarantined tests from a result set. parseLibtest prefixes each name
 // with its binary (`deno_core::<path>`); IGNORE holds bare `<path>`, so match
 // against the name with the leading `<bin>::` segment stripped.
+function isIgnoredName(n) {
+  if (!IGNORE.size) return false;
+  const bare = n.includes("::") ? n.slice(n.indexOf("::") + 2) : n;
+  return IGNORE.has(bare) || IGNORE.has(n);
+}
+
 function dropIgnored(set) {
   if (!IGNORE.size) return;
   for (const n of [...set]) {
-    const bare = n.includes("::") ? n.slice(n.indexOf("::") + 2) : n;
-    if (IGNORE.has(bare) || IGNORE.has(n)) set.delete(n);
+    if (isIgnoredName(n)) set.delete(n);
   }
+}
+
+function filterIgnored(set) {
+  if (!IGNORE.size) return new Set(set);
+  return new Set([...set].filter((n) => !isIgnoredName(n)));
 }
 
 function finalize(parsed) {
@@ -588,10 +601,15 @@ function report(res) {
     `\n[${backendId}/${suiteId}] pass=${res.pass} fail=${res.fail} skip=${res.skip} (total ${res.total})`,
   );
 
-  const baseline = loadBaseline(backendId, suiteId);
+  const rawBaseline = loadBaseline(backendId, suiteId);
+  const baseline = filterIgnored(rawBaseline);
 
   if (flag("update")) {
-    const n = saveBaseline(backendId, suiteId, _sets.pass);
+    const next = new Set(_sets.pass);
+    for (const n of rawBaseline) {
+      if (isIgnoredName(n)) next.add(n);
+    }
+    const n = saveBaseline(backendId, suiteId, next);
     console.error(`updated baseline: ${n} passing tests`);
     return;
   }

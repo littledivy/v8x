@@ -46,8 +46,8 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 pub(crate) type WeakCallback = unsafe extern "C" fn(*const c_void);
 
@@ -696,8 +696,14 @@ fn sab_funcs_table() -> *const JSSharedArrayBufferFunctions {
   &FUNCS.0
 }
 
+fn runtime_lifecycle_lock() -> MutexGuard<'static, ()> {
+  static LOCK: Mutex<()> = Mutex::new(());
+  LOCK.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
+  let _lifecycle_guard = runtime_lifecycle_lock();
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
@@ -865,6 +871,7 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
   if this.is_null() {
     return;
   }
+  let _lifecycle_guard = runtime_lifecycle_lock();
   unsafe {
     let mut st = Box::from_raw(this as *mut IsoState);
 
