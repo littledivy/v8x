@@ -46,6 +46,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::raw::{c_int, c_void};
 use std::ptr;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 
 pub(crate) type WeakCallback = unsafe extern "C" fn(*const c_void);
@@ -66,6 +67,12 @@ pub(crate) struct GcCallbackEntry {
   pub callback: crate::isolate::GcCallbackWithData,
   pub data: *mut c_void,
   pub gc_type_filter: crate::gc::GCType,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct InterruptEntry {
+  pub callback: crate::isolate::InterruptCallback,
+  pub data: *mut c_void,
 }
 
 /// Process-wide "force strict mode" flag, toggled by
@@ -238,6 +245,8 @@ pub(crate) struct IsoState {
   // uncatchable termination exception on the next safe point). An `AtomicBool`
   // because V8's terminate may be requested from another thread.
   pub terminating: std::sync::atomic::AtomicBool,
+
+  pub pending_interrupts: Mutex<Vec<InterruptEntry>>,
 
   pub array_buffer_allocator: SharedPtrBase<Allocator>,
 
@@ -601,6 +610,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     javascript_execution_disallow_scopes: Vec::new(),
     javascript_execution_allow_depth: 0,
     terminating: std::sync::atomic::AtomicBool::new(false),
+    pending_interrupts: Mutex::new(Vec::new()),
     array_buffer_allocator,
     pending_array_buffer_frees: Vec::new(),
     microtasks_policy: MicrotasksPolicy::Auto,
@@ -1424,6 +1434,10 @@ pub extern "C" fn v8__Script__Run(
   if !javascript_execution_allowed() {
     unsafe { throw_javascript_execution_disallowed(ctx) };
     return ptr::null();
+  }
+  let iso = current_iso();
+  if !iso.is_null() {
+    super::isolate::run_pending_interrupts(iso);
   }
   let src_val = jsval_of(script);
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {

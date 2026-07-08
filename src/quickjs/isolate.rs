@@ -620,7 +620,25 @@ pub(crate) unsafe extern "C" fn terminate_interrupt_handler(
   if iso.is_null() {
     return 0;
   }
+  run_pending_interrupts(iso);
   iso_state(iso).is_terminating() as c_int
+}
+
+pub(crate) fn run_pending_interrupts(iso: *mut RealIsolate) {
+  if iso.is_null() {
+    return;
+  }
+  let pending = {
+    let mut pending = iso_state(iso)
+      .pending_interrupts
+      .lock()
+      .unwrap_or_else(|poison| poison.into_inner());
+    std::mem::take(&mut *pending)
+  };
+  let raw = crate::isolate::UnsafeRawIsolatePtr::from_real_ptr(iso);
+  for entry in pending {
+    unsafe { (entry.callback)(raw, entry.data) };
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -657,10 +675,19 @@ pub extern "C" fn v8__Isolate__CancelTerminateExecution(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__RequestInterrupt(
-  _isolate: *const RealIsolate,
-  _callback: crate::isolate::InterruptCallback,
-  _data: *mut c_void,
+  isolate: *const RealIsolate,
+  callback: crate::isolate::InterruptCallback,
+  data: *mut c_void,
 ) {
+  let iso = terminate_target(isolate);
+  if iso.is_null() {
+    return;
+  }
+  let mut pending = iso_state(iso)
+    .pending_interrupts
+    .lock()
+    .unwrap_or_else(|poison| poison.into_inner());
+  pending.push(super::core::InterruptEntry { callback, data });
 }
 
 #[unsafe(no_mangle)]
