@@ -33,6 +33,17 @@ struct WeakCallbackInfoShim {
   second_pass: Option<crate::quickjs::core::WeakCallback>,
 }
 
+struct ProxyRevokeEntry {
+  proxy: JSValue,
+  revoke: JSValue,
+  revoked: bool,
+}
+
+thread_local! {
+  static PROXY_REVOKES: std::cell::RefCell<Vec<ProxyRevokeEntry>> =
+    const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn same_value_identity(a: JSValue, b: JSValue) -> bool {
   if a.tag != b.tag {
     return false;
@@ -48,6 +59,40 @@ fn same_value_identity(a: JSValue, b: JSValue) -> bool {
     JS_TAG_FLOAT64 => unsafe { a.u.float64.to_bits() == b.u.float64.to_bits() },
     _ => unsafe { a.u.int32 == b.u.int32 },
   }
+}
+
+fn register_proxy_revoke(ctx: *mut JSContext, proxy: JSValue, revoke: JSValue) {
+  PROXY_REVOKES.with(|entries| {
+    entries.borrow_mut().push(ProxyRevokeEntry {
+      proxy: unsafe { JS_DupValue(ctx, proxy) },
+      revoke,
+      revoked: false,
+    });
+  });
+}
+
+fn proxy_revoked_from_table(proxy: JSValue) -> Option<bool> {
+  PROXY_REVOKES.with(|entries| {
+    entries
+      .borrow()
+      .iter()
+      .find(|entry| same_value_identity(entry.proxy, proxy))
+      .map(|entry| entry.revoked)
+  })
+}
+
+fn proxy_revoke_function(
+  ctx: *mut JSContext,
+  proxy: JSValue,
+) -> Option<JSValue> {
+  PROXY_REVOKES.with(|entries| {
+    let mut entries = entries.borrow_mut();
+    let entry = entries
+      .iter_mut()
+      .find(|entry| same_value_identity(entry.proxy, proxy))?;
+    entry.revoked = true;
+    Some(unsafe { JS_DupValue(ctx, entry.revoke) })
+  })
 }
 
 fn is_strongly_reachable_from_handles(
@@ -1823,22 +1868,113 @@ pub extern "C" fn v8__Map__Set(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Proxy__IsRevoked(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> bool {
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return false;
+  }
+  let proxy = jsval_of(this as *const Value);
+  if let Some(revoked) = proxy_revoked_from_table(proxy) {
+    return revoked;
+  }
+  let target = unsafe { JS_GetProxyTarget(ctx, proxy) };
+  if target.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return true;
+  }
+  unsafe { JS_FreeValue(ctx, target) };
   false
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Proxy__New(
-  _context: *const std::os::raw::c_void,
-  _target: *const std::os::raw::c_void,
-  _handler: *const std::os::raw::c_void,
+  context: *const std::os::raw::c_void,
+  target: *const std::os::raw::c_void,
+  handler: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  if context.is_null() || target.is_null() || handler.is_null() {
+    return ptr::null();
+  }
+  let ctx = ctx_of(context as *const Context);
+  if ctx.is_null() {
+    return ptr::null();
+  }
+
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let proxy_ctor = JS_GetPropertyStr(ctx, global, c"Proxy".as_ptr());
+    JS_FreeValue(ctx, global);
+    if !jsv_is_object(&proxy_ctor) {
+      JS_FreeValue(ctx, proxy_ctor);
+      return ptr::null();
+    }
+    let revocable = JS_GetPropertyStr(ctx, proxy_ctor, c"revocable".as_ptr());
+    if !JS_IsFunction(ctx, revocable) {
+      JS_FreeValue(ctx, revocable);
+      JS_FreeValue(ctx, proxy_ctor);
+      return ptr::null();
+    }
+
+    let mut args = [
+      jsval_of(target as *const Object),
+      jsval_of(handler as *const Object),
+    ];
+    let result = JS_Call(ctx, revocable, proxy_ctor, 2, args.as_mut_ptr());
+    JS_FreeValue(ctx, revocable);
+    JS_FreeValue(ctx, proxy_ctor);
+    if result.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      return ptr::null();
+    }
+
+    let proxy = JS_GetPropertyStr(ctx, result, c"proxy".as_ptr());
+    let revoke = JS_GetPropertyStr(ctx, result, c"revoke".as_ptr());
+    JS_FreeValue(ctx, result);
+    if proxy.tag == JS_TAG_EXCEPTION
+      || revoke.tag == JS_TAG_EXCEPTION
+      || !JS_IsProxy(proxy)
+      || !JS_IsFunction(ctx, revoke)
+    {
+      if proxy.tag != JS_TAG_EXCEPTION {
+        JS_FreeValue(ctx, proxy);
+      }
+      if revoke.tag != JS_TAG_EXCEPTION {
+        JS_FreeValue(ctx, revoke);
+      }
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      return ptr::null();
+    }
+
+    register_proxy_revoke(ctx, proxy, revoke);
+    intern::<crate::Proxy>(proxy) as *const std::os::raw::c_void
+  }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Proxy__Revoke(_this: *const std::os::raw::c_void) {}
+pub extern "C" fn v8__Proxy__Revoke(this: *const std::os::raw::c_void) {
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return;
+  }
+  let proxy = jsval_of(this as *const Value);
+  let Some(revoke) = proxy_revoke_function(ctx, proxy) else {
+    return;
+  };
+  unsafe {
+    let result = JS_Call(ctx, revoke, jsv_undefined(), 0, ptr::null_mut());
+    JS_FreeValue(ctx, revoke);
+    if result.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    } else {
+      JS_FreeValue(ctx, result);
+    }
+  }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Set__Clear(this: *const crate::Set) {
