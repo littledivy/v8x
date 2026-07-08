@@ -230,6 +230,7 @@ struct FnTemplate {
   proto: *mut ObjTemplate,
   instance: *mut ObjTemplate,
   parent: *const FnTemplate,
+  signature: *const FnTemplate,
 
   props: Vec<(JSValue, JSValue, u32)>,
   accessors: Vec<TemplAccessor>,
@@ -279,6 +280,10 @@ struct NamedHandlerInstance {
   indexed_handler: Option<IndexedHandler>,
 }
 
+struct SignatureInfo {
+  templ: *const FnTemplate,
+}
+
 struct ObjTemplate {
   internal_field_count: i32,
   props: Vec<(JSValue, JSValue, u32)>,
@@ -326,6 +331,7 @@ struct DispatchEntry {
   data: JSValue,
 
   instance: *const ObjTemplate,
+  signature: *const FnTemplate,
 }
 
 thread_local! {
@@ -413,6 +419,7 @@ fn register_dispatch(
   callback: FunctionCallback,
   data: JSValue,
   instance: *const ObjTemplate,
+  signature: *const FnTemplate,
 ) -> c_int {
   DISPATCH.with(|t| {
     let mut t = t.borrow_mut();
@@ -421,6 +428,7 @@ fn register_dispatch(
       callback,
       data,
       instance,
+      signature,
     });
     idx
   })
@@ -428,11 +436,16 @@ fn register_dispatch(
 
 fn lookup_dispatch(
   idx: c_int,
-) -> Option<(FunctionCallback, JSValue, *const ObjTemplate)> {
+) -> Option<(
+  FunctionCallback,
+  JSValue,
+  *const ObjTemplate,
+  *const FnTemplate,
+)> {
   DISPATCH.with(|t| {
     t.borrow()
       .get(idx as usize)
-      .map(|e| (e.callback, e.data, e.instance))
+      .map(|e| (e.callback, e.data, e.instance, e.signature))
   })
 }
 
@@ -2031,6 +2044,46 @@ pub(crate) unsafe fn call_callback_for_wasm(
   }
 }
 
+fn receiver_matches_signature(
+  ctx: *mut JSContext,
+  recv: JSValue,
+  signature: *const FnTemplate,
+) -> bool {
+  if signature.is_null() {
+    return true;
+  }
+  if ctx.is_null() || !jsv_is_object(&recv) {
+    return false;
+  }
+
+  let expected = unsafe { build_prototype_object(ctx, signature) };
+  if !jsv_is_object(&expected) {
+    return false;
+  }
+
+  let mut current = unsafe { JS_DupValue(ctx, recv) };
+  for _ in 0..64 {
+    if unsafe { JS_IsStrictEqual(ctx, current, expected) } {
+      unsafe { JS_FreeValue(ctx, current) };
+      return true;
+    }
+
+    let next = unsafe { JS_GetPrototype(ctx, current) };
+    unsafe { JS_FreeValue(ctx, current) };
+    if next.tag == JS_TAG_EXCEPTION {
+      return false;
+    }
+    if !jsv_is_object(&next) {
+      unsafe { JS_FreeValue(ctx, next) };
+      return false;
+    }
+    current = next;
+  }
+
+  unsafe { JS_FreeValue(ctx, current) };
+  false
+}
+
 unsafe extern "C" fn fn_trampoline(
   ctx: *mut JSContext,
   this_val: JSValue,
@@ -2038,9 +2091,13 @@ unsafe extern "C" fn fn_trampoline(
   argv: *mut JSValue,
   magic: c_int,
 ) -> JSValue {
-  let Some((callback, data, _instance)) = lookup_dispatch(magic) else {
+  let Some((callback, data, _instance, signature)) = lookup_dispatch(magic)
+  else {
     return jsv_undefined();
   };
+  if !receiver_matches_signature(ctx, this_val, signature) {
+    return unsafe { JS_ThrowTypeError(ctx, c"Illegal invocation".as_ptr()) };
+  }
   unsafe {
     dispatch(
       ctx,
@@ -2062,7 +2119,8 @@ unsafe extern "C" fn fn_construct_trampoline(
   argv: *mut JSValue,
   magic: c_int,
 ) -> JSValue {
-  let Some((callback, data, instance)) = lookup_dispatch(magic) else {
+  let Some((callback, data, instance, _signature)) = lookup_dispatch(magic)
+  else {
     return unsafe { JS_NewObject(ctx) };
   };
 
@@ -2700,6 +2758,7 @@ pub(crate) unsafe fn make_function_len(
       length,
       construct,
       ptr::null(),
+      ptr::null(),
     )
   }
 }
@@ -2711,13 +2770,14 @@ unsafe fn make_function_len_with_instance(
   length: i32,
   construct: bool,
   instance: *const ObjTemplate,
+  signature: *const FnTemplate,
 ) -> JSValue {
   let data_owned = if jsv_is_undefined(&data) {
     jsv_undefined()
   } else {
     unsafe { JS_DupValue(ctx, data) }
   };
-  let magic = register_dispatch(callback, data_owned, instance);
+  let magic = register_dispatch(callback, data_owned, instance, signature);
   let cproto = if construct {
     JS_CFUNC_CONSTRUCTOR_OR_FUNC_MAGIC
   } else {
@@ -3467,15 +3527,14 @@ pub extern "C" fn v8__FunctionTemplate__New(
   c_functions: *const crate::fast_api::CFunction,
   c_functions_len: usize,
 ) -> *const FunctionTemplate {
-  let _ = (
-    isolate,
-    signature_or_null,
-    side_effect_type,
-    c_functions,
-    c_functions_len,
-  );
+  let _ = (isolate, side_effect_type, c_functions, c_functions_len);
   let constructable =
     matches!(constructor_behavior, crate::ConstructorBehavior::Allow);
+  let signature = if signature_or_null.is_null() {
+    ptr::null()
+  } else {
+    unsafe { (*(signature_or_null as *const SignatureInfo)).templ }
+  };
 
   let data = {
     let ctx = current_ctx();
@@ -3515,6 +3574,7 @@ pub extern "C" fn v8__FunctionTemplate__New(
     proto,
     instance,
     parent: ptr::null(),
+    signature,
     props: Vec::new(),
     accessors: Vec::new(),
     cached_proto: jsv_undefined(),
@@ -3552,6 +3612,7 @@ pub(crate) fn tape_make_template(
     proto,
     instance,
     parent: ptr::null(),
+    signature: ptr::null(),
     props: Vec::new(),
     accessors: Vec::new(),
     cached_proto: jsv_undefined(),
@@ -3582,8 +3643,9 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
       t.callback,
       t.data,
       t.length,
-      t.constructable,
+      t.constructable && t.signature.is_null(),
       t.instance,
+      t.signature,
     )
   };
 
@@ -4587,9 +4649,14 @@ pub extern "C" fn v8__ReturnValue__Value__SetEmptyString(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Signature__New(
   _isolate: *mut std::os::raw::c_void,
-  _templ: *const std::os::raw::c_void,
+  templ: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  if templ.is_null() {
+    return std::ptr::null();
+  }
+  Box::into_raw(Box::new(SignatureInfo {
+    templ: templ as *const FnTemplate,
+  })) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]
