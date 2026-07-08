@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=rusty_v8.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 194 passing. DO NOT hand-sort; the
+# (run.mjs --update). 195 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 rv8_slots::clear_all_context_slots
 rv8_slots::context_slots
@@ -73,6 +73,7 @@ rv8_test_api::equality_edge_cases
 rv8_test_api::escapable_handle_scope
 rv8_test_api::escapable_handle_scope_can_escape_only_once
 rv8_test_api::escapable_handle_scope_from_isolate
+rv8_test_api::exception
 rv8_test_api::exception_thrown_but_continues_execution
 rv8_test_api::external_onebyte_string
 rv8_test_api::external_onebyte_string_frees_external_memory

@@ -897,10 +897,30 @@ pub extern "C" fn v8__StackFrame__GetFunctionName(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Exception__CaptureStackTrace(
-  _context: *const std::os::raw::c_void,
-  _object: *const std::os::raw::c_void,
+  context: *const std::os::raw::c_void,
+  object: *const std::os::raw::c_void,
 ) -> crate::support::MaybeBool {
-  crate::support::MaybeBool::Nothing
+  let ctx = ctx_of(context as *const Context);
+  if ctx.is_null() || object.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let obj = jsval_of(object as *const Value);
+  if !jsv_is_object(&obj) {
+    return MaybeBool::Nothing;
+  }
+  let stack = unsafe { current_backtrace_string(ctx) };
+  let value = unsafe {
+    JS_NewStringLen(ctx, stack.as_ptr() as *const c_char, stack.len())
+  };
+  if value.tag == JS_TAG_EXCEPTION {
+    return MaybeBool::Nothing;
+  }
+  let rc = unsafe { JS_SetPropertyStr(ctx, obj, c"stack".as_ptr(), value) };
+  if rc < 0 {
+    unsafe { clear_pending(ctx) };
+    return MaybeBool::JustFalse;
+  }
+  MaybeBool::JustTrue
 }
 
 #[unsafe(no_mangle)]
