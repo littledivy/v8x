@@ -36,7 +36,8 @@ use std::mem::MaybeUninit;
 use std::ptr;
 
 use crate::quickjs::core::{
-  ctx_of, current_ctx, current_iso, intern, intern_ctx, intern_dup, iso_state,
+  ctx_of, current_ctx, current_host_defined_options, current_iso,
+  current_script_name_or_source_url, intern, intern_ctx, intern_dup, iso_state,
   jsval_of, note_compilation_cache_miss, note_compiled_bytecode,
   record_script_host_defined_options,
 };
@@ -375,6 +376,10 @@ thread_local! {
         Option<crate::isolate::RawHostImportModuleDynamicallyCallback>,
     > = const { std::cell::Cell::new(None) };
 
+    static DYN_IMPORT_PHASE_CB: std::cell::Cell<
+        Option<crate::isolate::RawHostImportModuleWithPhaseDynamicallyCallback>,
+    > = const { std::cell::Cell::new(None) };
+
     static DYN_IMPORT_CHAIN: std::cell::Cell<Option<JSValue>> =
         const { std::cell::Cell::new(None) };
 
@@ -388,6 +393,170 @@ pub(crate) fn set_dynamic_import_callback(
 ) {
   DYN_IMPORT_CB.with(|c| c.set(Some(cb)));
   unsafe { JS_SetDynamicImportHook(dynamic_import_hook) };
+}
+
+pub(crate) fn set_dynamic_import_with_phase_callback(
+  cb: crate::isolate::RawHostImportModuleWithPhaseDynamicallyCallback,
+) {
+  DYN_IMPORT_PHASE_CB.with(|c| c.set(Some(cb)));
+}
+
+pub(crate) unsafe fn install_dynamic_source_import_global(
+  ctx: *mut JSContext,
+  global: JSValue,
+) {
+  let import_source = unsafe {
+    JS_NewCFunction(
+      ctx,
+      dynamic_source_import_js_cb,
+      c"__v8x_import_source".as_ptr(),
+      1,
+    )
+  };
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      global,
+      c"__v8x_import_source".as_ptr(),
+      import_source,
+    );
+  }
+}
+
+unsafe extern "C" fn dynamic_source_import_js_cb(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  argc: int,
+  argv: *mut JSValue,
+) -> JSValue {
+  let Some(cb) = DYN_IMPORT_PHASE_CB.with(|c| c.get()) else {
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"dynamic source import: no host callback".as_ptr(),
+      )
+    };
+  };
+  if ctx.is_null() || argc < 1 || argv.is_null() {
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"dynamic source import: missing specifier".as_ptr(),
+      )
+    };
+  }
+
+  let spec = unsafe { jsval_to_rust(ctx, *argv) };
+  let Ok(cspec) = CString::new(spec.as_str()) else {
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"dynamic source import: invalid specifier".as_ptr(),
+      )
+    };
+  };
+  let spec_handle =
+    intern::<V8String>(unsafe { JS_NewString(ctx, cspec.as_ptr()) });
+
+  let host_opts = current_host_defined_options();
+  let host_opts = if host_opts.is_null() {
+    intern::<Data>(jsv_undefined())
+  } else {
+    host_opts
+  };
+
+  let referrer_name = current_script_name_or_source_url().unwrap_or_default();
+  let referrer = if referrer_name == "<eval>" || referrer_name == "<anonymous>"
+  {
+    unsafe { JS_NewString(ctx, c"".as_ptr()) }
+  } else if let Ok(cname) = CString::new(referrer_name.as_str()) {
+    unsafe { JS_NewString(ctx, cname.as_ptr()) }
+  } else {
+    unsafe { JS_NewString(ctx, c"".as_ptr()) }
+  };
+  let referrer = intern::<Value>(referrer);
+  let attrs_handle = intern::<FixedArray>(unsafe { JS_NewArray(ctx) });
+  let context = intern_ctx(ctx);
+
+  let (Some(ctx_l), Some(ho_l), Some(ref_l), Some(spec_l), Some(attr_l)) = (
+    unsafe { crate::Local::from_raw(context) },
+    unsafe { crate::Local::from_raw(host_opts) },
+    unsafe { crate::Local::from_raw(referrer) },
+    unsafe { crate::Local::from_raw(spec_handle) },
+    unsafe { crate::Local::from_raw(attrs_handle) },
+  ) else {
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"dynamic source import: handle alloc failed".as_ptr(),
+      )
+    };
+  };
+
+  let promise_ptr = unsafe {
+    cb(
+      ctx_l,
+      ho_l,
+      ref_l,
+      spec_l,
+      ModuleImportPhase::kSource,
+      attr_l,
+    )
+  };
+  if promise_ptr.is_null() {
+    if unsafe { JS_HasException(ctx) } {
+      return jsv_exception();
+    }
+    return unsafe {
+      JS_ThrowTypeError(
+        ctx,
+        c"dynamic source import: host callback returned null".as_ptr(),
+      )
+    };
+  }
+
+  unsafe { JS_DupValue(ctx, jsval_of(promise_ptr as *const Value)) }
+}
+
+pub(crate) fn rewrite_dynamic_source_phase_imports(
+  body: &str,
+) -> Option<std::string::String> {
+  if !body.contains("import.source") {
+    return None;
+  }
+
+  let bytes = body.as_bytes();
+  let mut out: Vec<u8> = Vec::with_capacity(body.len());
+  let mut i = 0;
+  let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
+  let mut changed = false;
+  while i < bytes.len() {
+    if bytes[i] == b'i'
+      && body[i..].starts_with("import.source")
+      && (i == 0 || !is_ident(bytes[i - 1]))
+    {
+      let mut j = i + "import.source".len();
+      while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
+        j += 1;
+      }
+      if j < bytes.len() && bytes[j] == b'(' {
+        out.extend_from_slice(b"globalThis.__v8x_import_source(");
+        i = j + 1;
+        changed = true;
+        continue;
+      }
+    }
+    out.push(bytes[i]);
+    i += 1;
+  }
+
+  if changed {
+    Some(
+      std::string::String::from_utf8(out).unwrap_or_else(|_| body.to_string()),
+    )
+  } else {
+    None
+  }
 }
 
 // Flatten QuickJS's null-proto `with` attributes object (e.g. {type:"json"})

@@ -938,8 +938,9 @@ pub extern "C" fn v8__Isolate__SetHostImportModuleDynamicallyCallback(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetHostImportModuleWithPhaseDynamicallyCallback(
   _isolate: *mut RealIsolate,
-  _callback: crate::isolate::RawHostImportModuleWithPhaseDynamicallyCallback,
+  callback: crate::isolate::RawHostImportModuleWithPhaseDynamicallyCallback,
 ) {
+  super::module::set_dynamic_import_with_phase_callback(callback);
 }
 
 #[cfg(not(target_os = "windows"))]

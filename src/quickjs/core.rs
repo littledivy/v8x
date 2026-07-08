@@ -44,7 +44,7 @@ use crate::{
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::os::raw::{c_int, c_void};
+use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
@@ -980,6 +980,7 @@ pub(crate) fn install_default_globals(
     if super::init::has_entropy_source() {
       install_entropy_math_random(ctx, global);
     }
+    super::module::install_dynamic_source_import_global(ctx, global);
     super::arraybuffer::install_array_buffer_constructor(isolate, ctx, global);
     JS_FreeValue(ctx, global);
   }
@@ -1390,14 +1391,21 @@ pub extern "C" fn v8__Script__Compile(
     if !cstr.is_null() {
       let source_bytes = std::slice::from_raw_parts(cstr as *const u8, len);
       maybe_report_strict_mode_use(source_bytes);
+      let rewritten = std::str::from_utf8(source_bytes)
+        .ok()
+        .and_then(super::module::rewrite_dynamic_source_phase_imports);
+      let (compile_ptr, compile_len) = match rewritten.as_ref() {
+        Some(text) => (text.as_ptr() as *const c_char, text.len()),
+        None => (cstr, len),
+      };
       let url_ptr = match name.as_ref() {
         Some(n) => n.as_ptr(),
         None => c"<anonymous>".as_ptr(),
       };
       let compiled = JS_Eval(
         ctx,
-        cstr,
-        len,
+        compile_ptr,
+        compile_len,
         url_ptr,
         global_eval_flags() | JS_EVAL_FLAG_COMPILE_ONLY,
       );
@@ -1406,9 +1414,22 @@ pub extern "C" fn v8__Script__Compile(
         stamp_syntax_error_location(ctx, name.as_ref());
         return ptr::null();
       }
-      note_compiled_bytecode(current_iso(), len);
+      note_compiled_bytecode(current_iso(), compile_len);
       note_compilation_cache_miss();
       JS_FreeValue(ctx, compiled);
+      if let Some(text) = rewritten {
+        let script_source =
+          JS_NewStringLen(ctx, text.as_ptr() as *const c_char, text.len());
+        let handle = intern::<crate::Script>(script_source);
+        record_script_host_defined_options(handle, host_defined_options);
+        if !handle.is_null()
+          && let Some(name) = name
+        {
+          SCRIPT_RESOURCE_NAMES
+            .with(|m| m.borrow_mut().insert(handle as usize, name));
+        }
+        return handle;
+      }
     }
   }
 
