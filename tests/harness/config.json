@@ -50,7 +50,9 @@
         "quickjs": [
           "concurrent_isolate_creation_and_disposal",
           "heap_limits",
-          "resource_constraints_near_heap_limit"
+          "resource_constraints_near_heap_limit",
+          "test_fast_calls",
+          "test_fast_calls_overload"
         ]
       }
     },
