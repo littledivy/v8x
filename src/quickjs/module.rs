@@ -179,6 +179,8 @@ pub(crate) unsafe fn bc_write(ctx: *mut JSContext, key: u64, obj: JSValue) {
   }
 }
 
+type ImportAttribute = (std::string::String, std::string::String, i32);
+
 struct ModuleState {
   status: ModuleStatus,
 
@@ -192,7 +194,7 @@ struct ModuleState {
   // opening quote in the module source (deno's `referrer_source_offset`) and
   // the full `with { ... }` attribute key/value set for that import.
   import_offsets: Vec<i32>,
-  import_attributes: Vec<Vec<(std::string::String, std::string::String)>>,
+  import_attributes: Vec<Vec<ImportAttribute>>,
 
   source_imports: Vec<(u64, std::string::String)>,
 
@@ -416,6 +418,33 @@ unsafe fn build_dyn_attrs(ctx: *mut JSContext, attributes: JSValue) -> JSValue {
     return unsafe { JS_NewArray(ctx) };
   }
   r
+}
+
+unsafe fn build_static_import_attrs(
+  ctx: *mut JSContext,
+  pairs: &[ImportAttribute],
+) -> JSValue {
+  let arr = unsafe { JS_NewArray(ctx) };
+  if arr.tag == JS_TAG_EXCEPTION {
+    return arr;
+  }
+
+  let mut out = 0u32;
+  for (key, value, offset) in pairs {
+    let (Ok(ck), Ok(cv)) =
+      (CString::new(key.as_str()), CString::new(value.as_str()))
+    else {
+      continue;
+    };
+    unsafe {
+      JS_SetPropertyUint32(ctx, arr, out, JS_NewString(ctx, ck.as_ptr()));
+      JS_SetPropertyUint32(ctx, arr, out + 1, JS_NewString(ctx, cv.as_ptr()));
+      JS_SetPropertyUint32(ctx, arr, out + 2, JS_NewInt32(ctx, *offset));
+    }
+    out += 3;
+  }
+
+  arr
 }
 
 unsafe extern "C" fn dynamic_import_hook(
@@ -954,7 +983,7 @@ fn compute_import_offsets(
 fn compute_import_attributes(
   text: &str,
   specifiers: &[std::string::String],
-) -> Vec<Vec<(std::string::String, std::string::String)>> {
+) -> Vec<Vec<ImportAttribute>> {
   let offsets = compute_import_offsets(text, specifiers);
   let mut out = Vec::with_capacity(specifiers.len());
   for (i, spec) in specifiers.iter().enumerate() {
@@ -963,16 +992,24 @@ fn compute_import_attributes(
     if off >= 0 {
       // Position just past the specifier's closing quote.
       let after = (off as usize + spec.len() + 2).min(text.len());
-      let tail = text[after..].trim_start();
+      let tail_full = &text[after..];
+      let leading_ws = tail_full.len() - tail_full.trim_start().len();
+      let tail_start = after + leading_ws;
+      let tail = &tail_full[leading_ws..];
       let kw = ["with", "assert"].iter().find_map(|k| {
-        tail.strip_prefix(*k).filter(|rest| {
-          rest.starts_with(|c: char| c.is_whitespace() || c == '{')
-        })
+        tail
+          .strip_prefix(*k)
+          .filter(|rest| {
+            rest.starts_with(|c: char| c.is_whitespace() || c == '{')
+          })
+          .map(|rest| (k.len(), rest))
       });
-      if let Some(rest) = kw {
+      if let Some((kw_len, rest)) = kw {
         if let Some(open) = rest.find('{') {
           if let Some(close_rel) = rest[open + 1..].find('}') {
             let body = &rest[open + 1..open + 1 + close_rel];
+            let body_start = tail_start + kw_len + open + 1;
+            let mut body_cursor = 0usize;
             for pair in body.split(',') {
               if let Some((k, v)) = pair.split_once(':') {
                 let key =
@@ -980,9 +1017,15 @@ fn compute_import_attributes(
                 let val =
                   v.trim().trim_matches(|c| c == '"' || c == '\'').to_string();
                 if !key.is_empty() {
-                  attrs.push((key, val));
+                  let key_leading = k.len() - k.trim_start().len();
+                  let quote_offset =
+                    usize::from(k.trim_start().starts_with(['"', '\'']));
+                  let key_offset =
+                    body_start + body_cursor + key_leading + quote_offset;
+                  attrs.push((key, val, key_offset as i32));
                 }
               }
+              body_cursor += pair.len() + 1;
             }
           }
         }
@@ -1585,10 +1628,11 @@ unsafe fn build_resolution_map(
     if !visited.insert(handle_key(m)) {
       continue;
     }
-    let Some((base, specs, src_imports)) = with_module_state(m, |st| {
+    let Some((base, specs, attrs, src_imports)) = with_module_state(m, |st| {
       (
         st.source_name.clone(),
         st.import_specifiers.clone(),
+        st.import_attributes.clone(),
         st.source_imports.clone(),
       )
     }) else {
@@ -1600,7 +1644,7 @@ unsafe fn build_resolution_map(
         unsafe { resolve_source_import(ctx, context, scb, m, *id, spec) };
       }
     }
-    for (spec, _ty) in specs {
+    for (si, (spec, _ty)) in specs.into_iter().enumerate() {
       let Ok(cspec) = CString::new(spec.as_str()) else {
         continue;
       };
@@ -1611,7 +1655,10 @@ unsafe fn build_resolution_map(
         continue;
       }
       let spec_handle = intern::<V8String>(sval);
-      let attrs_handle = intern::<FixedArray>(unsafe { JS_NewArray(ctx) });
+      let attr_pairs = attrs.get(si).map(Vec::as_slice).unwrap_or(&[]);
+      let attrs_handle = intern::<FixedArray>(unsafe {
+        build_static_import_attrs(ctx, attr_pairs)
+      });
       if spec_handle.is_null() || attrs_handle.is_null() {
         continue;
       }
@@ -2590,7 +2637,7 @@ pub extern "C" fn v8__Module__GetModuleRequests(
         let kv = unsafe { JS_NewArray(ctx) };
         if kv.tag != JS_TAG_EXCEPTION {
           let mut ki = 0u32;
-          for (k, v) in pairs.iter() {
+          for (k, v, _offset) in pairs.iter() {
             if let (Ok(ck), Ok(cv)) =
               (CString::new(k.as_str()), CString::new(v.as_str()))
             {
