@@ -37,7 +37,7 @@ use std::ptr;
 
 use crate::quickjs::core::{
   ctx_of, current_ctx, current_iso, intern, intern_ctx, intern_dup, iso_state,
-  jsval_of, note_compilation_cache_miss,
+  jsval_of, note_compilation_cache_miss, record_script_host_defined_options,
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::{
@@ -256,6 +256,7 @@ struct RawScriptOrigin {
   resource_name: usize,
   source_map_url: usize,
   script_id: int,
+  host_defined_options: usize,
 }
 
 #[repr(C)]
@@ -266,6 +267,7 @@ struct RawSource {
   resource_column_offset: int,
   resource_options: int,
   source_map_url: usize,
+  host_defined_options: usize,
 }
 
 fn next_module_script_id() -> int {
@@ -1932,7 +1934,7 @@ pub extern "C" fn v8__ScriptOrigin__CONSTRUCT(
   _resource_is_opaque: bool,
   _is_wasm: bool,
   _is_module: bool,
-  _host_defined_options: *const Data,
+  host_defined_options: *const Data,
 ) {
   if !buf.is_null() {
     unsafe {
@@ -1941,6 +1943,7 @@ pub extern "C" fn v8__ScriptOrigin__CONSTRUCT(
       (*raw).resource_name = resource_name as usize;
       (*raw).source_map_url = source_map_url as usize;
       (*raw).script_id = script_id;
+      (*raw).host_defined_options = host_defined_options as usize;
     }
   }
 }
@@ -1963,6 +1966,7 @@ pub extern "C" fn v8__ScriptCompiler__Source__CONSTRUCT(
       let origin = origin as *const RawScriptOrigin;
       (*raw).resource_name = (*origin).resource_name;
       (*raw).source_map_url = (*origin).source_map_url;
+      (*raw).host_defined_options = (*origin).host_defined_options;
     }
   }
 }
@@ -1983,6 +1987,14 @@ unsafe fn source_string_of(source: *mut Source) -> *const V8String {
     return ptr::null();
   }
   unsafe { (*(source as *const RawSource)).source_string as *const V8String }
+}
+
+#[inline]
+unsafe fn host_defined_options_of(source: *mut Source) -> *const Data {
+  if source.is_null() {
+    return ptr::null();
+  }
+  unsafe { (*(source as *const RawSource)).host_defined_options as *const Data }
 }
 
 #[inline]
@@ -2167,7 +2179,11 @@ pub extern "C" fn v8__ScriptCompiler__Compile(
   unsafe { JS_FreeValue(ctx, compiled) };
 
   record_script_source_map_url(src_val, source_map_url);
-  intern_dup::<Script>(ctx, src_val)
+  let script = intern_dup::<Script>(ctx, src_val);
+  unsafe {
+    record_script_host_defined_options(script, host_defined_options_of(source));
+  }
+  script
 }
 
 #[unsafe(no_mangle)]

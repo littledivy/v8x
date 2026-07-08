@@ -1,7 +1,8 @@
 #![allow(non_snake_case, unused)]
 
 use crate::quickjs::core::{
-  ctx_of, current_ctx, current_iso, intern, intern_dup, iso_state, jsval_of,
+  ctx_of, current_ctx, current_host_defined_options, current_iso, intern,
+  intern_dup, iso_state, jsval_of,
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::support::int;
@@ -1429,7 +1430,7 @@ pub extern "C" fn v8__Isolate__ClearKeptObjects(
 pub extern "C" fn v8__Isolate__GetCurrentHostDefinedOptions(
   _this: *mut std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  current_host_defined_options() as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]

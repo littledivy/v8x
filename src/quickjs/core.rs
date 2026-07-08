@@ -1188,6 +1188,9 @@ thread_local! {
     std::collections::HashMap<usize, std::ffi::CString>,
   > = RefCell::new(std::collections::HashMap::new());
 
+  static SCRIPT_HOST_DEFINED_OPTIONS: RefCell<HashMap<usize, usize>> =
+    RefCell::new(HashMap::new());
+
   // Source text per script filename, captured at eval time. Used by the
   // error-stack `Error.prepareStackTrace` shim (see `exception.rs`) to recover
   // V8's `new`-keyword column for `new X()` frames: quickjs records the
@@ -1198,6 +1201,9 @@ thread_local! {
   > = RefCell::new(std::collections::HashMap::new());
 
   static CURRENT_SCRIPT_NAMES: RefCell<Vec<std::string::String>> =
+    const { RefCell::new(Vec::new()) };
+
+  static CURRENT_HOST_DEFINED_OPTIONS: RefCell<Vec<usize>> =
     const { RefCell::new(Vec::new()) };
 }
 
@@ -1215,6 +1221,18 @@ impl Drop for CurrentScriptNameGuard {
   }
 }
 
+struct CurrentHostDefinedOptionsGuard {
+  _private: (),
+}
+
+impl Drop for CurrentHostDefinedOptionsGuard {
+  fn drop(&mut self) {
+    CURRENT_HOST_DEFINED_OPTIONS.with(|options| {
+      options.borrow_mut().pop();
+    });
+  }
+}
+
 fn push_current_script_name(
   name: Option<&std::ffi::CString>,
 ) -> CurrentScriptNameGuard {
@@ -1225,6 +1243,33 @@ fn push_current_script_name(
     names.borrow_mut().push(name.to_string());
   });
   CurrentScriptNameGuard { pushed: true }
+}
+
+fn push_current_host_defined_options(
+  options: Option<usize>,
+) -> CurrentHostDefinedOptionsGuard {
+  CURRENT_HOST_DEFINED_OPTIONS.with(|stack| {
+    stack.borrow_mut().push(options.unwrap_or(0));
+  });
+  CurrentHostDefinedOptionsGuard { _private: () }
+}
+
+pub(crate) fn record_script_host_defined_options(
+  script: *const crate::Script,
+  options: *const Data,
+) {
+  if script.is_null() || options.is_null() {
+    return;
+  }
+  SCRIPT_HOST_DEFINED_OPTIONS.with(|m| {
+    m.borrow_mut().insert(script as usize, options as usize);
+  });
+}
+
+pub(crate) fn current_host_defined_options() -> *const Data {
+  CURRENT_HOST_DEFINED_OPTIONS
+    .with(|stack| stack.borrow().last().copied())
+    .unwrap_or(0) as *const Data
 }
 
 pub(crate) fn current_script_name_or_source_url() -> Option<std::string::String>
@@ -1295,6 +1340,13 @@ unsafe fn origin_resource_name(
   std::ffi::CString::new(owned).ok()
 }
 
+unsafe fn origin_host_defined_options(origin: *const c_void) -> *const Data {
+  if origin.is_null() {
+    return ptr::null();
+  }
+  unsafe { *((origin as *const usize).add(3)) as *const Data }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Script__Compile(
   context: *const Context,
@@ -1307,6 +1359,7 @@ pub extern "C" fn v8__Script__Compile(
   }
 
   let name = unsafe { origin_resource_name(ctx, origin) };
+  let host_defined_options = unsafe { origin_host_defined_options(origin) };
 
   // Syntax-check now: V8 reports syntax errors at *compile* time, and deno's
   // `execute_script` reads the exception straight from a failed compile. QuickJS
@@ -1344,6 +1397,7 @@ pub extern "C" fn v8__Script__Compile(
   }
 
   let handle = intern_dup::<crate::Script>(ctx, jsval_of(source));
+  record_script_host_defined_options(handle, host_defined_options);
   if !handle.is_null()
     && let Some(name) = name
   {
@@ -1479,11 +1533,15 @@ pub extern "C" fn v8__Script__Run(
   // `<eval>` for scripts compiled without a ScriptOrigin.
   let fname_owned =
     SCRIPT_RESOURCE_NAMES.with(|m| m.borrow_mut().remove(&(script as usize)));
+  let host_defined_options = SCRIPT_HOST_DEFINED_OPTIONS
+    .with(|m| m.borrow().get(&(script as usize)).copied());
   let fname_ptr = match fname_owned.as_ref() {
     Some(name) => name.as_ptr(),
     None => c"<eval>".as_ptr(),
   };
   let _current_script_name = push_current_script_name(fname_owned.as_ref());
+  let _current_host_defined_options =
+    push_current_host_defined_options(host_defined_options);
   // Capture the source under its eval filename for the stack-trace shim.
   if let Some(name) = fname_owned.as_ref()
     && let Ok(fname) = name.to_str()
