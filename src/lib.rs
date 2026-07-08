@@ -101,6 +101,7 @@ mod property_handler_flags;
 mod proxy;
 #[path = "../vendor/rusty_v8/src/regexp.rs"]
 mod regexp;
+#[allow(dead_code)]
 #[path = "../vendor/rusty_v8/src/scope.rs"]
 mod scope;
 #[path = "../vendor/rusty_v8/src/script.rs"]
