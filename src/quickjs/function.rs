@@ -681,6 +681,57 @@ unsafe fn make_cfunc_magic(
   }
 }
 
+unsafe extern "C" fn native_function_to_string(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
+  let name = unsafe { JS_GetPropertyStr(ctx, this_val, c"name".as_ptr()) };
+  let name_text = if jsv_is_string(&name) {
+    let cstr = unsafe { JS_ToCString(ctx, name) };
+    let text = if cstr.is_null() {
+      std::string::String::new()
+    } else {
+      unsafe { std::ffi::CStr::from_ptr(cstr) }
+        .to_string_lossy()
+        .into_owned()
+    };
+    if !cstr.is_null() {
+      unsafe { JS_FreeCString(ctx, cstr) };
+    }
+    text
+  } else {
+    std::string::String::new()
+  };
+  unsafe { JS_FreeValue(ctx, name) };
+
+  let text = if name_text.is_empty() {
+    "function () { [native code] }".to_owned()
+  } else {
+    format!("function {name_text}() {{ [native code] }}")
+  };
+  unsafe { JS_NewStringLen(ctx, text.as_ptr() as *const c_char, text.len()) }
+}
+
+unsafe fn install_native_function_to_string(
+  ctx: *mut JSContext,
+  function: JSValue,
+) {
+  let to_string = unsafe {
+    JS_NewCFunction(ctx, native_function_to_string, c"toString".as_ptr(), 0)
+  };
+  unsafe {
+    JS_DefinePropertyValueStr(
+      ctx,
+      function,
+      c"toString".as_ptr(),
+      to_string,
+      JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE,
+    );
+  }
+}
+
 pub(crate) unsafe fn make_function_len(
   ctx: *mut JSContext,
   callback: FunctionCallback,
@@ -724,9 +775,11 @@ unsafe fn make_function_len_with_instance(
   } else {
     fn_trampoline
   };
-  unsafe {
+  let f = unsafe {
     make_cfunc_magic(ctx, tramp, ptr::null(), length.max(0), cproto, magic)
-  }
+  };
+  unsafe { install_native_function_to_string(ctx, f) };
+  f
 }
 
 const JS_CFUNC_CONSTRUCTOR_MAGIC: c_int = 3;
@@ -2046,9 +2099,26 @@ pub extern "C" fn v8__FunctionTemplate__SetAccessorProperty(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__GetName(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  if this.is_null() {
+    let empty = unsafe { JS_NewStringLen(ctx, c"".as_ptr(), 0) };
+    return intern::<String>(empty) as *const std::os::raw::c_void;
+  }
+
+  let name = unsafe {
+    JS_GetPropertyStr(ctx, jsval_of(this as *const Function), c"name".as_ptr())
+  };
+  if jsv_is_string(&name) {
+    return intern::<String>(name) as *const std::os::raw::c_void;
+  }
+  unsafe { JS_FreeValue(ctx, name) };
+  let empty = unsafe { JS_NewStringLen(ctx, c"".as_ptr(), 0) };
+  intern::<String>(empty) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]
