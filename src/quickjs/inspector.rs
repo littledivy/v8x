@@ -4,6 +4,7 @@ use crate::Context;
 use crate::StackTrace;
 use crate::Value;
 use crate::isolate::RealIsolate;
+use crate::quickjs::quickjs_sys::*;
 use crate::support::Opaque;
 use crate::support::UniquePtr;
 use crate::support::int;
@@ -34,6 +35,7 @@ struct InspectorState {
   _cxx_vtable: *const Opaque,
   client: *mut RawV8InspectorClient,
   context_group_id: int,
+  channel: *mut RawChannel,
 }
 
 thread_local! {
@@ -52,6 +54,10 @@ unsafe extern "C" {
     line_number: u32,
     column_number: u32,
     stack_trace: &mut V8StackTrace,
+  );
+  fn v8_inspector__V8Inspector__Channel__BASE__sendNotification(
+    this: *mut RawChannel,
+    message: UniquePtr<StringBuffer>,
   );
 }
 
@@ -101,6 +107,77 @@ pub(crate) fn emit_console_api_message(level: int, message: String) {
     );
     free_inert(stack_trace);
   }
+}
+
+fn json_string(value: &str) -> String {
+  let mut out = String::with_capacity(value.len() + 2);
+  out.push('"');
+  for ch in value.chars() {
+    match ch {
+      '"' => out.push_str("\\\""),
+      '\\' => out.push_str("\\\\"),
+      '\n' => out.push_str("\\n"),
+      '\r' => out.push_str("\\r"),
+      '\t' => out.push_str("\\t"),
+      ch if ch.is_control() => {
+        use std::fmt::Write;
+        let _ = write!(out, "\\u{:04x}", ch as u32);
+      }
+      ch => out.push(ch),
+    }
+  }
+  out.push('"');
+  out
+}
+
+unsafe fn js_value_to_string(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> Option<String> {
+  let mut len = 0usize;
+  let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, value) };
+  if cstr.is_null() {
+    return None;
+  }
+  let text = unsafe {
+    let bytes = std::slice::from_raw_parts(cstr as *const u8, len);
+    String::from_utf8_lossy(bytes).into_owned()
+  };
+  unsafe { JS_FreeCString(ctx, cstr) };
+  Some(text)
+}
+
+unsafe fn exception_description_and_message(
+  exception: *const Value,
+) -> (String, String) {
+  let ctx = crate::quickjs::core::current_ctx();
+  if ctx.is_null() || exception.is_null() {
+    return ("Error".to_string(), String::new());
+  }
+  let value = crate::quickjs::core::jsval_of(exception);
+  let description = unsafe { js_value_to_string(ctx, value) }
+    .unwrap_or_else(|| "Error".to_string());
+  let message_value =
+    unsafe { JS_GetPropertyStr(ctx, value, c"message".as_ptr()) };
+  let message = if message_value.tag == JS_TAG_EXCEPTION {
+    String::new()
+  } else {
+    unsafe { js_value_to_string(ctx, message_value) }.unwrap_or_default()
+  };
+  unsafe { JS_FreeValue(ctx, message_value) };
+  (description, message)
+}
+
+fn send_channel_notification(channel: *mut RawChannel, json: String) {
+  if channel.is_null() {
+    return;
+  }
+  let units: Vec<u16> = json.encode_utf16().collect();
+  let buf = RealStringBuffer::boxed_from_utf16(units);
+  let unique = unsafe { UniquePtr::from_raw(buf) };
+  unsafe {
+    v8_inspector__V8Inspector__Channel__BASE__sendNotification(channel, unique)
+  };
 }
 
 #[unsafe(no_mangle)]
@@ -300,18 +377,23 @@ pub extern "C" fn v8_inspector__V8Inspector__create(
     _cxx_vtable: std::ptr::null(),
     client,
     context_group_id: 1,
+    channel: std::ptr::null_mut(),
   }))
   .cast::<RawV8Inspector>()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__connect(
-  _inspector: *mut RawV8Inspector,
+  inspector: *mut RawV8Inspector,
   _context_group_id: int,
   channel: *mut RawChannel,
   _state: StringView,
   _client_trust_level: V8InspectorClientTrustLevel,
 ) -> *mut RawV8InspectorSession {
+  if !inspector.is_null() {
+    let state = unsafe { &mut *inspector.cast::<InspectorState>() };
+    state.channel = channel;
+  }
   let sess = Box::new(cdp::CdpSession::new(channel));
   Box::into_raw(sess).cast::<RawV8InspectorSession>()
 }
@@ -401,18 +483,36 @@ pub extern "C" fn v8_inspector__V8Inspector__allAsyncTasksCanceled(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__exceptionThrown(
-  _this: *mut RawV8Inspector,
+  this: *mut RawV8Inspector,
   _context: *const Context,
-  _message: StringView,
+  message: StringView,
   _exception: *const Value,
   _detailed_message: StringView,
-  _url: StringView,
+  url: StringView,
   _line_number: u32,
   _column_number: u32,
   _stack_trace: *mut V8StackTrace,
   _script_id: int,
 ) -> u32 {
-  0
+  if this.is_null() {
+    return 0;
+  }
+  let state = unsafe { &*this.cast::<InspectorState>() };
+  let text = string_view_to_string(&message);
+  let url = string_view_to_string(&url);
+  let (description, exception_message) =
+    unsafe { exception_description_and_message(_exception) };
+  let json = format!(
+    "{{\"method\":\"Runtime.exceptionThrown\",\"params\":{{\"timestamp\":0,\"exceptionDetails\":{{\"exceptionId\":1,\"text\":{},\"lineNumber\":0,\"columnNumber\":0,\"scriptId\":\"1\",\"url\":{},\"exception\":{{\"type\":\"object\",\"subtype\":\"error\",\"className\":\"Error\",\"description\":{},\"objectId\":\"1.1.1\",\"preview\":{{\"type\":\"object\",\"subtype\":\"error\",\"description\":{},\"overflow\":false,\"properties\":[{{\"name\":\"stack\",\"type\":\"string\",\"value\":{}}},{{\"name\":\"message\",\"type\":\"string\",\"value\":{}}}]}}}},\"executionContextId\":1}}}}}}",
+    json_string(&text),
+    json_string(&url),
+    json_string(&description),
+    json_string(&description),
+    json_string(&description),
+    json_string(&exception_message),
+  );
+  send_channel_notification(state.channel, json);
+  1
 }
 
 #[unsafe(no_mangle)]
