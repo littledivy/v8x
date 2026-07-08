@@ -1208,10 +1208,25 @@ pub extern "C" fn v8__CpuProfiler__UseDetailedSourcePositionsForProfiling(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__AddMessageListener(
-  _isolate: *mut std::os::raw::c_void,
-  _callback: *const std::os::raw::c_void,
+  isolate: *mut std::os::raw::c_void,
+  callback: crate::isolate::MessageCallback,
 ) -> bool {
-  false
+  if isolate.is_null() {
+    return false;
+  }
+  iso_state(isolate as *mut RealIsolate)
+    .message_listeners
+    .push(callback);
+  true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__AddMessageListenerWithErrorLevel(
+  isolate: *mut std::os::raw::c_void,
+  callback: crate::isolate::MessageCallback,
+  _message_levels: crate::isolate::MessageErrorLevel,
+) -> bool {
+  v8__Isolate__AddMessageListener(isolate, callback)
 }
 
 #[unsafe(no_mangle)]

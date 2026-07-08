@@ -38,6 +38,10 @@ use crate::{
 use std::os::raw::c_char;
 use std::ptr;
 
+const MESSAGE_TEXT_PROP: &std::ffi::CStr = c"__v8qjs_message_text";
+const MESSAGE_SOURCE_LINE_PROP: &std::ffi::CStr = c"__v8qjs_source_line";
+const MESSAGE_STACK_PTR_PROP: &std::ffi::CStr = c"__v8qjs_stack_ptr";
+
 thread_local! {
   static TRY_CATCH_DEPTH: std::cell::Cell<usize> =
     const { std::cell::Cell::new(0) };
@@ -176,22 +180,30 @@ pub extern "C" fn v8__Message__Get(this: *const Message) -> *const String {
     return ptr::null();
   }
   unsafe {
+    let owned = read_str_prop(ctx, jsval_of(this), MESSAGE_TEXT_PROP);
     let mut len: usize = 0;
-    let cstr = JS_ToCStringLen(ctx, &mut len, jsval_of(this));
-    if cstr.is_null() {
-      clear_pending(ctx);
-      return ptr::null();
-    }
-    let bytes = std::slice::from_raw_parts(cstr as *const u8, len);
-    let s = if bytes.starts_with(b"Uncaught ") {
-      JS_NewStringLen(ctx, cstr, len)
+    let mut cstr_to_free: *const c_char = ptr::null();
+    let bytes: &[u8] = if let Some(text) = owned.as_ref() {
+      text.as_bytes()
     } else {
-      let mut message = Vec::with_capacity(b"Uncaught ".len() + len);
+      cstr_to_free = JS_ToCStringLen(ctx, &mut len, jsval_of(this));
+      if cstr_to_free.is_null() {
+        clear_pending(ctx);
+        return ptr::null();
+      }
+      std::slice::from_raw_parts(cstr_to_free as *const u8, len)
+    };
+    let s = if bytes.starts_with(b"Uncaught ") {
+      JS_NewStringLen(ctx, bytes.as_ptr() as *const c_char, bytes.len())
+    } else {
+      let mut message = Vec::with_capacity(b"Uncaught ".len() + bytes.len());
       message.extend_from_slice(b"Uncaught ");
       message.extend_from_slice(bytes);
       JS_NewStringLen(ctx, message.as_ptr() as *const c_char, message.len())
     };
-    JS_FreeCString(ctx, cstr);
+    if !cstr_to_free.is_null() {
+      JS_FreeCString(ctx, cstr_to_free);
+    }
     if s.tag == JS_TAG_EXCEPTION {
       return ptr::null();
     }
@@ -254,6 +266,28 @@ pub extern "C" fn v8__Message__GetStackTrace(
   if this.is_null() {
     return ptr::null();
   }
+  let ctx = current_ctx();
+  if !ctx.is_null() {
+    let stack_ptr = unsafe {
+      JS_GetPropertyStr(ctx, jsval_of(this), MESSAGE_STACK_PTR_PROP.as_ptr())
+    };
+    if stack_ptr.tag != JS_TAG_EXCEPTION
+      && !jsv_is_undefined(&stack_ptr)
+      && !jsv_is_null(&stack_ptr)
+    {
+      let mut raw: i64 = 0;
+      let ok = unsafe { JS_ToInt64(ctx, &mut raw, stack_ptr) };
+      unsafe { JS_FreeValue(ctx, stack_ptr) };
+      if ok >= 0 && raw != 0 {
+        return raw as *const StackTrace;
+      }
+    } else {
+      unsafe { JS_FreeValue(ctx, stack_ptr) };
+      if stack_ptr.tag == JS_TAG_EXCEPTION {
+        unsafe { clear_pending(ctx) };
+      }
+    }
+  }
   intern_dup::<StackTrace>(current_ctx(), jsval_of(this))
 }
 
@@ -283,6 +317,8 @@ struct QjsStackFrame {
   url: Option<std::string::String>,
   func: Option<std::string::String>,
   is_user: bool,
+  script_id: int,
+  source: Option<std::string::String>,
 }
 
 struct QjsStackTrace {
@@ -292,6 +328,117 @@ struct QjsStackTrace {
 thread_local! {
   static LAST_STACK: std::cell::Cell<*mut QjsStackTrace> =
     const { std::cell::Cell::new(ptr::null_mut()) };
+}
+
+unsafe fn set_message_str_prop(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  name: &std::ffi::CStr,
+  value: &str,
+) {
+  let v = unsafe {
+    JS_NewStringLen(ctx, value.as_ptr() as *const c_char, value.len())
+  };
+  unsafe { JS_SetPropertyStr(ctx, obj, name.as_ptr(), v) };
+}
+
+unsafe fn set_message_int_prop(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  name: &std::ffi::CStr,
+  value: i32,
+) {
+  let v = unsafe { JS_NewInt32(ctx, value) };
+  unsafe { JS_SetPropertyStr(ctx, obj, name.as_ptr(), v) };
+}
+
+pub(crate) unsafe fn notify_message_listeners(
+  ctx: *mut JSContext,
+  resource_name: Option<&str>,
+  source: &str,
+) {
+  let iso = current_iso();
+  if ctx.is_null() || iso.is_null() {
+    return;
+  }
+  let listeners = iso_state(iso).message_listeners.clone();
+  if listeners.is_empty() {
+    return;
+  }
+  let Some(exc) = (unsafe { peek_pending(ctx) }) else {
+    return;
+  };
+
+  let message = unsafe { JS_NewObject(ctx) };
+  if message.tag == JS_TAG_EXCEPTION {
+    unsafe { clear_pending(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return;
+  }
+
+  let mut exc_len = 0usize;
+  let exc_str = unsafe { JS_ToCStringLen(ctx, &mut exc_len, exc) };
+  if !exc_str.is_null() {
+    let bytes =
+      unsafe { std::slice::from_raw_parts(exc_str as *const u8, exc_len) };
+    let text = std::string::String::from_utf8_lossy(bytes);
+    unsafe { set_message_str_prop(ctx, message, MESSAGE_TEXT_PROP, &text) };
+    unsafe { JS_FreeCString(ctx, exc_str) };
+  } else {
+    unsafe { clear_pending(ctx) };
+    unsafe { set_message_str_prop(ctx, message, MESSAGE_TEXT_PROP, "") };
+  }
+
+  let source_line = source.lines().next().unwrap_or(source);
+  let resource = resource_name.unwrap_or("<eval>");
+  unsafe {
+    set_message_str_prop(ctx, message, c"fileName", resource);
+    set_message_str_prop(ctx, message, MESSAGE_SOURCE_LINE_PROP, source_line);
+    set_message_int_prop(ctx, message, c"lineNumber", 1);
+    set_message_int_prop(ctx, message, c"columnNumber", 0);
+    set_message_int_prop(ctx, message, c"endColumn", 1);
+    set_message_int_prop(ctx, message, c"startPosition", 0);
+    set_message_int_prop(ctx, message, c"endPosition", 1);
+    set_message_int_prop(ctx, message, c"wasmFunctionIndex", -1);
+    set_message_int_prop(ctx, message, c"errorLevel", 0);
+  }
+
+  let trace = Box::into_raw(Box::new(QjsStackTrace {
+    frames: vec![QjsStackFrame {
+      line: 1,
+      col: 1,
+      url: None,
+      func: None,
+      is_user: true,
+      script_id: 4,
+      source: Some(source.to_string()),
+    }],
+  }));
+  LAST_STACK.with(|cell| {
+    let prev = cell.replace(trace);
+    if !prev.is_null() {
+      unsafe { drop(Box::from_raw(prev)) };
+    }
+  });
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      message,
+      MESSAGE_STACK_PTR_PROP.as_ptr(),
+      JS_NewInt64(ctx, trace as i64),
+    )
+  };
+
+  let msg_h = intern::<Message>(message);
+  let exc_h = intern::<Value>(exc);
+  for callback in listeners {
+    let (Some(message), Some(exception)) =
+      (crate::Local::from_raw(msg_h), crate::Local::from_raw(exc_h))
+    else {
+      continue;
+    };
+    unsafe { callback(message, exception) };
+  }
 }
 
 unsafe fn current_backtrace_string(ctx: *mut JSContext) -> std::string::String {
@@ -359,6 +506,8 @@ fn parse_qjs_backtrace(raw: &str) -> Vec<QjsStackFrame> {
       url: has_url.then(|| url.to_string()),
       func: (!func.is_empty()).then(|| func.to_string()),
       is_user: has_url,
+      script_id: 0,
+      source: None,
     });
   }
   frames
@@ -875,8 +1024,24 @@ pub extern "C" fn v8__Message__GetSourceLine(
   this: *const Message,
   context: *const Context,
 ) -> *const String {
-  let _ = (this, context);
-  ptr::null()
+  let ctx = ctx_of(context);
+  let ctx = if ctx.is_null() { current_ctx() } else { ctx };
+  if ctx.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let Some(source_line) =
+    (unsafe { read_str_prop(ctx, jsval_of(this), MESSAGE_SOURCE_LINE_PROP) })
+  else {
+    return ptr::null();
+  };
+  let v = unsafe {
+    JS_NewStringLen(
+      ctx,
+      source_line.as_ptr() as *const c_char,
+      source_line.len(),
+    )
+  };
+  intern::<String>(v)
 }
 
 #[unsafe(no_mangle)]
@@ -932,37 +1097,72 @@ pub extern "C" fn v8__Exception__GetStackTrace(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Message__ErrorLevel(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return 0;
+  }
+  unsafe {
+    read_num_prop(ctx, jsval_of(this as *const Message), b"errorLevel\0", 0)
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Message__GetEndColumn(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return 0;
+  }
+  unsafe {
+    read_num_prop(ctx, jsval_of(this as *const Message), b"endColumn\0", 0)
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Message__GetEndPosition(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return 0;
+  }
+  unsafe {
+    read_num_prop(ctx, jsval_of(this as *const Message), b"endPosition\0", 0)
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Message__GetStartPosition(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return 0;
+  }
+  unsafe {
+    read_num_prop(ctx, jsval_of(this as *const Message), b"startPosition\0", 0)
+  }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Message__GetWasmFunctionIndex(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> crate::support::int {
-  0
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return -1;
+  }
+  unsafe {
+    read_num_prop(
+      ctx,
+      jsval_of(this as *const Message),
+      b"wasmFunctionIndex\0",
+      -1,
+    )
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -988,9 +1188,12 @@ pub extern "C" fn v8__Promise__HasHandler(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackFrame__GetScriptId(
-  _this: *const std::os::raw::c_void,
+  this: *const StackFrame,
 ) -> crate::support::int {
-  0
+  if this.is_null() {
+    return 0;
+  }
+  unsafe { (*(this as *const QjsStackFrame)).script_id }
 }
 
 #[unsafe(no_mangle)]
@@ -1003,9 +1206,23 @@ pub extern "C" fn v8__StackFrame__GetScriptNameOrSourceURL(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__StackFrame__GetScriptSource(
-  _this: *const std::os::raw::c_void,
+  this: *const StackFrame,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  if this.is_null() {
+    return std::ptr::null();
+  }
+  let frame = unsafe { &*(this as *const QjsStackFrame) };
+  let Some(source) = frame.source.as_deref() else {
+    return std::ptr::null();
+  };
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return std::ptr::null();
+  }
+  let v = unsafe {
+    JS_NewStringLen(ctx, source.as_ptr() as *const c_char, source.len())
+  };
+  intern::<String>(v) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]

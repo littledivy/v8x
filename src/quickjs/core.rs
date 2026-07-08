@@ -203,6 +203,8 @@ pub(crate) struct IsoState {
 
   pub gc_epilogue_callbacks: Vec<GcCallbackEntry>,
 
+  pub message_listeners: Vec<crate::isolate::MessageCallback>,
+
   pub use_counter_callback: Option<crate::UseCounterCallback>,
 
   pub javascript_execution_disallow_scopes: Vec<crate::scope::OnFailure>,
@@ -555,6 +557,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     kept_objects_cleared: false,
     gc_prologue_callbacks: Vec::new(),
     gc_epilogue_callbacks: Vec::new(),
+    message_listeners: Vec::new(),
     use_counter_callback: None,
     javascript_execution_disallow_scopes: Vec::new(),
     javascript_execution_allow_depth: 0,
@@ -1465,6 +1468,11 @@ pub extern "C" fn v8__Script__Run(
     }
     return h_result;
   }
+  let source_for_message = if result.tag == JS_TAG_EXCEPTION {
+    Some(std::string::String::from_utf8_lossy(source_bytes).into_owned())
+  } else {
+    None
+  };
   unsafe { JS_FreeCString(ctx, cstr) };
   if result.tag == JS_TAG_EXCEPTION {
     if std::env::var_os("QJS_DEBUG_EXC").is_some() {
@@ -1495,6 +1503,15 @@ pub extern "C" fn v8__Script__Run(
     }
 
     if !super::exception::has_active_try_catch() {
+      let resource_name =
+        fname_owned.as_ref().and_then(|name| name.to_str().ok());
+      unsafe {
+        super::exception::notify_message_listeners(
+          ctx,
+          resource_name,
+          source_for_message.as_deref().unwrap_or(""),
+        )
+      };
       unsafe { super::exception::clear_pending(ctx) };
     }
 
