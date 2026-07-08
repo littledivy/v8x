@@ -54,6 +54,7 @@ unsafe extern "C" {
   ) -> c_int;
   fn JS_GetLength(ctx: *mut JSContext, obj: JSValue, pres: *mut i64) -> c_int;
   fn JS_ToBool(ctx: *mut JSContext, val: JSValue) -> c_int;
+  fn JS_IsStrictEqual(ctx: *mut JSContext, op1: JSValue, op2: JSValue) -> bool;
   fn JS_GetOwnPropertyNames(
     ctx: *mut JSContext,
     ptab: *mut *mut JSPropertyEnum,
@@ -540,6 +541,176 @@ pub extern "C" fn v8__Object__HasOwnProperty(
   just_bool(found)
 }
 
+unsafe fn atom_to_path_segment(
+  ctx: *mut JSContext,
+  atom: JSAtom,
+) -> Option<String> {
+  let key = unsafe { JS_AtomToString(ctx, atom) };
+  if key.tag == JS_TAG_EXCEPTION {
+    return None;
+  }
+  let cstr = unsafe { JS_ToCString(ctx, key) };
+  let out = if cstr.is_null() {
+    None
+  } else {
+    Some(
+      unsafe { std::ffi::CStr::from_ptr(cstr) }
+        .to_string_lossy()
+        .into_owned(),
+    )
+  };
+  if !cstr.is_null() {
+    unsafe { JS_FreeCString(ctx, cstr) };
+  }
+  unsafe { JS_FreeValue(ctx, key) };
+  out
+}
+
+unsafe fn find_inferred_constructor_path(
+  ctx: *mut JSContext,
+  object: JSValue,
+  target: JSValue,
+  prefix: &str,
+  depth: u8,
+  visited: &mut std::collections::HashSet<usize>,
+) -> Option<String> {
+  if depth > 3 || !jsv_is_object(&object) {
+    return None;
+  }
+  if !visited.insert(jsv_get_ptr(&object) as usize) {
+    return None;
+  }
+
+  let mut tab: *mut JSPropertyEnum = ptr::null_mut();
+  let mut len: u32 = 0;
+  let rc = unsafe {
+    JS_GetOwnPropertyNames(
+      ctx,
+      &mut tab,
+      &mut len,
+      object,
+      JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY,
+    )
+  };
+  if rc < 0 {
+    return None;
+  }
+
+  let mut found = None;
+  unsafe {
+    for i in 0..len as usize {
+      let atom = (*tab.add(i)).atom;
+      let Some(segment) = atom_to_path_segment(ctx, atom) else {
+        continue;
+      };
+      if segment.is_empty() {
+        continue;
+      }
+      let path = if prefix.is_empty() {
+        segment
+      } else {
+        format!("{prefix}.{segment}")
+      };
+      let value = JS_GetProperty(ctx, object, atom);
+      if value.tag == JS_TAG_EXCEPTION {
+        JS_FreeValue(ctx, JS_GetException(ctx));
+        continue;
+      }
+      if JS_IsStrictEqual(ctx, value, target) {
+        JS_FreeValue(ctx, value);
+        found = Some(path);
+        break;
+      }
+      if jsv_is_object(&value) && !JS_IsFunction(ctx, value) {
+        found = find_inferred_constructor_path(
+          ctx,
+          value,
+          target,
+          &path,
+          depth + 1,
+          visited,
+        );
+        if found.is_some() {
+          JS_FreeValue(ctx, value);
+          break;
+        }
+      }
+      JS_FreeValue(ctx, value);
+    }
+    JS_FreePropertyEnum(ctx, tab, len);
+  }
+  found
+}
+
+unsafe fn inferred_constructor_name(
+  ctx: *mut JSContext,
+  ctor: JSValue,
+) -> JSValue {
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let mut visited = std::collections::HashSet::new();
+  let path = unsafe {
+    find_inferred_constructor_path(ctx, global, ctor, "", 0, &mut visited)
+  };
+  unsafe { JS_FreeValue(ctx, global) };
+  if let Some(path) = path {
+    unsafe { JS_NewStringLen(ctx, path.as_ptr() as *const c_char, path.len()) }
+  } else {
+    jsv_null()
+  }
+}
+
+unsafe fn has_own_property_atom(
+  ctx: *mut JSContext,
+  object: JSValue,
+  want: JSAtom,
+) -> bool {
+  let mut tab: *mut JSPropertyEnum = ptr::null_mut();
+  let mut len: u32 = 0;
+  let rc = unsafe {
+    JS_GetOwnPropertyNames(ctx, &mut tab, &mut len, object, JS_GPN_STRING_MASK)
+  };
+  if rc < 0 {
+    return false;
+  }
+
+  let mut found = false;
+  unsafe {
+    for i in 0..len as usize {
+      if (*tab.add(i)).atom == want {
+        found = true;
+        break;
+      }
+    }
+    JS_FreePropertyEnum(ctx, tab, len);
+  }
+  found
+}
+
+unsafe fn constructor_from_prototype_chain(
+  ctx: *mut JSContext,
+  object: JSValue,
+  ctor_atom: JSAtom,
+) -> JSValue {
+  let mut proto = unsafe { JS_GetPrototype(ctx, object) };
+  let mut depth = 0;
+  while jsv_is_object(&proto) && depth < 64 {
+    if unsafe { has_own_property_atom(ctx, proto, ctor_atom) } {
+      let ctor = unsafe { JS_GetProperty(ctx, proto, ctor_atom) };
+      unsafe { JS_FreeValue(ctx, proto) };
+      return ctor;
+    }
+    let next = unsafe { JS_GetPrototype(ctx, proto) };
+    unsafe { JS_FreeValue(ctx, proto) };
+    proto = next;
+    depth += 1;
+  }
+  if proto.tag == JS_TAG_EXCEPTION {
+    return proto;
+  }
+  unsafe { JS_FreeValue(ctx, proto) };
+  unsafe { JS_GetProperty(ctx, object, ctor_atom) }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetConstructorName(
   this: *const Object,
@@ -558,7 +729,7 @@ pub extern "C" fn v8__Object__GetConstructorName(
       }
     };
     let ctor_atom = JS_NewAtom(ctx, c"constructor".as_ptr());
-    let ctor = JS_GetProperty(ctx, jsval_of(this), ctor_atom);
+    let ctor = constructor_from_prototype_chain(ctx, jsval_of(this), ctor_atom);
     JS_FreeAtom(ctx, ctor_atom);
     if ctor.tag == JS_TAG_EXCEPTION {
       drain_exc();
@@ -571,16 +742,33 @@ pub extern "C" fn v8__Object__GetConstructorName(
     let name_atom = JS_NewAtom(ctx, c"name".as_ptr());
     let name = JS_GetProperty(ctx, ctor, name_atom);
     JS_FreeAtom(ctx, name_atom);
-    JS_FreeValue(ctx, ctor);
     if name.tag == JS_TAG_EXCEPTION {
       drain_exc();
+      JS_FreeValue(ctx, ctor);
       return fallback();
     }
     if !jsv_is_string(&name) {
       JS_FreeValue(ctx, name);
+      JS_FreeValue(ctx, ctor);
       return fallback();
     }
+    let cstr = JS_ToCString(ctx, name);
+    let is_empty =
+      cstr.is_null() || std::ffi::CStr::from_ptr(cstr).to_bytes().is_empty();
+    if !cstr.is_null() {
+      JS_FreeCString(ctx, cstr);
+    }
+    if is_empty {
+      let inferred = inferred_constructor_name(ctx, ctor);
+      if jsv_is_string(&inferred) {
+        JS_FreeValue(ctx, name);
+        JS_FreeValue(ctx, ctor);
+        return intern::<V8String>(inferred);
+      }
+      JS_FreeValue(ctx, inferred);
+    }
 
+    JS_FreeValue(ctx, ctor);
     intern::<V8String>(name)
   }
 }
