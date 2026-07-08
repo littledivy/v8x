@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=rusty_v8.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 200 passing. DO NOT hand-sort; the
+# (run.mjs --update). 203 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 rv8_slots::clear_all_context_slots
 rv8_slots::context_slots
@@ -132,6 +132,9 @@ rv8_test_api::local_handle_deref
 rv8_test_api::low_memory_notification
 rv8_test_api::map
 rv8_test_api::memory_pressure_notification
+rv8_test_api::microtask_queue
+rv8_test_api::microtask_queue_new
+rv8_test_api::microtasks
 rv8_test_api::no_internal_field
 rv8_test_api::no_source_map_comment
 rv8_test_api::object

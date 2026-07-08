@@ -314,6 +314,25 @@ pub extern "C" fn v8__Context__SetAlignedPointerInEmbedderData(
 
 type JSPromiseHookType = i32;
 
+struct MicrotaskQueueState {
+  _policy: MicrotasksPolicy,
+}
+
+pub(crate) fn new_microtask_queue_state(
+  policy: MicrotasksPolicy,
+) -> *mut MicrotaskQueue {
+  Box::into_raw(Box::new(MicrotaskQueueState { _policy: policy }))
+    as *mut MicrotaskQueue
+}
+
+pub(crate) unsafe fn drop_microtask_queue_state(queue: *mut MicrotaskQueue) {
+  if !queue.is_null() {
+    unsafe {
+      drop(Box::from_raw(queue as *mut MicrotaskQueueState));
+    }
+  }
+}
+
 const PROMISE_REACTION_HOOK_SOURCE: &str = r#"
 (function(beforeHook, afterHook) {
   var key = Symbol.for("v8x.quickjs.promiseHooks");
@@ -771,9 +790,13 @@ pub extern "C" fn v8__Isolate__HasPendingBackgroundTasks(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetMicrotasksPolicy(
-  _isolate: *mut RealIsolate,
-  _policy: MicrotasksPolicy,
+  isolate: *mut RealIsolate,
+  policy: MicrotasksPolicy,
 ) {
+  if isolate.is_null() {
+    return;
+  }
+  iso_state(isolate).microtasks_policy = policy;
 }
 
 fn drain_jobs(rt: *mut JSRuntime) {
@@ -798,6 +821,17 @@ fn drain_jobs(rt: *mut JSRuntime) {
   }
 }
 
+pub(crate) fn run_microtasks_if_auto() {
+  let iso = current_iso();
+  if iso.is_null() {
+    return;
+  }
+  let st = iso_state(iso);
+  if st.microtasks_policy == MicrotasksPolicy::Auto {
+    drain_jobs(st.rt);
+  }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(
   isolate: *mut RealIsolate,
@@ -809,17 +843,7 @@ pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(
   drain_jobs(st.rt);
 }
 
-thread_local! {
-
-    static ENQUEUE_HELPER: std::cell::Cell<Option<JSValue>> = const { std::cell::Cell::new(None) };
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__EnqueueMicrotask(
-  _isolate: *mut RealIsolate,
-  function: *const Function,
-) {
-  let ctx = current_ctx();
+fn enqueue_microtask_function(ctx: *mut JSContext, function: *const Function) {
   if ctx.is_null() || function.is_null() {
     return;
   }
@@ -828,31 +852,26 @@ pub extern "C" fn v8__Isolate__EnqueueMicrotask(
     if !JS_IsFunction(ctx, f) {
       return;
     }
-    let helper = ENQUEUE_HELPER.with(|c| {
-      if let Some(h) = c.get() {
-        return h;
-      }
-      let src = c"(f)=>{Promise.resolve().then(f);}";
-      let h = JS_Eval(
-        ctx,
-        src.as_ptr(),
-        src.to_bytes().len(),
-        c"<enqueue-microtask>".as_ptr(),
-        JS_EVAL_TYPE_GLOBAL,
-      );
-      if h.tag == JS_TAG_EXCEPTION {
-        let exc = JS_GetException(ctx);
-        JS_FreeValue(ctx, exc);
-        return jsv_undefined();
-      }
-      c.set(Some(h));
-      h
-    });
+    let src = c"(f)=>{Promise.resolve().then(f);}";
+    let helper = JS_Eval(
+      ctx,
+      src.as_ptr(),
+      src.to_bytes().len(),
+      c"<enqueue-microtask>".as_ptr(),
+      JS_EVAL_TYPE_GLOBAL,
+    );
+    if helper.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      return;
+    }
     if !JS_IsFunction(ctx, helper) {
+      JS_FreeValue(ctx, helper);
       return;
     }
     let mut argv = [JS_DupValue(ctx, f)];
     let ret = JS_Call(ctx, helper, jsv_undefined(), 1, argv.as_mut_ptr());
+    JS_FreeValue(ctx, helper);
     JS_FreeValue(ctx, argv[0]);
     if ret.tag == JS_TAG_EXCEPTION {
       let exc = JS_GetException(ctx);
@@ -861,6 +880,15 @@ pub extern "C" fn v8__Isolate__EnqueueMicrotask(
       JS_FreeValue(ctx, ret);
     }
   }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__EnqueueMicrotask(
+  _isolate: *mut RealIsolate,
+  function: *const Function,
+) {
+  let ctx = current_ctx();
+  enqueue_microtask_function(ctx, function);
 }
 
 #[unsafe(no_mangle)]
@@ -997,19 +1025,14 @@ pub extern "C" fn v8__Isolate__GetEnteredOrMicrotaskContext(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__MicrotaskQueue__New(
   _isolate: *mut RealIsolate,
-  _policy: MicrotasksPolicy,
+  policy: MicrotasksPolicy,
 ) -> *mut MicrotaskQueue {
-  let b: Box<u8> = Box::new(0);
-  Box::into_raw(b) as *mut MicrotaskQueue
+  new_microtask_queue_state(policy)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__MicrotaskQueue__DESTRUCT(queue: *mut MicrotaskQueue) {
-  if !queue.is_null() {
-    unsafe {
-      drop(Box::from_raw(queue as *mut u8));
-    }
-  }
+  unsafe { drop_microtask_queue_state(queue) };
 }
 
 #[unsafe(no_mangle)]
@@ -1045,21 +1068,7 @@ pub extern "C" fn v8__MicrotaskQueue__EnqueueMicrotask(
   microtask: *const Function,
 ) {
   let ctx = current_ctx();
-  if ctx.is_null() || microtask.is_null() {
-    return;
-  }
-  let f = jsval_of(microtask);
-  unsafe {
-    if JS_IsFunction(ctx, f) {
-      let ret = JS_Call(ctx, f, jsv_undefined(), 0, ptr::null_mut());
-      if ret.tag == JS_TAG_EXCEPTION {
-        let exc = JS_GetException(ctx);
-        JS_FreeValue(ctx, exc);
-      } else {
-        JS_FreeValue(ctx, ret);
-      }
-    }
-  }
+  enqueue_microtask_function(ctx, microtask);
 }
 
 type RC = crate::isolate_create_params::raw::ResourceConstraints;
@@ -1300,16 +1309,43 @@ pub extern "C" fn v8__V8__IsSandboxEnabled() -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetMicrotaskQueue(
-  _this: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
 ) -> *const std::os::raw::c_void {
-  std::ptr::null()
+  let iso = current_iso();
+  if iso.is_null() {
+    return ptr::null();
+  }
+  let ctx = ctx_of(this as *const Context);
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  let st = iso_state(iso);
+  st.context_microtask_queues
+    .get(&(ctx as usize))
+    .copied()
+    .unwrap_or(st.default_microtask_queue) as *const std::os::raw::c_void
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__SetMicrotaskQueue(
-  _this: *const std::os::raw::c_void,
-  _microtask_queue: *const std::os::raw::c_void,
+  this: *const std::os::raw::c_void,
+  microtask_queue: *const std::os::raw::c_void,
 ) {
+  let iso = current_iso();
+  if iso.is_null() {
+    return;
+  }
+  let ctx = ctx_of(this as *const Context);
+  if ctx.is_null() {
+    return;
+  }
+  let st = iso_state(iso);
+  if microtask_queue.is_null() {
+    st.context_microtask_queues.remove(&(ctx as usize));
+  } else {
+    st.context_microtask_queues
+      .insert(ctx as usize, microtask_queue as *mut MicrotaskQueue);
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1385,9 +1421,12 @@ pub extern "C" fn v8__Isolate__GetDataFromSnapshotOnce(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetMicrotasksPolicy(
-  _isolate: *const std::os::raw::c_void,
+  isolate: *const std::os::raw::c_void,
 ) -> crate::MicrotasksPolicy {
-  crate::MicrotasksPolicy::Explicit
+  if isolate.is_null() {
+    return crate::MicrotasksPolicy::Auto;
+  }
+  iso_state(isolate as *mut RealIsolate).microtasks_policy
 }
 
 #[unsafe(no_mangle)]

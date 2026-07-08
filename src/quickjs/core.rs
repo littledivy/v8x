@@ -39,8 +39,8 @@
 use super::quickjs_sys::*;
 use crate::support::SharedPtrBase;
 use crate::{
-  Allocator, Context, Data, Object, ObjectTemplate, Primitive, RealIsolate,
-  String as V8String, Value,
+  Allocator, Context, Data, MicrotaskQueue, MicrotasksPolicy, Object,
+  ObjectTemplate, Primitive, RealIsolate, String as V8String, Value,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -221,6 +221,12 @@ pub(crate) struct IsoState {
   pub array_buffer_allocator: SharedPtrBase<Allocator>,
 
   pub pending_array_buffer_frees: Vec<(*mut Allocator, *mut c_void, usize)>,
+
+  pub microtasks_policy: MicrotasksPolicy,
+
+  pub default_microtask_queue: *mut MicrotaskQueue,
+
+  pub context_microtask_queues: HashMap<usize, *mut MicrotaskQueue>,
 }
 
 impl IsoState {
@@ -564,6 +570,11 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     terminating: std::sync::atomic::AtomicBool::new(false),
     array_buffer_allocator,
     pending_array_buffer_frees: Vec::new(),
+    microtasks_policy: MicrotasksPolicy::Auto,
+    default_microtask_queue: super::isolate::new_microtask_queue_state(
+      MicrotasksPolicy::Auto,
+    ),
+    context_microtask_queues: HashMap::new(),
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;
   // Arm the interrupt handler so a runaway loop unwinds once
@@ -644,6 +655,8 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
     {
       super::allocator::allocator_free(allocator, data, byte_length);
     }
+    super::isolate::drop_microtask_queue_state(st.default_microtask_queue);
+    st.context_microtask_queues.clear();
   }
   // The module registries are thread-locals keyed by NAME or by pointers into
   // the runtime that was just freed. A later isolate on this thread (e.g. a
@@ -817,7 +830,7 @@ pub extern "C" fn v8__Context__New(
   isolate: *mut RealIsolate,
   templ: *const c_void,
   _global_object: *const c_void,
-  _microtask_queue: *mut c_void,
+  microtask_queue: *mut c_void,
 ) -> *const Context {
   if isolate.is_null() {
     return ptr::null();
@@ -837,6 +850,10 @@ pub extern "C" fn v8__Context__New(
     st.extra_contexts.push(c);
     c
   };
+  if !microtask_queue.is_null() {
+    st.context_microtask_queues
+      .insert(ctx as usize, microtask_queue as *mut MicrotaskQueue);
+  }
   install_default_globals(isolate, ctx);
   if !templ.is_null() {
     unsafe {
@@ -1461,6 +1478,7 @@ pub extern "C" fn v8__Script__Run(
     eprintln!("[qjs snapshot]   -> result.tag={}", result.tag);
   }
   if result.tag != JS_TAG_EXCEPTION {
+    super::isolate::run_microtasks_if_auto();
     let h_result = intern::<Value>(unsafe { JS_DupValue(ctx, result) });
     unsafe { JS_FreeCString(ctx, cstr) };
     if result.tag != JS_TAG_EXCEPTION {
