@@ -708,7 +708,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
-  unsafe { JS_SetMaxStackSize(rt, 8 * 1024 * 1024) };
+  unsafe { JS_SetMaxStackSize(rt, 1024 * 1024) };
   // deno's V8 lets `Atomics.wait` block the main isolate (deno isn't a browser);
   // QuickJS gates it behind can_block (default false → "cannot block in this
   // thread"). Enable to match.
