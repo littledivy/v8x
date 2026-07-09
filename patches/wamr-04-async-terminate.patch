@@ -1,0 +1,97 @@
+diff --git a/core/iwasm/common/wasm_c_api.c b/core/iwasm/common/wasm_c_api.c
+--- a/core/iwasm/common/wasm_c_api.c
++++ b/core/iwasm/common/wasm_c_api.c
+@@ -3359,6 +3359,18 @@ argv_to_results(uint32 *argv, const wasm_valtype_vec_t *result_types,
+     return true;
+ }
+ 
++/* v82jsc: QuickJS owns the isolate-level termination flag. Re-check it after
++ * wasm_func_call clears stale WAMR exceptions so a termination request racing
++ * with entry into the interpreter cannot be lost. */
++extern bool v82jsc_wasm_should_terminate(void);
++
++void
++v82jsc_wasm_func_terminate(const wasm_func_t *func)
++{
++    if (func && func->inst_comm_rt)
++        wasm_runtime_terminate(func->inst_comm_rt);
++}
++
+ wasm_trap_t *
+ wasm_func_call(const wasm_func_t *func, const wasm_val_vec_t *params,
+                wasm_val_vec_t *results)
+@@ -3447,6 +3459,8 @@ wasm_func_call(const wasm_func_t *func, const wasm_val_vec_t *params,
+     }
+ 
+     wasm_runtime_set_exception(func->inst_comm_rt, NULL);
++    if (v82jsc_wasm_should_terminate())
++        wasm_runtime_terminate(func->inst_comm_rt);
+     if (!wasm_runtime_call_wasm(exec_env, func_comm_rt, argc, argv)) {
+         if (wasm_runtime_get_exception(func->inst_comm_rt)) {
+             LOG_DEBUG("%s", wasm_runtime_get_exception(func->inst_comm_rt));
+diff --git a/core/iwasm/interpreter/wasm_interp_classic.c b/core/iwasm/interpreter/wasm_interp_classic.c
+--- a/core/iwasm/interpreter/wasm_interp_classic.c
++++ b/core/iwasm/interpreter/wasm_interp_classic.c
+@@ -2236,6 +2236,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
+             {
+ #if WASM_ENABLE_THREAD_MGR != 0
+                 CHECK_SUSPEND_FLAGS();
++#else
++                if (wasm_copy_exception(module, NULL))
++                    goto got_exception;
+ #endif
+                 read_leb_uint32(frame_ip, frame_ip_end, depth);
+             label_pop_csp_n:
+@@ -2256,6 +2259,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
+             {
+ #if WASM_ENABLE_THREAD_MGR != 0
+                 CHECK_SUSPEND_FLAGS();
++#else
++                if (wasm_copy_exception(module, NULL))
++                    goto got_exception;
+ #endif
+                 read_leb_uint32(frame_ip, frame_ip_end, depth);
+                 cond = (uint32)POP_I32();
+@@ -2268,6 +2274,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
+             {
+ #if WASM_ENABLE_THREAD_MGR != 0
+                 CHECK_SUSPEND_FLAGS();
++#else
++                if (wasm_copy_exception(module, NULL))
++                    goto got_exception;
+ #endif
+                 read_leb_uint32(frame_ip, frame_ip_end, count);
+                 lidx = POP_I32();
+diff --git a/core/iwasm/interpreter/wasm_interp_fast.c b/core/iwasm/interpreter/wasm_interp_fast.c
+--- a/core/iwasm/interpreter/wasm_interp_fast.c
++++ b/core/iwasm/interpreter/wasm_interp_fast.c
+@@ -1641,6 +1641,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
+             {
+ #if WASM_ENABLE_THREAD_MGR != 0
+                 CHECK_SUSPEND_FLAGS();
++#else
++                if (wasm_copy_exception(module, NULL))
++                    goto got_exception;
+ #endif
+             recover_br_info:
+                 RECOVER_BR_INFO();
+@@ -1651,6 +1654,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
+             {
+ #if WASM_ENABLE_THREAD_MGR != 0
+                 CHECK_SUSPEND_FLAGS();
++#else
++                if (wasm_copy_exception(module, NULL))
++                    goto got_exception;
+ #endif
+                 cond = frame_lp[GET_OFFSET()];
+ 
+@@ -1668,6 +1674,9 @@ wasm_interp_call_func_bytecode(WASMModuleInstance *module,
+ 
+ #if WASM_ENABLE_THREAD_MGR != 0
+                 CHECK_SUSPEND_FLAGS();
++#else
++                if (wasm_copy_exception(module, NULL))
++                    goto got_exception;
+ #endif
+                 count = read_uint32(frame_ip);
+                 didx = GET_OPERAND(uint32, I32, 0);

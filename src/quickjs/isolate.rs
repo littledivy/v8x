@@ -904,6 +904,7 @@ pub(crate) unsafe extern "C" fn terminate_interrupt_handler(
     return 0;
   }
   run_pending_interrupts(iso);
+  maybe_drive_near_heap_limit_callback(iso);
   iso_state(iso).is_terminating() as c_int
 }
 
@@ -933,6 +934,7 @@ pub extern "C" fn v8__Isolate__TerminateExecution(isolate: *const RealIsolate) {
   iso_state(iso)
     .terminating
     .store(true, std::sync::atomic::Ordering::Release);
+  super::wasm::terminate_active_call(iso);
 }
 
 #[unsafe(no_mangle)]
