@@ -939,6 +939,38 @@ pub(crate) fn module_name_for_value(v: JSValue) -> Option<std::string::String> {
   MODULE_STATE.with(|t| t.borrow().get(&key).map(|m| m.module_name.clone()))
 }
 
+pub(crate) struct ModuleSnapshotInfo {
+  pub name: std::string::String,
+  pub source: Option<std::string::String>,
+  pub evaluated: bool,
+}
+
+pub(crate) fn module_snapshot_info_for_value(
+  v: JSValue,
+) -> Option<ModuleSnapshotInfo> {
+  if v.tag >= 0 {
+    return None;
+  }
+  let key = unsafe { v.u.ptr as usize };
+  MODULE_STATE.with(|t| {
+    t.borrow().get(&key).map(|m| {
+      let source = if m.source_text.is_empty() {
+        lookup_module_source_by_name(&m.module_name)
+      } else {
+        Some(m.source_text.clone())
+      };
+      let evaluated = matches!(m.status, ModuleStatus::Evaluated)
+        || (!m.module_def.is_null()
+          && unsafe { v82jsc_module_is_evaluated(m.module_def) != 0 });
+      ModuleSnapshotInfo {
+        name: m.module_name.clone(),
+        source,
+        evaluated,
+      }
+    })
+  })
+}
+
 #[inline]
 fn handle_key(this: *const Module) -> usize {
   let v = jsval_of(this);
@@ -1663,6 +1695,12 @@ pub(crate) fn refresh_tape_module_state(
       m.status = ModuleStatus::Evaluated;
     });
   }
+}
+
+pub(crate) fn mark_tape_module_evaluated(wrapper: *const Module) {
+  with_module_state(wrapper, |m| {
+    m.status = ModuleStatus::Evaluated;
+  });
 }
 
 /// True when `p` is a registered module WRAPPER handle. Module identity in

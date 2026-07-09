@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=deno_core.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 413 passing. DO NOT hand-sort; the
+# (run.mjs --update). 417 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 deno_core::arena::raw_arena::tests::test_add_clear_many
 deno_core::arena::raw_arena::tests::test_add_remove_many
@@ -218,6 +218,7 @@ deno_core::runtime::ops::tests::test_typed_external
 deno_core::runtime::tests::error::fast_call_error_preserves_class
 deno_core::runtime::tests::error::syntax_error
 deno_core::runtime::tests::error::test_error_builder
+deno_core::runtime::tests::jsrealm::es_snapshot
 deno_core::runtime::tests::jsrealm::js_realm_ref_unref_ops
 deno_core::runtime::tests::jsrealm::lazy
 deno_core::runtime::tests::jsrealm::test_set_format_exception_callback_realms
@@ -315,7 +316,10 @@ deno_core::runtime::tests::ops::test_op_return_serde_v8_error
 deno_core::runtime::tests::ops::test_ref_unref_ops
 deno_core::runtime::tests::ops::test_sync_op_serialize_object_with_numbers_as_keys
 deno_core::runtime::tests::ops::test_top_level_await
+deno_core::runtime::tests::snapshot::es_snapshot
 deno_core::runtime::tests::snapshot::es_snapshot_without_runtime_module_loader
+deno_core::runtime::tests::snapshot::lazy_loaded_esm_not_snapshotted_but_metadata_survives
+deno_core::runtime::tests::snapshot::snapshot_with_additional_extensions
 deno_core::runtime::tests::snapshot::test_from_snapshot
 deno_core::runtime::tests::snapshot::test_snapshot_callbacks
 deno_core::runtime::tests::snapshot::test_snapshot_creator

@@ -34,6 +34,7 @@ const SNAPSHOT_DATA_HOST_FUNCTION: u8 = 4;
 const SNAPSHOT_DATA_JS_FUNCTION: u8 = 5;
 const SNAPSHOT_DATA_ASYNC_STUB: u8 = 6;
 const SNAPSHOT_DATA_NOOP_FUNCTION: u8 = 7;
+const SNAPSHOT_DATA_JS_FUNCTION_SOURCE: u8 = 8;
 const JS_WRITE_OBJ_BYTECODE: c_int = 1 << 0;
 const JS_WRITE_OBJ_SAB: c_int = 1 << 2;
 const JS_WRITE_OBJ_REFERENCE: c_int = 1 << 3;
@@ -50,6 +51,15 @@ const ASYNC_STUB_SRC: &str = "(function setUpAsyncStub(opName,originalOp,maybePr
   if (maybeProto) { maybeProto[opName]=fn; return; }\
   return fn;\
 })\0";
+const CREATE_LAZY_LOADER_SRC: &str = "function createLazyLoader(specifier){\
+    let value;\
+    return function lazyLoad(){\
+      if(!value){\
+        value=globalThis.Deno.core.ops.op_lazy_load_esm(specifier);\
+      }\
+      return value;\
+    };\
+  }";
 const NOOP_FUNCTION_SRC: &str = "(function(){})\0";
 
 #[repr(C)]
@@ -158,8 +168,29 @@ fn serialize_value_with_refs(
   v: JSValue,
   external_refs: &[usize],
 ) -> Option<Vec<u8>> {
-  if let Some(name) = super::module::module_name_for_value(v) {
-    return Some(encode_module_data(&name));
+  serialize_value_with_refs_inner(ctx, v, external_refs, false)
+}
+
+fn serialize_global_value_with_refs(
+  ctx: *mut JSContext,
+  v: JSValue,
+  external_refs: &[usize],
+) -> Option<Vec<u8>> {
+  serialize_value_with_refs_inner(ctx, v, external_refs, true)
+}
+
+fn serialize_value_with_refs_inner(
+  ctx: *mut JSContext,
+  v: JSValue,
+  external_refs: &[usize],
+  allow_function_source: bool,
+) -> Option<Vec<u8>> {
+  if let Some(info) = super::module::module_snapshot_info_for_value(v) {
+    return Some(encode_module_data(
+      &info.name,
+      info.source.as_deref(),
+      info.evaluated,
+    ));
   }
   if let Some(info) = super::function::snapshot_function_info(v) {
     return Some(encode_function_data(info, external_refs));
@@ -167,6 +198,12 @@ fn serialize_value_with_refs(
   if !ctx.is_null() && unsafe { JS_IsFunction(ctx, v) } {
     if let Some(bytes) = write_object_bytes(ctx, v) {
       return Some(encode_js_function_data(&bytes));
+    }
+    if allow_function_source
+      && let Some(source) = function_source(ctx, v)
+      && is_eval_safe_function_source(&source)
+    {
+      return Some(encode_js_function_source_data(&source));
     }
     return Some(encode_noop_function_data());
   }
@@ -198,6 +235,29 @@ fn write_object_bytes(ctx: *mut JSContext, v: JSValue) -> Option<Vec<u8>> {
   let out = unsafe { std::slice::from_raw_parts(buf, size) }.to_vec();
   unsafe { js_free(ctx, buf as *mut std::os::raw::c_void) };
   Some(out)
+}
+
+fn function_source(ctx: *mut JSContext, v: JSValue) -> Option<String> {
+  let mut len: usize = 0;
+  let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, v) };
+  if cstr.is_null() {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return None;
+  }
+  let bytes = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+  let out = String::from_utf8(bytes.to_vec()).ok();
+  unsafe { JS_FreeCString(ctx, cstr) };
+  out
+}
+
+fn is_eval_safe_function_source(source: &str) -> bool {
+  let source = source.trim_start();
+  !source.contains("[native code]")
+    && (source.starts_with("function")
+      || source.starts_with("async function")
+      || source.starts_with("class")
+      || source.contains("=>"))
 }
 
 pub(crate) fn deserialize_value_with_refs(
@@ -290,6 +350,12 @@ fn serialize_host_object_inner(
         JS_FreeValue(ctx, exc);
         continue;
       }
+      if name == "createLazyLoader" && JS_IsFunction(ctx, value) {
+        props_out
+          .push((name, encode_js_function_source_data(CREATE_LAZY_LOADER_SRC)));
+        JS_FreeValue(ctx, value);
+        continue;
+      }
       if let Some(mut bytes) =
         serialize_host_object_inner(ctx, value, external_refs, seen, depth + 1)
       {
@@ -307,11 +373,21 @@ fn serialize_host_object_inner(
   Some(encode_host_object_data(&props_out))
 }
 
-fn encode_module_data(name: &str) -> Vec<u8> {
-  let mut out = Vec::with_capacity(DATA_MAGIC.len() + 1 + 4 + name.len());
+fn encode_module_data(
+  name: &str,
+  source: Option<&str>,
+  evaluated: bool,
+) -> Vec<u8> {
+  let mut out = Vec::with_capacity(
+    DATA_MAGIC.len() + 2 + 8 + name.len() + source.map_or(0, str::len),
+  );
   out.extend_from_slice(DATA_MAGIC);
   out.push(SNAPSHOT_DATA_MODULE);
   put_str(&mut out, name);
+  if let Some(source) = source {
+    put_str(&mut out, source);
+  }
+  out.push(u8::from(evaluated));
   out
 }
 
@@ -349,6 +425,14 @@ fn encode_js_function_data(bytes: &[u8]) -> Vec<u8> {
   out.extend_from_slice(DATA_MAGIC);
   out.push(SNAPSHOT_DATA_JS_FUNCTION);
   put_bytes(&mut out, bytes);
+  out
+}
+
+fn encode_js_function_source_data(source: &str) -> Vec<u8> {
+  let mut out = Vec::new();
+  out.extend_from_slice(DATA_MAGIC);
+  out.push(SNAPSHOT_DATA_JS_FUNCTION_SOURCE);
+  put_str(&mut out, source);
   out
 }
 
@@ -392,11 +476,20 @@ fn decode_special_data(
   match input.get_u8()? {
     SNAPSHOT_DATA_MODULE => {
       let name = input.get_string()?;
+      if let Some(source) = input.get_string()
+        && !source.is_empty()
+      {
+        super::module::register_module_source(&name, &source);
+      }
+      let evaluated = input.get_u8().unwrap_or(0) != 0;
       let module = super::module::tape_make_module_handle(ctx, &name);
       if module.is_null() {
         return None;
       }
       super::module::refresh_tape_module_state(ctx, module);
+      if evaluated {
+        super::module::mark_tape_module_evaluated(module);
+      }
       Some(unsafe { JS_DupValue(ctx, super::core::jsval_of(module)) })
     }
     SNAPSHOT_DATA_HOST_FUNCTION => {
@@ -445,6 +538,28 @@ fn decode_special_data(
         return None;
       }
       let value = unsafe { JS_EvalFunction(ctx, value) };
+      if value.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exc) };
+        return None;
+      }
+      Some(value)
+    }
+    SNAPSHOT_DATA_JS_FUNCTION_SOURCE => {
+      let source = input.get_string()?;
+      let wrapped = format!("({source})");
+      let Ok(csrc) = CString::new(wrapped) else {
+        return None;
+      };
+      let value = unsafe {
+        JS_Eval(
+          ctx,
+          csrc.as_ptr(),
+          csrc.as_bytes().len(),
+          c"<v8x-snapshot-function>".as_ptr(),
+          JS_EVAL_TYPE_GLOBAL,
+        )
+      };
       if value.tag == JS_TAG_EXCEPTION {
         let exc = unsafe { JS_GetException(ctx) };
         unsafe { JS_FreeValue(ctx, exc) };
@@ -682,7 +797,7 @@ fn capture_globals(
       } else if let Some(bytes) = if name == "Deno" {
         serialize_host_object(ctx, value, external_refs)
       } else {
-        serialize_value_with_refs(ctx, value, external_refs)
+        serialize_global_value_with_refs(ctx, value, external_refs)
       } {
         out.push(GlobalEntry::Value { name, bytes });
       }
