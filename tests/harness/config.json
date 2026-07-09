@@ -64,9 +64,7 @@
       "package": "deno_core",
       "ignore": [],
       "ignore_by_backend": {
-        "quickjs": [
-          "runtime::tests::misc::test_heap_limit_cb_multiple"
-        ]
+        "quickjs": []
       },
       "ignore_by_backend_os": {
         "quickjs": {
