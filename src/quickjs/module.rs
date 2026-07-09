@@ -245,6 +245,8 @@ thread_local! {
 
     static AFTER_FIRST_EVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+    static MODULE_EVAL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+
     static RESOLVED_SPECIFIERS: RefCell<HashMap<(std::string::String, std::string::String), std::string::String>> =
         RefCell::new(HashMap::new());
 
@@ -919,6 +921,34 @@ fn mark_all_modules_evaluated() {
     }
   });
   AFTER_FIRST_EVAL.with(|f| f.set(true));
+}
+
+struct ModuleEvalGuard {
+  nested: bool,
+}
+
+impl ModuleEvalGuard {
+  fn should_drain_jobs(&self) -> bool {
+    !self.nested
+  }
+}
+
+impl Drop for ModuleEvalGuard {
+  fn drop(&mut self) {
+    MODULE_EVAL_DEPTH.with(|depth| {
+      depth.set(depth.get().saturating_sub(1));
+    });
+  }
+}
+
+fn enter_module_eval() -> ModuleEvalGuard {
+  MODULE_EVAL_DEPTH.with(|depth| {
+    let current = depth.get();
+    depth.set(current.saturating_add(1));
+    ModuleEvalGuard {
+      nested: current != 0,
+    }
+  })
 }
 
 #[allow(dead_code)]
@@ -3460,6 +3490,8 @@ pub extern "C" fn v8__Module__Evaluate(
   } else {
     iso_state(iso).rt
   };
+  let evaluate_called_reentrantly =
+    MODULE_EVAL_DEPTH.with(|depth| depth.get() != 0);
   // If `Isolate::TerminateExecution` is pending, V8's `Module::Evaluate` returns
   // an empty handle so the embedder surfaces the termination (deno's mod_evaluate
   // then sends `ExecutionTerminated`). Mirror that here: otherwise the per-op
@@ -3563,8 +3595,11 @@ pub extern "C" fn v8__Module__Evaluate(
           },
         );
         let mv = unsafe { JS_DupValue(ctx, mv) };
+        let eval_guard = enter_module_eval();
         let result = unsafe { JS_EvalFunction(ctx, mv) };
-        unsafe { drain_jobs(rt) };
+        if eval_guard.should_drain_jobs() {
+          unsafe { drain_jobs(rt) };
+        }
         if result.tag == JS_TAG_EXCEPTION {
           let exc = unsafe { JS_GetException(ctx) };
           if std::env::var_os("QJS_DEBUG_MOD").is_some() {
@@ -3590,8 +3625,11 @@ pub extern "C" fn v8__Module__Evaluate(
 
   let mut async_promise: Option<JSValue> = None;
   if let Some(bc) = bytecode {
+    let eval_guard = enter_module_eval();
     let result = unsafe { JS_EvalFunction(ctx, bc) };
-    unsafe { drain_jobs(rt) };
+    if eval_guard.should_drain_jobs() {
+      unsafe { drain_jobs(rt) };
+    }
     if result.tag == JS_TAG_EXCEPTION {
       let exc = unsafe { JS_GetException(ctx) };
       if !iso.is_null() {
@@ -3662,11 +3700,15 @@ pub extern "C" fn v8__Module__Evaluate(
         }
       }
 
+      let mut should_drain_jobs = true;
       let result = if let Some(mv) = module_val {
         let def = unsafe { mv.u.ptr } as *mut JSModuleDef;
         with_module_state(this, |m| m.module_def = def);
         unsafe { populate_import_meta(ctx, def, &module_name_dbg) };
-        unsafe { JS_EvalFunction(ctx, mv) }
+        let eval_guard = enter_module_eval();
+        let result = unsafe { JS_EvalFunction(ctx, mv) };
+        should_drain_jobs = eval_guard.should_drain_jobs();
+        result
       } else if let Ok(csrc) = CString::new(source_text.clone()) {
         unsafe {
           JS_Eval(
@@ -3690,7 +3732,9 @@ pub extern "C" fn v8__Module__Evaluate(
       } else {
         None
       };
-      unsafe { drain_jobs(rt) };
+      if should_drain_jobs {
+        unsafe { drain_jobs(rt) };
+      }
       if let Some(exc) = sync_exc {
         let s = unsafe { jsval_to_rust(ctx, exc) };
         if !s.is_empty() {
@@ -3782,7 +3826,9 @@ pub extern "C" fn v8__Module__Evaluate(
   unsafe {
     JS_FreeValue(ctx, resolve);
     JS_FreeValue(ctx, reject);
-    drain_jobs(rt);
+    if !evaluate_called_reentrantly {
+      drain_jobs(rt);
+    }
   }
   intern::<Value>(promise)
 }

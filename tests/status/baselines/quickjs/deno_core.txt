@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=deno_core.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 417 passing. DO NOT hand-sort; the
+# (run.mjs --update). 419 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 deno_core::arena::raw_arena::tests::test_add_clear_many
 deno_core::arena::raw_arena::tests::test_add_remove_many
@@ -116,12 +116,14 @@ deno_core::modules::tests::test_concurrent_redirect_load
 deno_core::modules::tests::test_custom_module_type_callback_computed
 deno_core::modules::tests::test_custom_module_type_callback_synthetic
 deno_core::modules::tests::test_custom_module_type_default
+deno_core::modules::tests::test_dyn_import_async_graph_with_lazy_esm_no_stall
 deno_core::modules::tests::test_json_text_bytes_modules
 deno_core::modules::tests::test_lazy_load_esm_evaluates_pre_instantiated_sibling
 deno_core::modules::tests::test_lazy_loaded_esm
 deno_core::modules::tests::test_lazy_loaded_esm_aliased_specifier
 deno_core::modules::tests::test_lazy_loaded_esm_aliased_via_import
 deno_core::modules::tests::test_lazy_loaded_esm_concurrent_loads
+deno_core::modules::tests::test_lazy_loaded_esm_with_tla_no_panic
 deno_core::modules::tests::test_lazy_loaded_script
 deno_core::modules::tests::test_lazy_loaded_script_not_found
 deno_core::modules::tests::test_mods
