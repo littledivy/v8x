@@ -317,6 +317,7 @@ pub(crate) struct IsoState {
 
   // Snapshot support (see snapshot.rs). `snap` records on SnapshotCreator
   // isolates; `restored` holds a parsed blob to replay into new contexts.
+  pub is_snapshot_creator: bool,
   /// Per-context AddData slot counters (SnapshotCreator::AddData returns the
   /// data index; the tape replays slots in call order).
   pub ctx_data_counts: HashMap<usize, usize>,
@@ -781,6 +782,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     named_handler_class_id,
     main_ctx_claimed: false,
     extra_contexts: Vec::new(),
+    is_snapshot_creator: false,
     ctx_data_counts: HashMap::new(),
     iso_data_count: 0,
     iso_added_contexts: 0,

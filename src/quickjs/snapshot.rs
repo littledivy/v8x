@@ -26,6 +26,7 @@ const DATA_MAGIC: &[u8; 8] = b"V8XSDAT\0";
 const NO_REF_INDEX: u32 = u32::MAX;
 const GLOBAL_VALUE: u8 = 0;
 const GLOBAL_FUNCTION: u8 = 1;
+const GLOBAL_LEXICAL_VALUE: u8 = 2;
 const SNAPSHOT_DATA_MODULE: u8 = 1;
 const SNAPSHOT_DATA_OBJECT: u8 = 2;
 const SNAPSHOT_DATA_HOST_OBJECT: u8 = 3;
@@ -92,6 +93,7 @@ pub(crate) struct SnapshotBlob {
 #[derive(Clone)]
 pub(crate) struct ContextSnapshot {
   pub globals: Vec<GlobalEntry>,
+  pub lexical_globals: Vec<GlobalEntry>,
   pub embedder_data: Vec<Option<Vec<u8>>>,
   pub context_data: Vec<Vec<u8>>,
 }
@@ -99,6 +101,10 @@ pub(crate) struct ContextSnapshot {
 #[derive(Clone)]
 pub(crate) enum GlobalEntry {
   Value {
+    name: String,
+    bytes: Vec<u8>,
+  },
+  LexicalValue {
     name: String,
     bytes: Vec<u8>,
   },
@@ -577,6 +583,7 @@ pub(crate) fn capture_context(
 ) -> ContextSnapshot {
   ContextSnapshot {
     globals: capture_globals(ctx, external_refs),
+    lexical_globals: capture_global_lexicals(ctx, external_refs),
     embedder_data: capture_embedder_data(ctx),
     context_data: context_data.to_vec(),
   }
@@ -597,6 +604,17 @@ pub(crate) fn replay_context(
       replay_global_entry(isolate, ctx, global, entry, external_refs);
     }
     JS_FreeValue(ctx, global);
+
+    let lexical = v82jsc_global_var_obj(ctx);
+    if lexical.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    } else {
+      for entry in &snapshot.lexical_globals {
+        replay_lexical_global_entry(ctx, lexical, entry, external_refs);
+      }
+      JS_FreeValue(ctx, lexical);
+    }
   }
 
   for (index, value) in snapshot.embedder_data.iter().enumerate() {
@@ -676,6 +694,61 @@ fn capture_globals(
   out
 }
 
+fn capture_global_lexicals(
+  ctx: *mut JSContext,
+  external_refs: &[usize],
+) -> Vec<GlobalEntry> {
+  if ctx.is_null() {
+    return Vec::new();
+  }
+  let mut out = Vec::new();
+  unsafe {
+    let lexical = v82jsc_global_var_obj(ctx);
+    if lexical.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      return out;
+    }
+    let mut tab: *mut JSPropertyEnum = ptr::null_mut();
+    let mut len = 0u32;
+    let rc = JS_GetOwnPropertyNames(
+      ctx,
+      &mut tab,
+      &mut len,
+      lexical,
+      JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY,
+    );
+    if rc < 0 {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      JS_FreeValue(ctx, lexical);
+      return out;
+    }
+    let props = std::slice::from_raw_parts(tab, len as usize);
+    for prop in props {
+      let Some(name) = atom_to_string(ctx, prop.atom) else {
+        continue;
+      };
+      let value = JS_GetProperty(ctx, lexical, prop.atom);
+      if value.tag == JS_TAG_EXCEPTION {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+        continue;
+      }
+      if value.tag != JS_TAG_UNINITIALIZED
+        && let Some(bytes) =
+          serialize_value_with_refs(ctx, value, external_refs)
+      {
+        out.push(GlobalEntry::LexicalValue { name, bytes });
+      }
+      JS_FreeValue(ctx, value);
+    }
+    JS_FreePropertyEnum(ctx, tab, len);
+    JS_FreeValue(ctx, lexical);
+  }
+  out
+}
+
 fn capture_embedder_data(ctx: *mut JSContext) -> Vec<Option<Vec<u8>>> {
   super::misc::embedder_data_snapshot(ctx)
     .into_iter()
@@ -742,7 +815,27 @@ unsafe fn replay_global_entry(
       }
       unsafe { JS_SetPropertyStr(ctx, global, name.as_ptr(), function) };
     }
+    GlobalEntry::LexicalValue { .. } => {}
   }
+}
+
+unsafe fn replay_lexical_global_entry(
+  ctx: *mut JSContext,
+  lexical: JSValue,
+  entry: &GlobalEntry,
+  external_refs: &[usize],
+) {
+  let GlobalEntry::LexicalValue { name, bytes } = entry else {
+    return;
+  };
+  let Ok(name) = CString::new(name.as_str()) else {
+    return;
+  };
+  let Some(value) = deserialize_value_with_refs(ctx, bytes, external_refs)
+  else {
+    return;
+  };
+  unsafe { JS_SetPropertyStr(ctx, lexical, name.as_ptr(), value) };
 }
 
 unsafe fn atom_to_string(ctx: *mut JSContext, atom: JSAtom) -> Option<String> {
@@ -788,6 +881,7 @@ fn decode_blob(bytes: &[u8]) -> Option<SnapshotBlob> {
 
 fn put_context(out: &mut Vec<u8>, context: &ContextSnapshot) {
   put_vec(out, &context.globals, put_global);
+  put_vec(out, &context.lexical_globals, put_global);
   put_vec(out, &context.embedder_data, put_opt_bytes);
   put_vec(out, &context.context_data, |out, bytes| {
     put_bytes(out, bytes)
@@ -798,6 +892,11 @@ fn put_global(out: &mut Vec<u8>, entry: &GlobalEntry) {
   match entry {
     GlobalEntry::Value { name, bytes } => {
       out.push(GLOBAL_VALUE);
+      put_str(out, name);
+      put_bytes(out, bytes);
+    }
+    GlobalEntry::LexicalValue { name, bytes } => {
+      out.push(GLOBAL_LEXICAL_VALUE);
       put_str(out, name);
       put_bytes(out, bytes);
     }
@@ -941,6 +1040,7 @@ impl<'a> Reader<'a> {
   fn get_context(&mut self) -> Option<ContextSnapshot> {
     Some(ContextSnapshot {
       globals: self.get_vec(Reader::get_global)?,
+      lexical_globals: self.get_vec(Reader::get_global)?,
       embedder_data: self.get_vec(Reader::get_opt_bytes)?,
       context_data: self.get_vec(Reader::get_bytes)?,
     })
@@ -957,6 +1057,10 @@ impl<'a> Reader<'a> {
   fn get_global(&mut self) -> Option<GlobalEntry> {
     match self.get_u8()? {
       GLOBAL_VALUE => Some(GlobalEntry::Value {
+        name: self.get_string()?,
+        bytes: self.get_bytes()?,
+      }),
+      GLOBAL_LEXICAL_VALUE => Some(GlobalEntry::LexicalValue {
         name: self.get_string()?,
         bytes: self.get_bytes()?,
       }),

@@ -107,6 +107,20 @@ pub(crate) fn key_atom<T>(ctx: *mut JSContext, key: *const T) -> JSAtom {
   unsafe { JS_ValueToAtom(ctx, jsval_of(key)) }
 }
 
+fn preserve_snapshot_creator_init_delete(
+  ctx: *mut JSContext,
+  atom: JSAtom,
+) -> bool {
+  let iso = current_iso();
+  if iso.is_null() || !iso_state(iso).is_snapshot_creator {
+    return false;
+  }
+  matches!(
+    unsafe { atom_to_path_segment(ctx, atom) }.as_deref(),
+    Some("__setTickInfo") | Some("__setImmediateInfo") | Some("__setTimerInfo")
+  )
+}
+
 #[inline]
 fn attr_to_jsprop(attr: u32) -> c_int {
   let mut flags = JS_PROP_HAS_VALUE
@@ -658,6 +672,10 @@ pub extern "C" fn v8__Object__Delete(
   let atom = key_atom(ctx, key);
   if atom == 0 {
     return MaybeBool::Nothing;
+  }
+  if preserve_snapshot_creator_init_delete(ctx, atom) {
+    unsafe { JS_FreeAtom(ctx, atom) };
+    return MaybeBool::JustTrue;
   }
   // flags=0, NOT JS_PROP_THROW: V8's `Object::Delete` reports an
   // unconfigurable property as `false` without throwing (sloppy-mode delete

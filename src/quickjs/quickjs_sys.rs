@@ -554,6 +554,7 @@ unsafe extern "C" {
     ctx: *mut JSContext,
     m: *mut JSModuleDef,
   ) -> JSValue;
+  pub fn v82jsc_global_var_obj(ctx: *mut JSContext) -> JSValue;
   pub fn JS_NewCModule(
     ctx: *mut JSContext,
     name_str: *const c_char,

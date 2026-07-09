@@ -992,6 +992,9 @@ pub extern "C" fn v8__SnapshotCreator__CONSTRUCT(
   // just a plain isolate. CreateBlob returns an empty blob and the embedder
   // falls back to New-init.
   let iso = crate::quickjs::core::v8__Isolate__New(params);
+  if !iso.is_null() {
+    crate::quickjs::core::iso_state(iso).is_snapshot_creator = true;
+  }
   crate::quickjs::core::v8__Isolate__Enter(iso);
   if !buf.is_null() {
     unsafe { *(buf as *mut *mut RealIsolate) = iso };
