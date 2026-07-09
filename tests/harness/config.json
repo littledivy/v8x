@@ -65,8 +65,7 @@
       "ignore": [],
       "ignore_by_backend": {
         "quickjs": [
-          "runtime::tests::misc::test_heap_limit_cb_multiple",
-          "runtime::tests::misc::test_heap_limits"
+          "runtime::tests::misc::test_heap_limit_cb_multiple"
         ]
       },
       "ignore_by_backend_os": {
