@@ -68,9 +68,6 @@
       },
       "ignore_by_backend_os": {
         "quickjs": {
-          "darwin": [
-            "runtime::ops::tests::test_op_buffer_any_length"
-          ],
           "linux": [
             "uv_compat::tests::tty_init_dev_tty_select_fallback"
           ]
