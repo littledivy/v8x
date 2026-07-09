@@ -327,6 +327,9 @@ pub(crate) struct IsoState {
   pub iso_added_contexts: usize,
   pub snap_default_context: Option<usize>,
   pub snap_contexts: Vec<usize>,
+  // Capture while the rusty_v8 annex and embedder callbacks are still alive.
+  pub snap_default_context_capture: Option<super::snapshot::ContextSnapshot>,
+  pub snap_context_captures: Vec<super::snapshot::ContextSnapshot>,
   pub snap_isolate_data: Vec<Vec<u8>>,
   pub snap_context_data: HashMap<usize, Vec<Vec<u8>>>,
   pub restored_snapshot: Option<super::snapshot::SnapshotBlob>,
@@ -795,6 +798,8 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     iso_added_contexts: 0,
     snap_default_context: None,
     snap_contexts: Vec::new(),
+    snap_default_context_capture: None,
+    snap_context_captures: Vec::new(),
     snap_isolate_data: Vec::new(),
     snap_context_data: HashMap::new(),
     restored_snapshot,

@@ -1054,26 +1054,31 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
     };
   }
   let st = crate::quickjs::core::iso_state(iso);
-  let default_context = st.snap_default_context.map(|ctx| {
-    let context_data =
-      st.snap_context_data.get(&ctx).cloned().unwrap_or_default();
-    super::snapshot::capture_context(
-      ctx as *mut JSContext,
-      &st.external_references,
-      &context_data,
-    )
-  });
+  let default_context =
+    st.snap_default_context_capture.clone().map(|mut ctx| {
+      if let Some(context) = st.snap_default_context {
+        ctx.context_data = st
+          .snap_context_data
+          .get(&context)
+          .cloned()
+          .unwrap_or_default();
+      }
+      ctx
+    });
   let contexts = st
-    .snap_contexts
+    .snap_context_captures
     .iter()
-    .map(|ctx| {
-      let context_data =
-        st.snap_context_data.get(ctx).cloned().unwrap_or_default();
-      super::snapshot::capture_context(
-        *ctx as *mut JSContext,
-        &st.external_references,
-        &context_data,
-      )
+    .enumerate()
+    .map(|(index, capture)| {
+      let mut capture = capture.clone();
+      if let Some(context) = st.snap_contexts.get(index) {
+        capture.context_data = st
+          .snap_context_data
+          .get(context)
+          .cloned()
+          .unwrap_or_default();
+      }
+      capture
     })
     .collect();
   let blob = super::snapshot::SnapshotBlob {
@@ -1099,8 +1104,14 @@ pub extern "C" fn v8__SnapshotCreator__SetDefaultContext(
     return;
   }
   let qctx = ctx_of(context);
-  crate::quickjs::core::iso_state(iso).snap_default_context =
-    Some(qctx as usize);
+  let external_references = crate::quickjs::core::iso_state(iso)
+    .external_references
+    .clone();
+  let capture =
+    super::snapshot::capture_context(qctx, &external_references, &[]);
+  let st = crate::quickjs::core::iso_state(iso);
+  st.snap_default_context = Some(qctx as usize);
+  st.snap_default_context_capture = Some(capture);
 }
 
 #[unsafe(no_mangle)]
@@ -1113,9 +1124,15 @@ pub extern "C" fn v8__SnapshotCreator__AddContext(
     return 0;
   }
   let qctx = ctx_of(context);
+  let external_references = crate::quickjs::core::iso_state(iso)
+    .external_references
+    .clone();
+  let capture =
+    super::snapshot::capture_context(qctx, &external_references, &[]);
   let st = crate::quickjs::core::iso_state(iso);
   let n = st.snap_contexts.len();
   st.snap_contexts.push(qctx as usize);
+  st.snap_context_captures.push(capture);
   st.iso_added_contexts += 1;
   n
 }
