@@ -3516,7 +3516,24 @@ pub extern "C" fn v8__Module__Evaluate(
       let def =
         with_module_state(this, |m| m.module_def).unwrap_or(ptr::null_mut());
       if !def.is_null() {
-        unsafe { run_synthetic_eval_steps(ctx, def) };
+        let module = make_value(
+          JS_TAG_MODULE,
+          JSValueUnion {
+            ptr: def as *mut std::os::raw::c_void,
+          },
+        );
+        let module = unsafe { JS_DupValue(ctx, module) };
+        let eval_guard = enter_module_eval();
+        let result = unsafe { JS_EvalFunction(ctx, module) };
+        if eval_guard.should_drain_jobs() {
+          unsafe { drain_jobs(rt) };
+        }
+        if result.tag == JS_TAG_EXCEPTION {
+          let exc = unsafe { JS_GetException(ctx) };
+          with_module_state(this, |m| m.status = ModuleStatus::Errored);
+          return make_rejected_promise(ctx, exc);
+        }
+        unsafe { JS_FreeValue(ctx, result) };
       }
       with_module_state(this, |m| m.status = ModuleStatus::Evaluated);
     }
