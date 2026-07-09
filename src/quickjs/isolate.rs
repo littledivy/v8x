@@ -359,12 +359,18 @@ pub extern "C" fn v8__Context__GetDataFromSnapshotOnce(
     let st = super::core::iso_state(iso);
     st.external_references.clone()
   };
-  let Some(value) =
+  let result = if let Some(template) =
+    super::snapshot::deserialize_function_template(ctx, &bytes, &external_refs)
+  {
+    template
+  } else if let Some(value) =
     super::snapshot::deserialize_value_with_refs(ctx, &bytes, &external_refs)
-  else {
-    return ptr::null();
+  {
+    intern::<Data>(value)
+  } else {
+    ptr::null()
   };
-  intern::<Data>(value)
+  result
 }
 
 /// Native `getContinuationPreservedEmbedderData` for the extras binding object.
@@ -456,6 +462,61 @@ fn extras_binding_impl(ctx: *mut JSContext) -> *const Object {
       setf,
     );
     intern::<Object>(o)
+  }
+}
+
+pub(crate) unsafe fn install_snapshot_intrinsics(
+  ctx: *mut JSContext,
+  global: JSValue,
+) {
+  let existing = unsafe {
+    JS_GetPropertyStr(ctx, global, c"__v8x_snapshot_intrinsics".as_ptr())
+  };
+  let (registry, install_registry) = if jsv_is_object(&existing) {
+    (existing, false)
+  } else {
+    unsafe { JS_FreeValue(ctx, existing) };
+    (unsafe { JS_NewObject(ctx) }, true)
+  };
+  let getf = unsafe {
+    JS_NewCFunction(
+      ctx,
+      extras_get_cped,
+      c"getContinuationPreservedEmbedderData".as_ptr(),
+      0,
+    )
+  };
+  let setf = unsafe {
+    JS_NewCFunction(
+      ctx,
+      extras_set_cped,
+      c"setContinuationPreservedEmbedderData".as_ptr(),
+      1,
+    )
+  };
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      registry,
+      c"getContinuationPreservedEmbedderData".as_ptr(),
+      getf,
+    );
+    JS_SetPropertyStr(
+      ctx,
+      registry,
+      c"setContinuationPreservedEmbedderData".as_ptr(),
+      setf,
+    );
+    if install_registry {
+      JS_SetPropertyStr(
+        ctx,
+        global,
+        c"__v8x_snapshot_intrinsics".as_ptr(),
+        registry,
+      );
+    } else {
+      JS_FreeValue(ctx, registry);
+    }
   }
 }
 
@@ -1762,6 +1823,11 @@ pub extern "C" fn v8__Isolate__GetDataFromSnapshotOnce(
     let st = iso_state(iso);
     st.external_references.clone()
   };
+  if let Some(template) =
+    super::snapshot::deserialize_function_template(ctx, &bytes, &external_refs)
+  {
+    return template as *const std::os::raw::c_void;
+  }
   let Some(value) =
     super::snapshot::deserialize_value_with_refs(ctx, &bytes, &external_refs)
   else {

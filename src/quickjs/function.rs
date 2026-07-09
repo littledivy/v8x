@@ -401,6 +401,16 @@ pub(crate) struct SnapshotFunctionInfo {
   pub constructable: bool,
 }
 
+pub(crate) struct SnapshotFunctionTemplateInfo {
+  pub callback: FunctionCallback,
+  pub data_external: Option<*mut c_void>,
+  pub length: i32,
+  pub constructable: bool,
+  pub class_name: Option<std::string::String>,
+  pub cached_proto: Option<JSValue>,
+  pub instance_internal_field_count: i32,
+}
+
 #[derive(Clone, Copy)]
 struct NamedGetterEntry {
   getter: crate::NamedPropertyGetterCallback,
@@ -3979,6 +3989,49 @@ pub(crate) fn template_kind(p: *const c_void) -> Option<TemplKind> {
     return None;
   }
   TEMPLATES.with(|t| t.borrow().get(&(p as usize)).copied())
+}
+
+pub(crate) fn snapshot_function_template_info(
+  template: *const FunctionTemplate,
+) -> Option<SnapshotFunctionTemplateInfo> {
+  if template_kind(template as *const c_void) != Some(TemplKind::Func) {
+    return None;
+  }
+  let template = unsafe { &*(template as *const FnTemplate) };
+  let instance = unsafe { &*template.instance };
+  Some(SnapshotFunctionTemplateInfo {
+    callback: template.callback,
+    data_external: external_pointer_from_value(template.data),
+    length: template.length,
+    constructable: template.constructable,
+    class_name: template.class_name.clone(),
+    cached_proto: jsv_is_object(&template.cached_proto)
+      .then_some(template.cached_proto),
+    instance_internal_field_count: instance.internal_field_count,
+  })
+}
+
+pub(crate) fn restore_function_template_from_snapshot(
+  callback: FunctionCallback,
+  data_external: Option<*mut c_void>,
+  length: i32,
+  constructable: bool,
+  class_name: Option<std::string::String>,
+  cached_proto: Option<JSValue>,
+  instance_internal_field_count: i32,
+) -> *const FunctionTemplate {
+  let template =
+    tape_make_template(callback, data_external, length, constructable);
+  let template_mut = unsafe { &mut *(template as *mut FnTemplate) };
+  template_mut.class_name = class_name;
+  if let Some(cached_proto) = cached_proto {
+    template_mut.cached_proto = cached_proto;
+  }
+  unsafe {
+    (*template_mut.instance).internal_field_count =
+      instance_internal_field_count;
+  }
+  template
 }
 
 fn with_template_props(

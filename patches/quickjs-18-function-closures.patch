@@ -1,0 +1,1341 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -38087,6 +38087,14 @@
+     BC_TAG_MAP,
+     BC_TAG_SET,
+     BC_TAG_SYMBOL,
++    BC_TAG_BYTECODE_FUNCTION_OBJECT,
++    BC_TAG_C_FUNCTION_OBJECT,
++    BC_TAG_BOUND_FUNCTION_OBJECT,
++    BC_TAG_HOST_OBJECT,
++    BC_TAG_SNAPSHOT_OBJECT,
++    BC_TAG_C_FUNCTION_DATA_OBJECT,
++    BC_TAG_WEAK_MAP,
++    BC_TAG_WEAK_SET,
+ } BCTagEnum;
+ 
+ #define BC_VERSION 26
+@@ -38110,6 +38118,10 @@
+     int sab_tab_size;
+     /* list of referenced objects (used if allow_reference = true) */
+     JSObjectList object_list;
++    /* closure cells referenced by serialized bytecode functions */
++    JSVarRef **var_ref_tab;
++    int var_ref_count;
++    int var_ref_size;
+ } BCWriterState;
+ 
+ #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
+@@ -38138,6 +38150,14 @@
+     "Map",
+     "Set",
+     "Symbol",
++    "FunctionObject",
++    "CFunctionObject",
++    "BoundFunctionObject",
++    "HostObject",
++    "SnapshotObject",
++    "CFunctionDataObject",
++    "WeakMap",
++    "WeakSet",
+ };
+ 
+ static const char *bc_tag_name(uint8_t tag)
+@@ -38367,7 +38387,129 @@
+ }
+ 
+ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj);
++
++extern int v82jsc_snapshot_write_host_object(JSContext *ctx,
++                                             JSValueConst obj,
++                                             uint8_t *buf,
++                                             size_t *size);
++extern int v82jsc_snapshot_read_host_object(JSContext *ctx,
++                                            const uint8_t *buf,
++                                            size_t size,
++                                            JSValue *obj);
++
++typedef struct JSSnapshotIntrinsicCollector {
++    JSContext *ctx;
++    JSValue registry;
++    JSObject *registry_object;
++    JSObjectList visited;
++    uint32_t next_index;
++} JSSnapshotIntrinsicCollector;
++
++static void JS_CollectSnapshotIntrinsics(JSSnapshotIntrinsicCollector *s,
++                                         JSValueConst value, int depth)
++{
++    JSPropertyDescriptor desc;
++    JSPropertyEnum *props = NULL;
++    JSObject *p;
++    JSValue proto;
++    uint32_t len = 0, i;
++    int ret;
++
++    if (JS_VALUE_GET_TAG(value) != JS_TAG_OBJECT || depth > 64)
++        return;
++    p = JS_VALUE_GET_OBJ(value);
++    if (p == s->registry_object ||
++        js_object_list_find(s->ctx, &s->visited, p) >= 0)
++        return;
++    if (js_object_list_add(s->ctx, &s->visited, p))
++        return;
++
++    if (p->class_id == JS_CLASS_C_FUNCTION ||
++        p->class_id == JS_CLASS_C_FUNCTION_DATA) {
++        if (JS_SetPropertyUint32(s->ctx, s->registry, s->next_index++,
++                                 JS_DupValue(s->ctx, value)) < 0) {
++            JSValue exc = JS_GetException(s->ctx);
++            JS_FreeValue(s->ctx, exc);
++        }
++    }
++
++    ret = JS_GetOwnPropertyNames(s->ctx, &props, &len, value,
++                                 JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK |
++                                 JS_GPN_PRIVATE_MASK);
++    if (ret < 0) {
++        JSValue exc = JS_GetException(s->ctx);
++        JS_FreeValue(s->ctx, exc);
++        goto proto;
++    }
++    for (i = 0; i < len; i++) {
++        memset(&desc, 0, sizeof(desc));
++        desc.value = JS_UNDEFINED;
++        desc.getter = JS_UNDEFINED;
++        desc.setter = JS_UNDEFINED;
++        ret = JS_GetOwnProperty(s->ctx, &desc, value, props[i].atom);
++        if (ret > 0) {
++            JS_CollectSnapshotIntrinsics(s, desc.value, depth + 1);
++            JS_CollectSnapshotIntrinsics(s, desc.getter, depth + 1);
++            JS_CollectSnapshotIntrinsics(s, desc.setter, depth + 1);
++            JS_FreeValue(s->ctx, desc.value);
++            JS_FreeValue(s->ctx, desc.getter);
++            JS_FreeValue(s->ctx, desc.setter);
++        } else if (ret < 0) {
++            JSValue exc = JS_GetException(s->ctx);
++            JS_FreeValue(s->ctx, exc);
++        }
++    }
++    js_free_prop_enum(s->ctx, props, len);
+ 
++ proto:
++    proto = p->shape->proto ?
++        JS_MKPTR(JS_TAG_OBJECT, p->shape->proto) : JS_NULL;
++    JS_CollectSnapshotIntrinsics(s, proto, depth + 1);
++}
++
++void v82jsc_snapshot_capture_intrinsics(JSContext *ctx, JSValue registry)
++{
++    JSSnapshotIntrinsicCollector s;
++    JSValue global;
++    int64_t length = 0;
++    uint32_t i;
++
++    if (!ctx || JS_VALUE_GET_TAG(registry) != JS_TAG_OBJECT)
++        return;
++    memset(&s, 0, sizeof(s));
++    s.ctx = ctx;
++    s.registry = registry;
++    s.registry_object = JS_VALUE_GET_OBJ(registry);
++    if (JS_GetLength(ctx, registry, &length) < 0 || length < 0 ||
++        length > UINT32_MAX) {
++        JSValue exc = JS_GetException(ctx);
++        JS_FreeValue(ctx, exc);
++        return;
++    }
++    s.next_index = length;
++    js_object_list_init(&s.visited);
++
++    global = JS_GetGlobalObject(ctx);
++    JS_CollectSnapshotIntrinsics(&s, global, 0);
++    JS_FreeValue(ctx, global);
++    JS_CollectSnapshotIntrinsics(&s, ctx->global_var_obj, 0);
++    JS_CollectSnapshotIntrinsics(&s, ctx->function_proto, 0);
++    JS_CollectSnapshotIntrinsics(&s, ctx->function_ctor, 0);
++    JS_CollectSnapshotIntrinsics(&s, ctx->array_ctor, 0);
++    JS_CollectSnapshotIntrinsics(&s, ctx->regexp_ctor, 0);
++    JS_CollectSnapshotIntrinsics(&s, ctx->promise_ctor, 0);
++    JS_CollectSnapshotIntrinsics(&s, ctx->error_ctor, 0);
++    JS_CollectSnapshotIntrinsics(&s, ctx->iterator_ctor, 0);
++    JS_CollectSnapshotIntrinsics(&s, ctx->iterator_proto, 0);
++    JS_CollectSnapshotIntrinsics(&s, ctx->async_iterator_proto, 0);
++    JS_CollectSnapshotIntrinsics(&s, ctx->throw_type_error, 0);
++    JS_CollectSnapshotIntrinsics(&s, ctx->eval_obj, 0);
++    for (i = 0; i < ctx->rt->class_count; i++)
++        JS_CollectSnapshotIntrinsics(&s, ctx->class_proto[i], 0);
++
++    js_object_list_end(ctx, &s.visited);
++}
++
+ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+ {
+     JSFunctionBytecode *b = JS_VALUE_GET_PTR(obj);
+@@ -38460,9 +38602,362 @@
+     }
+     return 0;
+  fail:
++    return -1;
++}
++
++static int JS_WriteVarRef(BCWriterState *s, JSVarRef *var_ref)
++{
++    int i;
++    uint8_t flags;
++
++    if (!var_ref || !var_ref->pvalue) {
++        JS_ThrowInternalError(s->ctx, "invalid closure variable");
++        return -1;
++    }
++    for (i = 0; i < s->var_ref_count; i++) {
++        if (s->var_ref_tab[i] == var_ref) {
++            bc_put_u8(s, 0);
++            bc_put_leb128(s, i);
++            return 0;
++        }
++    }
++    if (js_resize_array(s->ctx, (void **)&s->var_ref_tab,
++                        sizeof(s->var_ref_tab[0]), &s->var_ref_size,
++                        s->var_ref_count + 1))
++        return -1;
++    s->var_ref_tab[s->var_ref_count++] = var_ref;
++
++    bc_put_u8(s, 1);
++    flags = var_ref->is_lexical | (var_ref->is_const << 1);
++    bc_put_u8(s, flags);
++    return JS_WriteObjectRec(s, *var_ref->pvalue);
++}
++
++static int JS_WriteBytecodeFunctionObject(BCWriterState *s,
++                                          JSValueConst obj)
++{
++    JSObject *p = JS_VALUE_GET_OBJ(obj);
++    JSFunctionBytecode *b = p->u.func.function_bytecode;
++    int i;
++
++    if (!s->allow_bytecode || !b)
++        goto invalid;
++    bc_put_u8(s, BC_TAG_BYTECODE_FUNCTION_OBJECT);
++    bc_put_u8(s, b->func_kind);
++    if (JS_WriteObjectRec(s, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE, b)))
++        return -1;
++    bc_put_leb128(s, b->closure_var_count);
++    for (i = 0; i < b->closure_var_count; i++) {
++        if (JS_WriteVarRef(s, p->u.func.var_refs[i]))
++            return -1;
++    }
++    if (p->u.func.home_object) {
++        bc_put_u8(s, 1);
++        if (JS_WriteObjectRec(s,
++                              JS_MKPTR(JS_TAG_OBJECT,
++                                       p->u.func.home_object)))
++            return -1;
++    } else {
++        bc_put_u8(s, 0);
++    }
++    return 0;
++
++ invalid:
++    JS_ThrowTypeError(s->ctx, "invalid bytecode function object");
+     return -1;
+ }
+ 
++/* Returns 1 when the embedder handled the object, 0 when it did not, and -1
++   on error. */
++static int JS_WriteHostObject(BCWriterState *s, JSValueConst obj)
++{
++    uint8_t *buf;
++    size_t size = 0, written;
++    int ret;
++
++    ret = v82jsc_snapshot_write_host_object(s->ctx, obj, NULL, &size);
++    if (ret <= 0)
++        return ret;
++    if (size > UINT32_MAX)
++        return -1;
++    buf = js_malloc(s->ctx, size);
++    if (!buf)
++        return -1;
++    written = size;
++    ret = v82jsc_snapshot_write_host_object(s->ctx, obj, buf, &written);
++    if (ret <= 0 || written != size) {
++        js_free(s->ctx, buf);
++        return -1;
++    }
++    bc_put_u8(s, BC_TAG_HOST_OBJECT);
++    bc_put_leb128(s, size);
++    dbuf_put(&s->dbuf, buf, size);
++    js_free(s->ctx, buf);
++    return 1;
++}
++
++#define JS_INTRINSIC_PATH_MAX 64
++#define JS_INTRINSIC_VALUE 0
++#define JS_INTRINSIC_GETTER 1
++#define JS_INTRINSIC_SETTER 2
++#define JS_INTRINSIC_PROTOTYPE 3
++
++typedef struct JSIntrinsicFunctionPath {
++    JSContext *ctx;
++    JSObjectList visited;
++    JSClassID target_class_id;
++    JSCFunction *target_function;
++    JSCFunctionData *target_function_data;
++    uint8_t target_length;
++    uint8_t target_cproto;
++    int16_t target_magic;
++    uint8_t depth;
++    uint8_t kinds[JS_INTRINSIC_PATH_MAX];
++    JSAtom atoms[JS_INTRINSIC_PATH_MAX];
++    uint8_t found_len;
++    uint8_t found_kinds[JS_INTRINSIC_PATH_MAX];
++    JSAtom found_atoms[JS_INTRINSIC_PATH_MAX];
++} JSIntrinsicFunctionPath;
++
++static int JS_SearchIntrinsicFunctionPath(JSIntrinsicFunctionPath *s,
++                                          JSValueConst value)
++{
++    JSPropertyDescriptor desc;
++    JSPropertyEnum *props = NULL;
++    JSObject *p;
++    JSValue proto;
++    uint32_t len = 0, i;
++    int kind, ret = 0;
++
++    if (JS_VALUE_GET_TAG(value) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(value);
++    if ((s->target_class_id == JS_CLASS_C_FUNCTION &&
++         p->class_id == JS_CLASS_C_FUNCTION &&
++         p->u.cfunc.c_function.generic == s->target_function &&
++         p->u.cfunc.length == s->target_length &&
++         p->u.cfunc.cproto == s->target_cproto &&
++         p->u.cfunc.magic == s->target_magic) ||
++        (s->target_class_id == JS_CLASS_C_FUNCTION_DATA &&
++         p->class_id == JS_CLASS_C_FUNCTION_DATA &&
++         p->u.c_function_data_record &&
++         p->u.c_function_data_record->func == s->target_function_data)) {
++        s->found_len = s->depth;
++        for (i = 0; i < s->depth; i++) {
++            s->found_kinds[i] = s->kinds[i];
++            s->found_atoms[i] = s->kinds[i] == JS_INTRINSIC_PROTOTYPE ?
++                JS_ATOM_NULL : JS_DupAtom(s->ctx, s->atoms[i]);
++        }
++        return 1;
++    }
++    if (s->depth >= JS_INTRINSIC_PATH_MAX ||
++        js_object_list_find(s->ctx, &s->visited, p) >= 0)
++        return 0;
++    if (js_object_list_add(s->ctx, &s->visited, p))
++        return -1;
++
++    if (JS_GetOwnPropertyNames(s->ctx, &props, &len, value,
++                               JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK) < 0)
++        goto done;
++    for (i = 0; i < len; i++) {
++        memset(&desc, 0, sizeof(desc));
++        desc.value = JS_UNDEFINED;
++        desc.getter = JS_UNDEFINED;
++        desc.setter = JS_UNDEFINED;
++        if (JS_GetOwnProperty(s->ctx, &desc, value, props[i].atom) < 0) {
++            ret = -1;
++            goto done;
++        }
++        for (kind = JS_INTRINSIC_VALUE; kind <= JS_INTRINSIC_SETTER; kind++) {
++            JSValue child = kind == JS_INTRINSIC_VALUE ? desc.value :
++                (kind == JS_INTRINSIC_GETTER ? desc.getter : desc.setter);
++            s->kinds[s->depth] = kind;
++            s->atoms[s->depth++] = props[i].atom;
++            ret = JS_SearchIntrinsicFunctionPath(s, child);
++            s->depth--;
++            if (ret != 0)
++                break;
++        }
++        JS_FreeValue(s->ctx, desc.value);
++        JS_FreeValue(s->ctx, desc.getter);
++        JS_FreeValue(s->ctx, desc.setter);
++        if (ret != 0)
++            goto done;
++    }
++    proto = p->shape->proto ?
++        JS_MKPTR(JS_TAG_OBJECT, p->shape->proto) : JS_NULL;
++    s->kinds[s->depth] = JS_INTRINSIC_PROTOTYPE;
++    s->atoms[s->depth++] = JS_ATOM_NULL;
++    ret = JS_SearchIntrinsicFunctionPath(s, proto);
++    s->depth--;
++
++ done:
++    if (props)
++        js_free_prop_enum(s->ctx, props, len);
++    return ret;
++}
++
++static int JS_FindIntrinsicFunctionPath(JSContext *ctx, JSValueConst value,
++                                        JSIntrinsicFunctionPath *path)
++{
++    JSObject *target = JS_VALUE_GET_OBJ(value);
++    JSValue global, registry;
++    JSAtom registry_atom;
++    int ret;
++
++    memset(path, 0, sizeof(*path));
++    path->ctx = ctx;
++    path->target_class_id = target->class_id;
++    if (target->class_id == JS_CLASS_C_FUNCTION) {
++        path->target_function = target->u.cfunc.c_function.generic;
++        path->target_length = target->u.cfunc.length;
++        path->target_cproto = target->u.cfunc.cproto;
++        path->target_magic = target->u.cfunc.magic;
++    } else if (target->class_id == JS_CLASS_C_FUNCTION_DATA &&
++               target->u.c_function_data_record) {
++        path->target_function_data = target->u.c_function_data_record->func;
++    } else {
++        return -1;
++    }
++    js_object_list_init(&path->visited);
++    global = JS_GetGlobalObject(ctx);
++    registry_atom = JS_NewAtom(ctx, "__v8x_snapshot_intrinsics");
++    registry = JS_GetProperty(ctx, global, registry_atom);
++    path->kinds[0] = JS_INTRINSIC_VALUE;
++    path->atoms[0] = registry_atom;
++    path->depth = 1;
++    ret = JS_SearchIntrinsicFunctionPath(path, registry);
++    path->depth = 0;
++    JS_FreeValue(ctx, registry);
++    JS_FreeAtom(ctx, registry_atom);
++    JS_FreeValue(ctx, global);
++    js_object_list_end(ctx, &path->visited);
++    return ret > 0 ? 0 : -1;
++}
++
++static void JS_FreeIntrinsicFunctionPath(JSIntrinsicFunctionPath *path)
++{
++    int i;
++    if (!path->ctx)
++        return;
++    for (i = 0; i < path->found_len; i++) {
++        if (path->found_kinds[i] != JS_INTRINSIC_PROTOTYPE)
++            JS_FreeAtom(path->ctx, path->found_atoms[i]);
++    }
++}
++
++static int JS_WriteCFunctionObject(BCWriterState *s, JSValueConst obj)
++{
++    JSIntrinsicFunctionPath path;
++    int i, ret;
++
++    memset(&path, 0, sizeof(path));
++    ret = JS_WriteHostObject(s, obj);
++    if (ret != 0)
++        return ret < 0 ? -1 : 0;
++    if (JS_FindIntrinsicFunctionPath(s->ctx, obj, &path)) {
++        const char *description;
++        JS_FreeIntrinsicFunctionPath(&path);
++        description = JS_ToCString(s->ctx, obj);
++        JS_ThrowTypeError(s->ctx, "unregistered native function: %s",
++                          description ? description : "<unknown>");
++        JS_FreeCString(s->ctx, description);
++        return -1;
++    }
++    bc_put_u8(s, BC_TAG_C_FUNCTION_OBJECT);
++    bc_put_leb128(s, path.found_len);
++    for (i = 0; i < path.found_len; i++) {
++        bc_put_u8(s, path.found_kinds[i]);
++        if (path.found_kinds[i] != JS_INTRINSIC_PROTOTYPE)
++            bc_put_atom(s, path.found_atoms[i]);
++    }
++    JS_FreeIntrinsicFunctionPath(&path);
++    return 0;
++}
++
++static int JS_WriteCFunctionDataObject(BCWriterState *s, JSValueConst obj)
++{
++    JSObject *p = JS_VALUE_GET_OBJ(obj);
++    JSCFunctionDataRecord *record = p->u.c_function_data_record;
++    JSIntrinsicFunctionPath path;
++    JSValue value;
++    int i, ret;
++
++    memset(&path, 0, sizeof(path));
++    ret = JS_WriteHostObject(s, obj);
++    if (ret != 0)
++        return ret < 0 ? -1 : 0;
++    if (!record || JS_FindIntrinsicFunctionPath(s->ctx, obj, &path)) {
++        const char *description;
++        JS_FreeIntrinsicFunctionPath(&path);
++        description = JS_ToCString(s->ctx, obj);
++        JS_ThrowTypeError(s->ctx, "unregistered native closure: %s",
++                          description ? description : "<unknown>");
++        JS_FreeCString(s->ctx, description);
++        return -1;
++    }
++    bc_put_u8(s, BC_TAG_C_FUNCTION_DATA_OBJECT);
++    bc_put_leb128(s, path.found_len);
++    for (i = 0; i < path.found_len; i++) {
++        bc_put_u8(s, path.found_kinds[i]);
++        if (path.found_kinds[i] != JS_INTRINSIC_PROTOTYPE)
++            bc_put_atom(s, path.found_atoms[i]);
++    }
++    JS_FreeIntrinsicFunctionPath(&path);
++    bc_put_u8(s, record->length);
++    bc_put_u16(s, record->magic);
++    bc_put_leb128(s, record->data_len);
++    for (i = 0; i < record->data_len; i++) {
++        if (JS_WriteObjectRec(s, record->data[i]))
++            return -1;
++    }
++    value = JS_GetProperty(s->ctx, obj, JS_ATOM_length);
++    if (JS_IsException(value))
++        return -1;
++    ret = JS_WriteObjectRec(s, value);
++    JS_FreeValue(s->ctx, value);
++    if (ret)
++        return -1;
++    value = JS_GetProperty(s->ctx, obj, JS_ATOM_name);
++    if (JS_IsException(value))
++        return -1;
++    ret = JS_WriteObjectRec(s, value);
++    JS_FreeValue(s->ctx, value);
++    return ret;
++}
++
++static int JS_WriteBoundFunctionObject(BCWriterState *s,
++                                       JSValueConst obj)
++{
++    JSObject *p = JS_VALUE_GET_OBJ(obj);
++    JSBoundFunction *bf = p->u.bound_function;
++    JSValue value;
++    int i, ret;
++
++    bc_put_u8(s, BC_TAG_BOUND_FUNCTION_OBJECT);
++    bc_put_leb128(s, bf->argc);
++    if (JS_WriteObjectRec(s, bf->func_obj) ||
++        JS_WriteObjectRec(s, bf->this_val))
++        return -1;
++    for (i = 0; i < bf->argc; i++) {
++        if (JS_WriteObjectRec(s, bf->argv[i]))
++            return -1;
++    }
++    value = JS_GetProperty(s->ctx, obj, JS_ATOM_length);
++    if (JS_IsException(value))
++        return -1;
++    ret = JS_WriteObjectRec(s, value);
++    JS_FreeValue(s->ctx, value);
++    if (ret)
++        return -1;
++    value = JS_GetProperty(s->ctx, obj, JS_ATOM_name);
++    if (JS_IsException(value))
++        return -1;
++    ret = JS_WriteObjectRec(s, value);
++    JS_FreeValue(s->ctx, value);
++    return ret;
++}
++
+ static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
+ {
+     JSModuleDef *m = JS_VALUE_GET_PTR(obj);
+@@ -38558,39 +39053,63 @@
+ 
+ static int JS_WriteObjectTag(BCWriterState *s, JSValueConst obj)
+ {
+-    JSObject *p = JS_VALUE_GET_OBJ(obj);
+-    uint32_t i, prop_count;
+-    JSShape *sh;
+-    JSShapeProperty *pr;
+-    int pass;
+-    JSAtom atom;
++    JSPropertyDescriptor desc;
++    JSPropertyEnum *props = NULL;
++    JSValue proto = JS_UNDEFINED;
++    uint32_t len = 0, i;
++    int extensible, ret = -1;
+ 
+-    bc_put_u8(s, BC_TAG_OBJECT);
+-    prop_count = 0;
+-    sh = p->shape;
+-    for(pass = 0; pass < 2; pass++) {
+-        if (pass == 1)
+-            bc_put_leb128(s, prop_count);
+-        for(i = 0, pr = sh->prop; i < sh->prop_count; i++, pr++) {
+-            atom = pr->atom;
+-            if (atom != JS_ATOM_NULL && (pr->flags & JS_PROP_ENUMERABLE)) {
+-                if (pr->flags & JS_PROP_TMASK) {
+-                    JS_ThrowTypeError(s->ctx, "only value properties are supported");
+-                    goto fail;
+-                }
+-                if (pass == 0) {
+-                    prop_count++;
+-                } else {
+-                    bc_put_atom(s, atom);
+-                    if (JS_WriteObjectRec(s, p->prop[i].u.value))
+-                        goto fail;
+-                }
+-            }
++    bc_put_u8(s, BC_TAG_SNAPSHOT_OBJECT);
++    proto = JS_GetPrototype(s->ctx, obj);
++    if (JS_IsException(proto) || JS_WriteObjectRec(s, proto))
++        goto fail;
++    JS_FreeValue(s->ctx, proto);
++    proto = JS_UNDEFINED;
++
++    extensible = JS_IsExtensible(s->ctx, obj);
++    if (extensible < 0)
++        goto fail;
++    bc_put_u8(s, extensible != 0);
++
++    if (JS_GetOwnPropertyNames(s->ctx, &props, &len, obj,
++                               JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK |
++                               JS_GPN_PRIVATE_MASK) < 0)
++        goto fail;
++    bc_put_leb128(s, len);
++    for (i = 0; i < len; i++) {
++        memset(&desc, 0, sizeof(desc));
++        desc.value = JS_UNDEFINED;
++        desc.getter = JS_UNDEFINED;
++        desc.setter = JS_UNDEFINED;
++        if (JS_GetOwnProperty(s->ctx, &desc, obj, props[i].atom) <= 0)
++            goto fail_desc;
++        if (bc_put_atom(s, props[i].atom))
++            goto fail_desc;
++        bc_put_leb128(s, desc.flags & (JS_PROP_C_W_E | JS_PROP_GETSET));
++        if (desc.flags & JS_PROP_GETSET) {
++            if (JS_WriteObjectRec(s, desc.getter) ||
++                JS_WriteObjectRec(s, desc.setter))
++                goto fail_desc;
++        } else if (JS_WriteObjectRec(s, desc.value)) {
++            goto fail_desc;
+         }
++        JS_FreeValue(s->ctx, desc.value);
++        JS_FreeValue(s->ctx, desc.getter);
++        JS_FreeValue(s->ctx, desc.setter);
+     }
+-    return 0;
++    ret = 0;
++    goto done;
++
++ fail_desc:
++    JS_FreeValue(s->ctx, desc.value);
++    JS_FreeValue(s->ctx, desc.getter);
++    JS_FreeValue(s->ctx, desc.setter);
+  fail:
+-    return -1;
++    JS_FreeValue(s->ctx, proto);
++ done:
++    if (props)
++        js_free_prop_enum(s->ctx, props, len);
++    return ret;
+ }
+ 
+ static int JS_WriteTypedArray(BCWriterState *s, JSValueConst obj)
+@@ -38650,6 +39169,8 @@
+ 
+ static int JS_WriteMap(BCWriterState *s, struct JSMapState *map_state);
+ static int JS_WriteSet(BCWriterState *s, struct JSMapState *map_state);
++static int JS_WriteWeakMap(BCWriterState *s, struct JSMapState *map_state);
++static int JS_WriteWeakSet(BCWriterState *s, struct JSMapState *map_state);
+ 
+ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
+ {
+@@ -38744,6 +39265,21 @@
+             case JS_CLASS_OBJECT:
+                 ret = JS_WriteObjectTag(s, obj);
+                 break;
++            case JS_CLASS_BYTECODE_FUNCTION:
++            case JS_CLASS_GENERATOR_FUNCTION:
++            case JS_CLASS_ASYNC_FUNCTION:
++            case JS_CLASS_ASYNC_GENERATOR_FUNCTION:
++                ret = JS_WriteBytecodeFunctionObject(s, obj);
++                break;
++            case JS_CLASS_C_FUNCTION:
++                ret = JS_WriteCFunctionObject(s, obj);
++                break;
++            case JS_CLASS_C_FUNCTION_DATA:
++                ret = JS_WriteCFunctionDataObject(s, obj);
++                break;
++            case JS_CLASS_BOUND_FUNCTION:
++                ret = JS_WriteBoundFunctionObject(s, obj);
++                break;
+             case JS_CLASS_ARRAY_BUFFER:
+                 ret = JS_WriteArrayBuffer(s, obj);
+                 break;
+@@ -38775,12 +39311,32 @@
+                 bc_put_u8(s, BC_TAG_SET);
+                 ret = JS_WriteSet(s, p->u.map_state);
+                 break;
++            case JS_CLASS_WEAKMAP:
++                bc_put_u8(s, BC_TAG_WEAK_MAP);
++                ret = JS_WriteWeakMap(s, p->u.map_state);
++                break;
++            case JS_CLASS_WEAKSET:
++                bc_put_u8(s, BC_TAG_WEAK_SET);
++                ret = JS_WriteWeakSet(s, p->u.map_state);
++                break;
+             default:
+                 if (is_typed_array(p->class_id)) {
+                     ret = JS_WriteTypedArray(s, obj);
+                 } else {
+-                    JS_ThrowTypeError(s->ctx, "unsupported object class");
+-                    ret = -1;
++                    ret = JS_WriteHostObject(s, obj);
++                    if (ret == 0) {
++                        const char *class_name = JS_AtomToCString(
++                            s->ctx,
++                            s->ctx->rt->class_array[p->class_id].class_name);
++                        JS_ThrowTypeError(s->ctx,
++                                          "unsupported object class: %s (%u)",
++                                          class_name ? class_name : "<unknown>",
++                                          p->class_id);
++                        JS_FreeCString(s->ctx, class_name);
++                        ret = -1;
++                    } else if (ret > 0) {
++                        ret = 0;
++                    }
+                 }
+                 break;
+             }
+@@ -38891,6 +39447,7 @@
+     if (JS_WriteObjectAtoms(s))
+         goto fail;
+     js_object_list_end(ctx, &s->object_list);
++    js_free(ctx, s->var_ref_tab);
+     js_free(ctx, s->atom_to_idx);
+     js_free(ctx, s->idx_to_atom);
+     *psize = s->dbuf.size;
+@@ -38907,6 +39464,7 @@
+     return d->buf;
+  fail:
+     js_object_list_end(ctx, &s->object_list);
++    js_free(ctx, s->var_ref_tab);
+     js_free(ctx, s->atom_to_idx);
+     js_free(ctx, s->idx_to_atom);
+     dbuf_free(&s->dbuf);
+@@ -38938,6 +39496,10 @@
+     JSObject **objects;
+     int objects_count;
+     int objects_size;
++    /* shared closure cells reconstructed for bytecode functions */
++    JSVarRef **var_refs;
++    int var_refs_count;
++    int var_refs_size;
+     /* SAB references */
+     uint8_t **sab_tab;
+     int sab_tab_len;
+@@ -39526,10 +40088,397 @@
+ 
+  fail:
+     JS_FreeAtom(ctx, bc.func_name);
++    JS_FreeValue(ctx, obj);
++    return JS_EXCEPTION;
++}
++
++static JSVarRef *JS_ReadVarRef(BCReaderState *s)
++{
++    JSContext *ctx = s->ctx;
++    JSVarRef *var_ref;
++    JSValue value;
++    uint32_t index;
++    uint8_t tag, flags;
++
++    if (bc_get_u8(s, &tag))
++        return NULL;
++    if (tag == 0) {
++        if (bc_get_leb128(s, &index))
++            return NULL;
++        if (index >= s->var_refs_count || !s->var_refs[index]) {
++            JS_ThrowSyntaxError(ctx, "invalid closure variable reference");
++            return NULL;
++        }
++        var_ref = s->var_refs[index];
++        var_ref->header.ref_count++;
++        return var_ref;
++    }
++    if (tag != 1 || bc_get_u8(s, &flags)) {
++        JS_ThrowSyntaxError(ctx, "invalid closure variable tag");
++        return NULL;
++    }
++
++    var_ref = js_malloc(ctx, sizeof(*var_ref));
++    if (!var_ref)
++        return NULL;
++    memset(var_ref, 0, sizeof(*var_ref));
++    var_ref->header.ref_count = 1;
++    var_ref->is_detached = true;
++    var_ref->is_lexical = flags & 1;
++    var_ref->is_const = (flags >> 1) & 1;
++    var_ref->value = JS_UNDEFINED;
++    var_ref->pvalue = &var_ref->value;
++    add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
++
++    if (js_resize_array(ctx, (void **)&s->var_refs,
++                        sizeof(s->var_refs[0]), &s->var_refs_size,
++                        s->var_refs_count + 1)) {
++        free_var_ref(ctx->rt, var_ref);
++        return NULL;
++    }
++    s->var_refs[s->var_refs_count++] = var_ref;
++    value = JS_ReadObjectRec(s);
++    if (JS_IsException(value)) {
++        s->var_refs[--s->var_refs_count] = NULL;
++        free_var_ref(ctx->rt, var_ref);
++        return NULL;
++    }
++    var_ref->value = value;
++    return var_ref;
++}
++
++static JSValue JS_ReadBytecodeFunctionObject(BCReaderState *s)
++{
++    JSContext *ctx = s->ctx;
++    JSFunctionBytecode *b;
++    JSObject *p;
++    JSValue obj = JS_UNDEFINED, bfunc = JS_UNDEFINED, home;
++    JSAtom name_atom;
++    uint32_t closure_var_count;
++    uint8_t func_kind, has_home_object;
++    int i;
++
++    if (bc_get_u8(s, &func_kind))
++        goto fail;
++    if (func_kind >= countof(func_kind_to_class_id) ||
++        func_kind_to_class_id[func_kind] == 0) {
++        JS_ThrowSyntaxError(ctx, "invalid function kind");
++        goto fail;
++    }
++    obj = JS_NewObjectClass(ctx, func_kind_to_class_id[func_kind]);
++    if (JS_IsException(obj))
++        goto fail;
++    p = JS_VALUE_GET_OBJ(obj);
++    p->u.func.function_bytecode = NULL;
++    p->u.func.var_refs = NULL;
++    p->u.func.home_object = NULL;
++    if (BC_add_object_ref(s, obj))
++        goto fail;
++
++    bfunc = JS_ReadObjectRec(s);
++    if (JS_VALUE_GET_TAG(bfunc) != JS_TAG_FUNCTION_BYTECODE) {
++        JS_ThrowSyntaxError(ctx, "function bytecode expected");
++        goto fail;
++    }
++    b = JS_VALUE_GET_PTR(bfunc);
++    if (b->func_kind != func_kind) {
++        JS_ThrowSyntaxError(ctx, "function kind mismatch");
++        goto fail;
++    }
++    p->u.func.function_bytecode = b;
++    bfunc = JS_UNDEFINED; /* ownership transferred to the function object */
++
++    if (bc_get_leb128(s, &closure_var_count))
++        goto fail;
++    if (closure_var_count != b->closure_var_count) {
++        JS_ThrowSyntaxError(ctx, "closure variable count mismatch");
++        goto fail;
++    }
++    if (closure_var_count != 0) {
++        p->u.func.var_refs = js_mallocz(
++            ctx, sizeof(p->u.func.var_refs[0]) * closure_var_count);
++        if (!p->u.func.var_refs)
++            goto fail;
++        for (i = 0; i < closure_var_count; i++) {
++            p->u.func.var_refs[i] = JS_ReadVarRef(s);
++            if (!p->u.func.var_refs[i])
++                goto fail;
++        }
++    }
++
++    if (bc_get_u8(s, &has_home_object))
++        goto fail;
++    if (has_home_object) {
++        home = JS_ReadObjectRec(s);
++        if (JS_VALUE_GET_TAG(home) != JS_TAG_OBJECT) {
++            JS_FreeValue(ctx, home);
++            JS_ThrowSyntaxError(ctx, "function home object expected");
++            goto fail;
++        }
++        p->u.func.home_object = JS_VALUE_GET_OBJ(home);
++    }
++
++    name_atom = b->func_name;
++    if (name_atom == JS_ATOM_NULL)
++        name_atom = JS_ATOM_empty_string;
++    js_function_set_properties(ctx, obj, name_atom, b->defined_arg_count);
++    if (b->func_kind & JS_FUNC_GENERATOR) {
++        JSValue proto;
++        int proto_class_id;
++        if (b->func_kind == JS_FUNC_ASYNC_GENERATOR)
++            proto_class_id = JS_CLASS_ASYNC_GENERATOR;
++        else
++            proto_class_id = JS_CLASS_GENERATOR;
++        proto = JS_NewObjectProto(ctx, ctx->class_proto[proto_class_id]);
++        if (JS_IsException(proto))
++            goto fail;
++        if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_prototype, proto,
++                                   JS_PROP_WRITABLE) < 0)
++            goto fail;
++    } else if (b->has_prototype) {
++        JS_SetConstructorBit(ctx, obj, true);
++        if (JS_DefineAutoInitProperty(ctx, obj, JS_ATOM_prototype,
++                                      JS_AUTOINIT_ID_PROTOTYPE, NULL,
++                                      JS_PROP_WRITABLE) < 0)
++            goto fail;
++    }
++    return obj;
++
++ fail:
++    JS_FreeValue(ctx, bfunc);
+     JS_FreeValue(ctx, obj);
+     return JS_EXCEPTION;
+ }
+ 
++static JSValue JS_ReadIntrinsicFunctionPath(BCReaderState *s,
++                                            JSClassID expected_class_id)
++{
++    JSPropertyDescriptor desc;
++    JSValue obj, next;
++    JSAtom atom = JS_ATOM_NULL;
++    uint32_t len, i;
++    uint8_t kind;
++
++    if (bc_get_leb128(s, &len) || len > JS_INTRINSIC_PATH_MAX)
++        return JS_ThrowSyntaxError(s->ctx, "invalid intrinsic function path");
++    obj = JS_GetGlobalObject(s->ctx);
++    for (i = 0; i < len; i++) {
++        if (bc_get_u8(s, &kind))
++            goto fail;
++        if (kind == JS_INTRINSIC_PROTOTYPE) {
++            next = JS_GetPrototype(s->ctx, obj);
++        } else {
++            if (kind > JS_INTRINSIC_SETTER || bc_get_atom(s, &atom))
++                goto fail;
++            memset(&desc, 0, sizeof(desc));
++            desc.value = JS_UNDEFINED;
++            desc.getter = JS_UNDEFINED;
++            desc.setter = JS_UNDEFINED;
++            if (JS_GetOwnProperty(s->ctx, &desc, obj, atom) <= 0) {
++                JS_FreeAtom(s->ctx, atom);
++                atom = JS_ATOM_NULL;
++                goto fail;
++            }
++            JS_FreeAtom(s->ctx, atom);
++            atom = JS_ATOM_NULL;
++            next = kind == JS_INTRINSIC_VALUE ? desc.value :
++                (kind == JS_INTRINSIC_GETTER ? desc.getter : desc.setter);
++            if (kind != JS_INTRINSIC_VALUE)
++                JS_FreeValue(s->ctx, desc.value);
++            if (kind != JS_INTRINSIC_GETTER)
++                JS_FreeValue(s->ctx, desc.getter);
++            if (kind != JS_INTRINSIC_SETTER)
++                JS_FreeValue(s->ctx, desc.setter);
++        }
++        JS_FreeValue(s->ctx, obj);
++        obj = next;
++        if (JS_IsException(obj))
++            goto fail;
++    }
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT ||
++        JS_VALUE_GET_OBJ(obj)->class_id != expected_class_id) {
++        JS_ThrowSyntaxError(s->ctx, "intrinsic native function expected");
++        goto fail;
++    }
++    return obj;
++
++ fail:
++    JS_FreeAtom(s->ctx, atom);
++    JS_FreeValue(s->ctx, obj);
++    return JS_EXCEPTION;
++}
++
++static JSValue JS_ReadCFunctionObject(BCReaderState *s)
++{
++    JSValue obj = JS_ReadIntrinsicFunctionPath(s, JS_CLASS_C_FUNCTION);
++
++    if (JS_IsException(obj))
++        return obj;
++    if (BC_add_object_ref(s, obj)) {
++        JS_FreeValue(s->ctx, obj);
++        return JS_EXCEPTION;
++    }
++    return obj;
++}
++
++static JSValue JS_ReadCFunctionDataObject(BCReaderState *s)
++{
++    JSContext *ctx = s->ctx;
++    JSCFunctionDataRecord *anchor_record, *record = NULL;
++    JSCFunctionData *func;
++    JSValue anchor = JS_UNDEFINED, obj = JS_UNDEFINED;
++    JSValue length_value = JS_UNDEFINED, name_value = JS_UNDEFINED;
++    uint32_t data_len, i;
++    uint16_t magic;
++    uint8_t length;
++
++    anchor = JS_ReadIntrinsicFunctionPath(s, JS_CLASS_C_FUNCTION_DATA);
++    if (JS_IsException(anchor))
++        goto fail;
++    anchor_record = JS_VALUE_GET_OBJ(anchor)->u.c_function_data_record;
++    if (!anchor_record || bc_get_u8(s, &length) || bc_get_u16(s, &magic) ||
++        bc_get_leb128(s, &data_len) || data_len > UINT8_MAX) {
++        JS_ThrowSyntaxError(ctx, "invalid native closure");
++        goto fail;
++    }
++    func = anchor_record->func;
++    obj = JS_NewObjectProtoClass(ctx, ctx->function_proto,
++                                 JS_CLASS_C_FUNCTION_DATA);
++    if (JS_IsException(obj))
++        goto fail;
++    record = js_malloc(ctx, sizeof(*record) + data_len * sizeof(JSValue));
++    if (!record)
++        goto fail;
++    record->func = func;
++    record->length = length;
++    record->data_len = data_len;
++    record->magic = magic;
++    for (i = 0; i < data_len; i++)
++        record->data[i] = JS_UNDEFINED;
++    JS_SetOpaqueInternal(obj, record);
++    record = NULL;
++    js_function_set_properties(ctx, obj, JS_ATOM_empty_string, length);
++    if (BC_add_object_ref(s, obj))
++        goto fail;
++
++    anchor_record = JS_VALUE_GET_OBJ(obj)->u.c_function_data_record;
++    for (i = 0; i < data_len; i++) {
++        anchor_record->data[i] = JS_ReadObjectRec(s);
++        if (JS_IsException(anchor_record->data[i]))
++            goto fail;
++    }
++    length_value = JS_ReadObjectRec(s);
++    if (JS_IsException(length_value))
++        goto fail;
++    name_value = JS_ReadObjectRec(s);
++    if (JS_IsException(name_value))
++        goto fail;
++    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_length, length_value,
++                               JS_PROP_CONFIGURABLE) < 0)
++        goto fail;
++    length_value = JS_UNDEFINED;
++    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_name, name_value,
++                               JS_PROP_CONFIGURABLE) < 0)
++        goto fail;
++    name_value = JS_UNDEFINED;
++    JS_FreeValue(ctx, anchor);
++    return obj;
++
++ fail:
++    js_free(ctx, record);
++    JS_FreeValue(ctx, anchor);
++    JS_FreeValue(ctx, length_value);
++    JS_FreeValue(ctx, name_value);
++    JS_FreeValue(ctx, obj);
++    return JS_EXCEPTION;
++}
++
++static JSValue JS_ReadBoundFunctionObject(BCReaderState *s)
++{
++    JSContext *ctx = s->ctx;
++    JSBoundFunction *bf;
++    JSObject *p;
++    JSValue obj = JS_UNDEFINED, length = JS_UNDEFINED, name = JS_UNDEFINED;
++    uint32_t argc;
++    int i;
++
++    if (bc_get_leb128(s, &argc) || argc > 1000 * 1000)
++        goto fail;
++    bf = js_mallocz(ctx, sizeof(*bf) + argc * sizeof(JSValue));
++    if (!bf)
++        goto fail;
++    bf->func_obj = JS_UNDEFINED;
++    bf->this_val = JS_UNDEFINED;
++    bf->argc = argc;
++    for (i = 0; i < argc; i++)
++        bf->argv[i] = JS_UNDEFINED;
++    obj = JS_NewObjectProtoClass(ctx, ctx->function_proto,
++                                 JS_CLASS_BOUND_FUNCTION);
++    if (JS_IsException(obj)) {
++        js_free(ctx, bf);
++        goto fail;
++    }
++    p = JS_VALUE_GET_OBJ(obj);
++    p->u.bound_function = bf;
++    if (BC_add_object_ref(s, obj))
++        goto fail;
++
++    bf->func_obj = JS_ReadObjectRec(s);
++    if (JS_IsException(bf->func_obj))
++        goto fail;
++    bf->this_val = JS_ReadObjectRec(s);
++    if (JS_IsException(bf->this_val))
++        goto fail;
++    for (i = 0; i < argc; i++) {
++        bf->argv[i] = JS_ReadObjectRec(s);
++        if (JS_IsException(bf->argv[i]))
++            goto fail;
++    }
++    length = JS_ReadObjectRec(s);
++    if (JS_IsException(length))
++        goto fail;
++    name = JS_ReadObjectRec(s);
++    if (JS_IsException(name))
++        goto fail;
++    p->is_constructor = JS_IsConstructor(ctx, bf->func_obj);
++    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_length, length,
++                               JS_PROP_CONFIGURABLE) < 0)
++        goto fail;
++    length = JS_UNDEFINED;
++    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_name, name,
++                               JS_PROP_CONFIGURABLE) < 0)
++        goto fail;
++    name = JS_UNDEFINED;
++    return obj;
++
++ fail:
++    JS_FreeValue(ctx, length);
++    JS_FreeValue(ctx, name);
++    JS_FreeValue(ctx, obj);
++    return JS_EXCEPTION;
++}
++
++static JSValue JS_ReadHostObject(BCReaderState *s)
++{
++    JSValue obj = JS_UNDEFINED;
++    uint32_t size;
++    int ret;
++
++    if (bc_get_leb128(s, &size))
++        return JS_EXCEPTION;
++    if ((size_t)(s->buf_end - s->ptr) < size)
++        return JS_ThrowSyntaxError(s->ctx, "invalid host object size");
++    ret = v82jsc_snapshot_read_host_object(s->ctx, s->ptr, size, &obj);
++    if (ret != 1)
++        return JS_ThrowSyntaxError(s->ctx, "invalid host object");
++    s->ptr += size;
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT || BC_add_object_ref(s, obj)) {
++        JS_FreeValue(s->ctx, obj);
++        return JS_EXCEPTION;
++    }
++    return obj;
++}
++
+ static JSValue JS_ReadModule(BCReaderState *s)
+ {
+     JSContext *ctx = s->ctx;
+@@ -39694,6 +40643,76 @@
+     return JS_EXCEPTION;
+ }
+ 
++static JSValue JS_ReadSnapshotObjectTag(BCReaderState *s)
++{
++    JSContext *ctx = s->ctx;
++    JSValue obj = JS_UNDEFINED, proto = JS_UNDEFINED;
++    JSValue value = JS_UNDEFINED, getter = JS_UNDEFINED;
++    JSValue setter = JS_UNDEFINED;
++    JSAtom atom = JS_ATOM_NULL;
++    uint32_t prop_count, flags, i;
++    uint8_t extensible;
++    int define_flags, ret;
++
++    obj = JS_NewObject(ctx);
++    if (JS_IsException(obj) || BC_add_object_ref(s, obj))
++        goto fail;
++    proto = JS_ReadObjectRec(s);
++    if (JS_IsException(proto) || JS_SetPrototype(ctx, obj, proto) < 0)
++        goto fail;
++    JS_FreeValue(ctx, proto);
++    proto = JS_UNDEFINED;
++
++    if (bc_get_u8(s, &extensible) || extensible > 1 ||
++        bc_get_leb128(s, &prop_count))
++        goto fail;
++    for (i = 0; i < prop_count; i++) {
++        if (bc_get_atom(s, &atom) || bc_get_leb128(s, &flags))
++            goto fail;
++        if (flags & ~(JS_PROP_C_W_E | JS_PROP_GETSET))
++            goto fail;
++        if (flags & JS_PROP_GETSET) {
++            getter = JS_ReadObjectRec(s);
++            if (JS_IsException(getter))
++                goto fail;
++            setter = JS_ReadObjectRec(s);
++            if (JS_IsException(setter))
++                goto fail;
++            define_flags = JS_PROP_HAS_CONFIGURABLE |
++                JS_PROP_HAS_ENUMERABLE | JS_PROP_HAS_GET | JS_PROP_HAS_SET |
++                (flags & (JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE));
++            ret = JS_DefineProperty(ctx, obj, atom, JS_UNDEFINED,
++                                    getter, setter, define_flags);
++            JS_FreeValue(ctx, getter);
++            JS_FreeValue(ctx, setter);
++            getter = setter = JS_UNDEFINED;
++        } else {
++            value = JS_ReadObjectRec(s);
++            if (JS_IsException(value))
++                goto fail;
++            ret = JS_DefinePropertyValue(ctx, obj, atom, value,
++                                         flags & JS_PROP_C_W_E);
++            value = JS_UNDEFINED;
++        }
++        JS_FreeAtom(ctx, atom);
++        atom = JS_ATOM_NULL;
++        if (ret < 0)
++            goto fail;
++    }
++    if (!extensible && JS_PreventExtensions(ctx, obj) < 0)
++        goto fail;
++    return obj;
++
++ fail:
++    JS_FreeAtom(ctx, atom);
++    JS_FreeValue(ctx, proto);
++    JS_FreeValue(ctx, value);
++    JS_FreeValue(ctx, getter);
++    JS_FreeValue(ctx, setter);
++    JS_FreeValue(ctx, obj);
++    return JS_EXCEPTION;
++}
++
+ static JSValue JS_ReadArray(BCReaderState *s, int tag)
+ {
+     JSContext *ctx = s->ctx;
+@@ -39873,6 +40892,7 @@
+     JSContext *ctx = s->ctx;
+     JSString *pattern;
+     JSString *bc;
++    JSValue obj;
+ 
+     pattern = JS_ReadString(s);
+     if (!pattern)
+@@ -39890,9 +40910,16 @@
+         return JS_ThrowInternalError(ctx, "bad regexp bytecode");
+     }
+ 
+-    return js_regexp_constructor_internal(ctx, JS_UNDEFINED,
+-                                          JS_MKPTR(JS_TAG_STRING, pattern),
+-                                          JS_MKPTR(JS_TAG_STRING, bc));
++    obj = js_regexp_constructor_internal(ctx, JS_UNDEFINED,
++                                         JS_MKPTR(JS_TAG_STRING, pattern),
++                                         JS_MKPTR(JS_TAG_STRING, bc));
++    if (JS_IsException(obj))
++        return obj;
++    if (BC_add_object_ref(s, obj)) {
++        JS_FreeValue(ctx, obj);
++        return JS_EXCEPTION;
++    }
++    return obj;
+ }
+ 
+ static JSValue JS_ReadDate(BCReaderState *s)
+@@ -39944,6 +40971,8 @@
+ 
+ static JSValue JS_ReadMap(BCReaderState *s);
+ static JSValue JS_ReadSet(BCReaderState *s);
++static JSValue JS_ReadWeakMap(BCReaderState *s);
++static JSValue JS_ReadWeakSet(BCReaderState *s);
+ 
+ static JSValue JS_ReadObjectRec(BCReaderState *s)
+ {
+@@ -40002,6 +41031,31 @@
+             goto no_allow_bytecode;
+         obj = JS_ReadFunctionTag(s);
+         break;
++    case BC_TAG_BYTECODE_FUNCTION_OBJECT:
++        if (!s->allow_bytecode)
++            goto no_allow_bytecode;
++        obj = JS_ReadBytecodeFunctionObject(s);
++        break;
++    case BC_TAG_C_FUNCTION_OBJECT:
++        if (!s->allow_bytecode)
++            goto no_allow_bytecode;
++        obj = JS_ReadCFunctionObject(s);
++        break;
++    case BC_TAG_C_FUNCTION_DATA_OBJECT:
++        if (!s->allow_bytecode)
++            goto no_allow_bytecode;
++        obj = JS_ReadCFunctionDataObject(s);
++        break;
++    case BC_TAG_BOUND_FUNCTION_OBJECT:
++        if (!s->allow_bytecode)
++            goto no_allow_bytecode;
++        obj = JS_ReadBoundFunctionObject(s);
++        break;
++    case BC_TAG_HOST_OBJECT:
++        if (!s->allow_bytecode)
++            goto no_allow_bytecode;
++        obj = JS_ReadHostObject(s);
++        break;
+     case BC_TAG_MODULE:
+         if (!s->allow_bytecode) {
+         no_allow_bytecode:
+@@ -40012,6 +41066,9 @@
+     case BC_TAG_OBJECT:
+         obj = JS_ReadObjectTag(s);
+         break;
++    case BC_TAG_SNAPSHOT_OBJECT:
++        obj = JS_ReadSnapshotObjectTag(s);
++        break;
+     case BC_TAG_ARRAY:
+     case BC_TAG_TEMPLATE_OBJECT:
+         obj = JS_ReadArray(s, tag);
+@@ -40060,6 +41117,12 @@
+     case BC_TAG_SET:
+         obj = JS_ReadSet(s);
+         break;
++    case BC_TAG_WEAK_MAP:
++        obj = JS_ReadWeakMap(s);
++        break;
++    case BC_TAG_WEAK_SET:
++        obj = JS_ReadWeakSet(s);
++        break;
+     case BC_TAG_SYMBOL:
+         {
+             JSAtom atom;
+@@ -40160,6 +41223,7 @@
+         js_free(s->ctx, s->idx_to_atom);
+     }
+     js_free(s->ctx, s->objects);
++    js_free(s->ctx, s->var_refs);
+ }
+ 
+ JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
+@@ -53481,6 +54545,8 @@
+     if (map_state) {
+         list_for_each(el, &map_state->records) {
+             mr = list_entry(el, JSMapRecord, link);
++            if (mr->empty)
++                continue;
+             if (JS_WriteObjectRec(s, mr->key))
+                 return -1;
+             // mr->value is always JS_UNDEFINED for sets
+@@ -53503,6 +54569,16 @@
+     return js_map_read(s, MAGIC_SET);
+ }
+ 
++static JSValue JS_ReadWeakMap(BCReaderState *s)
++{
++    return js_map_read(s, MAGIC_WEAK);
++}
++
++static JSValue JS_ReadWeakSet(BCReaderState *s)
++{
++    return js_map_read(s, MAGIC_SET | MAGIC_WEAK);
++}
++
+ static int JS_WriteMap(BCWriterState *s, struct JSMapState *map_state)
+ {
+     return js_map_write(s, map_state, 0);
+@@ -53513,6 +54589,16 @@
+     return js_map_write(s, map_state, MAGIC_SET);
+ }
+ 
++static int JS_WriteWeakMap(BCWriterState *s, struct JSMapState *map_state)
++{
++    return js_map_write(s, map_state, MAGIC_WEAK);
++}
++
++static int JS_WriteWeakSet(BCWriterState *s, struct JSMapState *map_state)
++{
++    return js_map_write(s, map_state, MAGIC_SET | MAGIC_WEAK);
++}
++
+ static int js_setlike_get_props(JSContext *ctx, JSValueConst setlike,
+                                 uint64_t *psize, JSValue *phas, JSValue *pkeys)
+ {

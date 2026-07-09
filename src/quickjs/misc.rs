@@ -22,7 +22,10 @@ use crate::quickjs::core::{
   intern, intern_dup, iso_state, jsval_of, release_external_string_memory,
 };
 use crate::quickjs::quickjs_sys::*;
-use crate::{Context, Data, Object, RealIsolate, String as V8String, Value};
+use crate::{
+  Context, Data, FunctionTemplate, Object, RealIsolate, String as V8String,
+  Value,
+};
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
@@ -1147,8 +1150,21 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_isolate(
     return 0;
   }
   let ctx = current_ctx();
-  let bytes =
-    super::snapshot::serialize_value(ctx, jsval_of(data)).unwrap_or_default();
+  let external_refs = crate::quickjs::core::iso_state(iso)
+    .external_references
+    .clone();
+  let bytes = if super::function::template_kind(data as *const c_void)
+    == Some(super::function::TemplKind::Func)
+  {
+    super::snapshot::serialize_function_template(
+      ctx,
+      data as *const FunctionTemplate,
+      &external_refs,
+    )
+  } else {
+    super::snapshot::serialize_value(ctx, jsval_of(data))
+  }
+  .unwrap_or_default();
   let st = crate::quickjs::core::iso_state(iso);
   let n = st.snap_isolate_data.len();
   st.snap_isolate_data.push(bytes);
@@ -1167,9 +1183,30 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
     return 0;
   }
   let ctx = ctx_of(context);
-  let val = jsval_of(data);
-  let bytes = super::snapshot::serialize_value(ctx, val);
+  let external_refs = crate::quickjs::core::iso_state(iso)
+    .external_references
+    .clone();
+  let is_function_template =
+    super::function::template_kind(data as *const c_void)
+      == Some(super::function::TemplKind::Func);
+  let val = (!is_function_template).then(|| jsval_of(data));
+  let bytes = if is_function_template {
+    super::snapshot::serialize_function_template(
+      ctx,
+      data as *const FunctionTemplate,
+      &external_refs,
+    )
+  } else {
+    super::snapshot::serialize_value(ctx, val.unwrap())
+  };
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
+    let Some(val) = val else {
+      eprintln!(
+        "[qjs snapshot] AddData_to_context FunctionTemplate ser={}",
+        bytes.is_some(),
+      );
+      return store_context_snapshot_data(iso, ctx, bytes.unwrap_or_default());
+    };
     let preview = unsafe {
       let mut l = 0usize;
       let s = JS_ToCStringLen(ctx, &mut l, val);
@@ -1192,6 +1229,14 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
     );
   }
   let bytes = bytes.unwrap_or_default();
+  store_context_snapshot_data(iso, ctx, bytes)
+}
+
+fn store_context_snapshot_data(
+  iso: *mut RealIsolate,
+  ctx: *mut JSContext,
+  bytes: Vec<u8>,
+) -> usize {
   let st = crate::quickjs::core::iso_state(iso);
   let n = st.ctx_data_counts.entry(ctx as usize).or_insert(0);
   let idx = *n;

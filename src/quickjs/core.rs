@@ -53,6 +53,13 @@ use std::sync::{Mutex, MutexGuard};
 
 pub(crate) type WeakCallback = unsafe extern "C" fn(*const c_void);
 
+unsafe extern "C" {
+  fn v82jsc_snapshot_capture_intrinsics(
+    ctx: *mut JSContext,
+    registry: JSValue,
+  );
+}
+
 pub(crate) struct WeakHandle {
   pub handle: *const Data,
   pub parameter: *const c_void,
@@ -1219,6 +1226,7 @@ pub(crate) fn install_default_globals(
   }
   unsafe {
     let global = JS_GetGlobalObject(ctx);
+    capture_snapshot_intrinsics(ctx);
 
     let existing = JS_GetPropertyStr(ctx, global, c"console".as_ptr());
     let absent = jsv_is_undefined(&existing) || existing.tag == JS_TAG_NULL;
@@ -1264,12 +1272,41 @@ pub(crate) fn install_default_globals(
     super::module::install_dynamic_source_import_global(ctx, global);
     super::arraybuffer::install_array_buffer_constructor(isolate, ctx, global);
     install_atomics_wait_async_shim(ctx, global);
+    capture_snapshot_intrinsics(ctx);
+    super::isolate::install_snapshot_intrinsics(ctx, global);
     JS_FreeValue(ctx, global);
   }
   install_weakref_kept_object_shim(ctx);
   // Install our V8-accurate `Error.prepareStackTrace` (no-op unless deno
   // registered a PrepareStackTraceCallback — see exception.rs).
   super::exception::install_prepare_stack_trace(ctx);
+}
+
+unsafe fn capture_snapshot_intrinsics(ctx: *mut JSContext) {
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let existing = unsafe {
+    JS_GetPropertyStr(ctx, global, c"__v8x_snapshot_intrinsics".as_ptr())
+  };
+  let registry = if jsv_is_object(&existing) {
+    existing
+  } else {
+    unsafe { JS_FreeValue(ctx, existing) };
+    let registry = unsafe { JS_NewArray(ctx) };
+    unsafe {
+      JS_SetPropertyStr(
+        ctx,
+        global,
+        c"__v8x_snapshot_intrinsics".as_ptr(),
+        JS_DupValue(ctx, registry),
+      );
+    }
+    registry
+  };
+  unsafe {
+    v82jsc_snapshot_capture_intrinsics(ctx, registry);
+    JS_FreeValue(ctx, registry);
+    JS_FreeValue(ctx, global);
+  };
 }
 
 unsafe extern "C" fn qjs_gc(

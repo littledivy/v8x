@@ -18,8 +18,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
 use super::quickjs_sys::*;
-use crate::FunctionCallback;
-use crate::RealIsolate;
+use crate::{Data, FunctionCallback, FunctionTemplate, RealIsolate};
 
 const MAGIC: &[u8; 8] = b"V8XSNP1\0";
 const DATA_MAGIC: &[u8; 8] = b"V8XSDAT\0";
@@ -32,9 +31,9 @@ const SNAPSHOT_DATA_OBJECT: u8 = 2;
 const SNAPSHOT_DATA_HOST_OBJECT: u8 = 3;
 const SNAPSHOT_DATA_HOST_FUNCTION: u8 = 4;
 const SNAPSHOT_DATA_JS_FUNCTION: u8 = 5;
-const SNAPSHOT_DATA_ASYNC_STUB: u8 = 6;
 const SNAPSHOT_DATA_NOOP_FUNCTION: u8 = 7;
 const SNAPSHOT_DATA_JS_FUNCTION_SOURCE: u8 = 8;
+const SNAPSHOT_DATA_FUNCTION_TEMPLATE: u8 = 9;
 const JS_WRITE_OBJ_BYTECODE: c_int = 1 << 0;
 const JS_WRITE_OBJ_SAB: c_int = 1 << 2;
 const JS_WRITE_OBJ_REFERENCE: c_int = 1 << 3;
@@ -45,31 +44,25 @@ const SNAPSHOT_READ_FLAGS: c_int =
   JS_READ_OBJ_BYTECODE | JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE;
 const JS_GPN_STRING_MASK: c_int = 1 << 0;
 const JS_GPN_ENUM_ONLY: c_int = 1 << 4;
-const ASYNC_STUB_SRC: &str = "(function setUpAsyncStub(opName,originalOp,maybeProto){\
-  var fn=function(){\
-    var args=Array.prototype.slice.call(arguments);\
-    try { return Promise.resolve(originalOp.apply(this,[0].concat(args))); }\
-    catch(e) { return Promise.reject(e); }\
-  };\
-  try { Object.defineProperty(fn,'name',{value:opName,configurable:true}); } catch(_) {}\
-  if (maybeProto) { maybeProto[opName]=fn; return; }\
-  return fn;\
-})\0";
-const CREATE_LAZY_LOADER_SRC: &str = "function createLazyLoader(specifier){\
-    let value;\
-    return function lazyLoad(){\
-      if(!value){\
-        value=globalThis.Deno.core.ops.op_lazy_load_esm(specifier);\
-      }\
-      return value;\
-    };\
-  }";
+const JS_GPN_SET_ENUM: c_int = 1 << 5;
+const JS_PROP_CONFIGURABLE: c_int = 1 << 0;
+const JS_PROP_WRITABLE: c_int = 1 << 1;
+const JS_PROP_ENUMERABLE: c_int = 1 << 2;
+const JS_PROP_GETSET: c_int = 1 << 4;
 const NOOP_FUNCTION_SRC: &str = "(function(){})\0";
 
 #[repr(C)]
 struct JSPropertyEnum {
   is_enumerable: bool,
   atom: JSAtom,
+}
+
+#[repr(C)]
+struct JSPropertyDescriptor {
+  flags: c_int,
+  value: JSValue,
+  getter: JSValue,
+  setter: JSValue,
 }
 
 unsafe extern "C" {
@@ -95,6 +88,19 @@ unsafe extern "C" {
     this_obj: JSValue,
     prop: JSAtom,
   ) -> JSValue;
+  fn JS_GetOwnProperty(
+    ctx: *mut JSContext,
+    desc: *mut JSPropertyDescriptor,
+    this_obj: JSValue,
+    prop: JSAtom,
+  ) -> c_int;
+  fn JS_DefinePropertyValueStr(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: *const c_char,
+    val: JSValue,
+    flags: c_int,
+  ) -> c_int;
 }
 
 #[derive(Clone)]
@@ -117,6 +123,7 @@ pub(crate) enum GlobalEntry {
   Value {
     name: String,
     bytes: Vec<u8>,
+    enumerable: bool,
   },
   LexicalValue {
     name: String,
@@ -128,6 +135,7 @@ pub(crate) enum GlobalEntry {
     data: Option<ExternalRefSlot>,
     length: i32,
     constructable: bool,
+    enumerable: bool,
   },
 }
 
@@ -157,6 +165,35 @@ impl ExternalRefSlot {
     }
     self.raw
   }
+}
+
+thread_local! {
+  static SNAPSHOT_EXTERNAL_REFERENCES: std::cell::RefCell<Vec<usize>> =
+    const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_snapshot_external_references<T>(
+  external_refs: &[usize],
+  f: impl FnOnce() -> T,
+) -> T {
+  struct Guard(Vec<usize>);
+
+  impl Drop for Guard {
+    fn drop(&mut self) {
+      SNAPSHOT_EXTERNAL_REFERENCES.with(|refs| {
+        refs.replace(std::mem::take(&mut self.0));
+      });
+    }
+  }
+
+  let previous = SNAPSHOT_EXTERNAL_REFERENCES
+    .with(|refs| refs.replace(external_refs.to_vec()));
+  let _guard = Guard(previous);
+  f()
+}
+
+fn current_snapshot_external_references() -> Vec<usize> {
+  SNAPSHOT_EXTERNAL_REFERENCES.with(|refs| refs.borrow().clone())
 }
 
 /// Structured-clone one JS value to bytes (no bytecode: plain data graph).
@@ -200,7 +237,7 @@ fn serialize_value_with_refs_inner(
     return Some(encode_function_data(info, external_refs));
   }
   if !ctx.is_null() && unsafe { JS_IsFunction(ctx, v) } {
-    if let Some(bytes) = write_object_bytes(ctx, v) {
+    if let Some(bytes) = write_object_bytes(ctx, v, external_refs) {
       return Some(encode_js_function_data(&bytes));
     }
     if allow_function_source
@@ -211,28 +248,51 @@ fn serialize_value_with_refs_inner(
     }
     return Some(encode_noop_function_data());
   }
-  let Some(out) = write_object_bytes(ctx, v) else {
-    if v.tag < 0 {
-      return Some(encode_object_data());
+  let Some(out) = write_object_bytes(ctx, v, external_refs) else {
+    if v.tag == JS_TAG_OBJECT {
+      return serialize_host_object(ctx, v, external_refs);
     }
     return None;
   };
   Some(out)
 }
 
-fn write_object_bytes(ctx: *mut JSContext, v: JSValue) -> Option<Vec<u8>> {
+fn write_object_bytes(
+  ctx: *mut JSContext,
+  v: JSValue,
+  external_refs: &[usize],
+) -> Option<Vec<u8>> {
   let mut size: usize = 0;
-  let buf = super::exception::with_prepare_stack_suppressed(|| unsafe {
-    JS_WriteObject(
-      ctx,
-      &mut size,
-      v,
-      JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE,
-    )
+  let buf = with_snapshot_external_references(external_refs, || {
+    super::exception::with_prepare_stack_suppressed(|| unsafe {
+      JS_WriteObject(
+        ctx,
+        &mut size,
+        v,
+        JS_WRITE_OBJ_BYTECODE | JS_WRITE_OBJ_SAB | JS_WRITE_OBJ_REFERENCE,
+      )
+    })
   });
   if buf.is_null() {
     // Clear the pending exception JS_WriteObject leaves behind.
     let exc = unsafe { JS_GetException(ctx) };
+    if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
+      let mut len = 0usize;
+      let text = unsafe { JS_ToCStringLen(ctx, &mut len, exc) };
+      let message = if text.is_null() {
+        "<unstringifiable>".into()
+      } else {
+        let bytes = unsafe { std::slice::from_raw_parts(text.cast::<u8>(), len) };
+        let message = String::from_utf8_lossy(bytes).into_owned();
+        unsafe { JS_FreeCString(ctx, text) };
+        message
+      };
+      let source = function_source(ctx, v).unwrap_or_default();
+      eprintln!(
+        "[qjs snapshot] value encode failed: {message}; value={:?}",
+        source.chars().take(160).collect::<String>()
+      );
+    }
     unsafe { JS_FreeValue(ctx, exc) };
     return None;
   }
@@ -275,8 +335,10 @@ pub(crate) fn deserialize_value_with_refs(
   if bytes.starts_with(DATA_MAGIC) {
     return decode_special_data(ctx, bytes, external_refs);
   }
-  let value = super::exception::with_prepare_stack_suppressed(|| unsafe {
-    JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), SNAPSHOT_READ_FLAGS)
+  let value = with_snapshot_external_references(external_refs, || {
+    super::exception::with_prepare_stack_suppressed(|| unsafe {
+      JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), SNAPSHOT_READ_FLAGS)
+    })
   });
   if value.tag == JS_TAG_EXCEPTION {
     let exc = unsafe { JS_GetException(ctx) };
@@ -348,24 +410,37 @@ fn serialize_host_object_inner(
       let Some(name) = atom_to_string(ctx, prop.atom) else {
         continue;
       };
-      let value = JS_GetProperty(ctx, v, prop.atom);
+      let mut desc = JSPropertyDescriptor {
+        flags: 0,
+        value: jsv_undefined(),
+        getter: jsv_undefined(),
+        setter: jsv_undefined(),
+      };
+      let rc = JS_GetOwnProperty(ctx, &mut desc, v, prop.atom);
+      if rc <= 0 {
+        if rc < 0 {
+          let exc = JS_GetException(ctx);
+          JS_FreeValue(ctx, exc);
+        }
+        continue;
+      }
+      if desc.flags & JS_PROP_GETSET != 0 {
+        JS_FreeValue(ctx, desc.value);
+        JS_FreeValue(ctx, desc.getter);
+        JS_FreeValue(ctx, desc.setter);
+        continue;
+      }
+      JS_FreeValue(ctx, desc.getter);
+      JS_FreeValue(ctx, desc.setter);
+      let value = desc.value;
       if value.tag == JS_TAG_EXCEPTION {
         let exc = JS_GetException(ctx);
         JS_FreeValue(ctx, exc);
         continue;
       }
-      if name == "createLazyLoader" && JS_IsFunction(ctx, value) {
-        props_out
-          .push((name, encode_js_function_source_data(CREATE_LAZY_LOADER_SRC)));
-        JS_FreeValue(ctx, value);
-        continue;
-      }
-      if let Some(mut bytes) =
+      if let Some(bytes) =
         serialize_host_object_inner(ctx, value, external_refs, seen, depth + 1)
       {
-        if name == "setUpAsyncStub" && JS_IsFunction(ctx, value) {
-          bytes = encode_async_stub_data();
-        }
         props_out.push((name, bytes));
       }
       JS_FreeValue(ctx, value);
@@ -424,6 +499,53 @@ fn encode_function_data(
   out
 }
 
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn v82jsc_snapshot_write_host_object(
+  _ctx: *mut JSContext,
+  value: JSValue,
+  output: *mut u8,
+  size: *mut usize,
+) -> c_int {
+  if size.is_null() {
+    return -1;
+  }
+  let Some(info) = super::function::snapshot_function_info(value) else {
+    return 0;
+  };
+  let external_refs = current_snapshot_external_references();
+  let bytes = encode_function_data(info, &external_refs);
+  if output.is_null() {
+    unsafe { *size = bytes.len() };
+    return 1;
+  }
+  if unsafe { *size } < bytes.len() {
+    unsafe { *size = bytes.len() };
+    return -1;
+  }
+  unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), output, bytes.len()) };
+  unsafe { *size = bytes.len() };
+  1
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn v82jsc_snapshot_read_host_object(
+  ctx: *mut JSContext,
+  input: *const u8,
+  size: usize,
+  output: *mut JSValue,
+) -> c_int {
+  if ctx.is_null() || input.is_null() || output.is_null() {
+    return -1;
+  }
+  let bytes = unsafe { std::slice::from_raw_parts(input, size) };
+  let external_refs = current_snapshot_external_references();
+  let Some(value) = decode_special_data(ctx, bytes, &external_refs) else {
+    return 0;
+  };
+  unsafe { *output = value };
+  1
+}
+
 fn encode_js_function_data(bytes: &[u8]) -> Vec<u8> {
   let mut out = Vec::new();
   out.extend_from_slice(DATA_MAGIC);
@@ -437,13 +559,6 @@ fn encode_js_function_source_data(source: &str) -> Vec<u8> {
   out.extend_from_slice(DATA_MAGIC);
   out.push(SNAPSHOT_DATA_JS_FUNCTION_SOURCE);
   put_str(&mut out, source);
-  out
-}
-
-fn encode_async_stub_data() -> Vec<u8> {
-  let mut out = Vec::new();
-  out.extend_from_slice(DATA_MAGIC);
-  out.push(SNAPSHOT_DATA_ASYNC_STUB);
   out
 }
 
@@ -463,6 +578,89 @@ fn encode_host_object_data(props: &[(String, Vec<u8>)]) -> Vec<u8> {
     put_bytes(out, bytes);
   });
   out
+}
+
+pub(crate) fn serialize_function_template(
+  ctx: *mut JSContext,
+  template: *const FunctionTemplate,
+  external_refs: &[usize],
+) -> Option<Vec<u8>> {
+  let info = super::function::snapshot_function_template_info(template)?;
+  let cached_proto = info
+    .cached_proto
+    .and_then(|proto| serialize_host_object(ctx, proto, external_refs));
+  let mut out = Vec::new();
+  out.extend_from_slice(DATA_MAGIC);
+  out.push(SNAPSHOT_DATA_FUNCTION_TEMPLATE);
+  put_ref_slot(
+    &mut out,
+    ExternalRefSlot::new(info.callback as usize, external_refs),
+  );
+  put_opt_ref_slot(
+    &mut out,
+    info
+      .data_external
+      .map(|ptr| ExternalRefSlot::new(ptr as usize, external_refs)),
+  );
+  put_i32(&mut out, info.length);
+  out.push(u8::from(info.constructable));
+  match info.class_name {
+    Some(name) => {
+      out.push(1);
+      put_str(&mut out, &name);
+    }
+    None => out.push(0),
+  }
+  put_opt_bytes(&mut out, &cached_proto);
+  put_i32(&mut out, info.instance_internal_field_count);
+  Some(out)
+}
+
+pub(crate) fn deserialize_function_template(
+  ctx: *mut JSContext,
+  bytes: &[u8],
+  external_refs: &[usize],
+) -> Option<*const Data> {
+  if !bytes.starts_with(DATA_MAGIC) {
+    return None;
+  }
+  let mut input = Reader {
+    bytes,
+    pos: DATA_MAGIC.len(),
+  };
+  if input.get_u8()? != SNAPSHOT_DATA_FUNCTION_TEMPLATE {
+    return None;
+  }
+  let callback = input.get_ref_slot()?.resolve(external_refs);
+  if callback == 0 {
+    return None;
+  }
+  let callback =
+    unsafe { std::mem::transmute::<usize, FunctionCallback>(callback) };
+  let data_external = input
+    .get_opt_ref_slot()?
+    .map(|slot| slot.resolve(external_refs) as *mut c_void)
+    .filter(|ptr| !ptr.is_null());
+  let length = input.get_i32()?;
+  let constructable = input.get_u8()? != 0;
+  let class_name = match input.get_u8()? {
+    0 => None,
+    1 => Some(input.get_string()?),
+    _ => return None,
+  };
+  let cached_proto = input
+    .get_opt_bytes()?
+    .and_then(|bytes| deserialize_value_with_refs(ctx, &bytes, external_refs));
+  let instance_internal_field_count = input.get_i32()?;
+  Some(super::function::restore_function_template_from_snapshot(
+    callback,
+    data_external,
+    length,
+    constructable,
+    class_name,
+    cached_proto,
+    instance_internal_field_count,
+  ) as *const Data)
 }
 
 fn decode_special_data(
@@ -533,19 +731,23 @@ fn decode_special_data(
     }
     SNAPSHOT_DATA_JS_FUNCTION => {
       let bytes = input.get_bytes()?;
-      let value = super::exception::with_prepare_stack_suppressed(|| unsafe {
-        JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), SNAPSHOT_READ_FLAGS)
+      let mut value = with_snapshot_external_references(external_refs, || {
+        super::exception::with_prepare_stack_suppressed(|| unsafe {
+          JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), SNAPSHOT_READ_FLAGS)
+        })
       });
       if value.tag == JS_TAG_EXCEPTION {
         let exc = unsafe { JS_GetException(ctx) };
         unsafe { JS_FreeValue(ctx, exc) };
         return None;
       }
-      let value = unsafe { JS_EvalFunction(ctx, value) };
-      if value.tag == JS_TAG_EXCEPTION {
-        let exc = unsafe { JS_GetException(ctx) };
-        unsafe { JS_FreeValue(ctx, exc) };
-        return None;
+      if value.tag == JS_TAG_FUNCTION_BYTECODE {
+        value = unsafe { JS_EvalFunction(ctx, value) };
+        if value.tag == JS_TAG_EXCEPTION {
+          let exc = unsafe { JS_GetException(ctx) };
+          unsafe { JS_FreeValue(ctx, exc) };
+          return None;
+        }
       }
       Some(value)
     }
@@ -583,23 +785,6 @@ fn decode_special_data(
             source.chars().take(240).collect::<String>()
           );
         }
-        unsafe { JS_FreeValue(ctx, exc) };
-        return None;
-      }
-      Some(value)
-    }
-    SNAPSHOT_DATA_ASYNC_STUB => {
-      let value = unsafe {
-        JS_Eval(
-          ctx,
-          ASYNC_STUB_SRC.as_ptr() as *const c_char,
-          ASYNC_STUB_SRC.len() - 1,
-          c"<v8x-async-stub>".as_ptr(),
-          JS_EVAL_TYPE_GLOBAL,
-        )
-      };
-      if value.tag == JS_TAG_EXCEPTION {
-        let exc = unsafe { JS_GetException(ctx) };
         unsafe { JS_FreeValue(ctx, exc) };
         return None;
       }
@@ -766,6 +951,42 @@ pub(crate) fn replay_context(
   }
 }
 
+unsafe fn standard_global_names(
+  ctx: *mut JSContext,
+) -> Option<HashSet<String>> {
+  let baseline_ctx = unsafe { JS_NewContext(JS_GetRuntime(ctx)) };
+  if baseline_ctx.is_null() {
+    return None;
+  }
+  let mut names = HashSet::new();
+  unsafe {
+    let global = JS_GetGlobalObject(baseline_ctx);
+    let mut tab: *mut JSPropertyEnum = ptr::null_mut();
+    let mut len = 0u32;
+    if JS_GetOwnPropertyNames(
+      baseline_ctx,
+      &mut tab,
+      &mut len,
+      global,
+      JS_GPN_STRING_MASK,
+    ) >= 0
+    {
+      for prop in std::slice::from_raw_parts(tab, len as usize) {
+        if let Some(name) = atom_to_string(baseline_ctx, prop.atom) {
+          names.insert(name);
+        }
+      }
+      JS_FreePropertyEnum(baseline_ctx, tab, len);
+    } else {
+      let exc = JS_GetException(baseline_ctx);
+      JS_FreeValue(baseline_ctx, exc);
+    }
+    JS_FreeValue(baseline_ctx, global);
+    JS_FreeContext(baseline_ctx);
+  }
+  Some(names)
+}
+
 fn capture_globals(
   ctx: *mut JSContext,
   external_refs: &[usize],
@@ -775,6 +996,7 @@ fn capture_globals(
   }
   let mut out = Vec::new();
   unsafe {
+    let standard_globals = standard_global_names(ctx);
     let global = JS_GetGlobalObject(ctx);
     let mut tab: *mut JSPropertyEnum = ptr::null_mut();
     let mut len = 0u32;
@@ -783,7 +1005,7 @@ fn capture_globals(
       &mut tab,
       &mut len,
       global,
-      JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY,
+      JS_GPN_STRING_MASK | JS_GPN_SET_ENUM,
     );
     if rc < 0 {
       let exc = JS_GetException(ctx);
@@ -799,7 +1021,40 @@ fn capture_globals(
       if should_skip_global(&name) {
         continue;
       }
-      let value = JS_GetProperty(ctx, global, prop.atom);
+      if !prop.is_enumerable
+        && standard_globals
+          .as_ref()
+          .is_none_or(|names| names.contains(&name))
+      {
+        continue;
+      }
+      let value = if prop.is_enumerable {
+        JS_GetProperty(ctx, global, prop.atom)
+      } else {
+        let mut desc = JSPropertyDescriptor {
+          flags: 0,
+          value: jsv_undefined(),
+          getter: jsv_undefined(),
+          setter: jsv_undefined(),
+        };
+        let rc = JS_GetOwnProperty(ctx, &mut desc, global, prop.atom);
+        if rc <= 0 {
+          if rc < 0 {
+            let exc = JS_GetException(ctx);
+            JS_FreeValue(ctx, exc);
+          }
+          continue;
+        }
+        if desc.flags & JS_PROP_GETSET != 0 {
+          JS_FreeValue(ctx, desc.value);
+          JS_FreeValue(ctx, desc.getter);
+          JS_FreeValue(ctx, desc.setter);
+          continue;
+        }
+        JS_FreeValue(ctx, desc.getter);
+        JS_FreeValue(ctx, desc.setter);
+        desc.value
+      };
       if value.tag == JS_TAG_EXCEPTION {
         let exc = JS_GetException(ctx);
         JS_FreeValue(ctx, exc);
@@ -814,13 +1069,16 @@ fn capture_globals(
             .map(|ptr| ExternalRefSlot::new(ptr as usize, external_refs)),
           length: info.length,
           constructable: info.constructable,
+          enumerable: prop.is_enumerable,
         });
-      } else if let Some(bytes) = if name == "Deno" {
-        serialize_host_object(ctx, value, external_refs)
-      } else {
+      } else if let Some(bytes) =
         serialize_global_value_with_refs(ctx, value, external_refs)
-      } {
-        out.push(GlobalEntry::Value { name, bytes });
+      {
+        out.push(GlobalEntry::Value {
+          name,
+          bytes,
+          enumerable: prop.is_enumerable,
+        });
       }
       JS_FreeValue(ctx, value);
     }
@@ -900,7 +1158,11 @@ unsafe fn replay_global_entry(
   external_refs: &[usize],
 ) {
   match entry {
-    GlobalEntry::Value { name, bytes } => {
+    GlobalEntry::Value {
+      name,
+      bytes,
+      enumerable,
+    } => {
       let Ok(name) = CString::new(name.as_str()) else {
         return;
       };
@@ -908,7 +1170,9 @@ unsafe fn replay_global_entry(
       else {
         return;
       };
-      unsafe { JS_SetPropertyStr(ctx, global, name.as_ptr(), value) };
+      unsafe {
+        define_snapshot_global(ctx, global, name.as_ptr(), value, *enumerable)
+      };
     }
     GlobalEntry::Function {
       name,
@@ -916,6 +1180,7 @@ unsafe fn replay_global_entry(
       data,
       length,
       constructable,
+      enumerable,
     } => {
       let callback = callback.resolve(external_refs);
       if callback == 0 {
@@ -949,10 +1214,32 @@ unsafe fn replay_global_entry(
       if !jsv_is_undefined(&data_value) {
         unsafe { JS_FreeValue(ctx, data_value) };
       }
-      unsafe { JS_SetPropertyStr(ctx, global, name.as_ptr(), function) };
+      unsafe {
+        define_snapshot_global(
+          ctx,
+          global,
+          name.as_ptr(),
+          function,
+          *enumerable,
+        )
+      };
     }
     GlobalEntry::LexicalValue { .. } => {}
   }
+}
+
+unsafe fn define_snapshot_global(
+  ctx: *mut JSContext,
+  global: JSValue,
+  name: *const c_char,
+  value: JSValue,
+  enumerable: bool,
+) {
+  let mut flags = JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE;
+  if enumerable {
+    flags |= JS_PROP_ENUMERABLE;
+  }
+  unsafe { JS_DefinePropertyValueStr(ctx, global, name, value, flags) };
 }
 
 unsafe fn replay_lexical_global_entry(
@@ -995,6 +1282,7 @@ fn should_skip_global(name: &str) -> bool {
       | "Math"
       | "ShadowRealm"
       | "__v8x_import_source"
+      | "__v8x_snapshot_intrinsics"
       | "__v8xKeptObjectsCleared"
       | "WeakRef"
       | "ArrayBuffer"
@@ -1026,10 +1314,15 @@ fn put_context(out: &mut Vec<u8>, context: &ContextSnapshot) {
 
 fn put_global(out: &mut Vec<u8>, entry: &GlobalEntry) {
   match entry {
-    GlobalEntry::Value { name, bytes } => {
+    GlobalEntry::Value {
+      name,
+      bytes,
+      enumerable,
+    } => {
       out.push(GLOBAL_VALUE);
       put_str(out, name);
       put_bytes(out, bytes);
+      out.push(u8::from(*enumerable));
     }
     GlobalEntry::LexicalValue { name, bytes } => {
       out.push(GLOBAL_LEXICAL_VALUE);
@@ -1042,6 +1335,7 @@ fn put_global(out: &mut Vec<u8>, entry: &GlobalEntry) {
       data,
       length,
       constructable,
+      enumerable,
     } => {
       out.push(GLOBAL_FUNCTION);
       put_str(out, name);
@@ -1049,6 +1343,7 @@ fn put_global(out: &mut Vec<u8>, entry: &GlobalEntry) {
       put_opt_ref_slot(out, *data);
       put_i32(out, *length);
       out.push(u8::from(*constructable));
+      out.push(u8::from(*enumerable));
     }
   }
 }
@@ -1195,6 +1490,7 @@ impl<'a> Reader<'a> {
       GLOBAL_VALUE => Some(GlobalEntry::Value {
         name: self.get_string()?,
         bytes: self.get_bytes()?,
+        enumerable: self.get_u8()? != 0,
       }),
       GLOBAL_LEXICAL_VALUE => Some(GlobalEntry::LexicalValue {
         name: self.get_string()?,
@@ -1206,6 +1502,7 @@ impl<'a> Reader<'a> {
         data: self.get_opt_ref_slot()?,
         length: self.get_i32()?,
         constructable: self.get_u8()? != 0,
+        enumerable: self.get_u8()? != 0,
       }),
       _ => None,
     }
@@ -1256,4 +1553,271 @@ pub(crate) fn free_blob(ptr: *const u8) {
   BLOBS.with(|b| {
     b.borrow_mut().remove(&(ptr as usize));
   });
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  struct TestContext {
+    runtime: *mut JSRuntime,
+    context: *mut JSContext,
+  }
+
+  impl TestContext {
+    fn new() -> Self {
+      let runtime = unsafe { JS_NewRuntime() };
+      assert!(!runtime.is_null());
+      let context = unsafe { JS_NewContext(runtime) };
+      assert!(!context.is_null());
+      crate::quickjs::core::install_default_globals(ptr::null_mut(), context);
+      Self { runtime, context }
+    }
+
+    fn eval(&self, source: &str) -> JSValue {
+      let source = CString::new(source).unwrap();
+      let value = unsafe {
+        JS_Eval(
+          self.context,
+          source.as_ptr(),
+          source.as_bytes().len(),
+          c"snapshot-test.js".as_ptr(),
+          JS_EVAL_TYPE_GLOBAL,
+        )
+      };
+      assert!(!jsv_is_exception(&value));
+      value
+    }
+  }
+
+  impl Drop for TestContext {
+    fn drop(&mut self) {
+      unsafe {
+        JS_FreeContext(self.context);
+        JS_FreeRuntime(self.runtime);
+      }
+    }
+  }
+
+  #[test]
+  fn bytecode_functions_roundtrip_shared_closure_state() {
+    let test = TestContext::new();
+    let source_value = test.eval(
+      "(() => {\
+         let state = 0;\
+         const increment = () => ++state;\
+         const read = () => state;\
+         return { increment, read };\
+       })()",
+    );
+    let bytes = serialize_value(test.context, source_value).unwrap();
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+
+    unsafe {
+      let increment =
+        JS_GetPropertyStr(test.context, restored, c"increment".as_ptr());
+      let read = JS_GetPropertyStr(test.context, restored, c"read".as_ptr());
+      let incremented =
+        JS_Call(test.context, increment, restored, 0, ptr::null_mut());
+      assert!(!jsv_is_exception(&incremented));
+      let mut incremented_number = 0;
+      assert_eq!(
+        JS_ToInt32(test.context, &mut incremented_number, incremented),
+        0
+      );
+      assert_eq!(incremented_number, 1);
+
+      let current = JS_Call(test.context, read, restored, 0, ptr::null_mut());
+      assert!(!jsv_is_exception(&current));
+      let mut current_number = 0;
+      assert_eq!(JS_ToInt32(test.context, &mut current_number, current), 0);
+      assert_eq!(current_number, 1);
+
+      JS_FreeValue(test.context, current);
+      JS_FreeValue(test.context, incremented);
+      JS_FreeValue(test.context, read);
+      JS_FreeValue(test.context, increment);
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, source_value);
+    }
+  }
+
+  #[test]
+  fn bytecode_function_roundtrips_recursive_closure() {
+    let test = TestContext::new();
+    let value =
+      test.eval("(() => { let self; self = () => self; return self; })()");
+    let bytes = serialize_value(test.context, value).unwrap();
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+
+    unsafe {
+      let result =
+        JS_Call(test.context, restored, jsv_undefined(), 0, ptr::null_mut());
+      assert!(!jsv_is_exception(&result));
+      assert_eq!(result.tag, JS_TAG_OBJECT);
+      assert_eq!(result.u.ptr, restored.u.ptr);
+
+      JS_FreeValue(test.context, result);
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, value);
+    }
+  }
+
+  #[test]
+  fn native_bound_function_roundtrips() {
+    let test = TestContext::new();
+    let source_value =
+      test.eval("Function.prototype.call.bind(Array.prototype.join)");
+    let bytes = serialize_value(test.context, source_value).unwrap();
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+    let argument = test.eval("[1, 2]");
+    let separator = test.eval("'-'");
+
+    unsafe {
+      let mut arguments = [argument, separator];
+      let result = JS_Call(
+        test.context,
+        restored,
+        jsv_undefined(),
+        arguments.len() as c_int,
+        arguments.as_mut_ptr(),
+      );
+      assert!(!jsv_is_exception(&result));
+      let mut len = 0;
+      let text = JS_ToCStringLen(test.context, &mut len, result);
+      assert!(!text.is_null());
+      let bytes = std::slice::from_raw_parts(text as *const u8, len);
+      assert_eq!(bytes, b"1-2");
+
+      JS_FreeCString(test.context, text);
+      JS_FreeValue(test.context, result);
+      JS_FreeValue(test.context, separator);
+      JS_FreeValue(test.context, argument);
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, source_value);
+    }
+  }
+
+  #[test]
+  fn native_intrinsics_roundtrip() {
+    let test = TestContext::new();
+    for source in [
+      "Array",
+      "Atomics.notify",
+      "Object.prototype.toLocaleString",
+      "Object.getPrototypeOf((function*() {})()).next",
+    ] {
+      let source_value = test.eval(source);
+      let bytes = serialize_value(test.context, source_value)
+        .unwrap_or_else(|| panic!("failed to serialize {source}"));
+      let restored = deserialize_value_with_refs(test.context, &bytes, &[])
+        .unwrap_or_else(|| panic!("failed to deserialize {source}"));
+      assert!(unsafe { JS_IsFunction(test.context, restored) }, "{source}");
+      unsafe {
+        JS_FreeValue(test.context, restored);
+        JS_FreeValue(test.context, source_value);
+      }
+    }
+  }
+
+  #[test]
+  fn regexp_references_roundtrip_with_identity() {
+    let test = TestContext::new();
+    let source_value =
+      test.eval("(() => { const re = /x/g; return { re, same: re }; })()");
+    let bytes = serialize_value(test.context, source_value).unwrap();
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+
+    unsafe {
+      let re = JS_GetPropertyStr(test.context, restored, c"re".as_ptr());
+      let same = JS_GetPropertyStr(test.context, restored, c"same".as_ptr());
+      assert_eq!(re.tag, JS_TAG_OBJECT);
+      assert_eq!(re.u.ptr, same.u.ptr);
+
+      JS_FreeValue(test.context, same);
+      JS_FreeValue(test.context, re);
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, source_value);
+    }
+  }
+
+  #[test]
+  fn weak_collections_roundtrip_with_shared_key() {
+    let test = TestContext::new();
+    let source_value = test.eval(
+      "(() => {\
+         const key = {};\
+         return {\
+           key,\
+           map: new WeakMap([[key, 42]]),\
+           set: new WeakSet([key]),\
+         };\
+       })()",
+    );
+    let bytes = serialize_value(test.context, source_value).unwrap();
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+
+    unsafe {
+      let key = JS_GetPropertyStr(test.context, restored, c"key".as_ptr());
+      let map = JS_GetPropertyStr(test.context, restored, c"map".as_ptr());
+      let set = JS_GetPropertyStr(test.context, restored, c"set".as_ptr());
+      let get = JS_GetPropertyStr(test.context, map, c"get".as_ptr());
+      let has = JS_GetPropertyStr(test.context, set, c"has".as_ptr());
+      let mut args = [key];
+      let mapped = JS_Call(test.context, get, map, 1, args.as_mut_ptr());
+      let contained = JS_Call(test.context, has, set, 1, args.as_mut_ptr());
+      assert!(!jsv_is_exception(&mapped));
+      assert!(!jsv_is_exception(&contained));
+      let mut mapped_number = 0;
+      assert_eq!(JS_ToInt32(test.context, &mut mapped_number, mapped), 0);
+      assert_eq!(mapped_number, 42);
+      assert_ne!(JS_ToBool(test.context, contained), 0);
+
+      JS_FreeValue(test.context, contained);
+      JS_FreeValue(test.context, mapped);
+      JS_FreeValue(test.context, has);
+      JS_FreeValue(test.context, get);
+      JS_FreeValue(test.context, set);
+      JS_FreeValue(test.context, map);
+      JS_FreeValue(test.context, key);
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, source_value);
+    }
+  }
+
+  #[test]
+  fn unsupported_object_roundtrips_data_properties_without_invoking_accessors()
+  {
+    let test = TestContext::new();
+    let source_value = test.eval(
+      "({\
+         core: { ops: { value: 42 } },\
+         get unsupported() { throw new Error('must not run'); }\
+       })",
+    );
+    let bytes = serialize_value(test.context, source_value).unwrap();
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+
+    unsafe {
+      let core = JS_GetPropertyStr(test.context, restored, c"core".as_ptr());
+      let ops = JS_GetPropertyStr(test.context, core, c"ops".as_ptr());
+      let property_value =
+        JS_GetPropertyStr(test.context, ops, c"value".as_ptr());
+      let mut number = 0;
+      assert_eq!(JS_ToInt32(test.context, &mut number, property_value), 0);
+      assert_eq!(number, 42);
+
+      JS_FreeValue(test.context, property_value);
+      JS_FreeValue(test.context, ops);
+      JS_FreeValue(test.context, core);
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, source_value);
+    }
+  }
 }
