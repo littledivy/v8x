@@ -39,6 +39,10 @@ const JS_WRITE_OBJ_BYTECODE: c_int = 1 << 0;
 const JS_WRITE_OBJ_SAB: c_int = 1 << 2;
 const JS_WRITE_OBJ_REFERENCE: c_int = 1 << 3;
 const JS_READ_OBJ_BYTECODE: c_int = 1 << 0;
+const JS_READ_OBJ_SAB: c_int = 1 << 2;
+const JS_READ_OBJ_REFERENCE: c_int = 1 << 3;
+const SNAPSHOT_READ_FLAGS: c_int =
+  JS_READ_OBJ_BYTECODE | JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE;
 const JS_GPN_STRING_MASK: c_int = 1 << 0;
 const JS_GPN_ENUM_ONLY: c_int = 1 << 4;
 const ASYNC_STUB_SRC: &str = "(function setUpAsyncStub(opName,originalOp,maybeProto){\
@@ -268,12 +272,12 @@ pub(crate) fn deserialize_value_with_refs(
   if ctx.is_null() || bytes.is_empty() {
     return None;
   }
-  if let Some(value) = decode_special_data(ctx, bytes, external_refs) {
-    return Some(value);
+  if bytes.starts_with(DATA_MAGIC) {
+    return decode_special_data(ctx, bytes, external_refs);
   }
-  let value = unsafe {
-    JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), JS_READ_OBJ_BYTECODE)
-  };
+  let value = super::exception::with_prepare_stack_suppressed(|| unsafe {
+    JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), SNAPSHOT_READ_FLAGS)
+  });
   if value.tag == JS_TAG_EXCEPTION {
     let exc = unsafe { JS_GetException(ctx) };
     unsafe { JS_FreeValue(ctx, exc) };
@@ -529,9 +533,9 @@ fn decode_special_data(
     }
     SNAPSHOT_DATA_JS_FUNCTION => {
       let bytes = input.get_bytes()?;
-      let value = unsafe {
-        JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), JS_READ_OBJ_BYTECODE)
-      };
+      let value = super::exception::with_prepare_stack_suppressed(|| unsafe {
+        JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), SNAPSHOT_READ_FLAGS)
+      });
       if value.tag == JS_TAG_EXCEPTION {
         let exc = unsafe { JS_GetException(ctx) };
         unsafe { JS_FreeValue(ctx, exc) };
@@ -551,7 +555,7 @@ fn decode_special_data(
       let Ok(csrc) = CString::new(wrapped) else {
         return None;
       };
-      let value = unsafe {
+      let value = super::exception::with_prepare_stack_suppressed(|| unsafe {
         JS_Eval(
           ctx,
           csrc.as_ptr(),
@@ -559,9 +563,26 @@ fn decode_special_data(
           c"<v8x-snapshot-function>".as_ptr(),
           JS_EVAL_TYPE_GLOBAL,
         )
-      };
+      });
       if value.tag == JS_TAG_EXCEPTION {
         let exc = unsafe { JS_GetException(ctx) };
+        if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
+          let mut len = 0usize;
+          let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, exc) };
+          let message = if cstr.is_null() {
+            "<unstringifiable>".into()
+          } else {
+            let bytes =
+              unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+            let message = String::from_utf8_lossy(bytes).into_owned();
+            unsafe { JS_FreeCString(ctx, cstr) };
+            message
+          };
+          eprintln!(
+            "[qjs snapshot] function source replay failed: {message}; source={:?}",
+            source.chars().take(240).collect::<String>()
+          );
+        }
         unsafe { JS_FreeValue(ctx, exc) };
         return None;
       }
