@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=deno_core.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 419 passing. DO NOT hand-sort; the
+# (run.mjs --update). 421 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 deno_core::arena::raw_arena::tests::test_add_clear_many
 deno_core::arena::raw_arena::tests::test_add_remove_many
@@ -126,6 +126,7 @@ deno_core::modules::tests::test_lazy_loaded_esm_concurrent_loads
 deno_core::modules::tests::test_lazy_loaded_esm_with_tla_no_panic
 deno_core::modules::tests::test_lazy_loaded_script
 deno_core::modules::tests::test_lazy_loaded_script_not_found
+deno_core::modules::tests::test_load_with_code_cache
 deno_core::modules::tests::test_mods
 deno_core::modules::tests::test_native_external_source_map_with_relative_path
 deno_core::modules::tests::test_native_source_map_synthetic_bundle_path
@@ -226,6 +227,7 @@ deno_core::runtime::tests::jsrealm::lazy
 deno_core::runtime::tests::jsrealm::test_set_format_exception_callback_realms
 deno_core::runtime::tests::misc::dangling_shared_isolate
 deno_core::runtime::tests::misc::esm_extensions_throws
+deno_core::runtime::tests::misc::eval_context_with_code_cache
 deno_core::runtime::tests::misc::foreground_tasks_delivered_without_tokio_handle
 deno_core::runtime::tests::misc::generic_in_extension_middleware
 deno_core::runtime::tests::misc::global_template_middleware

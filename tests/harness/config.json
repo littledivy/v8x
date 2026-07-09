@@ -66,10 +66,8 @@
       "ignore_by_backend": {
         "quickjs": [
           "modules::tests::dyn_import_recurse_err",
-          "modules::tests::test_load_with_code_cache",
           "runtime::ops::tests::test_op_arraybuffer_slice",
           "runtime::ops::tests::test_op_buffer_any_length",
-          "runtime::tests::misc::eval_context_with_code_cache",
           "runtime::tests::misc::terminate_execution",
           "runtime::tests::misc::terminate_execution_run_event_loop_js",
           "runtime::tests::misc::terminate_execution_webassembly",
