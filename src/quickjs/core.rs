@@ -84,6 +84,11 @@ pub(crate) struct InterruptEntry {
 /// every subsequently compiled global script is evaluated in strict mode.
 pub(crate) static FORCE_STRICT: AtomicBool = AtomicBool::new(false);
 
+/// Process-wide maximum stack region for subsequently created QuickJS
+/// runtimes. V8's `--stack-size` is expressed in KiB; this stores bytes for
+/// `JS_SetMaxStackSize`.
+pub(crate) static MAX_STACK_SIZE: AtomicUsize = AtomicUsize::new(1024 * 1024);
+
 /// The `JS_EVAL_TYPE_GLOBAL` flags to use when running a top-level script,
 /// folding in strict mode if `--use_strict` was set.
 #[inline]
@@ -718,7 +723,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
-  unsafe { JS_SetMaxStackSize(rt, 1024 * 1024) };
+  unsafe { JS_SetMaxStackSize(rt, MAX_STACK_SIZE.load(Ordering::Relaxed)) };
   // deno's V8 lets `Atomics.wait` block the main isolate (deno isn't a browser);
   // QuickJS gates it behind can_block (default false → "cannot block in this
   // thread"). Enable to match.

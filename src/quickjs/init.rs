@@ -145,35 +145,64 @@ pub extern "C" fn v8__V8__SetFlagsFromCommandLine(
   }
 }
 
-fn consume_v8_flag(flag: &str) -> bool {
-  let name = flag
-    .trim_start_matches('-')
+#[derive(Debug, PartialEq, Eq)]
+enum V8Flag {
+  ForceStrict(bool),
+  StackSize(usize),
+  Noop,
+}
+
+fn parse_v8_flag(flag: &str) -> Option<V8Flag> {
+  let flag = flag.trim_start_matches('-');
+  let (name, value) = flag
     .split_once('=')
-    .map_or(flag.trim_start_matches('-'), |(name, _)| name)
-    .replace('-', "_");
+    .map_or((flag, None), |(name, value)| (name, Some(value)));
+  let name = name.replace('-', "_");
+
   match name.as_str() {
-    "use_strict" => {
+    "use_strict" if value.is_none() => Some(V8Flag::ForceStrict(true)),
+    "no_use_strict" if value.is_none() => Some(V8Flag::ForceStrict(false)),
+    "stack_size" => value
+      .and_then(|value| value.parse::<usize>().ok())
+      .and_then(|kib| kib.checked_mul(1024))
+      .map(V8Flag::StackSize),
+    "external_memory_max_reasonable_size" | "max_old_space_size" => value
+      .and_then(|value| value.parse::<usize>().ok())
+      .map(|_| V8Flag::Noop),
+    "inspector_live_edit" | "no_inspector_live_edit" if value.is_none() => {
+      Some(V8Flag::Noop)
+    }
+    "help" | "log_colour" | "log_color" => Some(V8Flag::Noop),
+    _ => None,
+  }
+}
+
+fn consume_v8_flag(flag: &str) -> bool {
+  match parse_v8_flag(flag) {
+    Some(V8Flag::ForceStrict(true)) => {
       crate::quickjs::core::FORCE_STRICT
         .store(true, std::sync::atomic::Ordering::Relaxed);
       true
     }
-    "no_use_strict" => {
+    Some(V8Flag::ForceStrict(false)) => {
       crate::quickjs::core::FORCE_STRICT
         .store(false, std::sync::atomic::Ordering::Relaxed);
       true
     }
-    // Recognized V8 flags that do not have a QuickJS observable equivalent.
-    "help" | "log_colour" | "log_color" => true,
-    _ => false,
+    Some(V8Flag::StackSize(bytes)) => {
+      crate::quickjs::core::MAX_STACK_SIZE
+        .store(bytes, std::sync::atomic::Ordering::Relaxed);
+      true
+    }
+    Some(V8Flag::Noop) => true,
+    None => false,
   }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__SetFlagsFromString(flags: *const u8, length: usize) {
-  // Most V8 flags are inert for the QuickJS backend, but `--use_strict` changes
-  // observable JS semantics (it makes top-level scripts run in strict mode), so
-  // honor it. V8 normalizes `-`/`_` in flag names and supports a `--no` prefix
-  // to clear booleans, so accept both spellings.
+  // Apply the same compatibility allowlist as the command-line parser. V8
+  // normalizes `-`/`_` in flag names, so accept both spellings.
   if flags.is_null() || length == 0 {
     return;
   }
@@ -183,6 +212,35 @@ pub extern "C" fn v8__V8__SetFlagsFromString(flags: *const u8, length: usize) {
   };
   for tok in text.split_whitespace() {
     consume_v8_flag(tok);
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::{V8Flag, parse_v8_flag};
+
+  #[test]
+  fn parses_deno_v8_flags() {
+    assert_eq!(
+      parse_v8_flag("--stack-size=1024"),
+      Some(V8Flag::StackSize(1024 * 1024))
+    );
+    assert_eq!(parse_v8_flag("--inspector-live-edit"), Some(V8Flag::Noop));
+    assert_eq!(
+      parse_v8_flag("--external-memory-max-reasonable-size=0"),
+      Some(V8Flag::Noop)
+    );
+    assert_eq!(
+      parse_v8_flag("--max-old-space-size=3072"),
+      Some(V8Flag::Noop)
+    );
+  }
+
+  #[test]
+  fn rejects_unknown_or_malformed_v8_flags() {
+    assert_eq!(parse_v8_flag("--stack-size=invalid"), None);
+    assert_eq!(parse_v8_flag("--external-memory-max-reasonable-size"), None);
+    assert_eq!(parse_v8_flag("--definitely-not-a-v8-flag"), None);
   }
 }
 
