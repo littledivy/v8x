@@ -1,5 +1,5 @@
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Emit `$OUT_DIR/bc_embed.rs` defining `EMBEDDED_BC`. When `V82JSC_BC_BLOB`
 /// points at a packed bytecode blob (see `module.rs` for the format), its bytes
@@ -22,6 +22,21 @@ fn emit_bc_embed() {
     _ => "pub static EMBEDDED_BC: &[u8] = &[];".to_string(),
   };
   std::fs::write(&dst, body).unwrap();
+}
+
+fn emit_vendor_rerun_inputs(manifest_dir: &Path) {
+  println!("cargo:rerun-if-changed=tools/setup_vendor.sh");
+  let patches_dir = manifest_dir.join("patches");
+  println!("cargo:rerun-if-changed={}", patches_dir.display());
+  let Ok(entries) = std::fs::read_dir(&patches_dir) else {
+    return;
+  };
+  for entry in entries.flatten() {
+    let path = entry.path();
+    if path.is_file() {
+      println!("cargo:rerun-if-changed={}", path.display());
+    }
+  }
 }
 
 fn main() {
@@ -125,8 +140,7 @@ fn setup_vendor(manifest_dir: &std::path::Path, mode: &str) {
       "tools/setup_vendor.sh (submodule init + patches) failed: {other:?}"
     ),
   }
-  println!("cargo:rerun-if-changed=tools/setup_vendor.sh");
-  println!("cargo:rerun-if-changed=patches");
+  emit_vendor_rerun_inputs(manifest_dir);
 }
 
 /// Build the vendored wasm-micro-runtime (WAMR) as an interpreter-only static
@@ -450,6 +464,13 @@ fn build_quickjs(manifest_dir: &std::path::Path) {
     return;
   }
   let qjs = manifest_dir.join("vendor/quickjs-ng");
+  let quickjs_c = qjs.join("quickjs.c");
+  let quickjs_src =
+    std::fs::read_to_string(&quickjs_c).expect("failed to read quickjs.c");
+  assert!(
+    quickjs_src.contains("v82jsc_global_var_obj"),
+    "QuickJS patch series is missing quickjs-17-global-lexicals.patch"
+  );
   // The four core sources matching upstream CMake `qjs_sources`.
   let sources = [
     "quickjs.c",
