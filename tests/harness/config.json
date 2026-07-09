@@ -69,6 +69,13 @@
           "runtime::tests::misc::test_heap_limit_cb_multiple",
           "runtime::tests::misc::test_heap_limits"
         ]
+      },
+      "ignore_by_backend_os": {
+        "quickjs": {
+          "linux": [
+            "uv_compat::tests::tty_init_dev_tty_select_fallback"
+          ]
+        }
       }
     }
   ]

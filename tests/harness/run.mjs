@@ -53,12 +53,16 @@ const b = backend(cfg, backendId);
 // would block the binary; a crash would truncate it and make later tests'
 // outcomes order-dependent) AND excluded from pass/fail/baseline below, so the
 // cell is reproducible. From config `ignore` (all backends), per-backend
-// `ignore_by_backend`, and per-backend/per-arch `ignore_by_backend_arch`.
+// `ignore_by_backend`, per-backend/per-OS `ignore_by_backend_os`, and
+// per-backend/per-arch `ignore_by_backend_arch`.
+const osIgnore =
+  ((s.ignore_by_backend_os || {})[backendId] || {})[os.platform()] || [];
 const archIgnore =
   ((s.ignore_by_backend_arch || {})[backendId] || {})[os.arch()] || [];
 const IGNORE = new Set([
   ...(s.ignore || []),
   ...((s.ignore_by_backend || {})[backendId] || []),
+  ...osIgnore,
   ...archIgnore,
 ]);
 const isMac = os.platform() === "darwin";
