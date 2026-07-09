@@ -65,7 +65,6 @@
       "ignore": [],
       "ignore_by_backend": {
         "quickjs": [
-          "runtime::tests::misc::terminate_execution_webassembly",
           "runtime::tests::misc::test_heap_limit_cb_multiple",
           "runtime::tests::misc::test_heap_limits"
         ]

@@ -46,7 +46,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{
+  AtomicBool, AtomicI64, AtomicPtr, AtomicUsize, Ordering,
+};
 use std::sync::{Mutex, MutexGuard};
 
 pub(crate) type WeakCallback = unsafe extern "C" fn(*const c_void);
@@ -375,6 +377,11 @@ pub(crate) struct IsoState {
   // uncatchable termination exception on the next safe point). An `AtomicBool`
   // because V8's terminate may be requested from another thread.
   pub terminating: std::sync::atomic::AtomicBool,
+
+  // The WAMR function currently executing on this isolate, if any. WAMR runs
+  // outside QuickJS's interrupt polling, so cross-thread termination uses this
+  // stable (WAMR-owned) pointer to interrupt the interpreter directly.
+  pub active_wasm_func: AtomicPtr<c_void>,
 
   pub pending_interrupts: Mutex<Vec<InterruptEntry>>,
 
@@ -813,6 +820,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     near_heap_limit_initial: AtomicUsize::new(heap_limit),
     near_heap_limit_in_callback: AtomicBool::new(false),
     terminating: std::sync::atomic::AtomicBool::new(false),
+    active_wasm_func: AtomicPtr::new(ptr::null_mut()),
     pending_interrupts: Mutex::new(Vec::new()),
     array_buffer_allocator,
     pending_array_buffer_frees: Vec::new(),

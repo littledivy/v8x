@@ -179,6 +179,7 @@ unsafe extern "C" {
     args: *const wasm_vec_t,
     results: *mut wasm_vec_t,
   ) -> *mut wasm_trap_t;
+  pub fn v82jsc_wasm_func_terminate(f: *const wasm_func_t);
   pub fn wasm_func_type(f: *const wasm_func_t) -> *mut wasm_functype_t;
   pub fn wasm_func_as_extern(f: *mut wasm_func_t) -> *mut wasm_extern_t;
 
@@ -645,6 +646,22 @@ struct ExportFuncEnv {
   name: std::string::String,
 }
 
+pub(crate) fn terminate_active_call(iso: *mut RealIsolate) {
+  let func = iso_state(iso)
+    .active_wasm_func
+    .load(std::sync::atomic::Ordering::Acquire)
+    as *const wasm_func_t;
+  if !func.is_null() {
+    unsafe { v82jsc_wasm_func_terminate(func) };
+  }
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn v82jsc_wasm_should_terminate() -> bool {
+  let iso = current_iso();
+  !iso.is_null() && iso_state(iso).is_terminating()
+}
+
 unsafe extern "C" fn call_export(
   ctx: *mut JSContext,
   _this: JSValue,
@@ -659,6 +676,32 @@ unsafe extern "C" fn call_export(
     return unsafe { throw(ctx, "WebAssembly: invalid export binding") };
   }
   let env = unsafe { &*(envp as *const ExportFuncEnv) };
+
+  let iso = current_iso();
+  let previous_active = if iso.is_null() {
+    ptr::null_mut()
+  } else {
+    iso_state(iso)
+      .active_wasm_func
+      .swap(env.func.cast(), std::sync::atomic::Ordering::AcqRel)
+  };
+  struct ActiveWasmGuard {
+    iso: *mut RealIsolate,
+    previous: *mut c_void,
+  }
+  impl Drop for ActiveWasmGuard {
+    fn drop(&mut self) {
+      if !self.iso.is_null() {
+        iso_state(self.iso)
+          .active_wasm_func
+          .store(self.previous, std::sync::atomic::Ordering::Release);
+      }
+    }
+  }
+  let _active_guard = ActiveWasmGuard {
+    iso,
+    previous: previous_active,
+  };
 
   let depth = WASM_CALL_DEPTH.with(|d| {
     let n = d.get() + 1;
@@ -730,6 +773,14 @@ unsafe extern "C" fn call_export(
   }
   if !trap.is_null() {
     unsafe { wasm_trap_delete(trap) };
+    if !iso.is_null() && iso_state(iso).is_terminating() {
+      unsafe {
+        JS_ThrowInternalError(ctx, c"interrupted".as_ptr());
+        let exc = JS_GetException(ctx);
+        JS_SetUncatchableError(ctx, exc);
+        return JS_Throw(ctx, exc);
+      }
+    }
     if std::env::var("V82_WASM_TRACE").is_ok() {
       let d = WASM_CALL_DEPTH.with(|d| d.get());
       eprintln!("[wasm] TRAP in export {:?} depth={d}", env.name);
