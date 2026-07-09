@@ -26,6 +26,13 @@ MODE="${1:-rusty_v8}"
 
 # Apply every patches/<prefix>-NN-*.patch onto a submodule, in numeric order.
 # Idempotent: a patch that already reverse-applies is skipped.
+patch_already_applied() {
+  local sub="$1" patch="$2"
+  local out
+  out=$(patch --batch --dry-run --forward -p1 -d "$sub" < "$patch" 2>&1 || true)
+  [[ "$out" == *"previously applied"* ]]
+}
+
 apply_series() {
   local sub="$1" prefix="$2"
   if [ ! -e "$sub/.git" ]; then
@@ -34,7 +41,13 @@ apply_series() {
   for p in patches/"$prefix"-[0-9]*.patch; do
     [ -e "$p" ] || continue
     if ! git -C "$sub" apply --reverse --check "../../$p" 2>/dev/null; then
-      git -C "$sub" apply "../../$p" || echo "warn: $p may already be applied"
+      if ! git -C "$sub" apply "../../$p"; then
+        if patch_already_applied "$sub" "$p"; then
+          echo "warn: $p may already be applied"
+        else
+          return 1
+        fi
+      fi
     fi
   done
 }

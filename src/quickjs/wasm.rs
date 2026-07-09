@@ -206,6 +206,17 @@ unsafe extern "C" {
   ) -> *mut wasm_trap_t;
 
   pub fn wasm_extern_as_global(e: *mut wasm_extern_t) -> *mut wasm_global_t;
+  pub fn wasm_global_as_extern(g: *mut wasm_global_t) -> *mut wasm_extern_t;
+  pub fn wasm_valtype_new(kind: u8) -> *mut wasm_valtype_t;
+  pub fn wasm_globaltype_new(
+    val_type: *mut wasm_valtype_t,
+    mutability: u8,
+  ) -> *mut wasm_globaltype_t;
+  pub fn wasm_global_new(
+    store: *mut wasm_store_t,
+    global_type: *const wasm_globaltype_t,
+    init: *const wasm_val_t,
+  ) -> *mut wasm_global_t;
   pub fn wasm_global_get(g: *const wasm_global_t, out: *mut wasm_val_t);
   pub fn wasm_global_set(g: *mut wasm_global_t, v: *const wasm_val_t);
   pub fn wasm_global_type(g: *const wasm_global_t) -> *mut wasm_globaltype_t;
@@ -461,7 +472,7 @@ unsafe fn js_to_wasm_val(
     }
     WASM_I64 => {
       let mut i = 0i64;
-      unsafe { JS_ToInt64(ctx, &mut i, v) };
+      unsafe { JS_ToBigInt64(ctx, &mut i, v) };
       out.of = i as u64;
     }
     WASM_F32 => {
@@ -1052,6 +1063,12 @@ unsafe fn instantiate(
         )
       };
       externs.push(unsafe { wasm_func_as_extern(f) });
+    } else if kind == WASM_EXTERN_GLOBAL {
+      if let Some(global) = unsafe { obj_global_ptr(ctx, val) } {
+        externs.push(unsafe { wasm_global_as_extern(global) });
+      } else {
+        externs.push(ptr::null_mut());
+      }
     } else {
       externs.push(ptr::null_mut());
     }
@@ -1237,6 +1254,21 @@ struct GlobalEnv {
   global: *mut wasm_global_t,
 }
 
+unsafe fn obj_global_ptr(
+  ctx: *mut JSContext,
+  obj: JSValue,
+) -> Option<*mut wasm_global_t> {
+  let v = unsafe { JS_GetPropertyStr(ctx, obj, c"__wasm_global_ptr".as_ptr()) };
+  let mut ptr_value = 0i64;
+  let ok = unsafe { JS_ToBigInt64(ctx, &mut ptr_value, v) } == 0;
+  unsafe { JS_FreeValue(ctx, v) };
+  if ok && ptr_value != 0 {
+    Some(ptr_value as *mut wasm_global_t)
+  } else {
+    None
+  }
+}
+
 unsafe extern "C" fn global_value_get(
   ctx: *mut JSContext,
   _this: JSValue,
@@ -1294,6 +1326,14 @@ unsafe fn make_global_obj(
   global: *mut wasm_global_t,
 ) -> JSValue {
   let obj = unsafe { JS_NewObject(ctx) };
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      obj,
+      c"__wasm_global_ptr".as_ptr(),
+      JS_NewBigInt64(ctx, global as i64),
+    )
+  };
   let genv = Box::into_raw(Box::new(GlobalEnv { global }));
   let mut gd = [unsafe { JS_NewBigInt64(ctx, genv as i64) }];
   let getter = unsafe {
@@ -1316,6 +1356,68 @@ unsafe fn make_global_obj(
     JS_FreeAtom(ctx, atom);
   }
   obj
+}
+
+unsafe fn wasm_value_type_from_js(
+  ctx: *mut JSContext,
+  desc: JSValue,
+) -> Option<u8> {
+  let type_value = unsafe { JS_GetPropertyStr(ctx, desc, c"value".as_ptr()) };
+  let mut len = 0usize;
+  let cs = unsafe { JS_ToCStringLen(ctx, &mut len, type_value) };
+  unsafe { JS_FreeValue(ctx, type_value) };
+  if cs.is_null() {
+    return None;
+  }
+  let bytes = unsafe { std::slice::from_raw_parts(cs as *const u8, len) };
+  let kind = match bytes {
+    b"i32" => Some(WASM_I32),
+    b"i64" => Some(WASM_I64),
+    b"f32" => Some(WASM_F32),
+    b"f64" => Some(WASM_F64),
+    _ => None,
+  };
+  unsafe { JS_FreeCString(ctx, cs) };
+  kind
+}
+
+unsafe extern "C" fn wa_global_ctor(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  if argc < 2 {
+    return unsafe { throw(ctx, "WebAssembly.Global: missing arguments") };
+  }
+  let desc = unsafe { *argv };
+  let Some(kind) = (unsafe { wasm_value_type_from_js(ctx, desc) }) else {
+    return unsafe { throw(ctx, "WebAssembly.Global: invalid value type") };
+  };
+  let mutable = unsafe {
+    let v = JS_GetPropertyStr(ctx, desc, c"mutable".as_ptr());
+    let out = JS_ToBool(ctx, v) != 0;
+    JS_FreeValue(ctx, v);
+    out
+  };
+  let initial = unsafe { js_to_wasm_val(ctx, kind, *argv.add(1)) };
+  let valtype = unsafe { wasm_valtype_new(kind) };
+  if valtype.is_null() {
+    return unsafe { throw(ctx, "WebAssembly.Global: invalid value type") };
+  }
+  let globaltype =
+    unsafe { wasm_globaltype_new(valtype, if mutable { 1 } else { 0 }) };
+  if globaltype.is_null() {
+    return unsafe { throw(ctx, "WebAssembly.Global: invalid global type") };
+  }
+  let store = with_state(|st| st.store);
+  let global = unsafe { wasm_global_new(store, globaltype, &initial) };
+  if global.is_null() {
+    return unsafe {
+      throw(ctx, "WebAssembly.Global: failed to create global")
+    };
+  }
+  unsafe { make_global_obj(ctx, global) }
 }
 
 // Standalone `new WebAssembly.Memory({ initial, maximum })`. Unlike the
@@ -1938,6 +2040,7 @@ pub(crate) fn install_webassembly(ctx: *mut JSContext) {
     set_ctor(wa, c"Module", wa_module_ctor, 1);
     set_ctor(wa, c"Instance", wa_instance_ctor, 2);
     set_ctor(wa, c"Memory", wa_memory_ctor, 1);
+    set_ctor(wa, c"Global", wa_global_ctor, 2);
     set_fn(wa, c"compile", wa_compile, 1);
     set_fn(wa, c"instantiate", wa_instantiate, 2);
 
@@ -1972,6 +2075,19 @@ W.instantiateStreaming=async (s,i)=>W.instantiate(await check(s),i);})()";
     JS_FreeValue(ctx, r);
 
     set_fn(wa, c"compileStreaming", wa_compile_streaming, 1);
+    let instantiate_poly = c"(()=>{const W=globalThis.WebAssembly;\
+W.instantiateStreaming=async(s,i)=>{\
+const module=await W.compileStreaming(s);\
+const instance=await W.instantiate(module,i);\
+return {module,instance};};})()";
+    let r = JS_Eval(
+      ctx,
+      instantiate_poly.as_ptr(),
+      instantiate_poly.to_bytes().len(),
+      c"<wasm-instantiate-streaming>".as_ptr(),
+      JS_EVAL_TYPE_GLOBAL,
+    );
+    JS_FreeValue(ctx, r);
   }
 }
 

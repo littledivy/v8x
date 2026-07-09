@@ -317,6 +317,7 @@ pub(crate) struct IsoState {
 
   // Snapshot support (see snapshot.rs). `snap` records on SnapshotCreator
   // isolates; `restored` holds a parsed blob to replay into new contexts.
+  pub is_snapshot_creator: bool,
   /// Per-context AddData slot counters (SnapshotCreator::AddData returns the
   /// data index; the tape replays slots in call order).
   pub ctx_data_counts: HashMap<usize, usize>,
@@ -707,7 +708,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
-  unsafe { JS_SetMaxStackSize(rt, 8 * 1024 * 1024) };
+  unsafe { JS_SetMaxStackSize(rt, 1024 * 1024) };
   // deno's V8 lets `Atomics.wait` block the main isolate (deno isn't a browser);
   // QuickJS gates it behind can_block (default false → "cannot block in this
   // thread"). Enable to match.
@@ -781,6 +782,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     named_handler_class_id,
     main_ctx_claimed: false,
     extra_contexts: Vec::new(),
+    is_snapshot_creator: false,
     ctx_data_counts: HashMap::new(),
     iso_data_count: 0,
     iso_added_contexts: 0,

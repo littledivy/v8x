@@ -2896,6 +2896,22 @@ unsafe extern "C" fn global_define_property_trampoline(
       };
 
       let mut intercepted = false;
+      if let Some(descriptor) = entry.handler.descriptor {
+        let (state, value) = unsafe {
+          call_named_getter(ctx, target, atom, &entry.handler, descriptor)
+        };
+        if state < 0 {
+          unsafe {
+            JS_FreeAtom(ctx, atom);
+            free_parsed_define_descriptor(ctx, desc);
+          }
+          return jsv_exception();
+        }
+        if state > 0 {
+          unsafe { JS_FreeValue(ctx, value) };
+        }
+      }
+
       if desc.flags & JS_PROP_HAS_VALUE_QJS != 0 {
         if let Some(setter) = entry.handler.setter {
           let state = unsafe {
@@ -3627,8 +3643,18 @@ pub extern "C" fn v8__Function__Call(
   for i in 0..n {
     args.push(jsval_of(unsafe { *argv.add(i) }));
   }
+  let saved_pending = unsafe {
+    if JS_HasException(ctx) {
+      Some(JS_GetException(ctx))
+    } else {
+      None
+    }
+  };
   let r = unsafe { JS_Call(ctx, func, recv_v, n as c_int, args.as_mut_ptr()) };
   if jsv_is_exception(&r) {
+    if let Some(saved) = saved_pending {
+      unsafe { JS_FreeValue(ctx, saved) };
+    }
     if std::env::var("V82JSC_DEBUG").is_ok() {
       unsafe {
         let exc = JS_GetException(ctx);
@@ -3649,6 +3675,11 @@ pub extern "C" fn v8__Function__Call(
   }
 
   let h = intern::<Value>(r);
+  if let Some(saved) = saved_pending {
+    unsafe {
+      JS_Throw(ctx, saved);
+    }
+  }
   h
 }
 
@@ -4645,7 +4676,10 @@ fn install_global_define_property_handler(
   global: JSValue,
   handler: &NamedHandler,
 ) {
-  if handler.setter.is_none() && handler.definer.is_none() {
+  if handler.setter.is_none()
+    && handler.definer.is_none()
+    && handler.descriptor.is_none()
+  {
     return;
   }
 

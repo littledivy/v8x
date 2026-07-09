@@ -59,7 +59,7 @@ jobs:
           git -C ../deno checkout -q FETCH_HEAD
           sed "s#/Users/divy/gh/v82jsc#${GITHUB_WORKSPACE}#g" \
             tools/deno/deno-jsc-integration.patch > /tmp/deno.patch
-          git -C ../deno apply --3way /tmp/deno.patch || git -C ../deno apply /tmp/deno.patch
+          (cd ../deno && patch -p1 < /tmp/deno.patch)
           perl -0pi -e 's/"engine_jsc", "vendor_jsc"/${{ matrix.features }}/g' ../deno/Cargo.toml
 
       - uses: Swatinem/rust-cache@v2

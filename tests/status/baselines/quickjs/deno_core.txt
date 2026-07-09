@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=deno_core.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 393 passing. DO NOT hand-sort; the
+# (run.mjs --update). 426 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 deno_core::arena::raw_arena::tests::test_add_clear_many
 deno_core::arena::raw_arena::tests::test_add_remove_many
@@ -97,11 +97,14 @@ deno_core::modules::tests::builtin_core_module
 deno_core::modules::tests::dyn_import_borrow_mut_error
 deno_core::modules::tests::dyn_import_err
 deno_core::modules::tests::dyn_import_ok
+deno_core::modules::tests::dyn_import_recurse_err
+deno_core::modules::tests::dynamic_imports_snapshot
 deno_core::modules::tests::evaluate_already_evaluated_module
 deno_core::modules::tests::evaluate_already_evaluated_module_sync
 deno_core::modules::tests::ext_module_loader_relative
 deno_core::modules::tests::import_meta_filename_dirname
 deno_core::modules::tests::import_meta_resolve
+deno_core::modules::tests::import_meta_snapshot
 deno_core::modules::tests::invalid_utf8_module
 deno_core::modules::tests::loader_disappears_after_error
 deno_core::modules::tests::main_and_side_module
@@ -114,14 +117,17 @@ deno_core::modules::tests::test_concurrent_redirect_load
 deno_core::modules::tests::test_custom_module_type_callback_computed
 deno_core::modules::tests::test_custom_module_type_callback_synthetic
 deno_core::modules::tests::test_custom_module_type_default
+deno_core::modules::tests::test_dyn_import_async_graph_with_lazy_esm_no_stall
 deno_core::modules::tests::test_json_text_bytes_modules
 deno_core::modules::tests::test_lazy_load_esm_evaluates_pre_instantiated_sibling
 deno_core::modules::tests::test_lazy_loaded_esm
 deno_core::modules::tests::test_lazy_loaded_esm_aliased_specifier
 deno_core::modules::tests::test_lazy_loaded_esm_aliased_via_import
 deno_core::modules::tests::test_lazy_loaded_esm_concurrent_loads
+deno_core::modules::tests::test_lazy_loaded_esm_with_tla_no_panic
 deno_core::modules::tests::test_lazy_loaded_script
 deno_core::modules::tests::test_lazy_loaded_script_not_found
+deno_core::modules::tests::test_load_with_code_cache
 deno_core::modules::tests::test_mods
 deno_core::modules::tests::test_native_external_source_map_with_relative_path
 deno_core::modules::tests::test_native_source_map_synthetic_bundle_path
@@ -180,6 +186,7 @@ deno_core::runtime::ops::tests::test_op_64
 deno_core::runtime::ops::tests::test_op_add
 deno_core::runtime::ops::tests::test_op_add_option
 deno_core::runtime::ops::tests::test_op_add_smi
+deno_core::runtime::ops::tests::test_op_arraybuffer_slice
 deno_core::runtime::ops::tests::test_op_async_buffer
 deno_core::runtime::ops::tests::test_op_async_deferred
 deno_core::runtime::ops::tests::test_op_async_external
@@ -195,6 +202,7 @@ deno_core::runtime::ops::tests::test_op_bool
 deno_core::runtime::ops::tests::test_op_bool_to_from_v8
 deno_core::runtime::ops::tests::test_op_bool_to_from_v8_error
 deno_core::runtime::ops::tests::test_op_buffer_any
+deno_core::runtime::ops::tests::test_op_buffer_any_length
 deno_core::runtime::ops::tests::test_op_buffer_bytesmut
 deno_core::runtime::ops::tests::test_op_buffer_copy
 deno_core::runtime::ops::tests::test_op_buffer_jsbuffer
@@ -216,16 +224,24 @@ deno_core::runtime::ops::tests::test_typed_external
 deno_core::runtime::tests::error::fast_call_error_preserves_class
 deno_core::runtime::tests::error::syntax_error
 deno_core::runtime::tests::error::test_error_builder
+deno_core::runtime::tests::jsrealm::es_snapshot
 deno_core::runtime::tests::jsrealm::js_realm_ref_unref_ops
 deno_core::runtime::tests::jsrealm::lazy
+deno_core::runtime::tests::jsrealm::test_set_format_exception_callback_realms
 deno_core::runtime::tests::misc::dangling_shared_isolate
+deno_core::runtime::tests::misc::esm_extensions_throws
+deno_core::runtime::tests::misc::eval_context_with_code_cache
+deno_core::runtime::tests::misc::foreground_tasks_delivered_without_tokio_handle
 deno_core::runtime::tests::misc::generic_in_extension_middleware
+deno_core::runtime::tests::misc::global_template_middleware
 deno_core::runtime::tests::misc::icu
 deno_core::runtime::tests::misc::inspector
 deno_core::runtime::tests::misc::task_spawner
 deno_core::runtime::tests::misc::task_spawner_cross_thread
 deno_core::runtime::tests::misc::task_spawner_cross_thread_blocking
 deno_core::runtime::tests::misc::terminate_during_module_eval
+deno_core::runtime::tests::misc::terminate_execution
+deno_core::runtime::tests::misc::terminate_execution_run_event_loop_js
 deno_core::runtime::tests::misc::test_dynamic_import_module_error_stack
 deno_core::runtime::tests::misc::test_execute_script_return_value
 deno_core::runtime::tests::misc::test_get_module_namespace
@@ -287,8 +303,12 @@ deno_core::runtime::tests::misc::test_resolve_value::case_14
 deno_core::runtime::tests::misc::test_resolve_value::case_15
 deno_core::runtime::tests::misc::test_set_macrotask_callback_set_next_tick_callback
 deno_core::runtime::tests::misc::test_stalled_tla
+deno_core::runtime::tests::misc::test_timer_return_protocol_keeps_timers_armed_from_promise_hook
+deno_core::runtime::tests::misc::test_timer_return_protocol_keeps_timers_armed_from_run_next_ticks
 deno_core::runtime::tests::misc::test_v8_platform
 deno_core::runtime::tests::misc::test_wakers_for_async_ops
+deno_core::runtime::tests::misc::tla_in_esm_extensions_panics
+deno_core::runtime::tests::misc::wasm_streaming_op_invocation_in_import
 deno_core::runtime::tests::ops::duplicate_op_names
 deno_core::runtime::tests::ops::ops_in_js_have_proper_names
 deno_core::runtime::tests::ops::test_async_op_serialize_object_with_numbers_as_keys
@@ -305,6 +325,16 @@ deno_core::runtime::tests::ops::test_op_return_serde_v8_error
 deno_core::runtime::tests::ops::test_ref_unref_ops
 deno_core::runtime::tests::ops::test_sync_op_serialize_object_with_numbers_as_keys
 deno_core::runtime::tests::ops::test_top_level_await
+deno_core::runtime::tests::snapshot::es_snapshot
+deno_core::runtime::tests::snapshot::es_snapshot_without_runtime_module_loader
+deno_core::runtime::tests::snapshot::lazy_loaded_esm_not_snapshotted_but_metadata_survives
+deno_core::runtime::tests::snapshot::snapshot_with_additional_extensions
+deno_core::runtime::tests::snapshot::test_from_snapshot
+deno_core::runtime::tests::snapshot::test_snapshot_callbacks
+deno_core::runtime::tests::snapshot::test_snapshot_creator
+deno_core::runtime::tests::snapshot::test_snapshot_creator_warmup
+deno_core::runtime::tests::snapshot::will_snapshot
+deno_core::runtime::tests::snapshot::will_snapshot2
 deno_core::source_map::tests::test_source_map_relative_path_existing_file
 deno_core::source_map::tests::test_source_map_relative_path_nonexistent_file
 deno_core::source_map::tests::test_source_mapper
@@ -392,6 +422,9 @@ deno_core::webidl::tests::nullable
 deno_core::webidl::tests::r#enum
 deno_core::webidl::tests::record
 deno_core::webidl::tests::sequence
+deno_core::webidl::tests::sequence_check_next_method_once
+deno_core::webidl::tests::sequence_next_method_must_be_callable
+deno_core::webidl::tests::sequence_propagates_next_getter_exception
 deno_core::webidl::tests::string
 deno_core::webidl::tests::unrestricted_double
 deno_core::webidl::tests::unrestricted_float

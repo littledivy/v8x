@@ -245,6 +245,8 @@ thread_local! {
 
     static AFTER_FIRST_EVAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 
+    static MODULE_EVAL_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+
     static RESOLVED_SPECIFIERS: RefCell<HashMap<(std::string::String, std::string::String), std::string::String>> =
         RefCell::new(HashMap::new());
 
@@ -921,6 +923,34 @@ fn mark_all_modules_evaluated() {
   AFTER_FIRST_EVAL.with(|f| f.set(true));
 }
 
+struct ModuleEvalGuard {
+  nested: bool,
+}
+
+impl ModuleEvalGuard {
+  fn should_drain_jobs(&self) -> bool {
+    !self.nested
+  }
+}
+
+impl Drop for ModuleEvalGuard {
+  fn drop(&mut self) {
+    MODULE_EVAL_DEPTH.with(|depth| {
+      depth.set(depth.get().saturating_sub(1));
+    });
+  }
+}
+
+fn enter_module_eval() -> ModuleEvalGuard {
+  MODULE_EVAL_DEPTH.with(|depth| {
+    let current = depth.get();
+    depth.set(current.saturating_add(1));
+    ModuleEvalGuard {
+      nested: current != 0,
+    }
+  })
+}
+
 #[allow(dead_code)]
 fn after_first_eval() -> bool {
   AFTER_FIRST_EVAL.with(|f| f.get())
@@ -929,6 +959,46 @@ fn after_first_eval() -> bool {
 /// Public key for a module wrapper: the underlying JS object pointer.
 pub(crate) fn module_obj_key(this: *const Module) -> usize {
   handle_key(this)
+}
+
+pub(crate) fn module_name_for_value(v: JSValue) -> Option<std::string::String> {
+  if v.tag >= 0 {
+    return None;
+  }
+  let key = unsafe { v.u.ptr as usize };
+  MODULE_STATE.with(|t| t.borrow().get(&key).map(|m| m.module_name.clone()))
+}
+
+pub(crate) struct ModuleSnapshotInfo {
+  pub name: std::string::String,
+  pub source: Option<std::string::String>,
+  pub evaluated: bool,
+}
+
+pub(crate) fn module_snapshot_info_for_value(
+  v: JSValue,
+) -> Option<ModuleSnapshotInfo> {
+  if v.tag >= 0 {
+    return None;
+  }
+  let key = unsafe { v.u.ptr as usize };
+  MODULE_STATE.with(|t| {
+    t.borrow().get(&key).map(|m| {
+      let source = if m.source_text.is_empty() {
+        lookup_module_source_by_name(&m.module_name)
+      } else {
+        Some(m.source_text.clone())
+      };
+      let evaluated = matches!(m.status, ModuleStatus::Evaluated)
+        || (!m.module_def.is_null()
+          && unsafe { v82jsc_module_is_evaluated(m.module_def) != 0 });
+      ModuleSnapshotInfo {
+        name: m.module_name.clone(),
+        source,
+        evaluated,
+      }
+    })
+  })
 }
 
 #[inline]
@@ -1498,12 +1568,21 @@ fn extract_attr_type(stmt: &str) -> Option<std::string::String> {
 }
 
 fn has_top_level_await(src: &str) -> bool {
-  for line in src.lines() {
+  let mut depth = 0usize;
+  for mut line in src.lines() {
+    if let Some((before, _)) = line.split_once("//") {
+      line = before;
+    }
     let t = line.trim_start();
-    if (t.starts_with("await ") || t.starts_with("for await"))
-      && !line.starts_with("  ")
-    {
+    if depth == 0 && (t.starts_with("await ") || t.starts_with("for await")) {
       return true;
+    }
+    for ch in line.chars() {
+      match ch {
+        '{' | '(' | '[' => depth = depth.saturating_add(1),
+        '}' | ')' | ']' => depth = depth.saturating_sub(1),
+        _ => {}
+      }
     }
   }
   false
@@ -1539,6 +1618,7 @@ pub(crate) fn register_module_source(name: &str, source: &str) {
   if name.is_empty() {
     return;
   }
+  super::core::register_script_source(name, source);
   MODULE_SOURCES_BY_NAME.with(|t| {
     t.borrow_mut().insert(name.to_string(), source.to_string());
   });
@@ -1645,6 +1725,12 @@ pub(crate) fn refresh_tape_module_state(
       m.status = ModuleStatus::Evaluated;
     });
   }
+}
+
+pub(crate) fn mark_tape_module_evaluated(wrapper: *const Module) {
+  with_module_state(wrapper, |m| {
+    m.status = ModuleStatus::Evaluated;
+  });
 }
 
 /// True when `p` is a registered module WRAPPER handle. Module identity in
@@ -3349,6 +3435,36 @@ fn make_resolved_promise(ctx: *mut JSContext) -> *const Value {
   intern::<Value>(r)
 }
 
+fn make_rejected_promise(ctx: *mut JSContext, reason: JSValue) -> *const Value {
+  let mut funcs: [JSValue; 2] = [jsv_undefined(), jsv_undefined()];
+  let promise = unsafe { JS_NewPromiseCapability(ctx, funcs.as_mut_ptr()) };
+  if promise.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe {
+      JS_FreeValue(ctx, exc);
+      JS_FreeValue(ctx, reason);
+    }
+    return intern::<Value>(jsv_undefined());
+  }
+  let resolve = funcs[0];
+  let reject = funcs[1];
+  let mut args = [reason];
+  let r =
+    unsafe { JS_Call(ctx, reject, jsv_undefined(), 1, args.as_mut_ptr()) };
+  if r.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+  } else {
+    unsafe { JS_FreeValue(ctx, r) };
+  }
+  unsafe {
+    JS_FreeValue(ctx, reason);
+    JS_FreeValue(ctx, resolve);
+    JS_FreeValue(ctx, reject);
+  }
+  intern::<Value>(promise)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__Evaluate(
   this: *const Module,
@@ -3374,6 +3490,8 @@ pub extern "C" fn v8__Module__Evaluate(
   } else {
     iso_state(iso).rt
   };
+  let evaluate_called_reentrantly =
+    MODULE_EVAL_DEPTH.with(|depth| depth.get() != 0);
   // If `Isolate::TerminateExecution` is pending, V8's `Module::Evaluate` returns
   // an empty handle so the embedder surfaces the termination (deno's mod_evaluate
   // then sends `ExecutionTerminated`). Mirror that here: otherwise the per-op
@@ -3477,16 +3595,19 @@ pub extern "C" fn v8__Module__Evaluate(
           },
         );
         let mv = unsafe { JS_DupValue(ctx, mv) };
+        let eval_guard = enter_module_eval();
         let result = unsafe { JS_EvalFunction(ctx, mv) };
-        unsafe { drain_jobs(rt) };
+        if eval_guard.should_drain_jobs() {
+          unsafe { drain_jobs(rt) };
+        }
         if result.tag == JS_TAG_EXCEPTION {
           let exc = unsafe { JS_GetException(ctx) };
           if std::env::var_os("QJS_DEBUG_MOD").is_some() {
             let s = unsafe { jsval_to_rust(ctx, exc) };
             eprintln!("[qjs Evaluate reuse {module_name}] exception: {s}");
           }
-          unsafe { JS_FreeValue(ctx, exc) };
-          return make_resolved_promise(ctx);
+          with_module_state(this, |m| m.status = ModuleStatus::Errored);
+          return make_rejected_promise(ctx, exc);
         }
         return intern::<Value>(result);
       }
@@ -3504,8 +3625,11 @@ pub extern "C" fn v8__Module__Evaluate(
 
   let mut async_promise: Option<JSValue> = None;
   if let Some(bc) = bytecode {
+    let eval_guard = enter_module_eval();
     let result = unsafe { JS_EvalFunction(ctx, bc) };
-    unsafe { drain_jobs(rt) };
+    if eval_guard.should_drain_jobs() {
+      unsafe { drain_jobs(rt) };
+    }
     if result.tag == JS_TAG_EXCEPTION {
       let exc = unsafe { JS_GetException(ctx) };
       if !iso.is_null() {
@@ -3514,12 +3638,19 @@ pub extern "C" fn v8__Module__Evaluate(
           eprintln!("[qjs] Module::evaluate exception: {s}");
         }
       }
-      unsafe { JS_FreeValue(ctx, exc) };
+      with_module_state(this, |m| m.status = ModuleStatus::Errored);
+      return make_rejected_promise(ctx, exc);
     } else if result.tag == JS_TAG_OBJECT
       && unsafe { JS_IsPromise(result) }
       && unsafe { JS_PromiseState(ctx, result) } == 0
     {
       async_promise = Some(result);
+    } else if result.tag == JS_TAG_OBJECT
+      && unsafe { JS_IsPromise(result) }
+      && unsafe { JS_PromiseState(ctx, result) } == 2
+    {
+      with_module_state(this, |m| m.status = ModuleStatus::Errored);
+      return intern::<Value>(result);
     } else {
       unsafe { JS_FreeValue(ctx, result) };
     }
@@ -3569,11 +3700,15 @@ pub extern "C" fn v8__Module__Evaluate(
         }
       }
 
+      let mut should_drain_jobs = true;
       let result = if let Some(mv) = module_val {
         let def = unsafe { mv.u.ptr } as *mut JSModuleDef;
         with_module_state(this, |m| m.module_def = def);
         unsafe { populate_import_meta(ctx, def, &module_name_dbg) };
-        unsafe { JS_EvalFunction(ctx, mv) }
+        let eval_guard = enter_module_eval();
+        let result = unsafe { JS_EvalFunction(ctx, mv) };
+        should_drain_jobs = eval_guard.should_drain_jobs();
+        result
       } else if let Ok(csrc) = CString::new(source_text.clone()) {
         unsafe {
           JS_Eval(
@@ -3597,7 +3732,9 @@ pub extern "C" fn v8__Module__Evaluate(
       } else {
         None
       };
-      unsafe { drain_jobs(rt) };
+      if should_drain_jobs {
+        unsafe { drain_jobs(rt) };
+      }
       if let Some(exc) = sync_exc {
         let s = unsafe { jsval_to_rust(ctx, exc) };
         if !s.is_empty() {
@@ -3613,7 +3750,8 @@ pub extern "C" fn v8__Module__Evaluate(
             unsafe { JS_FreeValue(ctx, stk) };
           }
         }
-        unsafe { JS_FreeValue(ctx, exc) };
+        with_module_state(this, |m| m.status = ModuleStatus::Errored);
+        return make_rejected_promise(ctx, exc);
       } else {
         if std::env::var_os("QJS_DEBUG_MOD").is_some() {
           if result.tag == JS_TAG_OBJECT && unsafe { JS_IsPromise(result) } {
@@ -3636,11 +3774,15 @@ pub extern "C" fn v8__Module__Evaluate(
             eprintln!("[QJS Evaluate-result] tag={}", result.tag);
           }
         }
-        if result.tag == JS_TAG_OBJECT
-          && unsafe { JS_IsPromise(result) }
-          && unsafe { JS_PromiseState(ctx, result) } == 0
-        {
-          async_promise = Some(result);
+        if result.tag == JS_TAG_OBJECT && unsafe { JS_IsPromise(result) } {
+          match unsafe { JS_PromiseState(ctx, result) } {
+            0 => async_promise = Some(result),
+            2 => {
+              with_module_state(this, |m| m.status = ModuleStatus::Errored);
+              return intern::<Value>(result);
+            }
+            _ => unsafe { JS_FreeValue(ctx, result) },
+          }
         } else if result.tag != JS_TAG_UNDEFINED {
           unsafe { JS_FreeValue(ctx, result) };
         }
@@ -3684,14 +3826,77 @@ pub extern "C" fn v8__Module__Evaluate(
   unsafe {
     JS_FreeValue(ctx, resolve);
     JS_FreeValue(ctx, reject);
-    drain_jobs(rt);
+    if !evaluate_called_reentrantly {
+      drain_jobs(rt);
+    }
   }
   intern::<Value>(promise)
 }
 
+fn module_key_for_name(name: &str) -> Option<usize> {
+  MODULE_WRAPPER_BY_NAME.with(|t| {
+    t.borrow().get(name).and_then(|v| {
+      if v.tag < 0 {
+        Some(unsafe { v.u.ptr as usize })
+      } else {
+        None
+      }
+    })
+  })
+}
+
+fn module_graph_is_async_key(
+  key: usize,
+  visited: &mut std::collections::HashSet<usize>,
+) -> bool {
+  if !visited.insert(key) {
+    return false;
+  }
+  let Some((is_async, base, specs)) = MODULE_STATE.with(|t| {
+    t.borrow().get(&key).map(|m| {
+      (
+        m.is_async,
+        m.module_name.clone(),
+        m.import_specifiers
+          .iter()
+          .map(|(spec, _)| spec.clone())
+          .collect::<Vec<_>>(),
+      )
+    })
+  }) else {
+    return false;
+  };
+  if is_async {
+    return true;
+  }
+  for spec in specs {
+    let mut candidates = Vec::new();
+    if let Some(resolved) = lookup_resolved_specifier(&base, &spec) {
+      candidates.push(resolved);
+    }
+    candidates.push(spec.clone());
+    candidates.push(resolve_relative_specifier(&base, &spec));
+    if let Some(resolved) = lookup_resolved_specifier_any(&spec) {
+      candidates.push(resolved);
+    }
+    for name in candidates {
+      let Some(child_key) = module_key_for_name(&name) else {
+        continue;
+      };
+      if module_graph_is_async_key(child_key, visited) {
+        return true;
+      }
+    }
+  }
+  false
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__IsGraphAsync(this: *const Module) -> bool {
-  with_module_state(this, |m| m.is_async).unwrap_or(false)
+  module_graph_is_async_key(
+    handle_key(this),
+    &mut std::collections::HashSet::new(),
+  )
 }
 
 #[unsafe(no_mangle)]

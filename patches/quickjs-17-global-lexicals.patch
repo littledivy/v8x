@@ -1,0 +1,21 @@
+diff --git a/quickjs.c b/quickjs.c
+index 11caae0..11caae0 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1637,7 +1637,16 @@ JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
+ {
+     return js_dup(v);
+ }
+ 
++/* v82jsc: expose the hidden object QuickJS uses for global lexical
++   declarations (`let`/`const`). The snapshot shim serializes this separately
++   from the global object so restored contexts keep lexical bindings. */
++JSValue v82jsc_global_var_obj(JSContext *ctx) {
++    if (!ctx)
++        return JS_UNDEFINED;
++    return js_dup(ctx->global_var_obj);
++}
++
+ static void js_trigger_gc(JSRuntime *rt, size_t size)
+ {
+     bool force_gc;

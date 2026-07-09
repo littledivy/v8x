@@ -123,6 +123,47 @@ unsafe fn make_named_error(message: *const String, name: &str) -> JSValue {
   err
 }
 
+unsafe fn make_named_error_from_str(
+  ctx: *mut JSContext,
+  name: &str,
+  message: &str,
+) -> JSValue {
+  if ctx.is_null() {
+    return jsv_undefined();
+  }
+  let global = JS_GetGlobalObject(ctx);
+  let cname = match std::ffi::CString::new(name) {
+    Ok(c) => c,
+    Err(_) => {
+      JS_FreeValue(ctx, global);
+      return jsv_undefined();
+    }
+  };
+  let ctor = JS_GetPropertyStr(ctx, global, cname.as_ptr());
+  JS_FreeValue(ctx, global);
+  if ctor.tag == JS_TAG_EXCEPTION || !JS_IsConstructor(ctx, ctor) {
+    JS_FreeValue(ctx, ctor);
+    return jsv_undefined();
+  }
+  let cmessage = match std::ffi::CString::new(message) {
+    Ok(c) => c,
+    Err(_) => {
+      JS_FreeValue(ctx, ctor);
+      return jsv_undefined();
+    }
+  };
+  let msg = JS_NewString(ctx, cmessage.as_ptr());
+  let mut args = [msg];
+  let err = JS_CallConstructor(ctx, ctor, 1, args.as_mut_ptr());
+  JS_FreeValue(ctx, ctor);
+  JS_FreeValue(ctx, msg);
+  if err.tag == JS_TAG_EXCEPTION {
+    clear_pending(ctx);
+    return jsv_undefined();
+  }
+  err
+}
+
 unsafe fn read_num_prop(
   ctx: *mut JSContext,
   obj: JSValue,
@@ -972,6 +1013,13 @@ unsafe fn tc_ctx(this: *const TryCatch) -> *mut JSContext {
   st.contexts.last().copied().unwrap_or(st.ctx)
 }
 
+unsafe fn tc_iso(this: *const TryCatch) -> *mut RealIsolate {
+  if this.is_null() {
+    return ptr::null_mut();
+  }
+  *(this as *const usize).add(0) as *mut RealIsolate
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TryCatch__DESTRUCT(this: *mut usize) {
   if this.is_null() {
@@ -1000,8 +1048,11 @@ pub extern "C" fn v8__TryCatch__HasCaught(this: *const TryCatch) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TryCatch__HasTerminated(this: *const TryCatch) -> bool {
-  let _ = this;
-  false
+  if this.is_null() {
+    return false;
+  }
+  let isolate = unsafe { tc_iso(this) };
+  !isolate.is_null() && iso_state(isolate).is_terminating()
 }
 
 #[unsafe(no_mangle)]
@@ -1013,6 +1064,14 @@ pub extern "C" fn v8__TryCatch__Exception(
   }
   unsafe {
     let ctx = tc_ctx(this);
+    let isolate = tc_iso(this);
+    if !isolate.is_null() && iso_state(isolate).is_terminating() {
+      return intern::<Value>(make_named_error_from_str(
+        ctx,
+        "Error",
+        "execution terminated",
+      ));
+    }
     match peek_pending(ctx) {
       Some(exc) => intern::<Value>(exc),
       None => ptr::null(),
@@ -1387,6 +1446,8 @@ pub extern "C" fn v8__TryCatch__StackTrace(
 thread_local! {
   static PREPARE_STACK_ACTIVE: std::cell::Cell<bool> =
     const { std::cell::Cell::new(false) };
+  static PREPARE_STACK_SUPPRESS_DEPTH: std::cell::Cell<u32> =
+    const { std::cell::Cell::new(0) };
 
   // deno's native PrepareStackTraceCallback (registered via
   // v8__Isolate__SetPrepareStackTraceCallback). QuickJS has no engine hook for
@@ -1401,6 +1462,24 @@ thread_local! {
 
 pub(crate) fn is_prepare_stack_active() -> bool {
   PREPARE_STACK_ACTIVE.with(|c| c.get())
+}
+
+fn is_prepare_stack_suppressed() -> bool {
+  PREPARE_STACK_SUPPRESS_DEPTH.with(|c| c.get() != 0)
+}
+
+pub(crate) fn with_prepare_stack_suppressed<T>(f: impl FnOnce() -> T) -> T {
+  struct Guard;
+
+  impl Drop for Guard {
+    fn drop(&mut self) {
+      PREPARE_STACK_SUPPRESS_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+    }
+  }
+
+  PREPARE_STACK_SUPPRESS_DEPTH.with(|c| c.set(c.get().saturating_add(1)));
+  let _guard = Guard;
+  f()
 }
 
 /// Store deno's native PrepareStackTraceCallback so our `Error.prepareStackTrace`
@@ -1620,6 +1699,9 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
   argv: *mut JSValue,
 ) -> JSValue {
   if argc < 2 || argv.is_null() || ctx.is_null() {
+    return jsv_undefined();
+  }
+  if is_prepare_stack_suppressed() {
     return jsv_undefined();
   }
   let error = unsafe { *argv.add(0) };
