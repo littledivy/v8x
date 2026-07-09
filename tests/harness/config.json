@@ -66,8 +66,6 @@
       "ignore_by_backend": {
         "quickjs": [
           "modules::tests::dyn_import_recurse_err",
-          "runtime::tests::misc::terminate_execution",
-          "runtime::tests::misc::terminate_execution_run_event_loop_js",
           "runtime::tests::misc::terminate_execution_webassembly",
           "runtime::tests::misc::test_heap_limit_cb_multiple",
           "runtime::tests::misc::test_heap_limits"
