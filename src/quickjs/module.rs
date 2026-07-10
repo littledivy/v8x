@@ -4137,7 +4137,7 @@ pub extern "C" fn v8__Module__Evaluate(
 
   let (bytecode, source_text, source_name, module_name) =
     with_module_state(this, |m| {
-      m.status = ModuleStatus::Evaluating;
+      m.status = ModuleStatus::Evaluated;
       (
         m.bytecode.take(),
         m.source_text.clone(),
