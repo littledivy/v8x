@@ -1,6 +1,6 @@
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -7857,6 +7857,44 @@ static const char *get_func_name(JSContext *ctx, JSValueConst func)
+@@ -7857,6 +7857,50 @@ static const char *get_func_name(JSContext *ctx, JSValueConst func)
      return JS_ToCString(ctx, val);
  }
  
@@ -16,6 +16,8 @@
 +        JSObject *p;
 +        const char *function_name = "";
 +        const char *filename = "";
++        bool function_name_allocated = false;
++        bool filename_allocated = false;
 +        uint32_t pc_value = 0;
 +        int line_num, column_num;
 +
@@ -25,19 +27,23 @@
 +        if (!js_class_has_bytecode(p->class_id))
 +            continue;
 +        b = p->u.func.function_bytecode;
-+        if (b->func_name != JS_ATOM_NULL)
++        if (b->func_name != JS_ATOM_NULL) {
 +            function_name = JS_AtomToCString(b->realm, b->func_name);
-+        if (b->filename != JS_ATOM_NULL)
++            function_name_allocated = function_name != NULL;
++        }
++        if (b->filename != JS_ATOM_NULL) {
 +            filename = JS_AtomToCString(b->realm, b->filename);
++            filename_allocated = filename != NULL;
++        }
 +        if (sf->cur_pc && sf->cur_pc >= b->byte_code_buf &&
 +            sf->cur_pc <= b->byte_code_buf + b->byte_code_len) {
 +            pc_value = sf->cur_pc - b->byte_code_buf;
 +        }
 +        line_num = find_line_num(b->realm, b, pc_value, &column_num);
 +        visitor(opaque, function_name, filename, line_num, column_num);
-+        if (function_name && function_name[0] != '\0')
++        if (function_name_allocated)
 +            JS_FreeCString(b->realm, function_name);
-+        if (filename && filename[0] != '\0')
++        if (filename_allocated)
 +            JS_FreeCString(b->realm, filename);
 +    }
 +}
