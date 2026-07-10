@@ -1,0 +1,34 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -49251,10 +49251,13 @@ static int to_utf32_buf(JSContext *ctx, JSString *p, uint32_t **pbuf)
+     return j;
+ }
+ 
++extern int v82jsc_locale_compare_utf32(const uint32_t *left, int left_len,
++                                       const uint32_t *right, int right_len);
++
+ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv)
+ {
+-    int i, n, an, bn, cmp;
++    int an, bn, cmp;
+     uint32_t *as, *bs, *ts;
+     JSValue a, b, ret;
+ 
+@@ -49294,14 +49297,7 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
+     js_free(ctx, bs);
+     bs = ts;
+ 
+-    n = min_int(an, bn);
+-    for (i = 0; i < n; i++)
+-        if (as[i] != bs[i])
+-            break;
+-    if (i < n)
+-        cmp = compare_u32(as[i], bs[i]);
+-    else
+-        cmp = compare_u32(an, bn);
++    cmp = v82jsc_locale_compare_utf32(as, an, bs, bn);
+     ret = js_int32(cmp);
+ 
+ exception:

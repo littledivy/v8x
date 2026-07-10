@@ -25,11 +25,67 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::os::raw::{c_char, c_int};
 use std::ptr;
+use std::sync::OnceLock;
 
 const K_NULL_TERMINATE: int =
   crate::binding::v8_String_WriteFlags_kNullTerminate as int;
 const K_MAX_STRING_LENGTH: usize =
   crate::binding::v8__String__kMaxLength as usize;
+
+fn default_locale_compare(left: &str, right: &str) -> std::cmp::Ordering {
+  static COLLATOR: OnceLock<Option<icu_collator::CollatorBorrowed<'static>>> =
+    OnceLock::new();
+  let collator = COLLATOR.get_or_init(|| {
+    icu_collator::Collator::try_new(
+      icu_locale::locale!("en-US").into(),
+      Default::default(),
+    )
+    .ok()
+  });
+  collator
+    .as_ref()
+    .map(|collator| collator.compare(left, right))
+    .unwrap_or_else(|| left.cmp(right))
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn v82jsc_locale_compare_utf32(
+  left: *const u32,
+  left_len: c_int,
+  right: *const u32,
+  right_len: c_int,
+) -> c_int {
+  if left_len < 0
+    || right_len < 0
+    || (left.is_null() && left_len != 0)
+    || (right.is_null() && right_len != 0)
+  {
+    return 0;
+  }
+  let left = if left_len == 0 {
+    &[]
+  } else {
+    unsafe { std::slice::from_raw_parts(left, left_len as usize) }
+  };
+  let right = if right_len == 0 {
+    &[]
+  } else {
+    unsafe { std::slice::from_raw_parts(right, right_len as usize) }
+  };
+  let left: std::string::String = left
+    .iter()
+    .filter_map(|&c| std::char::from_u32(c))
+    .collect();
+  let right: std::string::String = right
+    .iter()
+    .filter_map(|&c| std::char::from_u32(c))
+    .collect();
+  match default_locale_compare(&left, &right) {
+    std::cmp::Ordering::Less => -1,
+    std::cmp::Ordering::Equal => 0,
+    std::cmp::Ordering::Greater => 1,
+  }
+}
 
 #[repr(C)]
 struct ExternalOneByteMeta {
@@ -831,4 +887,22 @@ pub extern "C" fn v8__String__NewExternalTwoByteStatic(
   let handle = v8__String__NewFromTwoByte(isolate, buffer, 0, length);
   remember_external_twobyte(handle);
   handle
+}
+
+#[cfg(test)]
+mod tests {
+  use super::default_locale_compare;
+  use std::cmp::Ordering;
+
+  #[test]
+  fn default_locale_compare_matches_v8() {
+    assert_eq!(
+      default_locale_compare("assert.ts", "assert_equals.ts"),
+      Ordering::Greater
+    );
+    assert_eq!(default_locale_compare("a-b", "ab"), Ordering::Less);
+    assert_eq!(default_locale_compare("A", "a"), Ordering::Greater);
+    assert_eq!(default_locale_compare("\u{e4}", "z"), Ordering::Less);
+    assert_eq!(default_locale_compare("2", "10"), Ordering::Greater);
+  }
 }
