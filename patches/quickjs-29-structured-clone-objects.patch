@@ -1,0 +1,43 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -39538,9 +39538,40 @@
+     return -1;
+ }
+ 
++static int JS_WritePlainObject(BCWriterState *s, JSValueConst obj)
++{
++    JSPropertyEnum *props = NULL;
++    JSValue value = JS_UNDEFINED;
++    uint32_t len = 0, i;
++    int ret = -1;
+ 
++    bc_put_u8(s, BC_TAG_OBJECT);
++    if (JS_GetOwnPropertyNames(s->ctx, &props, &len, obj,
++                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0)
++        goto done;
++    bc_put_leb128(s, len);
++    for (i = 0; i < len; i++) {
++        if (bc_put_atom(s, props[i].atom))
++            goto done;
++        value = JS_GetProperty(s->ctx, obj, props[i].atom);
++        if (JS_IsException(value) || JS_WriteObjectRec(s, value))
++            goto done;
++        JS_FreeValue(s->ctx, value);
++        value = JS_UNDEFINED;
++    }
++    ret = 0;
++
++ done:
++    JS_FreeValue(s->ctx, value);
++    if (props)
++        js_free_prop_enum(s->ctx, props, len);
++    return ret;
++}
++
+ static int JS_WriteObjectTag(BCWriterState *s, JSValueConst obj)
+ {
++    if (!s->allow_bytecode || !s->allow_reference)
++        return JS_WritePlainObject(s, obj);
+     bc_put_u8(s, BC_TAG_SNAPSHOT_OBJECT);
+     return JS_WriteSnapshotObjectState(s, obj, false, false, true);
+ }
