@@ -335,6 +335,9 @@ thread_local! {
     static RESOLVED_MODULE_TARGETS: RefCell<HashMap<(std::string::String, std::string::String), usize>> =
         RefCell::new(HashMap::new());
 
+    static ATTRIBUTED_MODULE_DEFS: RefCell<std::collections::HashSet<usize>> =
+        RefCell::new(std::collections::HashSet::new());
+
     static SYNTHETIC_EXPORTS: RefCell<HashMap<usize, Vec<(std::string::String, JSValue)>>> =
         RefCell::new(HashMap::new());
 
@@ -1073,6 +1076,17 @@ fn record_resolved_module_target(
     return;
   }
   let key = static_import_attribute_key(attributes);
+  if !key.is_empty() {
+    if let Some(module_def) =
+      with_module_state(module, |state| state.module_def)
+    {
+      if !module_def.is_null() {
+        ATTRIBUTED_MODULE_DEFS.with(|defs| {
+          defs.borrow_mut().insert(module_def as usize);
+        });
+      }
+    }
+  }
   RESOLVED_MODULE_TARGETS.with(|targets| {
     targets
       .borrow_mut()
@@ -2323,6 +2337,7 @@ pub(crate) fn clear_thread_module_caches() {
   MODULE_SOURCES_BY_NAME.with(|c| c.borrow_mut().clear());
   MODULE_DEF_CACHE.with(|c| c.borrow_mut().clear());
   RESOLVED_MODULE_TARGETS.with(|c| c.borrow_mut().clear());
+  ATTRIBUTED_MODULE_DEFS.with(|c| c.borrow_mut().clear());
   SYNTHETIC_EXPORTS.with(|c| c.borrow_mut().clear());
   SYNTHETIC_NS_EXPORTS.with(|c| c.borrow_mut().clear());
   SYNTHETIC_DEFS.with(|c| c.borrow_mut().clear());
@@ -2598,7 +2613,15 @@ unsafe fn load_module_by_name(
   };
 
   let existing = if allow_existing {
-    unsafe { v82jsc_get_loaded_module(ctx, name_c.as_ptr()) }
+    let existing = unsafe { v82jsc_get_loaded_module(ctx, name_c.as_ptr()) };
+    let is_attributed = !existing.is_null()
+      && ATTRIBUTED_MODULE_DEFS
+        .with(|defs| defs.borrow().contains(&(existing as usize)));
+    if is_attributed {
+      ptr::null_mut()
+    } else {
+      existing
+    }
   } else {
     ptr::null_mut()
   };
@@ -2700,6 +2723,11 @@ pub(crate) unsafe extern "C" fn module_loader_callback(
     });
     if let Some((module_def, target_name)) = target {
       if !module_def.is_null() {
+        if !attribute_key.is_empty() {
+          ATTRIBUTED_MODULE_DEFS.with(|defs| {
+            defs.borrow_mut().insert(module_def as usize);
+          });
+        }
         return module_def;
       }
 
@@ -2708,8 +2736,18 @@ pub(crate) unsafe extern "C" fn module_loader_callback(
       } else {
         target_name.as_str()
       };
-      let module_def = unsafe { load_module_by_name(ctx, target_name, false) };
+      // Plain modules retain QuickJS's name-based identity, including reuse of
+      // an in-flight definition while linking cycles. Attributed requests must
+      // bypass that registry because the same name can select another module.
+      let module_def = unsafe {
+        load_module_by_name(ctx, target_name, attribute_key.is_empty())
+      };
       if !module_def.is_null() {
+        if !attribute_key.is_empty() {
+          ATTRIBUTED_MODULE_DEFS.with(|defs| {
+            defs.borrow_mut().insert(module_def as usize);
+          });
+        }
         MODULE_STATE.with(|states| {
           if let Some(state) = states.borrow_mut().get_mut(&module_key) {
             state.module_def = module_def;
