@@ -1,0 +1,76 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -30153,14 +30153,6 @@
+                                 JSAtom module_name)
+ {
+     JSReqModuleEntry *rme;
+-    int i;
+-
+-    /* no need to add the module request if it is already present */
+-    for(i = 0; i < m->req_module_entries_count; i++) {
+-        rme = &m->req_module_entries[i];
+-        if (rme->module_name == module_name)
+-            return i;
+-    }
+ 
+     if (js_resize_array(ctx, (void **)&m->req_module_entries,
+                         sizeof(JSReqModuleEntry),
+@@ -30171,7 +30163,7 @@
+     rme->module_name = JS_DupAtom(ctx, module_name);
+     rme->module = NULL;
+     rme->attributes = JS_UNDEFINED;
+-    return i;
++    return m->req_module_entries_count - 1;
+ }
+ 
+ #endif // QJS_DISABLE_PARSER
+@@ -30450,12 +30442,15 @@
+         return NULL;
+     }
+ 
+-    /* first look at the loaded modules */
+-    m = js_find_loaded_module(ctx, module_name);
+-    if (m) {
+-        js_free(ctx, cname);
+-        JS_FreeAtom(ctx, module_name);
+-        return m;
++    /* An attributes-aware host owns module identity because the same normalized
++       name may resolve to different modules for different attributes. */
++    if (!rt->module_loader_has_attr) {
++        m = js_find_loaded_module(ctx, module_name);
++        if (m) {
++            js_free(ctx, cname);
++            JS_FreeAtom(ctx, module_name);
++            return m;
++        }
+     }
+ 
+     JS_FreeAtom(ctx, module_name);
+@@ -38153,7 +38148,7 @@
+     BC_TAG_SNAPSHOT_INTRINSIC,
+ } BCTagEnum;
+ 
+-#define BC_VERSION 26
++#define BC_VERSION 27
+ 
+ typedef struct BCWriterState {
+     JSContext *ctx;
+@@ -39205,6 +39200,8 @@
+     for(i = 0; i < m->req_module_entries_count; i++) {
+         JSReqModuleEntry *rme = &m->req_module_entries[i];
+         bc_put_atom(s, rme->module_name);
++        if (JS_WriteObjectRec(s, rme->attributes))
++            goto fail;
+     }
+ 
+     bc_put_leb128(s, m->export_entries_count);
+@@ -41087,6 +41084,9 @@
+             JSModuleDef **pm = &rme->module;
+             if (bc_get_atom(s, &rme->module_name))
+                 goto fail;
++            rme->attributes = JS_ReadObjectRec(s);
++            if (JS_IsException(rme->attributes))
++                goto fail;
+             // Resolves a module either from the cache or by requesting
+             // it from the module loader. From cache is not ideal because
+             // the module may not be the one it was a time of serialization

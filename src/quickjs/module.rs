@@ -67,16 +67,36 @@ unsafe extern "C" {
     val: JSValue,
     flags: int,
   ) -> int;
+  fn JS_GetProperty(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: JSAtom,
+  ) -> JSValue;
+  fn JS_GetOwnPropertyNames(
+    ctx: *mut JSContext,
+    ptab: *mut *mut ModulePropertyEnum,
+    plen: *mut u32,
+    obj: JSValue,
+    flags: int,
+  ) -> int;
+}
+
+#[repr(C)]
+struct ModulePropertyEnum {
+  is_enumerable: bool,
+  atom: JSAtom,
 }
 
 const JS_PROP_CONFIGURABLE: int = 1 << 0;
 const JS_PROP_WRITABLE: int = 1 << 1;
 const JS_PROP_ENUMERABLE: int = 1 << 2;
+const JS_GPN_STRING_MASK: int = 1 << 0;
+const JS_GPN_ENUM_ONLY: int = 1 << 4;
 
 const JS_WRITE_OBJ_BYTECODE: int = 1 << 0;
 const JS_READ_OBJ_BYTECODE: int = 1 << 0;
 
-const BC_MAGIC: u32 = 0x5142_4302;
+const BC_MAGIC: u32 = 0x5142_4303;
 
 fn bc_cache_dir() -> Option<std::path::PathBuf> {
   use std::sync::OnceLock;
@@ -135,8 +155,41 @@ pub(crate) fn fast_content_hash(seed: u64, bytes: &[u8]) -> u64 {
   h ^ (bytes.len() as u64)
 }
 
-pub(crate) fn bc_key(source: &str) -> u64 {
-  fast_content_hash(BC_MAGIC as u64, source.as_bytes())
+pub(crate) fn bc_key(source: &str, module_name: &str) -> u64 {
+  let seed = fast_content_hash(BC_MAGIC as u64, module_name.as_bytes());
+  fast_content_hash(seed, source.as_bytes())
+}
+
+#[cfg(test)]
+mod cache_key_tests {
+  use super::*;
+
+  #[test]
+  fn module_bytecode_cache_key_includes_name() {
+    assert_ne!(
+      bc_key("export const value = 1;", "file:///a.ts"),
+      bc_key("export const value = 1;", "file:///b.ts")
+    );
+  }
+
+  #[test]
+  fn import_attribute_keys_are_canonical() {
+    let first = import_attribute_key(vec![
+      ("type".to_string(), "bytes".to_string()),
+      ("mode".to_string(), "strict".to_string()),
+    ]);
+    let reordered = import_attribute_key(vec![
+      ("mode".to_string(), "strict".to_string()),
+      ("type".to_string(), "bytes".to_string()),
+    ]);
+    let different = import_attribute_key(vec![
+      ("mode".to_string(), "strict".to_string()),
+      ("type".to_string(), "text".to_string()),
+    ]);
+
+    assert_eq!(first, reordered);
+    assert_ne!(first, different);
+  }
 }
 
 /// QuickJS takes source as a pointer plus an explicit length, but its parser
@@ -277,6 +330,9 @@ thread_local! {
         RefCell::new(HashMap::new());
 
     static MODULE_DEF_CACHE: RefCell<HashMap<std::string::String, usize>> =
+        RefCell::new(HashMap::new());
+
+    static RESOLVED_MODULE_TARGETS: RefCell<HashMap<(std::string::String, std::string::String), usize>> =
         RefCell::new(HashMap::new());
 
     static SYNTHETIC_EXPORTS: RefCell<HashMap<usize, Vec<(std::string::String, JSValue)>>> =
@@ -676,6 +732,78 @@ unsafe fn build_static_import_attrs(
   arr
 }
 
+fn import_attribute_key(
+  mut pairs: Vec<(std::string::String, std::string::String)>,
+) -> std::string::String {
+  pairs.sort_unstable();
+  let mut key = std::string::String::new();
+  for (name, value) in pairs {
+    key.push_str(&format!("{}:{name}{}:{value}", name.len(), value.len()));
+  }
+  key
+}
+
+fn static_import_attribute_key(
+  pairs: &[ImportAttribute],
+) -> std::string::String {
+  import_attribute_key(
+    pairs
+      .iter()
+      .map(|(name, value, _)| (name.clone(), value.clone()))
+      .collect(),
+  )
+}
+
+unsafe fn module_import_attribute_key(
+  ctx: *mut JSContext,
+  attributes: JSValue,
+) -> std::string::String {
+  if !jsv_is_object(&attributes) {
+    return std::string::String::new();
+  }
+  let mut properties: *mut ModulePropertyEnum = ptr::null_mut();
+  let mut len = 0u32;
+  if unsafe {
+    JS_GetOwnPropertyNames(
+      ctx,
+      &mut properties,
+      &mut len,
+      attributes,
+      JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY,
+    )
+  } < 0
+  {
+    let exception = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exception) };
+    return std::string::String::new();
+  }
+
+  let mut pairs = Vec::with_capacity(len as usize);
+  for index in 0..len as usize {
+    let atom = unsafe { (*properties.add(index)).atom };
+    let name = unsafe { JS_AtomToString(ctx, atom) };
+    let value = unsafe { JS_GetProperty(ctx, attributes, atom) };
+    if name.tag != JS_TAG_EXCEPTION && value.tag != JS_TAG_EXCEPTION {
+      pairs.push((unsafe { jsval_to_rust(ctx, name) }, unsafe {
+        jsval_to_rust(ctx, value)
+      }));
+    }
+    if name.tag == JS_TAG_EXCEPTION || value.tag == JS_TAG_EXCEPTION {
+      let exception = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exception) };
+    }
+    unsafe {
+      JS_FreeValue(ctx, name);
+      JS_FreeValue(ctx, value);
+      JS_FreeAtom(ctx, atom);
+    }
+  }
+  if !properties.is_null() {
+    unsafe { js_free(ctx, properties.cast::<std::os::raw::c_void>()) };
+  }
+  import_attribute_key(pairs)
+}
+
 unsafe extern "C" fn dynamic_import_hook(
   ctx: *mut JSContext,
   basename: JSValue,
@@ -934,6 +1062,34 @@ fn record_resolved_specifier(base: &str, spec: &str, resolved: &str) {
     t.borrow_mut()
       .insert((base.to_string(), spec.to_string()), resolved.to_string());
   });
+}
+
+fn record_resolved_module_target(
+  resolved: &str,
+  attributes: &[ImportAttribute],
+  module: *const Module,
+) {
+  if resolved.is_empty() || module.is_null() {
+    return;
+  }
+  let key = static_import_attribute_key(attributes);
+  RESOLVED_MODULE_TARGETS.with(|targets| {
+    targets
+      .borrow_mut()
+      .insert((resolved.to_string(), key), handle_key(module));
+  });
+}
+
+fn lookup_resolved_module_target(
+  resolved: &str,
+  attributes: &str,
+) -> Option<usize> {
+  RESOLVED_MODULE_TARGETS.with(|targets| {
+    targets
+      .borrow()
+      .get(&(resolved.to_string(), attributes.to_string()))
+      .copied()
+  })
 }
 
 fn lookup_resolved_specifier_any(spec: &str) -> Option<std::string::String> {
@@ -2166,6 +2322,7 @@ pub(crate) fn clear_thread_module_caches() {
   MODULE_STATE.with(|c| c.borrow_mut().clear());
   MODULE_SOURCES_BY_NAME.with(|c| c.borrow_mut().clear());
   MODULE_DEF_CACHE.with(|c| c.borrow_mut().clear());
+  RESOLVED_MODULE_TARGETS.with(|c| c.borrow_mut().clear());
   SYNTHETIC_EXPORTS.with(|c| c.borrow_mut().clear());
   SYNTHETIC_NS_EXPORTS.with(|c| c.borrow_mut().clear());
   SYNTHETIC_DEFS.with(|c| c.borrow_mut().clear());
@@ -2339,6 +2496,7 @@ unsafe fn build_resolution_map(
       if let Some(rname) =
         with_module_state(resolved, |st| st.module_name.clone())
       {
+        record_resolved_module_target(&rname, attr_pairs, resolved);
         if !rname.is_empty() && rname != spec {
           record_resolved_specifier(&base, &spec, &rname);
         }
@@ -2423,15 +2581,11 @@ unsafe fn resolve_source_import(
   }
 }
 
-pub(crate) unsafe extern "C" fn module_loader_callback(
+unsafe fn load_module_by_name(
   ctx: *mut JSContext,
-  module_name: *const std::os::raw::c_char,
-  _opaque: *mut std::os::raw::c_void,
+  name: &str,
+  allow_existing: bool,
 ) -> *mut JSModuleDef {
-  let name = match unsafe { std::ffi::CStr::from_ptr(module_name) }.to_str() {
-    Ok(s) => s,
-    Err(_) => return ptr::null_mut(),
-  };
   let Some(source) = lookup_module_source_by_name(name) else {
     if std::env::var_os("QJS_DEBUG_EXC").is_some() {
       eprintln!("[QJS module loader] no source for {name}");
@@ -2443,7 +2597,11 @@ pub(crate) unsafe extern "C" fn module_loader_callback(
     return ptr::null_mut();
   };
 
-  let existing = unsafe { v82jsc_get_loaded_module(ctx, name_c.as_ptr()) };
+  let existing = if allow_existing {
+    unsafe { v82jsc_get_loaded_module(ctx, name_c.as_ptr()) }
+  } else {
+    ptr::null_mut()
+  };
   if std::env::var_os("QJS_DEBUG_MOD").is_some() && name.contains("stream") {
     eprintln!("[loader] {name} existing_loaded={}", !existing.is_null());
   }
@@ -2454,7 +2612,7 @@ pub(crate) unsafe extern "C" fn module_loader_callback(
     return existing;
   }
 
-  let key = bc_key(&source);
+  let key = bc_key(&source, name);
   if let Some(bytes) = bc_load(key) {
     if std::env::var_os("QJS_DEBUG_MOD").is_some() && name.contains("stream") {
       eprintln!("[loader] {name} -> BYTECODE path");
@@ -2518,6 +2676,51 @@ pub(crate) unsafe extern "C" fn module_loader_callback(
   unsafe { populate_import_meta(ctx, m, name) };
 
   m
+}
+
+pub(crate) unsafe extern "C" fn module_loader_callback(
+  ctx: *mut JSContext,
+  module_name: *const std::os::raw::c_char,
+  _opaque: *mut std::os::raw::c_void,
+  attributes: JSValue,
+) -> *mut JSModuleDef {
+  let name = match unsafe { std::ffi::CStr::from_ptr(module_name) }.to_str() {
+    Ok(s) => s,
+    Err(_) => return ptr::null_mut(),
+  };
+  let attribute_key = unsafe { module_import_attribute_key(ctx, attributes) };
+
+  if let Some(module_key) = lookup_resolved_module_target(name, &attribute_key)
+  {
+    let target = MODULE_STATE.with(|states| {
+      states
+        .borrow()
+        .get(&module_key)
+        .map(|state| (state.module_def, state.module_name.clone()))
+    });
+    if let Some((module_def, target_name)) = target {
+      if !module_def.is_null() {
+        return module_def;
+      }
+
+      let target_name = if target_name.is_empty() {
+        name
+      } else {
+        target_name.as_str()
+      };
+      let module_def = unsafe { load_module_by_name(ctx, target_name, false) };
+      if !module_def.is_null() {
+        MODULE_STATE.with(|states| {
+          if let Some(state) = states.borrow_mut().get_mut(&module_key) {
+            state.module_def = module_def;
+          }
+        });
+      }
+      return module_def;
+    }
+  }
+
+  unsafe { load_module_by_name(ctx, name, true) }
 }
 
 #[unsafe(no_mangle)]
@@ -3640,7 +3843,12 @@ unsafe fn materialize_module_def(
   } else {
     iso_state(iso).rt
   };
-  let key = bc_key(&source_text);
+  let cache_name = if module_name.is_empty() {
+    "<module>"
+  } else {
+    module_name.as_str()
+  };
+  let key = bc_key(&source_text, cache_name);
   let Ok(cname) = CString::new(if module_name.is_empty() {
     "<module>".to_string()
   } else {
@@ -4021,7 +4229,12 @@ pub extern "C" fn v8__Module__Evaluate(
       unsafe { JS_FreeValue(ctx, result) };
     }
   } else if !source_text.is_empty() {
-    let key = bc_key(&source_text);
+    let cache_name = if module_name.is_empty() {
+      "<module>"
+    } else {
+      module_name.as_str()
+    };
+    let key = bc_key(&source_text, cache_name);
     let cname = CString::new(if module_name.is_empty() {
       "<module>".to_string()
     } else {

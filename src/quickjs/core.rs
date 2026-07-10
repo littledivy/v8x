@@ -744,7 +744,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   unsafe { JS_SetSharedArrayBufferFunctions(rt, sab_funcs_table()) };
 
   unsafe {
-    JS_SetModuleLoaderFunc(
+    JS_SetModuleLoaderFunc2(
       rt,
       if std::env::var_os("QJS_NO_NORM").is_some() {
         None
@@ -752,6 +752,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
         Some(super::module::module_normalize_callback)
       },
       Some(super::module::module_loader_callback),
+      None,
       ptr::null_mut(),
     )
   };

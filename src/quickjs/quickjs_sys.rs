@@ -251,6 +251,20 @@ pub type JSModuleLoaderFunc = unsafe extern "C" fn(
   opaque: *mut c_void,
 ) -> *mut JSModuleDef;
 
+pub type JSModuleLoaderFunc2 = unsafe extern "C" fn(
+  ctx: *mut JSContext,
+  module_name: *const c_char,
+  opaque: *mut c_void,
+  attributes: JSValue,
+) -> *mut JSModuleDef;
+
+pub type JSModuleCheckSupportedImportAttributes = unsafe extern "C" fn(
+  ctx: *mut JSContext,
+  opaque: *mut c_void,
+  attributes: JSValue,
+)
+  -> c_int;
+
 pub type JSV82jscDynImportHook = unsafe extern "C" fn(
   ctx: *mut JSContext,
   basename: JSValue,
@@ -527,6 +541,13 @@ unsafe extern "C" {
     rt: *mut JSRuntime,
     normalize: Option<JSModuleNormalizeFunc>,
     loader: Option<JSModuleLoaderFunc>,
+    opaque: *mut c_void,
+  );
+  pub fn JS_SetModuleLoaderFunc2(
+    rt: *mut JSRuntime,
+    normalize: Option<JSModuleNormalizeFunc>,
+    loader: Option<JSModuleLoaderFunc2>,
+    check_attributes: Option<JSModuleCheckSupportedImportAttributes>,
     opaque: *mut c_void,
   );
   pub fn JS_GetModuleName(ctx: *mut JSContext, m: *mut JSModuleDef) -> JSAtom;
