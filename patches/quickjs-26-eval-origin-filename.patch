@@ -1,0 +1,43 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -37918,7 +37918,9 @@
+                              JSValueConst val, int flags, int scope_idx)
+ {
+     JSValue ret;
+-    const char *str;
++    JSStackFrame *sf;
++    JSAtom filename_atom = JS_ATOM_NULL;
++    const char *str, *filename = "<input>";
+     size_t len;
+ 
+     if (!JS_IsString(val))
+@@ -37926,7 +37928,28 @@
+     str = JS_ToCStringLen(ctx, &len, val);
+     if (!str)
+         return JS_EXCEPTION;
+-    ret = JS_EvalInternal(ctx, this_obj, str, len, "<input>", 1, flags, scope_idx);
++    for (sf = ctx->rt->current_stack_frame; sf; sf = sf->prev_frame) {
++        if (JS_VALUE_GET_TAG(sf->cur_func) == JS_TAG_OBJECT) {
++            JSObject *p = JS_VALUE_GET_OBJ(sf->cur_func);
++            if (js_class_has_bytecode(p->class_id)) {
++                filename_atom = JS_DupAtom(ctx, p->u.func.function_bytecode->filename);
++                break;
++            }
++        }
++    }
++    if (filename_atom != JS_ATOM_NULL) {
++        filename = JS_AtomToCString(ctx, filename_atom);
++        if (!filename) {
++            JS_FreeAtom(ctx, filename_atom);
++            JS_FreeCString(ctx, str);
++            return JS_EXCEPTION;
++        }
++    }
++    ret = JS_EvalInternal(ctx, this_obj, str, len, filename, 1, flags, scope_idx);
++    if (filename_atom != JS_ATOM_NULL) {
++        JS_FreeCString(ctx, filename);
++        JS_FreeAtom(ctx, filename_atom);
++    }
+     JS_FreeCString(ctx, str);
+     return ret;
+ 

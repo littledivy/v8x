@@ -215,6 +215,48 @@ mod raw_smoke_test {
       JS_FreeRuntime(rt);
     }
   }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
+  fn function_constructor_preserves_caller_resource_name() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source =
+        CString::new("new Function('return new Error().stack')()").unwrap();
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.as_bytes().len(),
+        c"function-origin-test.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "eval threw");
+
+      let mut len = 0;
+      let text = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!text.is_null());
+      let actual =
+        std::str::from_utf8(std::slice::from_raw_parts(text as *const u8, len))
+          .unwrap();
+      assert!(
+        actual.contains("function-origin-test.js"),
+        "generated function stack did not preserve caller resource name: {actual}"
+      );
+      assert!(
+        !actual.contains("<input>"),
+        "unexpected synthetic name: {actual}"
+      );
+
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
 }
 
 #[cfg(test)]
