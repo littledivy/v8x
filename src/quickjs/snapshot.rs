@@ -20,7 +20,7 @@ use std::ptr;
 use super::quickjs_sys::*;
 use crate::{Data, FunctionCallback, FunctionTemplate, RealIsolate};
 
-const MAGIC: &[u8; 8] = b"V8XSNP1\0";
+const MAGIC: &[u8; 8] = b"V8XSNP2\0";
 const DATA_MAGIC: &[u8; 8] = b"V8XSDAT\0";
 const NO_REF_INDEX: u32 = u32::MAX;
 const GLOBAL_VALUE: u8 = 0;
@@ -112,6 +112,7 @@ pub(crate) struct SnapshotBlob {
 
 #[derive(Clone)]
 pub(crate) struct ContextSnapshot {
+  pub global_object: Option<Vec<u8>>,
   pub globals: Vec<GlobalEntry>,
   pub lexical_globals: Vec<GlobalEntry>,
   pub embedder_data: Vec<Option<Vec<u8>>>,
@@ -197,14 +198,12 @@ fn current_snapshot_external_references() -> Vec<usize> {
 }
 
 /// Structured-clone one JS value to bytes (no bytecode: plain data graph).
-pub(crate) fn serialize_value(
-  ctx: *mut JSContext,
-  v: JSValue,
-) -> Option<Vec<u8>> {
+#[cfg(test)]
+fn serialize_value(ctx: *mut JSContext, v: JSValue) -> Option<Vec<u8>> {
   serialize_value_with_refs(ctx, v, &[])
 }
 
-fn serialize_value_with_refs(
+pub(crate) fn serialize_value_with_refs(
   ctx: *mut JSContext,
   v: JSValue,
   external_refs: &[usize],
@@ -678,7 +677,8 @@ fn decode_special_data(
       Some(unsafe { JS_DupValue(ctx, super::core::jsval_of(module)) })
     }
     SNAPSHOT_DATA_HOST_FUNCTION => {
-      let callback = input.get_ref_slot()?.resolve(external_refs);
+      let callback_slot = input.get_ref_slot()?;
+      let callback = callback_slot.resolve(external_refs);
       if callback == 0 {
         return None;
       }
@@ -885,10 +885,21 @@ pub(crate) fn capture_context(
   external_refs: &[usize],
   context_data: &[Vec<u8>],
 ) -> ContextSnapshot {
+  let global_object = unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let bytes = write_object_bytes(ctx, global, external_refs);
+    JS_FreeValue(ctx, global);
+    bytes
+  };
   ContextSnapshot {
-    globals: capture_globals(ctx, external_refs),
+    globals: if global_object.is_some() {
+      Vec::new()
+    } else {
+      capture_globals(ctx, external_refs)
+    },
+    global_object,
     lexical_globals: capture_global_lexicals(ctx, external_refs),
-    embedder_data: capture_embedder_data(ctx),
+    embedder_data: capture_embedder_data(ctx, external_refs),
     context_data: context_data.to_vec(),
   }
 }
@@ -901,6 +912,11 @@ pub(crate) fn replay_context(
 ) {
   if isolate.is_null() || ctx.is_null() {
     return;
+  }
+  if let Some(bytes) = &snapshot.global_object
+    && let Some(global) = deserialize_value_with_refs(ctx, bytes, external_refs)
+  {
+    unsafe { JS_FreeValue(ctx, global) };
   }
   unsafe {
     let global = JS_GetGlobalObject(ctx);
@@ -1126,10 +1142,16 @@ fn capture_global_lexicals(
   out
 }
 
-fn capture_embedder_data(ctx: *mut JSContext) -> Vec<Option<Vec<u8>>> {
+fn capture_embedder_data(
+  ctx: *mut JSContext,
+  external_refs: &[usize],
+) -> Vec<Option<Vec<u8>>> {
   super::misc::embedder_data_snapshot(ctx)
     .into_iter()
-    .map(|value| value.and_then(|value| serialize_value(ctx, value)))
+    .map(|value| {
+      value
+        .and_then(|value| serialize_value_with_refs(ctx, value, external_refs))
+    })
     .collect()
 }
 
@@ -1287,6 +1309,7 @@ fn decode_blob(bytes: &[u8]) -> Option<SnapshotBlob> {
 }
 
 fn put_context(out: &mut Vec<u8>, context: &ContextSnapshot) {
+  put_opt_bytes(out, &context.global_object);
   put_vec(out, &context.globals, put_global);
   put_vec(out, &context.lexical_globals, put_global);
   put_vec(out, &context.embedder_data, put_opt_bytes);
@@ -1453,6 +1476,7 @@ impl<'a> Reader<'a> {
 
   fn get_context(&mut self) -> Option<ContextSnapshot> {
     Some(ContextSnapshot {
+      global_object: self.get_opt_bytes()?,
       globals: self.get_vec(Reader::get_global)?,
       lexical_globals: self.get_vec(Reader::get_global)?,
       embedder_data: self.get_vec(Reader::get_opt_bytes)?,
@@ -1579,6 +1603,101 @@ mod tests {
         JS_FreeContext(self.context);
         JS_FreeRuntime(self.runtime);
       }
+    }
+  }
+
+  unsafe extern "C" fn snapshot_callback_a(
+    _info: *const crate::FunctionCallbackInfo,
+  ) {
+  }
+
+  unsafe extern "C" fn snapshot_callback_b(
+    _info: *const crate::FunctionCallbackInfo,
+  ) {
+  }
+
+  #[test]
+  fn host_functions_resolve_external_reference_slots() {
+    let test = TestContext::new();
+    let function = unsafe {
+      super::super::function::make_function_len(
+        test.context,
+        snapshot_callback_a,
+        jsv_undefined(),
+        0,
+        false,
+      )
+    };
+    let source_refs = [snapshot_callback_a as *const () as usize, 0];
+    let bytes =
+      serialize_value_with_refs(test.context, function, &source_refs).unwrap();
+    assert_eq!(
+      u32::from_le_bytes(bytes[9..13].try_into().unwrap()),
+      0,
+      "callback must be stored by external-reference index",
+    );
+
+    let target_refs = [snapshot_callback_b as *const () as usize, 0];
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &target_refs).unwrap();
+    let info =
+      super::super::function::snapshot_function_info(restored).unwrap();
+    assert_eq!(
+      info.callback as *const () as usize,
+      snapshot_callback_b as *const () as usize,
+    );
+
+    unsafe {
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, function);
+    }
+  }
+
+  #[test]
+  fn context_global_roundtrips_as_one_object_graph() {
+    let source = TestContext::new();
+    let setup = source.eval(
+      "(() => {\
+         const brand = Symbol('brand');\
+         class Root {}\
+         Object.setPrototypeOf(globalThis, Root.prototype);\
+         globalThis[brand] = brand;\
+         globalThis.alias = globalThis;\
+         globalThis.verifySnapshot = () =>\
+           (Object.getPrototypeOf(globalThis) === Root.prototype ? 1 : 0) +\
+           (globalThis[brand] === brand ? 2 : 0) +\
+           (globalThis.alias === globalThis ? 4 : 0);\
+       })()",
+    );
+    unsafe { JS_FreeValue(source.context, setup) };
+    let source_global = unsafe { JS_GetGlobalObject(source.context) };
+    let bytes = write_object_bytes(source.context, source_global, &[]).unwrap();
+    unsafe { JS_FreeValue(source.context, source_global) };
+
+    let target = TestContext::new();
+    let restored =
+      deserialize_value_with_refs(target.context, &bytes, &[]).unwrap();
+
+    unsafe {
+      let target_global = JS_GetGlobalObject(target.context);
+      assert_eq!(restored.tag, JS_TAG_OBJECT);
+      assert_eq!(restored.u.ptr, target_global.u.ptr);
+      let verify = JS_GetPropertyStr(
+        target.context,
+        target_global,
+        c"verifySnapshot".as_ptr(),
+      );
+      let result =
+        JS_Call(target.context, verify, target_global, 0, ptr::null_mut());
+      assert!(!jsv_is_exception(&result));
+      let mut checks = 0;
+      assert_eq!(JS_ToInt32(target.context, &mut checks, result), 0);
+      assert_eq!(checks, 7);
+
+      JS_FreeValue(target.context, result);
+      JS_FreeValue(target.context, verify);
+      JS_FreeValue(target.context, target_global);
+      JS_FreeValue(target.context, restored);
     }
   }
 

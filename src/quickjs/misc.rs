@@ -1162,7 +1162,11 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_isolate(
       &external_refs,
     )
   } else {
-    super::snapshot::serialize_value(ctx, jsval_of(data))
+    super::snapshot::serialize_value_with_refs(
+      ctx,
+      jsval_of(data),
+      &external_refs,
+    )
   }
   .unwrap_or_default();
   let st = crate::quickjs::core::iso_state(iso);
@@ -1197,7 +1201,11 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
       &external_refs,
     )
   } else {
-    super::snapshot::serialize_value(ctx, val.unwrap())
+    super::snapshot::serialize_value_with_refs(
+      ctx,
+      val.unwrap(),
+      &external_refs,
+    )
   };
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
     let Some(val) = val else {
