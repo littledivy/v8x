@@ -1,0 +1,19 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -44384,10 +44384,12 @@
+ 
+     if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
+         return JS_ThrowTypeErrorNotAnObject(ctx);
+-    if (!JS_IsString(value))
+-        return JS_ThrowTypeError(ctx, "Error.prototype.stack setter expects a string");
+-    if (js_same_value(ctx, this_val, ctx->class_proto[JS_CLASS_ERROR]))
+-        return JS_ThrowTypeError(ctx, "Error.prototype.stack setter called on the home object");
++    if (js_same_value(ctx, this_val, ctx->class_proto[JS_CLASS_ERROR])) {
++        if (JS_DefinePropertyValue(ctx, this_val, JS_ATOM_stack, js_dup(value),
++                                   JS_PROP_C_W_E | JS_PROP_THROW) < 0)
++            return JS_EXCEPTION;
++        return JS_UNDEFINED;
++    }
+     ret = JS_GetOwnPropertyFlagsInternal(ctx, &flags, JS_VALUE_GET_OBJ(this_val),
+                                          JS_ATOM_stack);
+     if (ret < 0)
