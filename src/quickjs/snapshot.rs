@@ -1706,6 +1706,7 @@ mod tests {
     let test = TestContext::new();
     for source in [
       "Array",
+      "Array.fromAsync",
       "Atomics.notify",
       "Object.prototype.toLocaleString",
       "Object.getPrototypeOf((function*() {})()).next",
