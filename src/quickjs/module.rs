@@ -59,6 +59,20 @@ use crate::script_compiler::{
 };
 use crate::support::{MaybeBool, int};
 
+unsafe extern "C" {
+  fn JS_DefinePropertyValueStr(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: *const std::os::raw::c_char,
+    val: JSValue,
+    flags: int,
+  ) -> int;
+}
+
+const JS_PROP_CONFIGURABLE: int = 1 << 0;
+const JS_PROP_WRITABLE: int = 1 << 1;
+const JS_PROP_ENUMERABLE: int = 1 << 2;
+
 const JS_WRITE_OBJ_BYTECODE: int = 1 << 0;
 const JS_READ_OBJ_BYTECODE: int = 1 << 0;
 
@@ -184,6 +198,7 @@ pub(crate) unsafe fn bc_write(ctx: *mut JSContext, key: u64, obj: JSValue) {
 type ImportAttribute = (std::string::String, std::string::String, i32);
 
 struct ModuleState {
+  context: *mut JSContext,
   status: ModuleStatus,
 
   module_def: *mut JSModuleDef,
@@ -201,6 +216,7 @@ struct ModuleState {
   source_imports: Vec<(u64, std::string::String)>,
 
   synthetic: bool,
+  engine_synthetic: bool,
 
   is_async: bool,
 
@@ -973,6 +989,8 @@ pub(crate) struct ModuleSnapshotInfo {
   pub name: std::string::String,
   pub source: Option<std::string::String>,
   pub evaluated: bool,
+  pub synthetic: bool,
+  pub synthetic_exports: Vec<(std::string::String, JSValue)>,
 }
 
 pub(crate) fn module_snapshot_info_for_value(
@@ -992,13 +1010,156 @@ pub(crate) fn module_snapshot_info_for_value(
       let evaluated = matches!(m.status, ModuleStatus::Evaluated)
         || (!m.module_def.is_null()
           && unsafe { v82jsc_module_is_evaluated(m.module_def) != 0 });
+      let synthetic_exports = if m.synthetic {
+        let def = SYNTHETIC_DEFS
+          .with(|defs| defs.borrow().get(&key).copied())
+          .unwrap_or(m.module_def as usize);
+        let values = SYNTHETIC_NS_EXPORTS
+          .with(|exports| exports.borrow().get(&def).cloned())
+          .or_else(|| {
+            SYNTHETIC_EXPORTS
+              .with(|exports| exports.borrow().get(&def).cloned())
+          })
+          .unwrap_or_default();
+        let mut names = SYNTHETIC_EXPORT_NAMES
+          .with(|names| {
+            names
+              .borrow()
+              .get(&def)
+              .map(|names| names.iter().cloned().collect::<Vec<_>>())
+          })
+          .unwrap_or_else(|| {
+            values.iter().map(|(name, _)| name.clone()).collect()
+          });
+        names.sort_unstable();
+        names.dedup();
+        names
+          .into_iter()
+          .map(|name| {
+            let value = values
+              .iter()
+              .rev()
+              .find(|(candidate, _)| candidate == &name)
+              .map(|(_, value)| *value)
+              .unwrap_or_else(jsv_undefined);
+            (name, value)
+          })
+          .collect()
+      } else {
+        Vec::new()
+      };
       ModuleSnapshotInfo {
         name: m.module_name.clone(),
         source,
         evaluated,
+        synthetic: m.synthetic,
+        synthetic_exports,
       }
     })
   })
+}
+
+pub(crate) fn snapshot_module_values(ctx: *mut JSContext) -> Vec<JSValue> {
+  let mut modules = MODULE_WRAPPER_BY_NAME.with(|modules| {
+    modules
+      .borrow()
+      .iter()
+      .filter(|(_, value)| {
+        let key = if value.tag < 0 {
+          unsafe { value.u.ptr as usize }
+        } else {
+          return false;
+        };
+        MODULE_STATE.with(|states| {
+          states
+            .borrow()
+            .get(&key)
+            .is_some_and(|module| module.context == ctx)
+        })
+      })
+      .map(|(name, value)| (name.clone(), *value))
+      .collect::<Vec<_>>()
+  });
+  modules.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+  modules.into_iter().map(|(_, value)| value).collect()
+}
+
+pub(crate) fn snapshot_module_namespace(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> Option<JSValue> {
+  let key = if value.tag < 0 {
+    unsafe { value.u.ptr as usize }
+  } else {
+    return None;
+  };
+  let (status, engine_synthetic, mut def, name) =
+    MODULE_STATE.with(|modules| {
+      modules.borrow().get(&key).map(|module| {
+        (
+          clone_status(&module.status),
+          module.engine_synthetic,
+          module.module_def,
+          module.module_name.clone(),
+        )
+      })
+    })?;
+  if def.is_null()
+    && let Ok(name) = CString::new(name.as_str())
+  {
+    def = unsafe { v82jsc_get_loaded_module(ctx, name.as_ptr()) };
+  }
+  if def.is_null() {
+    def = MODULE_DEF_CACHE
+      .with(|cache| cache.borrow().get(&name).copied())
+      .unwrap_or(0) as *mut JSModuleDef;
+  }
+  let evaluated = matches!(status, ModuleStatus::Evaluated)
+    || (!def.is_null() && unsafe { v82jsc_module_is_evaluated(def) != 0 });
+  if !evaluated || def.is_null() {
+    return None;
+  }
+  if !engine_synthetic {
+    let namespace = unsafe { JS_GetModuleNamespace(ctx, def) };
+    if namespace.tag == JS_TAG_EXCEPTION {
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+      return None;
+    }
+    return Some(namespace);
+  }
+
+  let info = module_snapshot_info_for_value(value)?;
+  let namespace = unsafe { JS_NewObject(ctx) };
+  if namespace.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    return None;
+  }
+  for (name, value) in info.synthetic_exports {
+    let Ok(name) = CString::new(name) else {
+      unsafe { JS_FreeValue(ctx, namespace) };
+      return None;
+    };
+    if unsafe {
+      JS_DefinePropertyValueStr(
+        ctx,
+        namespace,
+        name.as_ptr(),
+        JS_DupValue(ctx, value),
+        JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_ENUMERABLE,
+      )
+    } < 0
+    {
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe {
+        JS_FreeValue(ctx, exc);
+        JS_FreeValue(ctx, namespace);
+      }
+      return None;
+    }
+  }
+  Some(namespace)
 }
 
 #[inline]
@@ -1733,6 +1894,15 @@ pub(crate) fn mark_tape_module_evaluated(wrapper: *const Module) {
   });
 }
 
+pub(crate) fn mark_tape_module_synthetic(
+  wrapper: *const Module,
+  synthetic: bool,
+) {
+  with_module_state(wrapper, |m| {
+    m.synthetic = synthetic;
+  });
+}
+
 /// True when `p` is a registered module WRAPPER handle. Module identity in
 /// every side table is the wrapper pointer itself, so handle copies
 /// (Global/Local) must preserve it — see `core::is_non_value_handle`.
@@ -1772,6 +1942,7 @@ pub(crate) fn tape_make_module_handle(
   record_module_state(
     this,
     ModuleState {
+      context: ctx,
       status: if evaluated {
         ModuleStatus::Evaluated
       } else {
@@ -1784,6 +1955,7 @@ pub(crate) fn tape_make_module_handle(
       import_attributes: Vec::new(),
       source_imports: Vec::new(),
       synthetic: false,
+      engine_synthetic: false,
       is_async: has_top_level_await(&source),
       source_text: source.clone(),
       source_name: name.to_string(),
@@ -1796,6 +1968,156 @@ pub(crate) fn tape_make_module_handle(
   this
 }
 
+pub(crate) fn restore_synthetic_module(
+  ctx: *mut JSContext,
+  name: &str,
+  exports: Vec<(std::string::String, JSValue)>,
+  evaluated: bool,
+) -> *const Module {
+  restore_module_from_snapshot_exports(ctx, name, exports, evaluated, true)
+}
+
+pub(crate) fn restore_module_from_snapshot_exports(
+  ctx: *mut JSContext,
+  name: &str,
+  exports: Vec<(std::string::String, JSValue)>,
+  evaluated: bool,
+  synthetic: bool,
+) -> *const Module {
+  let handle_val = unsafe { JS_NewObject(ctx) };
+  if handle_val.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    for (_, value) in exports {
+      unsafe { JS_FreeValue(ctx, value) };
+    }
+    return ptr::null();
+  }
+  let this = intern_module(handle_val);
+  if !restore_module_from_snapshot_exports_for_wrapper(
+    ctx, this, name, exports, evaluated, synthetic,
+  ) {
+    return ptr::null();
+  }
+  this
+}
+
+pub(crate) fn restore_module_from_snapshot_exports_in_place(
+  ctx: *mut JSContext,
+  wrapper: JSValue,
+  name: &str,
+  exports: Vec<(std::string::String, JSValue)>,
+  evaluated: bool,
+  synthetic: bool,
+) -> bool {
+  let this = &wrapper as *const JSValue as *const Module;
+  restore_module_from_snapshot_exports_for_wrapper(
+    ctx, this, name, exports, evaluated, synthetic,
+  )
+}
+
+fn restore_module_from_snapshot_exports_for_wrapper(
+  ctx: *mut JSContext,
+  this: *const Module,
+  name: &str,
+  exports: Vec<(std::string::String, JSValue)>,
+  evaluated: bool,
+  synthetic: bool,
+) -> bool {
+  let free_exports = |exports: Vec<(std::string::String, JSValue)>| {
+    for (_, value) in exports {
+      unsafe { JS_FreeValue(ctx, value) };
+    }
+  };
+  let Ok(cname) = CString::new(name) else {
+    free_exports(exports);
+    return false;
+  };
+  let def = unsafe {
+    JS_NewCModule(ctx, cname.as_ptr(), Some(synthetic_module_init_callback))
+  };
+  if def.is_null() {
+    free_exports(exports);
+    return false;
+  }
+
+  let mut export_names = std::collections::HashSet::new();
+  for (export_name, _) in &exports {
+    let Ok(export_name) = CString::new(export_name.as_str()) else {
+      free_exports(exports);
+      return false;
+    };
+    if unsafe { JS_AddModuleExport(ctx, def, export_name.as_ptr()) } < 0 {
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+      free_exports(exports);
+      return false;
+    }
+    export_names.insert(export_name.to_string_lossy().into_owned());
+  }
+
+  let key = handle_key(this);
+  SYNTHETIC_DEFS.with(|defs| {
+    defs.borrow_mut().insert(key, def as usize);
+  });
+  SYNTHETIC_EXPORT_NAMES.with(|names| {
+    names.borrow_mut().insert(def as usize, export_names);
+  });
+  SYNTHETIC_EXPORTS.with(|stored| {
+    stored.borrow_mut().insert(def as usize, exports);
+  });
+  MODULE_DEF_CACHE.with(|cache| {
+    cache.borrow_mut().insert(name.to_string(), def as usize);
+  });
+  record_module_state(
+    this,
+    ModuleState {
+      context: ctx,
+      status: ModuleStatus::Uninstantiated,
+      module_def: def,
+      bytecode: None,
+      import_specifiers: Vec::new(),
+      import_offsets: Vec::new(),
+      import_attributes: Vec::new(),
+      source_imports: Vec::new(),
+      synthetic,
+      engine_synthetic: true,
+      is_async: false,
+      source_text: std::string::String::new(),
+      source_name: name.to_string(),
+      module_name: name.to_string(),
+      script_id: assign_module_script_id(name),
+      source_map_url: None,
+    },
+  );
+  record_module_wrapper(name, this);
+
+  if evaluated {
+    let module = make_value(
+      JS_TAG_MODULE,
+      JSValueUnion {
+        ptr: def as *mut std::os::raw::c_void,
+      },
+    );
+    let module = unsafe { JS_DupValue(ctx, module) };
+    let result = unsafe { JS_EvalFunction(ctx, module) };
+    let isolate = current_iso();
+    if !isolate.is_null() {
+      unsafe { drain_jobs(iso_state(isolate).rt) };
+    }
+    if result.tag == JS_TAG_EXCEPTION {
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+      with_module_state(this, |module| module.status = ModuleStatus::Errored);
+      return false;
+    }
+    unsafe { JS_FreeValue(ctx, result) };
+    with_module_state(this, |module| module.status = ModuleStatus::Evaluated);
+  }
+
+  true
+}
+
 /// Reset every module registry on this thread. Called from
 /// `v8__Isolate__Dispose`: these thread-locals are keyed by module NAME or by
 /// pointers into the disposed runtime, so a later isolate on the same thread
@@ -1803,6 +2125,7 @@ pub(crate) fn tape_make_module_handle(
 /// would otherwise resolve its modules to dangling defs from the old runtime.
 /// Values are dropped WITHOUT JS_FreeValue — their runtime is already gone.
 pub(crate) fn clear_thread_module_caches() {
+  super::snapshot::clear_thread_snapshot_caches();
   MODULE_STATE.with(|c| c.borrow_mut().clear());
   MODULE_SOURCES_BY_NAME.with(|c| c.borrow_mut().clear());
   MODULE_DEF_CACHE.with(|c| c.borrow_mut().clear());
@@ -2549,6 +2872,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   record_module_state(
     this,
     ModuleState {
+      context: ctx,
       status: ModuleStatus::Uninstantiated,
       module_def: ptr::null_mut(),
       bytecode: None,
@@ -2557,6 +2881,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
       import_attributes,
       source_imports,
       synthetic: false,
+      engine_synthetic: false,
       is_async,
       source_text: text,
       source_name: fname.clone(),
@@ -3175,11 +3500,12 @@ pub extern "C" fn v8__Module__GetModuleNamespace(
   if ctx.is_null() {
     return ptr::null();
   }
+  super::snapshot::restore_snapshot_module_exports(ctx);
   // Synthetic modules (e.g. dynamically-imported JSON) are `JS_NewCModule`s with
   // no `func_obj`; QuickJS's `JS_GetModuleNamespace` -> `js_build_module_ns`
   // dereferences `func_obj` and segfaults. Build the namespace object directly
   // from the recorded synthetic exports instead.
-  if with_module_state(this, |m| m.synthetic).unwrap_or(false) {
+  if with_module_state(this, |m| m.engine_synthetic).unwrap_or(false) {
     let ns = unsafe { JS_NewObject(ctx) };
     if let Some(def) =
       SYNTHETIC_DEFS.with(|t| t.borrow().get(&handle_key(this)).copied())
@@ -3398,6 +3724,7 @@ pub extern "C" fn v8__Module__InstantiateModule(
   }
   let ctx = ctx_of(context);
   if !ctx.is_null() {
+    super::snapshot::restore_snapshot_module_exports(ctx);
     if !unsafe { build_resolution_map(ctx, context, cb, source_callback, this) }
     {
       return MaybeBool::Nothing;
@@ -3474,6 +3801,7 @@ pub extern "C" fn v8__Module__Evaluate(
   if ctx.is_null() {
     return ptr::null();
   }
+  super::snapshot::restore_snapshot_module_exports(ctx);
   if std::env::var_os("QJS_DEBUG_EVAL").is_some() {
     let nm =
       with_module_state(this, |m| m.source_name.clone()).unwrap_or_default();
@@ -3508,7 +3836,7 @@ pub extern "C" fn v8__Module__Evaluate(
     None
   };
 
-  if with_module_state(this, |m| m.synthetic).unwrap_or(false) {
+  if with_module_state(this, |m| m.engine_synthetic).unwrap_or(false) {
     let already_evaluated =
       with_module_state(this, |m| matches!(m.status, ModuleStatus::Evaluated))
         .unwrap_or(false);
@@ -4005,6 +4333,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
   record_module_state(
     this,
     ModuleState {
+      context: ctx,
       status: ModuleStatus::Uninstantiated,
       module_def: def,
       bytecode: None,
@@ -4013,6 +4342,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
       import_attributes: Vec::new(),
       source_imports: Vec::new(),
       synthetic: true,
+      engine_synthetic: true,
       is_async: false,
       source_map_url: None,
       source_text: std::string::String::new(),

@@ -171,6 +171,12 @@ impl ExternalRefSlot {
 thread_local! {
   static SNAPSHOT_EXTERNAL_REFERENCES: std::cell::RefCell<Vec<usize>> =
     const { std::cell::RefCell::new(Vec::new()) };
+  static CAPTURED_SNAPSHOT_MODULE_EXPORTS: std::cell::RefCell<HashMap<usize, HashSet<String>>> =
+    std::cell::RefCell::new(HashMap::new());
+}
+
+pub(crate) fn clear_thread_snapshot_caches() {
+  CAPTURED_SNAPSHOT_MODULE_EXPORTS.with(|exports| exports.borrow_mut().clear());
 }
 
 fn with_snapshot_external_references<T>(
@@ -226,11 +232,7 @@ fn serialize_value_with_refs_inner(
   allow_function_source: bool,
 ) -> Option<Vec<u8>> {
   if let Some(info) = super::module::module_snapshot_info_for_value(v) {
-    return Some(encode_module_data(
-      &info.name,
-      info.source.as_deref(),
-      info.evaluated,
-    ));
+    return encode_module_data(ctx, info, external_refs);
   }
   if let Some(info) = super::function::snapshot_function_info(v) {
     return Some(encode_function_data(info, external_refs));
@@ -435,21 +437,70 @@ fn serialize_host_object_inner(
 }
 
 fn encode_module_data(
-  name: &str,
-  source: Option<&str>,
-  evaluated: bool,
-) -> Vec<u8> {
+  ctx: *mut JSContext,
+  info: super::module::ModuleSnapshotInfo,
+  external_refs: &[usize],
+) -> Option<Vec<u8>> {
+  let registry_exports = info.evaluated
+    && (snapshot_module_exports_has(ctx, &info.name)
+      || CAPTURED_SNAPSHOT_MODULE_EXPORTS.with(|exports| {
+        exports
+          .borrow()
+          .get(&(ctx as usize))
+          .is_some_and(|names| names.contains(&info.name))
+      }));
+  let snapshot_exports = if info.synthetic && !registry_exports {
+    let exports = unsafe { JS_NewObject(ctx) };
+    if exports.tag == JS_TAG_EXCEPTION {
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+      return None;
+    }
+    for (name, value) in &info.synthetic_exports {
+      let Ok(name) = CString::new(name.as_str()) else {
+        unsafe { JS_FreeValue(ctx, exports) };
+        return None;
+      };
+      let result = unsafe {
+        JS_DefinePropertyValueStr(
+          ctx,
+          exports,
+          name.as_ptr(),
+          JS_DupValue(ctx, *value),
+          JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_ENUMERABLE,
+        )
+      };
+      if result < 0 {
+        let exc = unsafe { JS_GetException(ctx) };
+        unsafe {
+          JS_FreeValue(ctx, exc);
+          JS_FreeValue(ctx, exports);
+        }
+        return None;
+      }
+    }
+    let bytes = write_object_bytes(ctx, exports, external_refs);
+    unsafe { JS_FreeValue(ctx, exports) };
+    Some(bytes?)
+  } else {
+    None
+  };
   let mut out = Vec::with_capacity(
-    DATA_MAGIC.len() + 2 + 8 + name.len() + source.map_or(0, str::len),
+    DATA_MAGIC.len()
+      + 4
+      + 8
+      + info.name.len()
+      + info.source.as_ref().map_or(0, String::len),
   );
   out.extend_from_slice(DATA_MAGIC);
   out.push(SNAPSHOT_DATA_MODULE);
-  put_str(&mut out, name);
-  if let Some(source) = source {
-    put_str(&mut out, source);
-  }
-  out.push(u8::from(evaluated));
-  out
+  put_str(&mut out, &info.name);
+  put_opt_string(&mut out, info.source.as_deref());
+  out.push(u8::from(info.evaluated));
+  out.push(u8::from(info.synthetic));
+  out.push(u8::from(registry_exports));
+  put_opt_bytes(&mut out, &snapshot_exports);
+  Some(out)
 }
 
 fn encode_object_data() -> Vec<u8> {
@@ -668,18 +719,39 @@ fn decode_special_data(
   match input.get_u8()? {
     SNAPSHOT_DATA_MODULE => {
       let name = input.get_string()?;
-      if let Some(source) = input.get_string()
-        && !source.is_empty()
-      {
+      if let Some(source) = input.get_opt_string()? {
         super::module::register_module_source(&name, &source);
       }
-      let evaluated = input.get_u8().unwrap_or(0) != 0;
-      let module = super::module::tape_make_module_handle(ctx, &name);
+      let evaluated = input.get_u8()? != 0;
+      let synthetic = input.get_u8()? != 0;
+      let registry_exports = input.get_u8()? != 0;
+      let serialized_exports = input.get_opt_bytes()?;
+      let export_object = if registry_exports {
+        None
+      } else {
+        serialized_exports.and_then(|bytes| {
+          deserialize_value_with_refs(ctx, &bytes, external_refs)
+        })
+      };
+      let had_snapshot_exports = export_object.is_some();
+      let module = if let Some(export_object) = export_object {
+        let exports = decode_synthetic_exports(ctx, export_object);
+        unsafe { JS_FreeValue(ctx, export_object) };
+        let exports = exports?;
+        super::module::restore_module_from_snapshot_exports(
+          ctx, &name, exports, evaluated, synthetic,
+        )
+      } else {
+        super::module::tape_make_module_handle(ctx, &name)
+      };
       if module.is_null() {
         return None;
       }
+      if !had_snapshot_exports {
+        super::module::mark_tape_module_synthetic(module, synthetic);
+      }
       super::module::refresh_tape_module_state(ctx, module);
-      if evaluated {
+      if evaluated && !had_snapshot_exports {
         super::module::mark_tape_module_evaluated(module);
       }
       Some(unsafe { JS_DupValue(ctx, super::core::jsval_of(module)) })
@@ -759,23 +831,6 @@ fn decode_special_data(
       });
       if value.tag == JS_TAG_EXCEPTION {
         let exc = unsafe { JS_GetException(ctx) };
-        if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
-          let mut len = 0usize;
-          let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, exc) };
-          let message = if cstr.is_null() {
-            "<unstringifiable>".into()
-          } else {
-            let bytes =
-              unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
-            let message = String::from_utf8_lossy(bytes).into_owned();
-            unsafe { JS_FreeCString(ctx, cstr) };
-            message
-          };
-          eprintln!(
-            "[qjs snapshot] function source replay failed: {message}; source={:?}",
-            source.chars().take(240).collect::<String>()
-          );
-        }
         unsafe { JS_FreeValue(ctx, exc) };
         return None;
       }
@@ -834,6 +889,82 @@ fn decode_special_data(
   }
 }
 
+fn decode_synthetic_exports(
+  ctx: *mut JSContext,
+  object: JSValue,
+) -> Option<Vec<(String, JSValue)>> {
+  if object.tag != JS_TAG_OBJECT {
+    return None;
+  }
+  let mut exports = Vec::new();
+  unsafe {
+    let mut properties: *mut JSPropertyEnum = ptr::null_mut();
+    let mut len = 0u32;
+    if JS_GetOwnPropertyNames(
+      ctx,
+      &mut properties,
+      &mut len,
+      object,
+      JS_GPN_STRING_MASK,
+    ) < 0
+    {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      return None;
+    }
+    for property in std::slice::from_raw_parts(properties, len as usize) {
+      let Some(name) = atom_to_string(ctx, property.atom) else {
+        continue;
+      };
+      let value = JS_GetProperty(ctx, object, property.atom);
+      if value.tag == JS_TAG_EXCEPTION {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+        continue;
+      }
+      exports.push((name, value));
+    }
+    JS_FreePropertyEnum(ctx, properties, len);
+  }
+  Some(exports)
+}
+
+fn snapshot_module_export_object(
+  ctx: *mut JSContext,
+  namespace: JSValue,
+) -> Option<JSValue> {
+  let exports = decode_synthetic_exports(ctx, namespace)?;
+  let object = unsafe { JS_NewObject(ctx) };
+  if object.tag == JS_TAG_EXCEPTION {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    for (_, value) in exports {
+      unsafe { JS_FreeValue(ctx, value) };
+    }
+    return None;
+  }
+  for (name, value) in exports {
+    let Ok(name) = CString::new(name) else {
+      unsafe { JS_FreeValue(ctx, value) };
+      continue;
+    };
+    if unsafe {
+      JS_DefinePropertyValueStr(
+        ctx,
+        object,
+        name.as_ptr(),
+        value,
+        JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_ENUMERABLE,
+      )
+    } < 0
+    {
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+    }
+  }
+  Some(object)
+}
+
 pub(crate) fn external_references_from_params(
   raw_params: *const crate::isolate_create_params::raw::CreateParams,
 ) -> Vec<usize> {
@@ -888,11 +1019,236 @@ pub(crate) fn encode_blob(blob: &SnapshotBlob) -> Box<[u8]> {
   out.into_boxed_slice()
 }
 
+fn install_snapshot_module_exports(ctx: *mut JSContext) {
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let registry = JS_NewObject(ctx);
+    let mut captured_names = HashSet::new();
+    if registry.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      JS_FreeValue(ctx, global);
+      return;
+    }
+    for module in super::module::snapshot_module_values(ctx) {
+      let Some(info) = super::module::module_snapshot_info_for_value(module)
+      else {
+        continue;
+      };
+      let Some(namespace) =
+        super::module::snapshot_module_namespace(ctx, module)
+      else {
+        continue;
+      };
+      let export_object = snapshot_module_export_object(ctx, namespace);
+      JS_FreeValue(ctx, namespace);
+      let Some(export_object) = export_object else {
+        continue;
+      };
+      let Ok(name) = CString::new(info.name.as_str()) else {
+        JS_FreeValue(ctx, export_object);
+        continue;
+      };
+      if JS_DefinePropertyValueStr(
+        ctx,
+        registry,
+        name.as_ptr(),
+        export_object,
+        JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_ENUMERABLE,
+      ) < 0
+      {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+      } else {
+        captured_names.insert(info.name);
+      }
+    }
+    CAPTURED_SNAPSHOT_MODULE_EXPORTS.with(|exports| {
+      exports
+        .borrow_mut()
+        .insert(ctx as usize, captured_names.clone());
+    });
+    if captured_names.is_empty() {
+      JS_FreeValue(ctx, registry);
+      JS_FreeValue(ctx, global);
+      return;
+    }
+    if JS_DefinePropertyValueStr(
+      ctx,
+      global,
+      c"__v8x_snapshot_module_exports".as_ptr(),
+      registry,
+      JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE,
+    ) < 0
+    {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    JS_FreeValue(ctx, global);
+  }
+}
+
+fn snapshot_module_exports(ctx: *mut JSContext, name: &str) -> Option<JSValue> {
+  let name = CString::new(name).ok()?;
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let registry =
+      JS_GetPropertyStr(ctx, global, c"__v8x_snapshot_module_exports".as_ptr());
+    JS_FreeValue(ctx, global);
+    if registry.tag != JS_TAG_OBJECT {
+      if registry.tag == JS_TAG_EXCEPTION {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+      }
+      JS_FreeValue(ctx, registry);
+      return None;
+    }
+    let exports = JS_GetPropertyStr(ctx, registry, name.as_ptr());
+    JS_FreeValue(ctx, registry);
+    if exports.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      return None;
+    }
+    if jsv_is_undefined(&exports) {
+      JS_FreeValue(ctx, exports);
+      None
+    } else {
+      Some(exports)
+    }
+  }
+}
+
+fn snapshot_module_exports_has(ctx: *mut JSContext, name: &str) -> bool {
+  let Some(exports) = snapshot_module_exports(ctx, name) else {
+    return false;
+  };
+  unsafe { JS_FreeValue(ctx, exports) };
+  true
+}
+
+fn has_snapshot_module_exports_registry(ctx: *mut JSContext) -> bool {
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let registry =
+      JS_GetPropertyStr(ctx, global, c"__v8x_snapshot_module_exports".as_ptr());
+    JS_FreeValue(ctx, global);
+    let exists = registry.tag == JS_TAG_OBJECT;
+    if registry.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    JS_FreeValue(ctx, registry);
+    exists
+  }
+}
+
+fn remove_snapshot_module_export(ctx: *mut JSContext, name: &str) {
+  let Ok(name) = CString::new(name) else {
+    return;
+  };
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let registry =
+      JS_GetPropertyStr(ctx, global, c"__v8x_snapshot_module_exports".as_ptr());
+    if registry.tag != JS_TAG_OBJECT {
+      if registry.tag == JS_TAG_EXCEPTION {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+      }
+      JS_FreeValue(ctx, registry);
+      JS_FreeValue(ctx, global);
+      return;
+    }
+    if JS_DeletePropertyStr(ctx, registry, name.as_ptr(), 0) < 0 {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    let mut properties: *mut JSPropertyEnum = ptr::null_mut();
+    let mut len = 0u32;
+    let empty = JS_GetOwnPropertyNames(
+      ctx,
+      &mut properties,
+      &mut len,
+      registry,
+      JS_GPN_STRING_MASK,
+    ) >= 0
+      && len == 0;
+    if !properties.is_null() {
+      JS_FreePropertyEnum(ctx, properties, len);
+    }
+    if empty
+      && JS_DeletePropertyStr(
+        ctx,
+        global,
+        c"__v8x_snapshot_module_exports".as_ptr(),
+        0,
+      ) < 0
+    {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    JS_FreeValue(ctx, registry);
+    JS_FreeValue(ctx, global);
+  }
+}
+
+fn remove_snapshot_module_exports(ctx: *mut JSContext) {
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let result = JS_DeletePropertyStr(
+      ctx,
+      global,
+      c"__v8x_snapshot_module_exports".as_ptr(),
+      0,
+    );
+    if result < 0 {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    JS_FreeValue(ctx, global);
+  }
+}
+
+pub(crate) fn restore_snapshot_module_exports(ctx: *mut JSContext) {
+  if !has_snapshot_module_exports_registry(ctx) {
+    return;
+  }
+  let modules = super::module::snapshot_module_values(ctx);
+  for module in modules {
+    let Some(info) = super::module::module_snapshot_info_for_value(module)
+    else {
+      continue;
+    };
+    if !info.evaluated {
+      continue;
+    }
+    let Some(export_object) = snapshot_module_exports(ctx, &info.name) else {
+      continue;
+    };
+    remove_snapshot_module_export(ctx, &info.name);
+    let exports = decode_synthetic_exports(ctx, export_object);
+    unsafe { JS_FreeValue(ctx, export_object) };
+    let Some(exports) = exports else {
+      continue;
+    };
+    super::module::restore_module_from_snapshot_exports_in_place(
+      ctx,
+      module,
+      &info.name,
+      exports,
+      true,
+      info.synthetic,
+    );
+  }
+}
+
 pub(crate) fn capture_context(
   ctx: *mut JSContext,
   external_refs: &[usize],
   context_data: &[Vec<u8>],
 ) -> ContextSnapshot {
+  install_snapshot_module_exports(ctx);
   let global_object = unsafe {
     super::core::refresh_snapshot_intrinsics(ctx);
     let global = JS_GetGlobalObject(ctx);
@@ -900,17 +1256,20 @@ pub(crate) fn capture_context(
     JS_FreeValue(ctx, global);
     bytes
   };
-  ContextSnapshot {
-    globals: if global_object.is_some() {
-      Vec::new()
-    } else {
-      capture_globals(ctx, external_refs)
-    },
+  let globals = if global_object.is_some() {
+    Vec::new()
+  } else {
+    capture_globals(ctx, external_refs)
+  };
+  let snapshot = ContextSnapshot {
     global_object,
+    globals,
     lexical_globals: capture_global_lexicals(ctx, external_refs),
     embedder_data: capture_embedder_data(ctx, external_refs),
     context_data: context_data.to_vec(),
-  }
+  };
+  remove_snapshot_module_exports(ctx);
+  snapshot
 }
 
 pub(crate) fn replay_context(
@@ -928,6 +1287,7 @@ pub(crate) fn replay_context(
   {
     unsafe { JS_FreeValue(ctx, global) };
   }
+  restore_snapshot_module_exports(ctx);
   unsafe {
     let global = JS_GetGlobalObject(ctx);
     for entry in &snapshot.globals {
@@ -1384,6 +1744,16 @@ fn put_opt_bytes(out: &mut Vec<u8>, bytes: &Option<Vec<u8>>) {
   }
 }
 
+fn put_opt_string(out: &mut Vec<u8>, value: Option<&str>) {
+  match value {
+    Some(value) => {
+      out.push(1);
+      put_str(out, value);
+    }
+    None => out.push(0),
+  }
+}
+
 fn put_opt_ref_slot(out: &mut Vec<u8>, slot: Option<ExternalRefSlot>) {
   match slot {
     Some(slot) => {
@@ -1529,6 +1899,14 @@ impl<'a> Reader<'a> {
     match self.get_u8()? {
       0 => Some(None),
       1 => Some(Some(self.get_bytes()?)),
+      _ => None,
+    }
+  }
+
+  fn get_opt_string(&mut self) -> Option<Option<String>> {
+    match self.get_u8()? {
+      0 => Some(None),
+      1 => Some(Some(self.get_string()?)),
       _ => None,
     }
   }
@@ -1929,6 +2307,119 @@ mod tests {
       JS_FreeValue(test.context, evaluated);
       JS_FreeValue(test.context, module);
     }
+  }
+
+  #[test]
+  fn restored_synthetic_module_can_be_imported() {
+    let (global_bytes, module_bytes) = {
+      let source = TestContext::new();
+      let shared = source.eval("({ marker: 42 })");
+      let global = unsafe { JS_GetGlobalObject(source.context) };
+      assert_eq!(
+        unsafe {
+          JS_SetPropertyStr(
+            source.context,
+            global,
+            c"shared".as_ptr(),
+            JS_DupValue(source.context, shared),
+          )
+        },
+        1,
+      );
+      let host_function = unsafe {
+        super::super::function::make_function_len(
+          source.context,
+          snapshot_callback_a,
+          jsv_undefined(),
+          0,
+          false,
+        )
+      };
+      let module = super::super::module::restore_synthetic_module(
+        source.context,
+        "snapshot:synthetic",
+        vec![
+          ("hostFunction".to_string(), host_function),
+          ("shared".to_string(), shared),
+        ],
+        true,
+      );
+      assert!(!module.is_null());
+      install_snapshot_module_exports(source.context);
+      let global_bytes =
+        write_object_bytes(source.context, global, &[]).unwrap();
+      remove_snapshot_module_exports(source.context);
+      let module_bytes =
+        serialize_value(source.context, super::super::core::jsval_of(module))
+          .unwrap();
+      unsafe { JS_FreeValue(source.context, global) };
+      super::super::module::clear_thread_module_caches();
+      (global_bytes, module_bytes)
+    };
+
+    let target = TestContext::new();
+    let restored_global =
+      deserialize_value_with_refs(target.context, &global_bytes, &[]).unwrap();
+    let restored =
+      deserialize_value_with_refs(target.context, &module_bytes, &[]).unwrap();
+    let replayed_global =
+      deserialize_value_with_refs(target.context, &global_bytes, &[]).unwrap();
+    let global = unsafe { JS_GetGlobalObject(target.context) };
+    let restored_shared =
+      unsafe { JS_GetPropertyStr(target.context, global, c"shared".as_ptr()) };
+    assert_eq!(
+      unsafe {
+        JS_SetPropertyStr(
+          target.context,
+          restored_shared,
+          c"marker".as_ptr(),
+          JS_NewInt32(target.context, 43),
+        )
+      },
+      1,
+    );
+    unsafe {
+      JS_FreeValue(target.context, restored_shared);
+      JS_FreeValue(target.context, global);
+    }
+    restore_snapshot_module_exports(target.context);
+    let source = CString::new(
+      "import { hostFunction, shared } from 'snapshot:synthetic';\
+       globalThis.syntheticResult =\
+         `${typeof hostFunction}:${shared.marker}:${shared === globalThis.shared}`;",
+    )
+    .unwrap();
+    let consumer = unsafe {
+      JS_Eval(
+        target.context,
+        source.as_ptr(),
+        source.as_bytes().len(),
+        c"snapshot-consumer.js".as_ptr(),
+        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+      )
+    };
+    assert_eq!(consumer.tag, JS_TAG_MODULE);
+    let result = unsafe { JS_EvalFunction(target.context, consumer) };
+    assert!(!jsv_is_exception(&result));
+    let global = unsafe { JS_GetGlobalObject(target.context) };
+    let value = unsafe {
+      JS_GetPropertyStr(target.context, global, c"syntheticResult".as_ptr())
+    };
+    assert_eq!(
+      function_source(target.context, value).unwrap(),
+      "function:43:true",
+    );
+
+    remove_snapshot_module_exports(target.context);
+    unsafe {
+      JS_FreeValue(target.context, value);
+      JS_FreeValue(target.context, global);
+      JS_FreeValue(target.context, result);
+      JS_FreeValue(target.context, restored);
+      JS_FreeValue(target.context, replayed_global);
+      JS_FreeValue(target.context, restored_global);
+    }
+    super::super::module::clear_thread_module_caches();
   }
 
   #[test]

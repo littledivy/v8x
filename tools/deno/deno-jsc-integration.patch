@@ -410,3 +410,106 @@ index e0ecaa1..20320e2 100644
      Ok((source_text.into(), maybe_source_map))
    }
  }
+diff --git a/libs/core/runtime/bindings.rs b/libs/core/runtime/bindings.rs
+index 052efb385a..41134d4634 100644
+--- a/libs/core/runtime/bindings.rs
++++ b/libs/core/runtime/bindings.rs
+@@ -20,6 +20,7 @@ use crate::FastString;
+ use crate::JsRuntime;
+ use crate::ModuleType;
+ use crate::OpDecl;
++use crate::RequestedModuleType;
+ use crate::cppgc::FunctionTemplateData;
+ use crate::cppgc::cppgc_template_constructor;
+ use crate::error::CoreError;
+@@ -590,6 +591,76 @@ pub(crate) fn initialize_deno_core_ops_bindings<'s, 'i>(
+   }
+ }
+ 
++pub(crate) fn synchronize_snapshotted_core_ops(
++  scope: &mut v8::PinScope,
++  context: v8::Local<v8::Context>,
++  module_map: &ModuleMap,
++) {
++  let Some(module_id) =
++    module_map.get_id("ext:core/mod.js", RequestedModuleType::None)
++  else {
++    return;
++  };
++  let Ok(namespace) = module_map.get_module_namespace(scope, module_id) else {
++    return;
++  };
++  let namespace = v8::Local::new(scope, namespace);
++  let core_key = CORE.v8_string(scope).unwrap();
++  let Some(module_core) = namespace.get(scope, core_key.into()) else {
++    return;
++  };
++  let Ok(module_core) = v8::Local::<v8::Object>::try_from(module_core) else {
++    return;
++  };
++  let ops_key = OPS.v8_string(scope).unwrap();
++  let Some(module_ops) = module_core.get(scope, ops_key.into()) else {
++    return;
++  };
++  let Ok(module_ops) = v8::Local::<v8::Object>::try_from(module_ops) else {
++    return;
++  };
++
++  let global = context.global(scope);
++  let deno_key = DENO.v8_string(scope).unwrap();
++  let Some(deno_obj) = global.get(scope, deno_key.into()) else {
++    return;
++  };
++  let Ok(deno_obj) = v8::Local::<v8::Object>::try_from(deno_obj) else {
++    return;
++  };
++  let Some(live_core) = deno_obj.get(scope, core_key.into()) else {
++    return;
++  };
++  let Ok(live_core) = v8::Local::<v8::Object>::try_from(live_core) else {
++    return;
++  };
++  let Some(live_ops) = live_core.get(scope, ops_key.into()) else {
++    return;
++  };
++  let Ok(live_ops) = v8::Local::<v8::Object>::try_from(live_ops) else {
++    return;
++  };
++  let Some(names) = live_ops.get_own_property_names(
++    scope,
++    v8::GetPropertyNamesArgsBuilder::new()
++      .mode(v8::KeyCollectionMode::OwnOnly)
++      .property_filter(v8::PropertyFilter::SKIP_SYMBOLS)
++      .key_conversion(v8::KeyConversionMode::ConvertToString)
++      .build(),
++  ) else {
++    return;
++  };
++  for index in 0..names.length() {
++    let Some(name) = names.get_index(scope, index) else {
++      continue;
++    };
++    let Some(value) = live_ops.get(scope, name) else {
++      continue;
++    };
++    module_ops.set(scope, name, value);
++  }
++}
++
+ /// Re-attach fast-call overloads to snapshotted ops after deserialization.
+ ///
+ /// Fast-call setup creates V8 `Managed<CFunctionWithSignature>` resources,
+diff --git a/libs/core/runtime/jsruntime.rs b/libs/core/runtime/jsruntime.rs
+index 37d7b6e478..a2e22e27b6 100644
+--- a/libs/core/runtime/jsruntime.rs
++++ b/libs/core/runtime/jsruntime.rs
+@@ -1187,6 +1187,9 @@ impl JsRuntime {
+           mapper.add_ext_source_map(ModuleName::from_static(key), map.into());
+         }
+       }
++      if has_snapshot {
++        bindings::synchronize_snapshotted_core_ops(scope, context, &module_map);
++      }
+       startup_phase_end(_phase, "load module map from snapshot");
+ 
+       if context_state.ext_import_meta_proto.borrow().is_none() {
