@@ -1,0 +1,29 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21366,12 +21366,6 @@
+                 JSFunctionBytecode *b = fp->u.func.function_bytecode;
+                 uint32_t pc = s->func_state.frame.cur_pc - b->byte_code_buf - 1;
+                 async_line = find_line_num(ctx, b, pc, &async_col);
+-                /* v82jsc: quickjs's pc2line stores `mark - eol` and s->eol is
+-                   initialised to buf_start (not buf_start-1), so the first
+-                   character on line 1 winds up at offset 0 even though v8
+-                   reports it at 1-based col 1. Normalise by +1 on line 1. */
+-                if (async_line == 1)
+-                    async_col += 1;
+                 if (b->filename != JS_ATOM_NULL)
+                     async_file = JS_AtomToCString(ctx, b->filename);
+             }
+@@ -27683,8 +27677,12 @@
+         /* v82jsc: capture the await keyword position before next_token advances
+            past it, so the OP_await opcode can carry its source loc — v8's
+            async-stack frame `at async <file>:<line>:<col>` points at `await`. */
+         await_line_num = s->token.line_num;
+-        await_col_num = s->token.col_num;
++        /* token.col_num clamps the first token to 1, but otherwise the first
++           physical line is zero-based. Derive a consistently 1-based column. */
++        await_col_num = s->token.ptr - s->eol;
++        if (s->eol == s->buf_start)
++            await_col_num += 1;
+         if (next_token(s))
+             return -1;
+         if (js_parse_unary(s, PF_POW_FORBIDDEN))
