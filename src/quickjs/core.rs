@@ -54,10 +54,7 @@ use std::sync::{Mutex, MutexGuard};
 pub(crate) type WeakCallback = unsafe extern "C" fn(*const c_void);
 
 unsafe extern "C" {
-  fn v82jsc_snapshot_capture_intrinsics(
-    ctx: *mut JSContext,
-    registry: JSValue,
-  );
+  fn v82jsc_snapshot_capture_intrinsics(ctx: *mut JSContext, registry: JSValue);
 }
 
 pub(crate) struct WeakHandle {

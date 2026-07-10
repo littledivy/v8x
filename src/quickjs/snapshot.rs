@@ -1683,8 +1683,7 @@ mod tests {
       let result =
         JS_Call(test.context, increment, restored, 0, ptr::null_mut());
       assert!(!jsv_is_exception(&result));
-      let value =
-        JS_GetPropertyStr(test.context, restored, c"value".as_ptr());
+      let value = JS_GetPropertyStr(test.context, restored, c"value".as_ptr());
       let mut number = 0;
       assert_eq!(JS_ToInt32(test.context, &mut number, value), 0);
       assert_eq!(number, 2);
@@ -1702,36 +1701,27 @@ mod tests {
   #[test]
   fn bytecode_class_roundtrips_prototype() {
     let test = TestContext::new();
-    let source_value = test.eval(
-      "class Window { method() { return 42; } }; Window",
-    );
+    let source_value =
+      test.eval("class Window { method() { return 42; } }; Window");
     let bytes = serialize_value(test.context, source_value).unwrap();
     let restored =
       deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
 
     unsafe {
       assert!(JS_IsConstructor(test.context, restored));
-      let instance = JS_CallConstructor(
-        test.context,
-        restored,
-        0,
-        ptr::null_mut(),
-      );
+      let instance =
+        JS_CallConstructor(test.context, restored, 0, ptr::null_mut());
       assert_eq!(instance.tag, JS_TAG_OBJECT);
       let prototype =
         JS_GetPropertyStr(test.context, restored, c"prototype".as_ptr());
       assert_eq!(prototype.tag, JS_TAG_OBJECT);
-      let constructor = JS_GetPropertyStr(
-        test.context,
-        prototype,
-        c"constructor".as_ptr(),
-      );
+      let constructor =
+        JS_GetPropertyStr(test.context, prototype, c"constructor".as_ptr());
       assert_eq!(constructor.tag, JS_TAG_OBJECT);
       assert_eq!(constructor.u.ptr, restored.u.ptr);
       let method =
         JS_GetPropertyStr(test.context, instance, c"method".as_ptr());
-      let result =
-        JS_Call(test.context, method, instance, 0, ptr::null_mut());
+      let result = JS_Call(test.context, method, instance, 0, ptr::null_mut());
       assert!(!jsv_is_exception(&result));
       let mut number = 0;
       assert_eq!(JS_ToInt32(test.context, &mut number, result), 0);
@@ -1742,6 +1732,46 @@ mod tests {
       JS_FreeValue(test.context, constructor);
       JS_FreeValue(test.context, prototype);
       JS_FreeValue(test.context, instance);
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, source_value);
+    }
+  }
+
+  #[test]
+  fn bytecode_function_roundtrips_array_named_properties() {
+    let test = TestContext::new();
+    let source_value = test.eval(
+      "(() => {\
+         const converters = [];\
+         converters.DOMString = (value) => String(value);\
+         converters.suffix = 42;\
+         return (value) => converters.DOMString(value) + converters.suffix;\
+       })()",
+    );
+    let bytes = serialize_value(test.context, source_value).unwrap();
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+    let argument = test.eval("'value-'");
+
+    unsafe {
+      let mut arguments = [argument];
+      let result = JS_Call(
+        test.context,
+        restored,
+        jsv_undefined(),
+        arguments.len() as c_int,
+        arguments.as_mut_ptr(),
+      );
+      assert!(!jsv_is_exception(&result));
+      let mut len = 0;
+      let text = JS_ToCStringLen(test.context, &mut len, result);
+      assert!(!text.is_null());
+      let bytes = std::slice::from_raw_parts(text as *const u8, len);
+      assert_eq!(bytes, b"value-42");
+
+      JS_FreeCString(test.context, text);
+      JS_FreeValue(test.context, result);
+      JS_FreeValue(test.context, argument);
       JS_FreeValue(test.context, restored);
       JS_FreeValue(test.context, source_value);
     }
@@ -1893,28 +1923,14 @@ mod tests {
     unsafe {
       let registry =
         JS_GetPropertyStr(test.context, restored, c"registry".as_ptr());
-      let token =
-        JS_GetPropertyStr(test.context, restored, c"token".as_ptr());
-      let unregister = JS_GetPropertyStr(
-        test.context,
-        registry,
-        c"unregister".as_ptr(),
-      );
+      let token = JS_GetPropertyStr(test.context, restored, c"token".as_ptr());
+      let unregister =
+        JS_GetPropertyStr(test.context, registry, c"unregister".as_ptr());
       let mut args = [token];
-      let removed = JS_Call(
-        test.context,
-        unregister,
-        registry,
-        1,
-        args.as_mut_ptr(),
-      );
-      let removed_again = JS_Call(
-        test.context,
-        unregister,
-        registry,
-        1,
-        args.as_mut_ptr(),
-      );
+      let removed =
+        JS_Call(test.context, unregister, registry, 1, args.as_mut_ptr());
+      let removed_again =
+        JS_Call(test.context, unregister, registry, 1, args.as_mut_ptr());
       assert!(!jsv_is_exception(&removed));
       assert!(!jsv_is_exception(&removed_again));
       assert_ne!(JS_ToBool(test.context, removed), 0);
@@ -1958,12 +1974,10 @@ mod tests {
       deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
 
     unsafe {
-      let proxy =
-        JS_GetPropertyStr(test.context, restored, c"proxy".as_ptr());
+      let proxy = JS_GetPropertyStr(test.context, restored, c"proxy".as_ptr());
       let target =
         JS_GetPropertyStr(test.context, restored, c"target".as_ptr());
-      let answer =
-        JS_GetPropertyStr(test.context, proxy, c"answer".as_ptr());
+      let answer = JS_GetPropertyStr(test.context, proxy, c"answer".as_ptr());
       let target_proxy =
         JS_GetPropertyStr(test.context, target, c"proxy".as_ptr());
       let mut answer_number = 0;
@@ -1972,11 +1986,8 @@ mod tests {
       assert_eq!(target_proxy.tag, JS_TAG_OBJECT);
       assert_eq!(target_proxy.u.ptr, proxy.u.ptr);
 
-      let revoked_proxy = JS_GetPropertyStr(
-        test.context,
-        restored,
-        c"revokedProxy".as_ptr(),
-      );
+      let revoked_proxy =
+        JS_GetPropertyStr(test.context, restored, c"revokedProxy".as_ptr());
       let revoked_value =
         JS_GetPropertyStr(test.context, revoked_proxy, c"value".as_ptr());
       assert!(jsv_is_exception(&revoked_value));
