@@ -14,8 +14,6 @@
 +    for (sf = rt->current_stack_frame; sf; sf = sf->prev_frame) {
 +        JSFunctionBytecode *b;
 +        JSObject *p;
-+        char function_buf[ATOM_GET_STR_BUF_SIZE];
-+        char filename_buf[ATOM_GET_STR_BUF_SIZE];
 +        const char *function_name = "";
 +        const char *filename = "";
 +        uint32_t pc_value = 0;
@@ -28,17 +26,19 @@
 +            continue;
 +        b = p->u.func.function_bytecode;
 +        if (b->func_name != JS_ATOM_NULL)
-+            function_name = JS_AtomGetStrRT(rt, function_buf,
-+                                            sizeof(function_buf), b->func_name);
++            function_name = JS_AtomToCString(b->realm, b->func_name);
 +        if (b->filename != JS_ATOM_NULL)
-+            filename = JS_AtomGetStrRT(rt, filename_buf,
-+                                       sizeof(filename_buf), b->filename);
++            filename = JS_AtomToCString(b->realm, b->filename);
 +        if (sf->cur_pc && sf->cur_pc >= b->byte_code_buf &&
 +            sf->cur_pc <= b->byte_code_buf + b->byte_code_len) {
 +            pc_value = sf->cur_pc - b->byte_code_buf;
 +        }
 +        line_num = find_line_num(b->realm, b, pc_value, &column_num);
 +        visitor(opaque, function_name, filename, line_num, column_num);
++        if (function_name && function_name[0] != '\0')
++            JS_FreeCString(b->realm, function_name);
++        if (filename && filename[0] != '\0')
++            JS_FreeCString(b->realm, filename);
 +    }
 +}
 +
