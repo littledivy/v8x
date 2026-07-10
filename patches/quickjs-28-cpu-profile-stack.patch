@@ -1,0 +1,61 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -7857,6 +7857,44 @@ static const char *get_func_name(JSContext *ctx, JSValueConst func)
+     return JS_ToCString(ctx, val);
+ }
+ 
++void JS_VisitStackFrames(JSRuntime *rt, JSStackFrameVisitor *visitor,
++                         void *opaque)
++{
++    JSStackFrame *sf;
++
++    if (!rt || !visitor)
++        return;
++    for (sf = rt->current_stack_frame; sf; sf = sf->prev_frame) {
++        JSFunctionBytecode *b;
++        JSObject *p;
++        char function_buf[ATOM_GET_STR_BUF_SIZE];
++        char filename_buf[ATOM_GET_STR_BUF_SIZE];
++        const char *function_name = "";
++        const char *filename = "";
++        uint32_t pc_value = 0;
++        int line_num, column_num;
++
++        if (JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++            continue;
++        p = JS_VALUE_GET_OBJ(sf->cur_func);
++        if (!js_class_has_bytecode(p->class_id))
++            continue;
++        b = p->u.func.function_bytecode;
++        if (b->func_name != JS_ATOM_NULL)
++            function_name = JS_AtomGetStrRT(rt, function_buf,
++                                            sizeof(function_buf), b->func_name);
++        if (b->filename != JS_ATOM_NULL)
++            filename = JS_AtomGetStrRT(rt, filename_buf,
++                                       sizeof(filename_buf), b->filename);
++        if (sf->cur_pc && sf->cur_pc >= b->byte_code_buf &&
++            sf->cur_pc <= b->byte_code_buf + b->byte_code_len) {
++            pc_value = sf->cur_pc - b->byte_code_buf;
++        }
++        line_num = find_line_num(b->realm, b, pc_value, &column_num);
++        visitor(opaque, function_name, filename, line_num, column_num);
++    }
++}
++
+ /* Note: it is important that no exception is returned by this function */
+ static bool can_add_backtrace(JSValueConst obj)
+ {
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1139,6 +1139,11 @@ JS_EXTERN void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRe
+ /* return != 0 if the JS code needs to be interrupted */
+ typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
+ JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);
++typedef void JSStackFrameVisitor(void *opaque, const char *function_name,
++                                 const char *filename, int line_num,
++                                 int column_num);
++JS_EXTERN void JS_VisitStackFrames(JSRuntime *rt, JSStackFrameVisitor *visitor,
++                                   void *opaque);
+ /* if can_block is true, Atomics.wait() can be used */
+ JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
+ /* set the [IsHTMLDDA] internal slot */

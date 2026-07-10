@@ -399,6 +399,8 @@ pub(crate) struct IsoState {
 
   pub pending_interrupts: Mutex<Vec<InterruptEntry>>,
 
+  pub cpu_profiler: super::inspector::CpuProfilerState,
+
   pub array_buffer_allocator: SharedPtrBase<Allocator>,
 
   pub pending_array_buffer_frees: Vec<(*mut Allocator, *mut c_void, usize)>,
@@ -845,6 +847,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     terminating: std::sync::atomic::AtomicBool::new(false),
     active_wasm_func: AtomicPtr::new(ptr::null_mut()),
     pending_interrupts: Mutex::new(Vec::new()),
+    cpu_profiler: super::inspector::CpuProfilerState::new(),
     array_buffer_allocator,
     pending_array_buffer_frees: Vec::new(),
     microtasks_policy: MicrotasksPolicy::Auto,

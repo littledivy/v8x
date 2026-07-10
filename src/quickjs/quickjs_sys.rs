@@ -285,6 +285,13 @@ pub type JSHostPromiseRejectionTracker = unsafe extern "C" fn(
 // Return != 0 to interrupt the running JS.
 pub type JSInterruptHandler =
   unsafe extern "C" fn(rt: *mut JSRuntime, opaque: *mut c_void) -> c_int;
+pub type JSStackFrameVisitor = unsafe extern "C" fn(
+  opaque: *mut c_void,
+  function_name: *const c_char,
+  filename: *const c_char,
+  line_num: c_int,
+  column_num: c_int,
+);
 
 unsafe extern "C" {
   pub fn JS_GetVersion() -> *const std::os::raw::c_char;
@@ -315,6 +322,11 @@ unsafe extern "C" {
   pub fn JS_SetInterruptHandler(
     rt: *mut JSRuntime,
     cb: Option<JSInterruptHandler>,
+    opaque: *mut c_void,
+  );
+  pub fn JS_VisitStackFrames(
+    rt: *mut JSRuntime,
+    visitor: Option<JSStackFrameVisitor>,
     opaque: *mut c_void,
   );
 

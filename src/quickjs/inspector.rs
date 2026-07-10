@@ -11,6 +11,163 @@ use crate::support::int;
 
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
+use std::time::Duration;
+use std::time::Instant;
+use std::time::SystemTime;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) struct CpuProfileFrame {
+  function_name: String,
+  url: String,
+  line_number: i32,
+  column_number: i32,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct CpuProfileSample {
+  frames: Vec<CpuProfileFrame>,
+  timestamp_us: u64,
+}
+
+#[derive(Debug)]
+pub(crate) struct CompletedCpuProfile {
+  start_time_us: u64,
+  end_time_us: u64,
+  samples: Vec<CpuProfileSample>,
+}
+
+#[derive(Debug)]
+pub(crate) struct CpuProfilerState {
+  active: bool,
+  interval: Duration,
+  started_at: Option<Instant>,
+  start_time_us: u64,
+  last_sample_at: Option<Instant>,
+  samples: Vec<CpuProfileSample>,
+}
+
+impl CpuProfilerState {
+  pub(crate) fn new() -> Self {
+    Self {
+      active: false,
+      interval: Duration::from_micros(1_000),
+      started_at: None,
+      start_time_us: 0,
+      last_sample_at: None,
+      samples: Vec::new(),
+    }
+  }
+
+  fn set_interval(&mut self, interval_us: u64) {
+    if !self.active {
+      self.interval = Duration::from_micros(interval_us.max(1));
+    }
+  }
+
+  fn start(&mut self) {
+    let now = Instant::now();
+    self.active = true;
+    self.started_at = Some(now);
+    self.start_time_us = SystemTime::now()
+      .duration_since(SystemTime::UNIX_EPOCH)
+      .unwrap_or_default()
+      .as_micros()
+      .min(u64::MAX as u128) as u64;
+    self.last_sample_at = None;
+    self.samples.clear();
+  }
+
+  fn finish(&mut self) -> CompletedCpuProfile {
+    let elapsed_us = self
+      .started_at
+      .map(|start| start.elapsed().as_micros())
+      .unwrap_or_default()
+      .min(u64::MAX as u128) as u64;
+    self.active = false;
+    self.started_at = None;
+    self.last_sample_at = None;
+    CompletedCpuProfile {
+      start_time_us: self.start_time_us,
+      end_time_us: self.start_time_us.saturating_add(elapsed_us),
+      samples: std::mem::take(&mut self.samples),
+    }
+  }
+}
+
+unsafe extern "C" fn collect_cpu_profile_frame(
+  opaque: *mut c_void,
+  function_name: *const std::ffi::c_char,
+  filename: *const std::ffi::c_char,
+  line_num: i32,
+  column_num: i32,
+) {
+  let frames = unsafe { &mut *opaque.cast::<Vec<CpuProfileFrame>>() };
+  let function_name = if function_name.is_null() {
+    String::new()
+  } else {
+    unsafe { std::ffi::CStr::from_ptr(function_name) }
+      .to_string_lossy()
+      .into_owned()
+  };
+  let url = if filename.is_null() {
+    String::new()
+  } else {
+    unsafe { std::ffi::CStr::from_ptr(filename) }
+      .to_string_lossy()
+      .into_owned()
+  };
+  frames.push(CpuProfileFrame {
+    function_name,
+    url,
+    line_number: line_num.saturating_sub(1),
+    column_number: column_num.saturating_sub(1),
+  });
+}
+
+pub(crate) unsafe fn maybe_collect_cpu_profile_sample(
+  isolate: *mut RealIsolate,
+  runtime: *mut JSRuntime,
+) {
+  if isolate.is_null() || runtime.is_null() {
+    return;
+  }
+  let now = Instant::now();
+  let should_sample = {
+    let profiler = &crate::quickjs::core::iso_state(isolate).cpu_profiler;
+    profiler.active
+      && profiler
+        .last_sample_at
+        .is_none_or(|last| now.duration_since(last) >= profiler.interval)
+  };
+  if !should_sample {
+    return;
+  }
+
+  let mut frames = Vec::new();
+  unsafe {
+    JS_VisitStackFrames(
+      runtime,
+      Some(collect_cpu_profile_frame),
+      (&mut frames as *mut Vec<CpuProfileFrame>).cast(),
+    );
+  }
+  if frames.is_empty() {
+    return;
+  }
+
+  let profiler = &mut crate::quickjs::core::iso_state(isolate).cpu_profiler;
+  let Some(started_at) = profiler.started_at else {
+    return;
+  };
+  profiler.last_sample_at = Some(now);
+  profiler.samples.push(CpuProfileSample {
+    frames,
+    timestamp_us: now
+      .duration_since(started_at)
+      .as_micros()
+      .min(u64::MAX as u128) as u64,
+  });
+}
 
 use crate::inspector::RawV8Inspector;
 use crate::inspector::RawV8InspectorClient;
@@ -644,11 +801,15 @@ pub extern "C" fn v8_inspector__V8StackTrace__DELETE(this: *mut V8StackTrace) {
 }
 
 mod cdp {
+  use super::CompletedCpuProfile;
+  use super::CpuProfileFrame;
   use super::RawChannel;
   use super::RawV8InspectorClient;
   use super::RealStringBuffer;
   use crate::inspector::StringBuffer;
   use crate::quickjs::core::current_ctx;
+  use crate::quickjs::core::current_iso;
+  use crate::quickjs::core::iso_state;
   use crate::quickjs::quickjs_sys::*;
   use crate::support::UniquePtr;
   use crate::support::int;
@@ -1266,6 +1427,216 @@ mod cdp {
     unsafe { send_obj(sess, ctx, resp, Some(call_id)) };
   }
 
+  #[derive(Debug)]
+  struct ProfileNode {
+    frame: CpuProfileFrame,
+    children: Vec<usize>,
+    hit_count: u32,
+  }
+
+  unsafe fn profile_node_to_value(
+    ctx: *mut JSContext,
+    node: &ProfileNode,
+    id: usize,
+    script_id: &str,
+  ) -> JSValue {
+    let value = unsafe { JS_NewObject(ctx) };
+    unsafe { set_val(ctx, value, c"id", JS_NewInt32(ctx, id as i32)) };
+    let call_frame = unsafe { JS_NewObject(ctx) };
+    unsafe {
+      set_str(ctx, call_frame, c"functionName", &node.frame.function_name);
+      set_str(ctx, call_frame, c"scriptId", script_id);
+      set_str(ctx, call_frame, c"url", &node.frame.url);
+      set_val(
+        ctx,
+        call_frame,
+        c"lineNumber",
+        JS_NewInt32(ctx, node.frame.line_number),
+      );
+      set_val(
+        ctx,
+        call_frame,
+        c"columnNumber",
+        JS_NewInt32(ctx, node.frame.column_number),
+      );
+      set_val(ctx, value, c"callFrame", call_frame);
+      set_val(ctx, value, c"hitCount", JS_NewUint32(ctx, node.hit_count));
+    }
+    if !node.children.is_empty() {
+      let children = unsafe { JS_NewArray(ctx) };
+      for (index, child) in node.children.iter().enumerate() {
+        unsafe {
+          JS_SetPropertyUint32(
+            ctx,
+            children,
+            index as u32,
+            JS_NewInt32(ctx, (*child + 1) as i32),
+          )
+        };
+      }
+      unsafe { set_val(ctx, value, c"children", children) };
+    }
+    value
+  }
+
+  unsafe fn cpu_profile_to_value(
+    ctx: *mut JSContext,
+    profile: CompletedCpuProfile,
+  ) -> JSValue {
+    let root_frame = CpuProfileFrame {
+      function_name: "(root)".to_string(),
+      url: String::new(),
+      line_number: -1,
+      column_number: -1,
+    };
+    let mut nodes = vec![ProfileNode {
+      frame: root_frame,
+      children: Vec::new(),
+      hit_count: 0,
+    }];
+    let mut edges: HashMap<(usize, CpuProfileFrame), usize> = HashMap::new();
+    let mut sample_node_ids = Vec::with_capacity(profile.samples.len());
+    let mut time_deltas = Vec::with_capacity(profile.samples.len());
+    let mut previous_timestamp = 0u64;
+
+    for sample in &profile.samples {
+      let mut parent = 0usize;
+      for frame in sample.frames.iter().rev() {
+        let key = (parent, frame.clone());
+        let node_id = if let Some(node_id) = edges.get(&key) {
+          *node_id
+        } else {
+          let node_id = nodes.len();
+          nodes.push(ProfileNode {
+            frame: frame.clone(),
+            children: Vec::new(),
+            hit_count: 0,
+          });
+          nodes[parent].children.push(node_id);
+          edges.insert(key, node_id);
+          node_id
+        };
+        parent = node_id;
+      }
+      nodes[parent].hit_count = nodes[parent].hit_count.saturating_add(1);
+      sample_node_ids.push(parent + 1);
+      time_deltas.push(sample.timestamp_us.saturating_sub(previous_timestamp));
+      previous_timestamp = sample.timestamp_us;
+    }
+
+    let mut script_ids = HashMap::<String, String>::new();
+    let mut next_script_id = 1usize;
+    let nodes_value = unsafe { JS_NewArray(ctx) };
+    for (index, node) in nodes.iter().enumerate() {
+      let script_id = if node.frame.url.is_empty() {
+        "0".to_string()
+      } else if let Some(script_id) = script_ids.get(&node.frame.url) {
+        script_id.clone()
+      } else {
+        let script_id = next_script_id.to_string();
+        next_script_id += 1;
+        script_ids.insert(node.frame.url.clone(), script_id.clone());
+        script_id
+      };
+      let node_value =
+        unsafe { profile_node_to_value(ctx, node, index + 1, &script_id) };
+      unsafe {
+        JS_SetPropertyUint32(ctx, nodes_value, index as u32, node_value)
+      };
+    }
+
+    let samples_value = unsafe { JS_NewArray(ctx) };
+    let deltas_value = unsafe { JS_NewArray(ctx) };
+    for (index, node_id) in sample_node_ids.into_iter().enumerate() {
+      unsafe {
+        JS_SetPropertyUint32(
+          ctx,
+          samples_value,
+          index as u32,
+          JS_NewInt32(ctx, node_id as i32),
+        );
+        JS_SetPropertyUint32(
+          ctx,
+          deltas_value,
+          index as u32,
+          JS_NewInt64(ctx, time_deltas[index].min(i64::MAX as u64) as i64),
+        );
+      }
+    }
+
+    let value = unsafe { JS_NewObject(ctx) };
+    unsafe {
+      set_val(ctx, value, c"nodes", nodes_value);
+      set_val(
+        ctx,
+        value,
+        c"startTime",
+        JS_NewFloat64(ctx, profile.start_time_us as f64),
+      );
+      set_val(
+        ctx,
+        value,
+        c"endTime",
+        JS_NewFloat64(ctx, profile.end_time_us as f64),
+      );
+      set_val(ctx, value, c"samples", samples_value);
+      set_val(ctx, value, c"timeDeltas", deltas_value);
+    }
+    value
+  }
+
+  unsafe fn handle_profiler_set_sampling_interval(
+    sess: &CdpSession,
+    ctx: *mut JSContext,
+    params: JSValue,
+    call_id: i32,
+  ) {
+    if let Some(interval) = unsafe { get_int(ctx, params, c"interval") } {
+      let isolate = current_iso();
+      if !isolate.is_null() {
+        iso_state(isolate)
+          .cpu_profiler
+          .set_interval(interval.max(1) as u64);
+      }
+    }
+    unsafe { ack(sess, ctx, call_id) };
+  }
+
+  unsafe fn handle_profiler_start(
+    sess: &CdpSession,
+    ctx: *mut JSContext,
+    call_id: i32,
+  ) {
+    let isolate = current_iso();
+    if !isolate.is_null() {
+      iso_state(isolate).cpu_profiler.start();
+    }
+    unsafe { ack(sess, ctx, call_id) };
+  }
+
+  unsafe fn handle_profiler_stop(
+    sess: &CdpSession,
+    ctx: *mut JSContext,
+    call_id: i32,
+  ) {
+    let isolate = current_iso();
+    let profile = if isolate.is_null() {
+      CompletedCpuProfile {
+        start_time_us: 0,
+        end_time_us: 0,
+        samples: Vec::new(),
+      }
+    } else {
+      iso_state(isolate).cpu_profiler.finish()
+    };
+    let result = unsafe { JS_NewObject(ctx) };
+    let profile = unsafe { cpu_profile_to_value(ctx, profile) };
+    unsafe {
+      set_val(ctx, result, c"profile", profile);
+      send_obj(sess, ctx, result, Some(call_id));
+    }
+  }
+
   pub fn dispatch(sess: &mut CdpSession, message: &str) {
     let ctx = current_ctx();
     if ctx.is_null() {
@@ -1287,6 +1658,12 @@ mod cdp {
     let params = unsafe { JS_GetPropertyStr(ctx, parsed, c"params".as_ptr()) };
 
     match method.as_str() {
+      "Profiler.enable" | "Profiler.disable" => unsafe { ack(sess, ctx, id) },
+      "Profiler.setSamplingInterval" => unsafe {
+        handle_profiler_set_sampling_interval(sess, ctx, params, id)
+      },
+      "Profiler.start" => unsafe { handle_profiler_start(sess, ctx, id) },
+      "Profiler.stop" => unsafe { handle_profiler_stop(sess, ctx, id) },
       "Runtime.enable" => unsafe { handle_runtime_enable(sess, ctx, id) },
       "Runtime.evaluate" => unsafe { handle_evaluate(sess, ctx, params, id) },
       "Runtime.callFunctionOn" => unsafe {

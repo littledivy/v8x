@@ -976,13 +976,14 @@ pub(crate) fn maybe_drive_near_heap_limit_callback(isolate: *mut RealIsolate) {
 /// loop; the op-dispatch boundary (see `function.rs`) handles the more common
 /// "first op after terminate" case immediately, without waiting for a poll.
 pub(crate) unsafe extern "C" fn terminate_interrupt_handler(
-  _rt: *mut JSRuntime,
+  rt: *mut JSRuntime,
   opaque: *mut c_void,
 ) -> c_int {
   let iso = opaque as *mut RealIsolate;
   if iso.is_null() {
     return 0;
   }
+  unsafe { super::inspector::maybe_collect_cpu_profile_sample(iso, rt) };
   run_pending_interrupts(iso);
   maybe_drive_near_heap_limit_callback(iso);
   iso_state(iso).is_terminating() as c_int
