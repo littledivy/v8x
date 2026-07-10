@@ -2240,6 +2240,15 @@ mod tests {
       )
     };
     let source_prototype = source.eval("({ log() { return 42; } })");
+    let source_static_method = unsafe {
+      super::super::function::make_function_len(
+        source.context,
+        snapshot_callback_b,
+        jsv_undefined(),
+        0,
+        false,
+      )
+    };
     assert_eq!(
       unsafe {
         JS_DefinePropertyValueStr(
@@ -2248,6 +2257,18 @@ mod tests {
           c"prototype".as_ptr(),
           source_prototype,
           JS_PROP_WRITABLE,
+        )
+      },
+      1,
+    );
+    assert_eq!(
+      unsafe {
+        JS_DefinePropertyValueStr(
+          source.context,
+          source_function,
+          c"staticMethod".as_ptr(),
+          source_static_method,
+          JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE,
         )
       },
       1,
@@ -2285,6 +2306,9 @@ mod tests {
       let constructor =
         JS_GetPropertyStr(target.context, prototype, c"constructor".as_ptr());
       assert_eq!(constructor.u.ptr, restored.u.ptr);
+      let static_method =
+        JS_GetPropertyStr(target.context, restored, c"staticMethod".as_ptr());
+      assert!(JS_IsFunction(target.context, static_method));
       let log = JS_GetPropertyStr(target.context, prototype, c"log".as_ptr());
       let result = JS_Call(target.context, log, prototype, 0, ptr::null_mut());
       assert!(!jsv_is_exception(&result));
@@ -2294,6 +2318,7 @@ mod tests {
 
       JS_FreeValue(target.context, result);
       JS_FreeValue(target.context, log);
+      JS_FreeValue(target.context, static_method);
       JS_FreeValue(target.context, constructor);
       JS_FreeValue(target.context, prototype);
       JS_FreeValue(target.context, restored);

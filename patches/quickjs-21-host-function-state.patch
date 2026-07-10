@@ -1,0 +1,203 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -38690,7 +38690,9 @@
+ }
+ 
+ static int JS_WriteSnapshotObjectState(BCWriterState *s, JSValueConst obj,
+-                                       bool skip_intrinsic_registry);
++                                       bool skip_intrinsic_registry,
++                                       bool skip_function_builtins,
++                                       bool include_internal_prototype);
+ 
+ static int JS_WriteBytecodeFunctionObject(BCWriterState *s,
+                                           JSValueConst obj)
+@@ -38720,7 +38722,7 @@
+         bc_put_u8(s, 0);
+     }
+     bc_put_u8(s, p->is_constructor);
+-    return JS_WriteSnapshotObjectState(s, obj, false);
++    return JS_WriteSnapshotObjectState(s, obj, false, false, true);
+ 
+  invalid:
+     JS_ThrowTypeError(s->ctx, "invalid bytecode function object");
+@@ -38765,7 +38767,7 @@
+         if (ret)
+             return -1;
+     }
+-    return 1;
++    return JS_WriteSnapshotObjectState(s, obj, false, true, false) ? -1 : 1;
+ }
+ 
+ #define JS_INTRINSIC_PATH_MAX 64
+@@ -39250,7 +39252,9 @@
+ }
+ 
+ static int JS_WriteSnapshotObjectState(BCWriterState *s, JSValueConst obj,
+-                                       bool skip_intrinsic_registry)
++                                       bool skip_intrinsic_registry,
++                                       bool skip_function_builtins,
++                                       bool include_internal_prototype)
+ {
+     JSPropertyDescriptor desc;
+     JSPropertyEnum *props = NULL;
+@@ -39259,11 +39263,13 @@
+     uint32_t len = 0, serialized_len, i;
+     int extensible, ret = -1;
+ 
+-    proto = JS_GetPrototype(s->ctx, obj);
+-    if (JS_IsException(proto) || JS_WriteObjectRec(s, proto))
+-        goto fail;
+-    JS_FreeValue(s->ctx, proto);
+-    proto = JS_UNDEFINED;
++    if (include_internal_prototype) {
++        proto = JS_GetPrototype(s->ctx, obj);
++        if (JS_IsException(proto) || JS_WriteObjectRec(s, proto))
++            goto fail;
++        JS_FreeValue(s->ctx, proto);
++        proto = JS_UNDEFINED;
++    }
+ 
+     extensible = JS_IsExtensible(s->ctx, obj);
+     if (extensible < 0)
+@@ -39272,7 +39278,8 @@
+ 
+     if (JS_GetOwnPropertyNames(s->ctx, &props, &len, obj,
+                                JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK |
+-                               JS_GPN_PRIVATE_MASK) < 0)
++                               (skip_function_builtins ? 0 :
++                                JS_GPN_PRIVATE_MASK)) < 0)
+         goto fail;
+     serialized_len = len;
+     if (skip_intrinsic_registry) {
+@@ -39284,9 +39291,23 @@
+                 serialized_len--;
+         }
+     }
++    if (skip_function_builtins) {
++        for (i = 0; i < len; i++) {
++            if (props[i].atom == JS_ATOM_length ||
++                props[i].atom == JS_ATOM_name ||
++                props[i].atom == JS_ATOM_prototype ||
++                props[i].atom == JS_ATOM_toString)
++                serialized_len--;
++        }
++    }
+     bc_put_leb128(s, serialized_len);
+     for (i = 0; i < len; i++) {
+-        if (props[i].atom == skip_atom)
++        if (props[i].atom == skip_atom ||
++            (skip_function_builtins &&
++             (props[i].atom == JS_ATOM_length ||
++              props[i].atom == JS_ATOM_name ||
++              props[i].atom == JS_ATOM_prototype ||
++              props[i].atom == JS_ATOM_toString)))
+             continue;
+         memset(&desc, 0, sizeof(desc));
+         desc.value = JS_UNDEFINED;
+@@ -39390,19 +39411,19 @@
+ static int JS_WriteObjectTag(BCWriterState *s, JSValueConst obj)
+ {
+     bc_put_u8(s, BC_TAG_SNAPSHOT_OBJECT);
+-    return JS_WriteSnapshotObjectState(s, obj, false);
++    return JS_WriteSnapshotObjectState(s, obj, false, false, true);
+ }
+ 
+ static int JS_WriteSnapshotArray(BCWriterState *s, JSValueConst obj)
+ {
+     bc_put_u8(s, BC_TAG_SNAPSHOT_ARRAY);
+-    return JS_WriteSnapshotObjectState(s, obj, false);
++    return JS_WriteSnapshotObjectState(s, obj, false, false, true);
+ }
+ 
+ static int JS_WriteContextGlobal(BCWriterState *s, JSValueConst obj)
+ {
+     bc_put_u8(s, BC_TAG_CONTEXT_GLOBAL);
+-    return JS_WriteSnapshotObjectState(s, obj, true);
++    return JS_WriteSnapshotObjectState(s, obj, true, false, true);
+ }
+ 
+ static int JS_WriteTypedArray(BCWriterState *s, JSValueConst obj)
+@@ -40473,7 +40494,8 @@
+     return var_ref;
+ }
+ 
+-static int JS_ReadSnapshotObjectState(BCReaderState *s, JSValueConst obj);
++static int JS_ReadSnapshotObjectState(BCReaderState *s, JSValueConst obj,
++                                      bool include_internal_prototype);
+ 
+ static JSValue JS_ReadBytecodeFunctionObject(BCReaderState *s)
+ {
+@@ -40550,7 +40572,7 @@
+     if (bc_get_u8(s, &is_constructor) || is_constructor > 1)
+         goto fail;
+     JS_SetConstructorBit(ctx, obj, is_constructor);
+-    if (JS_ReadSnapshotObjectState(s, obj))
++    if (JS_ReadSnapshotObjectState(s, obj, true))
+         goto fail;
+     return obj;
+ 
+@@ -40985,6 +41007,8 @@
+             goto fail;
+         prototype = JS_UNDEFINED;
+     }
++    if (JS_ReadSnapshotObjectState(s, obj, false))
++        goto fail;
+     return obj;
+ 
+  fail:
+@@ -41157,7 +41181,8 @@
+     return JS_EXCEPTION;
+ }
+ 
+-static int JS_ReadSnapshotObjectState(BCReaderState *s, JSValueConst obj)
++static int JS_ReadSnapshotObjectState(BCReaderState *s, JSValueConst obj,
++                                      bool include_internal_prototype)
+ {
+     JSContext *ctx = s->ctx;
+     JSValue proto = JS_UNDEFINED;
+@@ -41168,11 +41193,13 @@
+     uint8_t extensible;
+     int define_flags, ret;
+ 
+-    proto = JS_ReadObjectRec(s);
+-    if (JS_IsException(proto) || JS_SetPrototype(ctx, obj, proto) < 0)
+-        goto fail;
+-    JS_FreeValue(ctx, proto);
+-    proto = JS_UNDEFINED;
++    if (include_internal_prototype) {
++        proto = JS_ReadObjectRec(s);
++        if (JS_IsException(proto) || JS_SetPrototype(ctx, obj, proto) < 0)
++            goto fail;
++        JS_FreeValue(ctx, proto);
++        proto = JS_UNDEFINED;
++    }
+ 
+     if (bc_get_u8(s, &extensible) || extensible > 1 ||
+         bc_get_leb128(s, &prop_count))
+@@ -41255,7 +41282,7 @@
+     JSValue obj = JS_NewObject(s->ctx);
+ 
+     if (JS_IsException(obj) || BC_add_object_ref(s, obj) ||
+-        JS_ReadSnapshotObjectState(s, obj)) {
++        JS_ReadSnapshotObjectState(s, obj, true)) {
+         JS_FreeValue(s->ctx, obj);
+         return JS_EXCEPTION;
+     }
+@@ -41267,7 +41294,7 @@
+     JSValue obj = JS_NewArray(s->ctx);
+ 
+     if (JS_IsException(obj) || BC_add_object_ref(s, obj) ||
+-        JS_ReadSnapshotObjectState(s, obj)) {
++        JS_ReadSnapshotObjectState(s, obj, true)) {
+         JS_FreeValue(s->ctx, obj);
+         return JS_EXCEPTION;
+     }
+@@ -41279,7 +41306,7 @@
+     JSValue obj = JS_GetGlobalObject(s->ctx);
+ 
+     if (JS_IsException(obj) || BC_add_object_ref(s, obj) ||
+-        JS_ReadSnapshotObjectState(s, obj)) {
++        JS_ReadSnapshotObjectState(s, obj, true)) {
+         JS_FreeValue(s->ctx, obj);
+         return JS_EXCEPTION;
+     }
