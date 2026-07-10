@@ -1666,6 +1666,57 @@ mod tests {
   }
 
   #[test]
+  fn module_namespace_roundtrips_live_bindings() {
+    let test = TestContext::new();
+    let source = CString::new(
+      "export let value = 1;\
+       export function increment() { value++; }",
+    )
+    .unwrap();
+    let module = unsafe {
+      JS_Eval(
+        test.context,
+        source.as_ptr(),
+        source.as_bytes().len(),
+        c"snapshot-module.js".as_ptr(),
+        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+      )
+    };
+    assert_eq!(module.tag, JS_TAG_MODULE);
+    let module_def = unsafe { module.u.ptr }.cast::<JSModuleDef>();
+    let evaluated = unsafe {
+      JS_EvalFunction(test.context, JS_DupValue(test.context, module))
+    };
+    assert!(!jsv_is_exception(&evaluated));
+    let namespace = unsafe { JS_GetModuleNamespace(test.context, module_def) };
+    assert!(!jsv_is_exception(&namespace));
+    let bytes = serialize_value(test.context, namespace).unwrap();
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+
+    unsafe {
+      let increment =
+        JS_GetPropertyStr(test.context, restored, c"increment".as_ptr());
+      let result =
+        JS_Call(test.context, increment, restored, 0, ptr::null_mut());
+      assert!(!jsv_is_exception(&result));
+      let value =
+        JS_GetPropertyStr(test.context, restored, c"value".as_ptr());
+      let mut number = 0;
+      assert_eq!(JS_ToInt32(test.context, &mut number, value), 0);
+      assert_eq!(number, 2);
+
+      JS_FreeValue(test.context, value);
+      JS_FreeValue(test.context, result);
+      JS_FreeValue(test.context, increment);
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, namespace);
+      JS_FreeValue(test.context, evaluated);
+      JS_FreeValue(test.context, module);
+    }
+  }
+
+  #[test]
   fn native_bound_function_roundtrips() {
     let test = TestContext::new();
     let source_value =
