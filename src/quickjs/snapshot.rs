@@ -1791,6 +1791,63 @@ mod tests {
   }
 
   #[test]
+  fn finalization_registry_roundtrips_live_registration() {
+    let test = TestContext::new();
+    let source_value = test.eval(
+      "(() => {\
+         const calls = [];\
+         const key = {};\
+         const token = {};\
+         const registry = new FinalizationRegistry(value => calls.push(value));\
+         registry.register(key, 42, token);\
+         return { registry, key, token, calls };\
+       })()",
+    );
+    let bytes = serialize_value(test.context, source_value).unwrap();
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+
+    unsafe {
+      let registry =
+        JS_GetPropertyStr(test.context, restored, c"registry".as_ptr());
+      let token =
+        JS_GetPropertyStr(test.context, restored, c"token".as_ptr());
+      let unregister = JS_GetPropertyStr(
+        test.context,
+        registry,
+        c"unregister".as_ptr(),
+      );
+      let mut args = [token];
+      let removed = JS_Call(
+        test.context,
+        unregister,
+        registry,
+        1,
+        args.as_mut_ptr(),
+      );
+      let removed_again = JS_Call(
+        test.context,
+        unregister,
+        registry,
+        1,
+        args.as_mut_ptr(),
+      );
+      assert!(!jsv_is_exception(&removed));
+      assert!(!jsv_is_exception(&removed_again));
+      assert_ne!(JS_ToBool(test.context, removed), 0);
+      assert_eq!(JS_ToBool(test.context, removed_again), 0);
+
+      JS_FreeValue(test.context, removed_again);
+      JS_FreeValue(test.context, removed);
+      JS_FreeValue(test.context, unregister);
+      JS_FreeValue(test.context, token);
+      JS_FreeValue(test.context, registry);
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, source_value);
+    }
+  }
+
+  #[test]
   fn unsupported_object_roundtrips_data_properties_without_invoking_accessors()
   {
     let test = TestContext::new();
