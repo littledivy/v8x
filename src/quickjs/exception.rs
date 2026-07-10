@@ -1423,9 +1423,9 @@ pub extern "C" fn v8__TryCatch__StackTrace(
 // place of `Error.prepareStackTrace`, reading structured CallSite frames and
 // formatting them. QuickJS-ng has no equivalent native hook — it only consults
 // `Error.prepareStackTrace`. The vendored fork exposes the full V8 CallSite API
-// on its native CallSites, but with placeholder values (isToplevel /
-// isConstructor always false, getColumnNumber = the construct CALL column,
-// synthetic Promise/Error-construct native frames left in). Left as-is, deno's
+// on its native CallSites, but with placeholder values (isToplevel always
+// false, getColumnNumber = the construct CALL column, synthetic Promise/Error
+// native frames left in). Left as-is, deno's
 // `Display for JsError` prints the raw multi-frame quickjs stack, e.g.
 //   Error: fail
 //       at construct ([native code])
@@ -1437,10 +1437,11 @@ pub extern "C" fn v8__TryCatch__StackTrace(
 // We close the gap with our own `Error.prepareStackTrace`, installed ONLY on
 // runtimes that called SetPrepareStackTraceCallback (deno_core — never the bare
 // rusty_v8 cell, which keeps quickjs's native stack untouched). It reads the
-// fork's CallSites and re-formats them V8-style: native/file-less frames are
-// dropped, top-level frames print without a function name, and `new X()`
-// construct columns are moved from the call `(` back to the `new` keyword
-// (recovered from the source line registered at eval time).
+// fork's CallSites and re-formats them V8-style: synthetic native frames are
+// dropped while native constructor frames are retained, top-level frames print
+// without a function name, and `new X()` construct columns are moved from the
+// call `(` back to the `new` keyword (recovered from the source line registered
+// at eval time).
 // ---------------------------------------------------------------------------
 
 thread_local! {
@@ -1619,6 +1620,17 @@ unsafe fn call_site_int(
     unsafe { clear_pending(ctx) };
     return 0;
   }
+  out
+}
+
+unsafe fn call_site_bool(
+  ctx: *mut JSContext,
+  site: JSValue,
+  name: &std::ffi::CStr,
+) -> bool {
+  let v = unsafe { call_site_method(ctx, site, name) };
+  let out = unsafe { JS_ToBool(ctx, v) != 0 };
+  unsafe { JS_FreeValue(ctx, v) };
   out
 }
 
@@ -1837,17 +1849,8 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     n.max(0)
   };
 
-  // Corrected frames, collected for deno's native (source-mapping) formatter:
-  // (file, line, column, function-name, type-name, method-name, is_top_level).
-  let mut frames: Vec<(
-    std::string::String,
-    i32,
-    i32,
-    Option<std::string::String>,
-    Option<std::string::String>,
-    Option<std::string::String>,
-    bool,
-  )> = Vec::new();
+  // Corrected frames, collected for deno's native (source-mapping) formatter.
+  let mut frames: Vec<PreparedFrame> = Vec::new();
 
   for i in 0..len as u32 {
     let site = unsafe { JS_GetPropertyUint32(ctx, sites, i) };
@@ -1856,11 +1859,20 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
       continue;
     }
     let file = unsafe { call_site_str(ctx, site, c"getFileName") };
-    // Drop native / file-less frames — V8 elides quickjs's synthetic
-    // Promise.reject / Error-construct frames.
-    let Some(file) = file else {
-      unsafe { JS_FreeValue(ctx, site) };
-      continue;
+    let line = unsafe { call_site_int(ctx, site, c"getLineNumber") };
+    let mut col = unsafe { call_site_int(ctx, site, c"getColumnNumber") };
+    let func = unsafe { call_site_str(ctx, site, c"getFunctionName") };
+    let type_name = unsafe { call_site_str(ctx, site, c"getTypeName") };
+    let method_name = unsafe { call_site_str(ctx, site, c"getMethodName") };
+    let is_constructor = unsafe { call_site_bool(ctx, site, c"isConstructor") };
+    unsafe { JS_FreeValue(ctx, site) };
+
+    // V8 retains native constructor calls such as `new Promise (<anonymous>)`,
+    // but elides QuickJS's other synthetic native/file-less frames.
+    let file = match file {
+      Some(file) => file,
+      None if is_constructor && func.is_some() => "<anonymous>".to_string(),
+      None => continue,
     };
     // V8 reports an unnamed (eval'd) script as `<anonymous>`; quickjs uses our
     // `<eval>` sentinel. Normalise so deno's stack matches V8.
@@ -1869,13 +1881,6 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     } else {
       file
     };
-    let line = unsafe { call_site_int(ctx, site, c"getLineNumber") };
-    let mut col = unsafe { call_site_int(ctx, site, c"getColumnNumber") };
-    let func = unsafe { call_site_str(ctx, site, c"getFunctionName") };
-    let type_name = unsafe { call_site_str(ctx, site, c"getTypeName") };
-    let method_name = unsafe { call_site_str(ctx, site, c"getMethodName") };
-    unsafe { JS_FreeValue(ctx, site) };
-
     // Recover V8's `new`-keyword column for `new X()` frames.
     if let Some(src) = super::core::script_source_line(&file, line) {
       col = v8_new_expr_column(&src, col);
@@ -1897,14 +1902,19 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
       type_name.clone(),
       method_name.clone(),
       is_top_level,
+      is_constructor,
     ));
 
     out.push_str("\n    at ");
     if is_top_level {
       append_location(&mut out, &file, line, col);
     } else {
+      if is_constructor {
+        out.push_str("new ");
+      }
       if let Some(func) = func.as_deref() {
-        if let Some(type_name) = type_name.as_deref()
+        if !is_constructor
+          && let Some(type_name) = type_name.as_deref()
           && !func.starts_with(type_name)
         {
           out.push_str(type_name);
@@ -1944,12 +1954,24 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
   unsafe { JS_NewStringLen(ctx, bytes.as_ptr() as *const c_char, bytes.len()) }
 }
 
+type PreparedFrame = (
+  std::string::String,
+  i32,
+  i32,
+  Option<std::string::String>,
+  Option<std::string::String>,
+  Option<std::string::String>,
+  bool,
+  bool,
+);
+
 /// JS factory that turns rows of
-/// `[file, line, col, funcOrNull, typeOrNull, methodOrNull, isTopLevel]`
+/// `[file, line, col, funcOrNull, typeOrNull, methodOrNull, isTopLevel,
+/// isConstructor]`
 /// into the V8-shaped CallSite objects deno's `from_callsite_object` consumes
 /// (it calls each accessor and applies source maps to file/line/column).
 const CALLSITE_FACTORY_SRC: &str = "(function(d){return d.map(function(f){\
-  var file=f[0],line=f[1],col=f[2],top=f[6],fn=top?null:f[3],type=top?null:f[4],method=top?null:f[5];\
+  var file=f[0],line=f[1],col=f[2],top=f[6],constructor=f[7],fn=top?null:f[3],type=top?null:f[4],method=top?null:f[5];\
   return {\
     getFileName:function(){return file||undefined;},\
     getScriptNameOrSourceURL:function(){return file||undefined;},\
@@ -1964,7 +1986,7 @@ const CALLSITE_FACTORY_SRC: &str = "(function(d){return d.map(function(f){\
     isToplevel:function(){return top;},\
     isEval:function(){return false;},\
     isNative:function(){return false;},\
-    isConstructor:function(){return false;},\
+    isConstructor:function(){return constructor;},\
     isAsync:function(){return false;},\
     isPromiseAll:function(){return false;},\
     getPromiseIndex:function(){return null;},\
@@ -1975,15 +1997,7 @@ const CALLSITE_FACTORY_SRC: &str = "(function(d){return d.map(function(f){\
 /// an owned (+1) JSValue array, or `None` on failure.
 unsafe fn build_callsites(
   ctx: *mut JSContext,
-  frames: &[(
-    std::string::String,
-    i32,
-    i32,
-    Option<std::string::String>,
-    Option<std::string::String>,
-    Option<std::string::String>,
-    bool,
-  )],
+  frames: &[PreparedFrame],
 ) -> Option<JSValue> {
   unsafe {
     // Evaluate the factory function.
@@ -2007,8 +2021,10 @@ unsafe fn build_callsites(
       JS_FreeValue(ctx, factory);
       return None;
     }
-    for (i, (file, line, col, func, type_name, method_name, top)) in
-      frames.iter().enumerate()
+    for (
+      i,
+      (file, line, col, func, type_name, method_name, top, constructor),
+    ) in frames.iter().enumerate()
     {
       let row = JS_NewArray(ctx);
       let fv = JS_NewStringLen(ctx, file.as_ptr() as *const c_char, file.len());
@@ -2035,6 +2051,7 @@ unsafe fn build_callsites(
       };
       JS_SetPropertyUint32(ctx, row, 5, methodv);
       JS_SetPropertyUint32(ctx, row, 6, JS_NewBool(ctx, *top as c_int));
+      JS_SetPropertyUint32(ctx, row, 7, JS_NewBool(ctx, *constructor as c_int));
       JS_SetPropertyUint32(ctx, rows, i as u32, row);
     }
 
@@ -2100,15 +2117,7 @@ unsafe fn restore_prepare_stack_trace(
 unsafe fn source_mapped_stack(
   ctx: *mut JSContext,
   error: JSValue,
-  frames: &[(
-    std::string::String,
-    i32,
-    i32,
-    Option<std::string::String>,
-    Option<std::string::String>,
-    Option<std::string::String>,
-    bool,
-  )],
+  frames: &[PreparedFrame],
 ) -> Option<JSValue> {
   let cb = PREPARE_STACK_TRACE_CB.with(|c| c.get())?;
   if ctx.is_null() {

@@ -109,6 +109,49 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn callsite_reports_native_constructor() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = CString::new(
+        "Error.prepareStackTrace = (_, sites) => {
+         const site = sites.find((site) => site.getFunctionName() === 'Promise');
+         return `${site.getFunctionName()}:${site.isConstructor()}:${site.getLineNumber()}:${site.getColumnNumber()}`;
+         };
+         let error;
+         new Promise(() => { error = new Error('fail'); });
+         error.stack;",
+      )
+      .unwrap();
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.as_bytes().len(),
+        c"callsite-constructor-test.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "eval threw");
+
+      let mut len = 0;
+      let text = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!text.is_null());
+      let actual =
+        std::str::from_utf8(std::slice::from_raw_parts(text as *const u8, len))
+          .unwrap();
+      assert_eq!(actual, "Promise:true:null:null");
+
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn property_access_errors_match_v8() {
     unsafe {
       let rt = JS_NewRuntime();
