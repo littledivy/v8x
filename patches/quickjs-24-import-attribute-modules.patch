@@ -74,3 +74,30 @@
              // Resolves a module either from the cache or by requesting
              // it from the module loader. From cache is not ideal because
              // the module may not be the one it was a time of serialization
+diff --git a/builtin-array-fromasync.h b/builtin-array-fromasync.h
+--- a/builtin-array-fromasync.h
++++ b/builtin-array-fromasync.h
+@@ -6,4 +6,4 @@ const uint32_t qjsc_builtin_array_fromasync_size = 888;
+ 
+ const uint8_t qjsc_builtin_array_fromasync[888] = {
+- 0x1a, 0xc5, 0x39, 0x53, 0x3c, 0x0e, 0x01, 0x28,
++ 0x1b, 0xc5, 0x39, 0x53, 0x3c, 0x0e, 0x01, 0x28,
+  0x53, 0x79, 0x6d, 0x62, 0x6f, 0x6c, 0xb7, 0x61,
+diff --git a/builtin-iterator-zip.h b/builtin-iterator-zip.h
+--- a/builtin-iterator-zip.h
++++ b/builtin-iterator-zip.h
+@@ -6,4 +6,4 @@ const uint32_t qjsc_builtin_iterator_zip_size = 2621;
+ 
+ const uint8_t qjsc_builtin_iterator_zip[2621] = {
+- 0x1a, 0xca, 0x2d, 0xe4, 0xa6, 0x2a, 0x01, 0x1c,
++ 0x1b, 0xca, 0x2d, 0xe4, 0xa6, 0x2a, 0x01, 0x1c,
+  0x49, 0x74, 0x65, 0x72, 0x61, 0x74, 0x6f, 0x72,
+diff --git a/builtin-iterator-zip-keyed.h b/builtin-iterator-zip-keyed.h
+--- a/builtin-iterator-zip-keyed.h
++++ b/builtin-iterator-zip-keyed.h
+@@ -6,4 +6,4 @@ const uint32_t qjsc_builtin_iterator_zip_keyed_size = 2582;
+ 
+ const uint8_t qjsc_builtin_iterator_zip_keyed[2582] = {
+- 0x1a, 0xeb, 0x00, 0x6f, 0x50, 0x2b, 0x01, 0x1c,
++ 0x1b, 0xeb, 0x00, 0x6f, 0x50, 0x2b, 0x01, 0x1c,
+  0x49, 0x74, 0x65, 0x72, 0x61, 0x74, 0x6f, 0x72,

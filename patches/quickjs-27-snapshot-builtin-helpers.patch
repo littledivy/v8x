@@ -1,0 +1,50 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -38507,6 +38507,34 @@ static void JS_RegisterSnapshotIntrinsic(JSSnapshotIntrinsicCollector *s,
+     }
+ }
+ 
++static void JS_RegisterSnapshotCFunction(JSSnapshotIntrinsicCollector *s,
++                                         JSCFunction *func,
++                                         const char *name, int length)
++{
++    JSValue value;
++    JSObject *p;
++    int64_t count = 0;
++    uint32_t i;
++
++    if (JS_GetLength(s->ctx, s->registry, &count) < 0)
++        return;
++    for (i = 0; i < (uint32_t)count; i++) {
++        value = JS_GetPropertyUint32(s->ctx, s->registry, i);
++        if (JS_VALUE_GET_TAG(value) == JS_TAG_OBJECT) {
++            p = JS_VALUE_GET_OBJ(value);
++            if (p->class_id == JS_CLASS_C_FUNCTION &&
++                p->u.cfunc.c_function.generic == func) {
++                JS_FreeValue(s->ctx, value);
++                return;
++            }
++        }
++        JS_FreeValue(s->ctx, value);
++    }
++    value = JS_NewCFunction(s->ctx, func, name, length);
++    JS_RegisterSnapshotIntrinsic(s, value);
++    JS_FreeValue(s->ctx, value);
++}
++
+ static void JS_CollectSnapshotIntrinsics(JSSnapshotIntrinsicCollector *s,
+                                          JSValueConst value, int depth)
+ {
+@@ -38612,6 +38640,11 @@ void v82jsc_snapshot_capture_intrinsics(JSContext *ctx, JSValue registry)
+     JS_RegisterSnapshotIntrinsic(&s, ctx->function_proto);
+     JS_RegisterSnapshotIntrinsic(&s, ctx->iterator_proto);
+     JS_RegisterSnapshotIntrinsic(&s, ctx->async_iterator_proto);
++    JS_RegisterSnapshotCFunction(&s, js_call_function, "call", 2);
++    JS_RegisterSnapshotCFunction(
++        &s, js_hasOwnEnumProperty, "hasOwnEnumProperty", 2);
++    JS_RegisterSnapshotCFunction(
++        &s, js_getOwnPropertyKeys, "getOwnPropertyKeys", 1);
+ 
+     js_object_list_end(ctx, &s.visited);
+     js_object_list_end(ctx, &s.registered);

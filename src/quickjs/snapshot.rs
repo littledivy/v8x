@@ -45,25 +45,15 @@ const SNAPSHOT_READ_FLAGS: c_int =
   JS_READ_OBJ_BYTECODE | JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE;
 const JS_GPN_STRING_MASK: c_int = 1 << 0;
 const JS_GPN_ENUM_ONLY: c_int = 1 << 4;
-const JS_GPN_SET_ENUM: c_int = 1 << 5;
 const JS_PROP_CONFIGURABLE: c_int = 1 << 0;
 const JS_PROP_WRITABLE: c_int = 1 << 1;
 const JS_PROP_ENUMERABLE: c_int = 1 << 2;
-const JS_PROP_GETSET: c_int = 1 << 4;
 const NOOP_FUNCTION_SRC: &str = "(function(){})\0";
 
 #[repr(C)]
 struct JSPropertyEnum {
   is_enumerable: bool,
   atom: JSAtom,
-}
-
-#[repr(C)]
-struct JSPropertyDescriptor {
-  flags: c_int,
-  value: JSValue,
-  getter: JSValue,
-  setter: JSValue,
 }
 
 unsafe extern "C" {
@@ -89,12 +79,6 @@ unsafe extern "C" {
     this_obj: JSValue,
     prop: JSAtom,
   ) -> JSValue;
-  fn JS_GetOwnProperty(
-    ctx: *mut JSContext,
-    desc: *mut JSPropertyDescriptor,
-    this_obj: JSValue,
-    prop: JSAtom,
-  ) -> c_int;
   fn JS_DefinePropertyValueStr(
     ctx: *mut JSContext,
     this_obj: JSValue,
@@ -216,22 +200,13 @@ pub(crate) fn serialize_value_with_refs(
   v: JSValue,
   external_refs: &[usize],
 ) -> Option<Vec<u8>> {
-  serialize_value_with_refs_inner(ctx, v, external_refs, false)
-}
-
-fn serialize_global_value_with_refs(
-  ctx: *mut JSContext,
-  v: JSValue,
-  external_refs: &[usize],
-) -> Option<Vec<u8>> {
-  serialize_value_with_refs_inner(ctx, v, external_refs, true)
+  serialize_value_with_refs_inner(ctx, v, external_refs)
 }
 
 fn serialize_value_with_refs_inner(
   ctx: *mut JSContext,
   v: JSValue,
   external_refs: &[usize],
-  allow_function_source: bool,
 ) -> Option<Vec<u8>> {
   if let Some(info) = super::module::module_snapshot_info_for_value(v) {
     return encode_module_data(ctx, info, external_refs);
@@ -240,24 +215,10 @@ fn serialize_value_with_refs_inner(
     return Some(encode_function_data(info, external_refs));
   }
   if !ctx.is_null() && unsafe { JS_IsFunction(ctx, v) } {
-    if let Some(bytes) = write_object_bytes(ctx, v, external_refs) {
-      return Some(encode_js_function_data(&bytes));
-    }
-    if allow_function_source
-      && let Some(source) = function_source(ctx, v)
-      && is_eval_safe_function_source(&source)
-    {
-      return Some(encode_js_function_source_data(&source));
-    }
-    return Some(encode_noop_function_data());
+    let bytes = write_object_bytes(ctx, v, external_refs)?;
+    return Some(encode_js_function_data(&bytes));
   }
-  let Some(out) = write_object_bytes(ctx, v, external_refs) else {
-    if v.tag == JS_TAG_OBJECT {
-      return serialize_host_object(ctx, v, external_refs);
-    }
-    return None;
-  };
-  Some(out)
+  write_object_bytes(ctx, v, external_refs)
 }
 
 fn write_object_bytes(
@@ -279,6 +240,18 @@ fn write_object_bytes(
   if buf.is_null() {
     // Clear the pending exception JS_WriteObject leaves behind.
     let exc = unsafe { JS_GetException(ctx) };
+    if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
+      let mut len = 0;
+      let text = unsafe { JS_ToCStringLen(ctx, &mut len, exc) };
+      if !text.is_null() {
+        let bytes = unsafe { std::slice::from_raw_parts(text.cast(), len) };
+        eprintln!(
+          "[qjs snapshot] JS_WriteObject failed: {}",
+          String::from_utf8_lossy(bytes),
+        );
+        unsafe { JS_FreeCString(ctx, text) };
+      }
+    }
     unsafe { JS_FreeValue(ctx, exc) };
     return None;
   }
@@ -299,29 +272,6 @@ pub(crate) fn duplicate_graph_serializable_value(
   }
   write_object_bytes(ctx, value, external_refs)?;
   Some(unsafe { JS_DupValue(ctx, value) })
-}
-
-fn function_source(ctx: *mut JSContext, v: JSValue) -> Option<String> {
-  let mut len: usize = 0;
-  let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, v) };
-  if cstr.is_null() {
-    let exc = unsafe { JS_GetException(ctx) };
-    unsafe { JS_FreeValue(ctx, exc) };
-    return None;
-  }
-  let bytes = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
-  let out = String::from_utf8(bytes.to_vec()).ok();
-  unsafe { JS_FreeCString(ctx, cstr) };
-  out
-}
-
-fn is_eval_safe_function_source(source: &str) -> bool {
-  let source = source.trim_start();
-  !source.contains("[native code]")
-    && (source.starts_with("function")
-      || source.starts_with("async function")
-      || source.starts_with("class")
-      || source.contains("=>"))
 }
 
 pub(crate) fn deserialize_value_with_refs(
@@ -355,101 +305,6 @@ pub(crate) fn deserialize_value_with_refs(
     return Some(value);
   }
   Some(value)
-}
-
-fn serialize_host_object(
-  ctx: *mut JSContext,
-  v: JSValue,
-  external_refs: &[usize],
-) -> Option<Vec<u8>> {
-  let mut seen = HashSet::new();
-  super::exception::with_prepare_stack_suppressed(|| {
-    serialize_host_object_inner(ctx, v, external_refs, &mut seen, 0)
-  })
-}
-
-fn serialize_host_object_inner(
-  ctx: *mut JSContext,
-  v: JSValue,
-  external_refs: &[usize],
-  seen: &mut HashSet<usize>,
-  depth: usize,
-) -> Option<Vec<u8>> {
-  if ctx.is_null() {
-    return None;
-  }
-  if super::module::module_name_for_value(v).is_some()
-    || super::function::snapshot_function_info(v).is_some()
-    || unsafe { JS_IsFunction(ctx, v) }
-    || v.tag >= 0
-  {
-    return serialize_value_with_refs(ctx, v, external_refs);
-  }
-  if depth > 8 {
-    return Some(encode_object_data());
-  }
-  let key = unsafe { v.u.ptr as usize };
-  if key == 0 || !seen.insert(key) {
-    return Some(encode_object_data());
-  }
-
-  let mut props_out = Vec::new();
-  unsafe {
-    let mut tab: *mut JSPropertyEnum = ptr::null_mut();
-    let mut len = 0u32;
-    let rc =
-      JS_GetOwnPropertyNames(ctx, &mut tab, &mut len, v, JS_GPN_STRING_MASK);
-    if rc < 0 {
-      let exc = JS_GetException(ctx);
-      JS_FreeValue(ctx, exc);
-      seen.remove(&key);
-      return Some(encode_object_data());
-    }
-    let props = std::slice::from_raw_parts(tab, len as usize);
-    for prop in props {
-      let Some(name) = atom_to_string(ctx, prop.atom) else {
-        continue;
-      };
-      let mut desc = JSPropertyDescriptor {
-        flags: 0,
-        value: jsv_undefined(),
-        getter: jsv_undefined(),
-        setter: jsv_undefined(),
-      };
-      let rc = JS_GetOwnProperty(ctx, &mut desc, v, prop.atom);
-      if rc <= 0 {
-        if rc < 0 {
-          let exc = JS_GetException(ctx);
-          JS_FreeValue(ctx, exc);
-        }
-        continue;
-      }
-      if desc.flags & JS_PROP_GETSET != 0 {
-        JS_FreeValue(ctx, desc.value);
-        JS_FreeValue(ctx, desc.getter);
-        JS_FreeValue(ctx, desc.setter);
-        continue;
-      }
-      JS_FreeValue(ctx, desc.getter);
-      JS_FreeValue(ctx, desc.setter);
-      let value = desc.value;
-      if value.tag == JS_TAG_EXCEPTION {
-        let exc = JS_GetException(ctx);
-        JS_FreeValue(ctx, exc);
-        continue;
-      }
-      if let Some(bytes) =
-        serialize_host_object_inner(ctx, value, external_refs, seen, depth + 1)
-      {
-        props_out.push((name, bytes));
-      }
-      JS_FreeValue(ctx, value);
-    }
-    JS_FreePropertyEnum(ctx, tab, len);
-  }
-
-  seen.remove(&key);
-  Some(encode_host_object_data(&props_out))
 }
 
 fn encode_module_data(
@@ -517,13 +372,6 @@ fn encode_module_data(
   out.push(u8::from(registry_exports));
   put_opt_bytes(&mut out, &snapshot_exports);
   Some(out)
-}
-
-fn encode_object_data() -> Vec<u8> {
-  let mut out = Vec::with_capacity(DATA_MAGIC.len() + 1);
-  out.extend_from_slice(DATA_MAGIC);
-  out.push(SNAPSHOT_DATA_OBJECT);
-  out
 }
 
 fn encode_function_data(
@@ -608,32 +456,6 @@ fn encode_js_function_data(bytes: &[u8]) -> Vec<u8> {
   out.extend_from_slice(DATA_MAGIC);
   out.push(SNAPSHOT_DATA_JS_FUNCTION);
   put_bytes(&mut out, bytes);
-  out
-}
-
-fn encode_js_function_source_data(source: &str) -> Vec<u8> {
-  let mut out = Vec::new();
-  out.extend_from_slice(DATA_MAGIC);
-  out.push(SNAPSHOT_DATA_JS_FUNCTION_SOURCE);
-  put_str(&mut out, source);
-  out
-}
-
-fn encode_noop_function_data() -> Vec<u8> {
-  let mut out = Vec::new();
-  out.extend_from_slice(DATA_MAGIC);
-  out.push(SNAPSHOT_DATA_NOOP_FUNCTION);
-  out
-}
-
-fn encode_host_object_data(props: &[(String, Vec<u8>)]) -> Vec<u8> {
-  let mut out = Vec::new();
-  out.extend_from_slice(DATA_MAGIC);
-  out.push(SNAPSHOT_DATA_HOST_OBJECT);
-  put_vec(&mut out, props, |out, (name, bytes)| {
-    put_str(out, name);
-    put_bytes(out, bytes);
-  });
   out
 }
 
@@ -1265,21 +1087,18 @@ pub(crate) fn capture_context(
   context_data: &[Vec<u8>],
 ) -> ContextSnapshot {
   install_snapshot_module_exports(ctx);
-  let global_object = unsafe {
+  let global_object = Some(unsafe {
     super::core::refresh_snapshot_intrinsics(ctx);
     let global = JS_GetGlobalObject(ctx);
     let bytes = write_object_bytes(ctx, global, external_refs);
     JS_FreeValue(ctx, global);
-    bytes
-  };
-  let globals = if global_object.is_some() {
-    Vec::new()
-  } else {
-    capture_globals(ctx, external_refs)
-  };
+    bytes.expect(
+      "QuickJS snapshot must serialize the context global as one object graph",
+    )
+  });
   let snapshot = ContextSnapshot {
     global_object,
-    globals,
+    globals: Vec::new(),
     lexical_globals: capture_global_lexicals(ctx, external_refs),
     embedder_data: capture_embedder_data(ctx, external_refs),
     context_data: context_data.to_vec(),
@@ -1295,20 +1114,10 @@ pub(crate) fn capture_context_with_data_roots(
   context_data: &[Vec<u8>],
   context_values: &[Option<JSValue>],
 ) -> ContextSnapshot {
-  let mut refs = install_context_data_registry(ctx, context_values);
+  let refs = install_context_data_registry(ctx, context_values);
   let mut snapshot = capture_context(ctx, external_refs, context_data);
   remove_context_data_registry(ctx);
 
-  if snapshot.global_object.is_none() {
-    refs.fill(false);
-    snapshot.globals.retain(|entry| match entry {
-      GlobalEntry::Value { name, .. }
-      | GlobalEntry::LexicalValue { name, .. }
-      | GlobalEntry::Function { name, .. } => {
-        name != CONTEXT_DATA_REGISTRY.to_str().unwrap()
-      }
-    });
-  }
   snapshot.context_data_refs = refs;
   snapshot
 }
@@ -1429,11 +1238,13 @@ pub(crate) fn replay_context(
     return;
   }
   unsafe { super::core::refresh_snapshot_intrinsics(ctx) };
-  if let Some(bytes) = &snapshot.global_object
-    && let Some(global) = deserialize_value_with_refs(ctx, bytes, external_refs)
-  {
-    unsafe { JS_FreeValue(ctx, global) };
-  }
+  let bytes = snapshot
+    .global_object
+    .as_ref()
+    .expect("QuickJS snapshot is missing its context-global object graph");
+  let global = deserialize_value_with_refs(ctx, bytes, external_refs)
+    .expect("QuickJS snapshot context-global graph failed to deserialize");
+  unsafe { JS_FreeValue(ctx, global) };
   restore_snapshot_module_exports(ctx);
   let context_values =
     take_context_data_registry(ctx, &snapshot.context_data_refs);
@@ -1443,12 +1254,6 @@ pub(crate) fn replay_context(
       .insert(ctx as usize, context_values);
   }
   unsafe {
-    let global = JS_GetGlobalObject(ctx);
-    for entry in &snapshot.globals {
-      replay_global_entry(isolate, ctx, global, entry, external_refs);
-    }
-    JS_FreeValue(ctx, global);
-
     let lexical = v82jsc_global_var_obj(ctx);
     if lexical.tag == JS_TAG_EXCEPTION {
       let exc = JS_GetException(ctx);
@@ -1472,143 +1277,6 @@ pub(crate) fn replay_context(
     super::misc::set_embedder_data_raw(ctx, index, value);
     unsafe { JS_FreeValue(ctx, value) };
   }
-}
-
-unsafe fn standard_global_names(
-  ctx: *mut JSContext,
-) -> Option<HashSet<String>> {
-  let baseline_ctx = unsafe { JS_NewContext(JS_GetRuntime(ctx)) };
-  if baseline_ctx.is_null() {
-    return None;
-  }
-  let mut names = HashSet::new();
-  unsafe {
-    let global = JS_GetGlobalObject(baseline_ctx);
-    let mut tab: *mut JSPropertyEnum = ptr::null_mut();
-    let mut len = 0u32;
-    if JS_GetOwnPropertyNames(
-      baseline_ctx,
-      &mut tab,
-      &mut len,
-      global,
-      JS_GPN_STRING_MASK,
-    ) >= 0
-    {
-      for prop in std::slice::from_raw_parts(tab, len as usize) {
-        if let Some(name) = atom_to_string(baseline_ctx, prop.atom) {
-          names.insert(name);
-        }
-      }
-      JS_FreePropertyEnum(baseline_ctx, tab, len);
-    } else {
-      let exc = JS_GetException(baseline_ctx);
-      JS_FreeValue(baseline_ctx, exc);
-    }
-    JS_FreeValue(baseline_ctx, global);
-    JS_FreeContext(baseline_ctx);
-  }
-  Some(names)
-}
-
-fn capture_globals(
-  ctx: *mut JSContext,
-  external_refs: &[usize],
-) -> Vec<GlobalEntry> {
-  if ctx.is_null() {
-    return Vec::new();
-  }
-  let mut out = Vec::new();
-  unsafe {
-    let standard_globals = standard_global_names(ctx);
-    let global = JS_GetGlobalObject(ctx);
-    let mut tab: *mut JSPropertyEnum = ptr::null_mut();
-    let mut len = 0u32;
-    let rc = JS_GetOwnPropertyNames(
-      ctx,
-      &mut tab,
-      &mut len,
-      global,
-      JS_GPN_STRING_MASK | JS_GPN_SET_ENUM,
-    );
-    if rc < 0 {
-      let exc = JS_GetException(ctx);
-      JS_FreeValue(ctx, exc);
-      JS_FreeValue(ctx, global);
-      return out;
-    }
-    let props = std::slice::from_raw_parts(tab, len as usize);
-    for prop in props {
-      let Some(name) = atom_to_string(ctx, prop.atom) else {
-        continue;
-      };
-      if should_skip_global(&name) {
-        continue;
-      }
-      if !prop.is_enumerable
-        && standard_globals
-          .as_ref()
-          .is_none_or(|names| names.contains(&name))
-      {
-        continue;
-      }
-      let value = if prop.is_enumerable {
-        JS_GetProperty(ctx, global, prop.atom)
-      } else {
-        let mut desc = JSPropertyDescriptor {
-          flags: 0,
-          value: jsv_undefined(),
-          getter: jsv_undefined(),
-          setter: jsv_undefined(),
-        };
-        let rc = JS_GetOwnProperty(ctx, &mut desc, global, prop.atom);
-        if rc <= 0 {
-          if rc < 0 {
-            let exc = JS_GetException(ctx);
-            JS_FreeValue(ctx, exc);
-          }
-          continue;
-        }
-        if desc.flags & JS_PROP_GETSET != 0 {
-          JS_FreeValue(ctx, desc.value);
-          JS_FreeValue(ctx, desc.getter);
-          JS_FreeValue(ctx, desc.setter);
-          continue;
-        }
-        JS_FreeValue(ctx, desc.getter);
-        JS_FreeValue(ctx, desc.setter);
-        desc.value
-      };
-      if value.tag == JS_TAG_EXCEPTION {
-        let exc = JS_GetException(ctx);
-        JS_FreeValue(ctx, exc);
-        continue;
-      }
-      if let Some(info) = super::function::snapshot_function_info(value) {
-        out.push(GlobalEntry::Function {
-          name,
-          callback: ExternalRefSlot::new(info.callback as usize, external_refs),
-          data: info
-            .data_external
-            .map(|ptr| ExternalRefSlot::new(ptr as usize, external_refs)),
-          length: info.length,
-          constructable: info.constructable,
-          enumerable: prop.is_enumerable,
-        });
-      } else if let Some(bytes) =
-        serialize_global_value_with_refs(ctx, value, external_refs)
-      {
-        out.push(GlobalEntry::Value {
-          name,
-          bytes,
-          enumerable: prop.is_enumerable,
-        });
-      }
-      JS_FreeValue(ctx, value);
-    }
-    JS_FreePropertyEnum(ctx, tab, len);
-    JS_FreeValue(ctx, global);
-  }
-  out
 }
 
 fn capture_global_lexicals(
@@ -1679,98 +1347,6 @@ fn capture_embedder_data(
     .collect()
 }
 
-unsafe fn replay_global_entry(
-  isolate: *mut RealIsolate,
-  ctx: *mut JSContext,
-  global: JSValue,
-  entry: &GlobalEntry,
-  external_refs: &[usize],
-) {
-  match entry {
-    GlobalEntry::Value {
-      name,
-      bytes,
-      enumerable,
-    } => {
-      let Ok(name) = CString::new(name.as_str()) else {
-        return;
-      };
-      let Some(value) = deserialize_value_with_refs(ctx, bytes, external_refs)
-      else {
-        return;
-      };
-      unsafe {
-        define_snapshot_global(ctx, global, name.as_ptr(), value, *enumerable)
-      };
-    }
-    GlobalEntry::Function {
-      name,
-      callback,
-      data,
-      length,
-      constructable,
-      enumerable,
-    } => {
-      let callback = callback.resolve(external_refs);
-      if callback == 0 {
-        return;
-      }
-      let Ok(name) = CString::new(name.as_str()) else {
-        return;
-      };
-      let callback =
-        unsafe { std::mem::transmute::<usize, FunctionCallback>(callback) };
-      let data_value = data
-        .map(|slot| slot.resolve(external_refs))
-        .filter(|raw| *raw != 0)
-        .map(|raw| {
-          super::function::make_external_jsvalue(
-            isolate,
-            ctx,
-            raw as *mut c_void,
-          )
-        })
-        .unwrap_or_else(jsv_undefined);
-      let function = unsafe {
-        super::function::make_function_len(
-          ctx,
-          callback,
-          data_value,
-          *length,
-          *constructable,
-        )
-      };
-      if !jsv_is_undefined(&data_value) {
-        unsafe { JS_FreeValue(ctx, data_value) };
-      }
-      unsafe {
-        define_snapshot_global(
-          ctx,
-          global,
-          name.as_ptr(),
-          function,
-          *enumerable,
-        )
-      };
-    }
-    GlobalEntry::LexicalValue { .. } => {}
-  }
-}
-
-unsafe fn define_snapshot_global(
-  ctx: *mut JSContext,
-  global: JSValue,
-  name: *const c_char,
-  value: JSValue,
-  enumerable: bool,
-) {
-  let mut flags = JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE;
-  if enumerable {
-    flags |= JS_PROP_ENUMERABLE;
-  }
-  unsafe { JS_DefinePropertyValueStr(ctx, global, name, value, flags) };
-}
-
 unsafe fn replay_lexical_global_entry(
   ctx: *mut JSContext,
   lexical: JSValue,
@@ -1800,24 +1376,6 @@ unsafe fn atom_to_string(ctx: *mut JSContext, atom: JSAtom) -> Option<String> {
   let out = String::from_utf8(bytes.to_vec()).ok();
   unsafe { JS_FreeCString(ctx, ptr) };
   out
-}
-
-fn should_skip_global(name: &str) -> bool {
-  matches!(
-    name,
-    "console"
-      | "gc"
-      | "Intl"
-      | "Math"
-      | "ShadowRealm"
-      | "__v8x_import_source"
-      | "__v8x_snapshot_intrinsics"
-      | "__v8xKeptObjectsCleared"
-      | "WeakRef"
-      | "ArrayBuffer"
-      | "WebAssembly"
-      | "__v82jsc_wasm_src"
-  )
 }
 
 fn decode_blob(bytes: &[u8]) -> Option<SnapshotBlob> {
@@ -2152,6 +1710,21 @@ mod tests {
     }
   }
 
+  fn value_to_string(
+    context: *mut JSContext,
+    value: JSValue,
+  ) -> Option<String> {
+    let mut len = 0;
+    let text = unsafe { JS_ToCStringLen(context, &mut len, value) };
+    if text.is_null() {
+      return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(text as *const u8, len) };
+    let value = String::from_utf8_lossy(bytes).into_owned();
+    unsafe { JS_FreeCString(context, text) };
+    Some(value)
+  }
+
   unsafe extern "C" fn snapshot_callback_a(
     _info: *const crate::FunctionCallbackInfo,
   ) {
@@ -2476,6 +2049,53 @@ mod tests {
   }
 
   #[test]
+  fn async_stub_factories_roundtrip_shared_closure_state() {
+    let test = TestContext::new();
+    let source_value = test.eval(
+      "(() => {\
+         let nextPromiseId = 0;\
+         const promiseRing = [];\
+         function setPromise(id) { promiseRing[id] = id; return id; }\
+         function resolvePromise(id) { return promiseRing[id]; }\
+         function setUpAsyncStub(originalOp) {\
+           return function asyncOp() {\
+             const id = nextPromiseId;\
+             originalOp.call(this, id);\
+             nextPromiseId = id + 1;\
+             return setPromise(id);\
+           };\
+         }\
+         const ops = { first: setUpAsyncStub(() => undefined),\
+                       second: setUpAsyncStub(() => undefined) };\
+         return { ops: { ...ops }, resolvePromise };\
+       })()",
+    );
+    let bytes = serialize_value(test.context, source_value).unwrap();
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+
+    unsafe {
+      let ops = JS_GetPropertyStr(test.context, restored, c"ops".as_ptr());
+      let second = JS_GetPropertyStr(test.context, ops, c"second".as_ptr());
+      let id = JS_Call(test.context, second, ops, 0, ptr::null_mut());
+      assert!(!jsv_is_exception(&id));
+      let resolve =
+        JS_GetPropertyStr(test.context, restored, c"resolvePromise".as_ptr());
+      let mut args = [id];
+      let result =
+        JS_Call(test.context, resolve, restored, 1, args.as_mut_ptr());
+      assert!(!jsv_is_exception(&result));
+      let mut number = -1;
+      assert_eq!(JS_ToInt32(test.context, &mut number, result), 0);
+      assert_eq!(number, 0);
+
+      for value in [result, resolve, id, second, ops, restored, source_value] {
+        JS_FreeValue(test.context, value);
+      }
+    }
+  }
+
+  #[test]
   fn bytecode_function_roundtrips_recursive_closure() {
     let test = TestContext::new();
     let value =
@@ -2644,7 +2264,7 @@ mod tests {
       JS_GetPropertyStr(target.context, global, c"syntheticResult".as_ptr())
     };
     assert_eq!(
-      function_source(target.context, value).unwrap(),
+      value_to_string(target.context, value).unwrap(),
       "function:43:true",
     );
 
@@ -2781,6 +2401,8 @@ mod tests {
     for source in [
       "Array",
       "Array.fromAsync",
+      "Iterator.zip",
+      "Iterator.zipKeyed",
       "Atomics.notify",
       "Object.prototype.toLocaleString",
       "Object.getPrototypeOf((function*() {})()).next",

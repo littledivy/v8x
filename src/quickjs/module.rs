@@ -4615,10 +4615,11 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
       source_map_url: None,
       source_text: std::string::String::new(),
       source_name: std::string::String::new(),
-      module_name: name,
+      module_name: name.clone(),
       script_id: assign_module_script_id(""),
     },
   );
+  record_module_wrapper(&name, this);
   this
 }
 
