@@ -408,7 +408,11 @@ unsafe extern "C" fn extras_get_cped(
   _argc: c_int,
   _argv: *mut JSValue,
 ) -> JSValue {
-  let stored = CONTINUATION_DATA.with(|c| c.get());
+  let iso = current_iso();
+  if iso.is_null() {
+    return jsv_undefined();
+  }
+  let stored = iso_state(iso).continuation_data;
   unsafe { JS_DupValue(ctx, stored) }
 }
 
@@ -425,9 +429,13 @@ unsafe extern "C" fn extras_set_cped(
   } else {
     jsv_undefined()
   };
-  let new = unsafe { JS_DupValue(ctx, v) };
-  let old = CONTINUATION_DATA.with(|c| c.replace(new));
-  unsafe { JS_FreeValue(ctx, old) };
+  let iso = current_iso();
+  if !iso.is_null() {
+    unsafe {
+      enable_continuation_hooks(iso);
+      set_continuation_data(iso, ctx, v);
+    }
+  }
   jsv_undefined()
 }
 
@@ -621,54 +629,6 @@ pub(crate) unsafe fn drop_microtask_queue_state(queue: *mut MicrotaskQueue) {
   }
 }
 
-const PROMISE_REACTION_HOOK_SOURCE: &str = r#"
-(function(beforeHook, afterHook) {
-  var key = Symbol.for("v8x.quickjs.promiseHooks");
-  var state = globalThis[key];
-  if (!state) {
-    state = {};
-    state.originalThen = Promise.prototype.then;
-    state.before = void 0;
-    state.after = void 0;
-    state.busy = false;
-    Object.defineProperty(globalThis, key, { value: state });
-    Promise.prototype.then = function(onFulfilled, onRejected) {
-      var promise = this;
-      function callHook(hook) {
-        if (state.busy || typeof hook !== "function") return;
-        state.busy = true;
-        try {
-          hook(promise);
-        } catch (e) {
-        } finally {
-          state.busy = false;
-        }
-      }
-      function wrap(handler, isReject) {
-        var callable = typeof handler === "function";
-        return function(value) {
-          callHook(state.before);
-          try {
-            if (callable) return handler.call(this, value);
-            if (isReject) throw value;
-            return value;
-          } finally {
-            callHook(state.after);
-          }
-        };
-      }
-      return state.originalThen.call(
-        this,
-        wrap(onFulfilled, false),
-        wrap(onRejected, true)
-      );
-    };
-  }
-  state.before = typeof beforeHook === "function" ? beforeHook : void 0;
-  state.after = typeof afterHook === "function" ? afterHook : void 0;
-})
-"#;
-
 unsafe extern "C" {
   fn JS_SetPromiseHook(
     rt: *mut JSRuntime,
@@ -683,45 +643,20 @@ unsafe extern "C" {
     >,
     opaque: *mut c_void,
   );
-}
-
-unsafe fn install_promise_reaction_hooks(
-  ctx: *mut JSContext,
-  before_hook: JSValue,
-  after_hook: JSValue,
-) {
-  let Ok(source) = std::ffi::CString::new(PROMISE_REACTION_HOOK_SOURCE) else {
-    return;
-  };
-  let helper = unsafe {
-    JS_Eval(
-      ctx,
-      source.as_ptr(),
-      source.as_bytes().len(),
-      c"<v8-promise-hooks>".as_ptr(),
-      JS_EVAL_TYPE_GLOBAL,
-    )
-  };
-  if helper.tag == JS_TAG_EXCEPTION {
-    let exc = unsafe { JS_GetException(ctx) };
-    unsafe { JS_FreeValue(ctx, exc) };
-    return;
-  }
-  if unsafe { !JS_IsFunction(ctx, helper) } {
-    unsafe { JS_FreeValue(ctx, helper) };
-    return;
-  }
-
-  let mut args = [before_hook, after_hook];
-  let ret =
-    unsafe { JS_Call(ctx, helper, jsv_undefined(), 2, args.as_mut_ptr()) };
-  unsafe { JS_FreeValue(ctx, helper) };
-  if ret.tag == JS_TAG_EXCEPTION {
-    let exc = unsafe { JS_GetException(ctx) };
-    unsafe { JS_FreeValue(ctx, exc) };
-  } else {
-    unsafe { JS_FreeValue(ctx, ret) };
-  }
+  fn JS_SetJobContextHooks(
+    rt: *mut JSRuntime,
+    capture: Option<
+      unsafe extern "C" fn(ctx: *mut JSContext, opaque: *mut c_void) -> JSValue,
+    >,
+    set: Option<
+      unsafe extern "C" fn(
+        ctx: *mut JSContext,
+        value: JSValue,
+        opaque: *mut c_void,
+      ),
+    >,
+    opaque: *mut c_void,
+  );
 }
 
 thread_local! {
@@ -825,7 +760,6 @@ pub extern "C" fn v8__Context__SetPromiseHooks(
     promote(after_hook),
     promote(resolve_hook),
   ];
-  unsafe { install_promise_reaction_hooks(ctx, new[1], new[2]) };
   let old = PROMISE_HOOKS.with(|h| h.replace(new));
   for v in old {
     if !jsv_is_undefined(&v) {
@@ -846,39 +780,103 @@ pub extern "C" fn v8__Context__SetPromiseHooks(
   };
 }
 
-thread_local! {
+unsafe extern "C" fn capture_job_context(
+  ctx: *mut JSContext,
+  opaque: *mut c_void,
+) -> JSValue {
+  let iso = opaque as *mut RealIsolate;
+  if iso.is_null() {
+    return jsv_undefined();
+  }
+  unsafe { JS_DupValue(ctx, iso_state(iso).continuation_data) }
+}
 
-    static CONTINUATION_DATA: std::cell::Cell<JSValue> =
-        std::cell::Cell::new(jsv_undefined());
+unsafe extern "C" fn restore_job_context(
+  ctx: *mut JSContext,
+  value: JSValue,
+  opaque: *mut c_void,
+) {
+  let iso = opaque as *mut RealIsolate;
+  if !iso.is_null() {
+    unsafe { set_continuation_data(iso, ctx, value) };
+  }
+}
+
+unsafe fn set_continuation_data(
+  iso: *mut RealIsolate,
+  ctx: *mut JSContext,
+  value: JSValue,
+) {
+  let new = unsafe { JS_DupValue(ctx, value) };
+  let old = std::mem::replace(&mut iso_state(iso).continuation_data, new);
+  unsafe { JS_FreeValue(ctx, old) };
+}
+
+unsafe fn enable_continuation_hooks(iso: *mut RealIsolate) {
+  let st = iso_state(iso);
+  if st.continuation_hooks_enabled {
+    return;
+  }
+  st.continuation_hooks_enabled = true;
+  unsafe {
+    JS_SetJobContextHooks(
+      st.rt,
+      Some(capture_job_context),
+      Some(restore_job_context),
+      iso as *mut c_void,
+    );
+  }
+}
+
+pub(crate) unsafe fn release_continuation_state(
+  st: &mut super::core::IsoState,
+) {
+  if st.continuation_hooks_enabled {
+    unsafe {
+      JS_SetJobContextHooks(st.rt, None, None, ptr::null_mut());
+    }
+    st.continuation_hooks_enabled = false;
+  }
+  let data = std::mem::replace(&mut st.continuation_data, jsv_undefined());
+  unsafe { JS_FreeValue(st.ctx, data) };
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__SetContinuationPreservedEmbedderData(
-  _this: *mut RealIsolate,
+  this: *mut RealIsolate,
   value: *const Value,
 ) {
-  let ctx = current_ctx();
+  let iso = if this.is_null() { current_iso() } else { this };
+  if iso.is_null() {
+    return;
+  }
+  let mut ctx = current_ctx();
+  if ctx.is_null() {
+    ctx = iso_state(iso).ctx;
+  }
   let new = if value.is_null() {
     jsv_undefined()
-  } else if ctx.is_null() {
-    jsval_of(value)
   } else {
-    unsafe { JS_DupValue(ctx, jsval_of(value)) }
+    jsval_of(value)
   };
-  let old = CONTINUATION_DATA.with(|c| c.replace(new));
-  if !ctx.is_null() {
-    unsafe { JS_FreeValue(ctx, old) };
+  unsafe {
+    enable_continuation_hooks(iso);
+    set_continuation_data(iso, ctx, new);
   }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetContinuationPreservedEmbedderData(
-  _this: *mut RealIsolate,
+  this: *mut RealIsolate,
 ) -> *const Value {
-  let stored = CONTINUATION_DATA.with(|c| c.get());
-  let ctx = current_ctx();
-  if ctx.is_null() {
+  let iso = if this.is_null() { current_iso() } else { this };
+  if iso.is_null() {
     return ptr::null();
+  }
+  let stored = iso_state(iso).continuation_data;
+  let mut ctx = current_ctx();
+  if ctx.is_null() {
+    ctx = iso_state(iso).ctx;
   }
   intern_dup::<Value>(ctx, stored)
 }

@@ -408,6 +408,10 @@ pub(crate) struct IsoState {
   pub default_microtask_queue: *mut MicrotaskQueue,
 
   pub context_microtask_queues: HashMap<usize, *mut MicrotaskQueue>,
+
+  pub continuation_data: JSValue,
+
+  pub continuation_hooks_enabled: bool,
 }
 
 impl IsoState {
@@ -847,6 +851,8 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
       MicrotasksPolicy::Auto,
     ),
     context_microtask_queues: HashMap::new(),
+    continuation_data: jsv_undefined(),
+    continuation_hooks_enabled: false,
   });
   let iso = Box::into_raw(state) as *mut RealIsolate;
   // Arm the interrupt handler so a runaway loop unwinds once
@@ -929,6 +935,7 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
         JS_FreeValue(ctx as *mut JSContext, value);
       }
     }
+    super::isolate::release_continuation_state(&mut st);
     // Release any saved eval/Function bindings a context held while code
     // generation from strings was disabled, before its JSContext is freed.
     for c in &st.extra_contexts {

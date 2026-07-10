@@ -242,12 +242,57 @@ mod api_test {
       assert_eq!(result.to_rust_string_lossy(scope), "2");
     }
 
+    assert_continuation_data_survives_await();
     assert_snapshot_context_data_preserves_global_identity();
 
     unsafe {
       v8::V8::dispose();
     }
     v8::V8::dispose_platform();
+  }
+
+  fn assert_continuation_data_survives_await() {
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let extras = context.get_extras_binding_object(scope);
+    let extras_name = v8::String::new(scope, "__extras").unwrap();
+    context
+      .global(scope)
+      .set(scope, extras_name.into(), extras.into())
+      .unwrap();
+
+    let code = v8::String::new(
+      scope,
+      "const alreadyResolved = Promise.resolve();\n\
+       const inner = { name: 'inner' };\n\
+       const outer = { name: 'outer' };\n\
+       __extras.setContinuationPreservedEmbedderData(inner);\n\
+       async function run() {\n\
+         await alreadyResolved;\n\
+         globalThis.observedContinuation =\n\
+           __extras.getContinuationPreservedEmbedderData().name;\n\
+       }\n\
+       run();\n\
+       __extras.setContinuationPreservedEmbedderData(outer);",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, code, None).unwrap();
+    script.run(scope).unwrap();
+    scope.perform_microtask_checkpoint();
+
+    let check = v8::String::new(
+      scope,
+      "observedContinuation + ':' +\n\
+       (__extras.getContinuationPreservedEmbedderData() === undefined)",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, check, None).unwrap();
+    let result = script.run(scope).unwrap();
+    assert_eq!(result.to_rust_string_lossy(scope), "inner:true");
   }
 
   fn assert_snapshot_context_data_preserves_global_identity() {
