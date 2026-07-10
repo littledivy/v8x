@@ -341,9 +341,11 @@ pub(crate) struct IsoState {
   pub snap_context_captures: Vec<super::snapshot::ContextSnapshot>,
   pub snap_isolate_data: Vec<Vec<u8>>,
   pub snap_context_data: HashMap<usize, Vec<Vec<u8>>>,
+  pub snap_context_data_values: HashMap<usize, Vec<Option<JSValue>>>,
   pub restored_snapshot: Option<super::snapshot::SnapshotBlob>,
   pub restored_isolate_data: Vec<Option<Vec<u8>>>,
   pub restored_context_data: HashMap<usize, Vec<Option<Vec<u8>>>>,
+  pub restored_context_values: HashMap<usize, Vec<Option<JSValue>>>,
   pub external_references: Vec<usize>,
 
   pub external_memory: AtomicI64,
@@ -811,9 +813,11 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     snap_context_captures: Vec::new(),
     snap_isolate_data: Vec::new(),
     snap_context_data: HashMap::new(),
+    snap_context_data_values: HashMap::new(),
     restored_snapshot,
     restored_isolate_data,
     restored_context_data: HashMap::new(),
+    restored_context_values: HashMap::new(),
     external_references,
     external_memory: AtomicI64::new(0),
     external_string_memory: AtomicI64::new(0),
@@ -914,6 +918,16 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
     while let Some((symbol, name)) = st.private_symbols.pop() {
       JS_FreeValue(st.ctx, symbol);
       JS_FreeValue(st.ctx, name);
+    }
+    for (ctx, slots) in st.snap_context_data_values.drain() {
+      for value in slots.into_iter().flatten() {
+        JS_FreeValue(ctx as *mut JSContext, value);
+      }
+    }
+    for (ctx, slots) in st.restored_context_values.drain() {
+      for value in slots.into_iter().flatten() {
+        JS_FreeValue(ctx as *mut JSContext, value);
+      }
     }
     // Release any saved eval/Function bindings a context held while code
     // generation from strings was disabled, before its JSContext is freed.

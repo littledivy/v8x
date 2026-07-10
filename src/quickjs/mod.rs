@@ -133,9 +133,51 @@ mod api_test {
       assert_eq!(result.to_rust_string_lossy(scope), "2");
     }
 
+    assert_snapshot_context_data_preserves_global_identity();
+
     unsafe {
       v8::V8::dispose();
     }
     v8::V8::dispose_platform();
+  }
+
+  fn assert_snapshot_context_data_preserves_global_identity() {
+    let context_data_index;
+    let startup_data = {
+      let mut creator = v8::Isolate::snapshot_creator(None, None);
+      {
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut creator));
+        let scope = &mut scope.init();
+        let context = v8::Context::new(scope, Default::default());
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let code = v8::String::new(
+          scope,
+          "globalThis.sharedSnapshotValue = { marker: 1 }; sharedSnapshotValue",
+        )
+        .unwrap();
+        let script = v8::Script::compile(scope, code, None).unwrap();
+        let shared = script.run(scope).unwrap();
+        scope.set_default_context(context);
+        context_data_index = scope.add_context_data(context, shared);
+      }
+      creator.create_blob(v8::FunctionCodeHandling::Keep).unwrap()
+    };
+
+    {
+      let params = v8::Isolate::create_params().snapshot_blob(startup_data);
+      let isolate = &mut v8::Isolate::new(params);
+      let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+      let scope = &mut scope.init();
+      let context = v8::Context::new(scope, Default::default());
+      let scope = &mut v8::ContextScope::new(scope, context);
+      let restored = scope
+        .get_context_data_from_snapshot_once::<v8::Value>(context_data_index)
+        .unwrap();
+      let code =
+        v8::String::new(scope, "globalThis.sharedSnapshotValue").unwrap();
+      let script = v8::Script::compile(scope, code, None).unwrap();
+      let global_value = script.run(scope).unwrap();
+      assert!(restored.strict_equals(global_value));
+    }
   }
 }

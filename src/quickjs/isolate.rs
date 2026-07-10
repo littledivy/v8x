@@ -345,6 +345,27 @@ pub extern "C" fn v8__Context__GetDataFromSnapshotOnce(
   if ctx.is_null() || iso.is_null() {
     return ptr::null();
   }
+  let restored_value = {
+    let st = super::core::iso_state(iso);
+    let value = st
+      .restored_context_values
+      .get_mut(&(ctx as usize))
+      .and_then(|slots| slots.get_mut(index))
+      .and_then(Option::take);
+    if value.is_some() {
+      if let Some(bytes) = st
+        .restored_context_data
+        .get_mut(&(ctx as usize))
+        .and_then(|slots| slots.get_mut(index))
+      {
+        *bytes = None;
+      }
+    }
+    value
+  };
+  if let Some(value) = restored_value {
+    return intern::<Data>(value);
+  }
   let bytes = {
     let st = super::core::iso_state(iso);
     st.restored_context_data

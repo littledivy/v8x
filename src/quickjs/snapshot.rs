@@ -20,8 +20,9 @@ use std::ptr;
 use super::quickjs_sys::*;
 use crate::{Data, FunctionCallback, FunctionTemplate, RealIsolate};
 
-const MAGIC: &[u8; 8] = b"V8XSNP2\0";
+const MAGIC: &[u8; 8] = b"V8XSNP3\0";
 const DATA_MAGIC: &[u8; 8] = b"V8XSDAT\0";
+const CONTEXT_DATA_REGISTRY: &std::ffi::CStr = c"__v8x_snapshot_context_data";
 const NO_REF_INDEX: u32 = u32::MAX;
 const GLOBAL_VALUE: u8 = 0;
 const GLOBAL_FUNCTION: u8 = 1;
@@ -117,6 +118,7 @@ pub(crate) struct ContextSnapshot {
   pub lexical_globals: Vec<GlobalEntry>,
   pub embedder_data: Vec<Option<Vec<u8>>>,
   pub context_data: Vec<Vec<u8>>,
+  pub context_data_refs: Vec<bool>,
 }
 
 #[derive(Clone)]
@@ -283,6 +285,20 @@ fn write_object_bytes(
   let out = unsafe { std::slice::from_raw_parts(buf, size) }.to_vec();
   unsafe { js_free(ctx, buf as *mut std::os::raw::c_void) };
   Some(out)
+}
+
+pub(crate) fn duplicate_graph_serializable_value(
+  ctx: *mut JSContext,
+  value: JSValue,
+  external_refs: &[usize],
+) -> Option<JSValue> {
+  if super::module::module_snapshot_info_for_value(value).is_some()
+    || super::function::snapshot_function_info(value).is_some()
+  {
+    return None;
+  }
+  write_object_bytes(ctx, value, external_refs)?;
+  Some(unsafe { JS_DupValue(ctx, value) })
 }
 
 fn function_source(ctx: *mut JSContext, v: JSValue) -> Option<String> {
@@ -1267,9 +1283,140 @@ pub(crate) fn capture_context(
     lexical_globals: capture_global_lexicals(ctx, external_refs),
     embedder_data: capture_embedder_data(ctx, external_refs),
     context_data: context_data.to_vec(),
+    context_data_refs: vec![false; context_data.len()],
   };
   remove_snapshot_module_exports(ctx);
   snapshot
+}
+
+pub(crate) fn capture_context_with_data_roots(
+  ctx: *mut JSContext,
+  external_refs: &[usize],
+  context_data: &[Vec<u8>],
+  context_values: &[Option<JSValue>],
+) -> ContextSnapshot {
+  let mut refs = install_context_data_registry(ctx, context_values);
+  let mut snapshot = capture_context(ctx, external_refs, context_data);
+  remove_context_data_registry(ctx);
+
+  if snapshot.global_object.is_none() {
+    refs.fill(false);
+    snapshot.globals.retain(|entry| match entry {
+      GlobalEntry::Value { name, .. }
+      | GlobalEntry::LexicalValue { name, .. }
+      | GlobalEntry::Function { name, .. } => {
+        name != CONTEXT_DATA_REGISTRY.to_str().unwrap()
+      }
+    });
+  }
+  snapshot.context_data_refs = refs;
+  snapshot
+}
+
+fn install_context_data_registry(
+  ctx: *mut JSContext,
+  context_values: &[Option<JSValue>],
+) -> Vec<bool> {
+  let mut refs = vec![false; context_values.len()];
+  if ctx.is_null() || !context_values.iter().any(Option::is_some) {
+    return refs;
+  }
+  unsafe {
+    let registry = JS_NewArray(ctx);
+    if registry.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      return refs;
+    }
+    for (index, value) in context_values.iter().enumerate() {
+      let Some(value) = value else {
+        continue;
+      };
+      if JS_SetPropertyUint32(
+        ctx,
+        registry,
+        index as u32,
+        JS_DupValue(ctx, *value),
+      ) >= 0
+      {
+        refs[index] = true;
+      } else {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+      }
+    }
+
+    let global = JS_GetGlobalObject(ctx);
+    if JS_DefinePropertyValueStr(
+      ctx,
+      global,
+      CONTEXT_DATA_REGISTRY.as_ptr(),
+      registry,
+      JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE,
+    ) < 0
+    {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+      refs.fill(false);
+    }
+    JS_FreeValue(ctx, global);
+  }
+  refs
+}
+
+fn remove_context_data_registry(ctx: *mut JSContext) {
+  if ctx.is_null() {
+    return;
+  }
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    if JS_DeletePropertyStr(ctx, global, CONTEXT_DATA_REGISTRY.as_ptr(), 0) < 0
+    {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    JS_FreeValue(ctx, global);
+  }
+}
+
+fn take_context_data_registry(
+  ctx: *mut JSContext,
+  refs: &[bool],
+) -> Vec<Option<JSValue>> {
+  let mut values = (0..refs.len()).map(|_| None).collect::<Vec<_>>();
+  if ctx.is_null() || !refs.iter().any(|value| *value) {
+    return values;
+  }
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let registry =
+      JS_GetPropertyStr(ctx, global, CONTEXT_DATA_REGISTRY.as_ptr());
+    if registry.tag == JS_TAG_OBJECT {
+      for (index, is_ref) in refs.iter().enumerate() {
+        if !is_ref {
+          continue;
+        }
+        let value = JS_GetPropertyUint32(ctx, registry, index as u32);
+        if value.tag == JS_TAG_EXCEPTION {
+          let exc = JS_GetException(ctx);
+          JS_FreeValue(ctx, exc);
+        } else {
+          values[index] = Some(value);
+        }
+      }
+    } else if registry.tag == JS_TAG_EXCEPTION {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    JS_FreeValue(ctx, registry);
+    if JS_DeletePropertyStr(ctx, global, CONTEXT_DATA_REGISTRY.as_ptr(), 0) < 0
+    {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    JS_FreeValue(ctx, global);
+  }
+  values
 }
 
 pub(crate) fn replay_context(
@@ -1288,6 +1435,13 @@ pub(crate) fn replay_context(
     unsafe { JS_FreeValue(ctx, global) };
   }
   restore_snapshot_module_exports(ctx);
+  let context_values =
+    take_context_data_registry(ctx, &snapshot.context_data_refs);
+  if context_values.iter().any(Option::is_some) {
+    super::core::iso_state(isolate)
+      .restored_context_values
+      .insert(ctx as usize, context_values);
+  }
   unsafe {
     let global = JS_GetGlobalObject(ctx);
     for entry in &snapshot.globals {
@@ -1686,6 +1840,9 @@ fn put_context(out: &mut Vec<u8>, context: &ContextSnapshot) {
   put_vec(out, &context.context_data, |out, bytes| {
     put_bytes(out, bytes)
   });
+  put_vec(out, &context.context_data_refs, |out, value| {
+    out.push(u8::from(*value))
+  });
 }
 
 fn put_global(out: &mut Vec<u8>, entry: &GlobalEntry) {
@@ -1861,6 +2018,7 @@ impl<'a> Reader<'a> {
       lexical_globals: self.get_vec(Reader::get_global)?,
       embedder_data: self.get_vec(Reader::get_opt_bytes)?,
       context_data: self.get_vec(Reader::get_bytes)?,
+      context_data_refs: self.get_vec(|reader| Some(reader.get_u8()? != 0))?,
     })
   }
 

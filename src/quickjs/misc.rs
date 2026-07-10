@@ -1058,30 +1058,19 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
   }
   let st = crate::quickjs::core::iso_state(iso);
   let default_context =
-    st.snap_default_context_capture.clone().map(|mut ctx| {
-      if let Some(context) = st.snap_default_context {
-        ctx.context_data = st
-          .snap_context_data
-          .get(&context)
-          .cloned()
-          .unwrap_or_default();
-      }
-      ctx
+    st.snap_default_context_capture.as_ref().map(|capture| {
+      finalize_context_snapshot(st, st.snap_default_context, capture)
     });
   let contexts = st
     .snap_context_captures
     .iter()
     .enumerate()
     .map(|(index, capture)| {
-      let mut capture = capture.clone();
-      if let Some(context) = st.snap_contexts.get(index) {
-        capture.context_data = st
-          .snap_context_data
-          .get(context)
-          .cloned()
-          .unwrap_or_default();
-      }
-      capture
+      finalize_context_snapshot(
+        st,
+        st.snap_contexts.get(index).copied(),
+        capture,
+      )
     })
     .collect();
   let blob = super::snapshot::SnapshotBlob {
@@ -1094,6 +1083,39 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
   RawStartupDataAbi {
     data: data as *const c_char,
     raw_size,
+  }
+}
+
+fn finalize_context_snapshot(
+  st: &crate::quickjs::core::IsoState,
+  context: Option<usize>,
+  capture: &super::snapshot::ContextSnapshot,
+) -> super::snapshot::ContextSnapshot {
+  let Some(context) = context else {
+    return capture.clone();
+  };
+  let context_data = st
+    .snap_context_data
+    .get(&context)
+    .cloned()
+    .unwrap_or_default();
+  let context_values = st
+    .snap_context_data_values
+    .get(&context)
+    .cloned()
+    .unwrap_or_default();
+  if context_values.iter().any(Option::is_some) {
+    super::snapshot::capture_context_with_data_roots(
+      context as *mut JSContext,
+      &st.external_references,
+      &context_data,
+      &context_values,
+    )
+  } else {
+    let mut capture = capture.clone();
+    capture.context_data = context_data;
+    capture.context_data_refs = vec![false; capture.context_data.len()];
+    capture
   }
 }
 
@@ -1207,13 +1229,25 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
       &external_refs,
     )
   };
+  let graph_value = val.and_then(|value| {
+    super::snapshot::duplicate_graph_serializable_value(
+      ctx,
+      value,
+      &external_refs,
+    )
+  });
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
     let Some(val) = val else {
       eprintln!(
         "[qjs snapshot] AddData_to_context FunctionTemplate ser={}",
         bytes.is_some(),
       );
-      return store_context_snapshot_data(iso, ctx, bytes.unwrap_or_default());
+      return store_context_snapshot_data(
+        iso,
+        ctx,
+        bytes.unwrap_or_default(),
+        None,
+      );
     };
     let preview = unsafe {
       let mut l = 0usize;
@@ -1237,13 +1271,14 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
     );
   }
   let bytes = bytes.unwrap_or_default();
-  store_context_snapshot_data(iso, ctx, bytes)
+  store_context_snapshot_data(iso, ctx, bytes, graph_value)
 }
 
 fn store_context_snapshot_data(
   iso: *mut RealIsolate,
   ctx: *mut JSContext,
   bytes: Vec<u8>,
+  graph_value: Option<JSValue>,
 ) -> usize {
   let st = crate::quickjs::core::iso_state(iso);
   let n = st.ctx_data_counts.entry(ctx as usize).or_insert(0);
@@ -1253,6 +1288,10 @@ fn store_context_snapshot_data(
     .entry(ctx as usize)
     .or_default()
     .push(bytes);
+  st.snap_context_data_values
+    .entry(ctx as usize)
+    .or_default()
+    .push(graph_value);
   idx
 }
 
