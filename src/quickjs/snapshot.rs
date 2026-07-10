@@ -645,7 +645,7 @@ pub(crate) fn serialize_function_template(
   let info = super::function::snapshot_function_template_info(template)?;
   let cached_proto = info
     .cached_proto
-    .and_then(|proto| serialize_host_object(ctx, proto, external_refs));
+    .and_then(|proto| write_object_bytes(ctx, proto, external_refs));
   let mut out = Vec::new();
   out.extend_from_slice(DATA_MAGIC);
   out.push(SNAPSHOT_DATA_FUNCTION_TEMPLATE);
@@ -2325,6 +2325,61 @@ mod tests {
       JS_FreeValue(target.context, restored_global);
       JS_FreeValue(source.context, source_global);
       JS_FreeValue(source.context, source_function);
+    }
+  }
+
+  #[test]
+  fn function_template_cached_prototype_accessors_roundtrip() {
+    let source = TestContext::new();
+    let prototype = unsafe { JS_NewObject(source.context) };
+    unsafe {
+      let getter = source.eval("(() => 42)");
+      let atom = JS_NewAtom(source.context, c"value".as_ptr());
+      assert_eq!(
+        JS_DefinePropertyGetSet(
+          source.context,
+          prototype,
+          atom,
+          getter,
+          jsv_undefined(),
+          JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE,
+        ),
+        1,
+      );
+      JS_FreeAtom(source.context, atom);
+      super::super::core::refresh_snapshot_intrinsics(source.context);
+    }
+    let template =
+      super::super::function::restore_function_template_from_snapshot(
+        snapshot_callback_a,
+        None,
+        0,
+        true,
+        None,
+        Some(prototype),
+        0,
+      );
+
+    let bytes =
+      serialize_function_template(source.context, template, &[]).unwrap();
+    let target = TestContext::new();
+    unsafe { super::super::core::refresh_snapshot_intrinsics(target.context) };
+    let restored =
+      deserialize_function_template(target.context, &bytes, &[]).unwrap();
+    let info = super::super::function::snapshot_function_template_info(
+      restored as *const FunctionTemplate,
+    )
+    .unwrap();
+    let prototype = info.cached_proto.unwrap();
+
+    unsafe {
+      let value =
+        JS_GetPropertyStr(target.context, prototype, c"value".as_ptr());
+      assert!(!jsv_is_exception(&value));
+      let mut number = 0;
+      assert_eq!(JS_ToInt32(target.context, &mut number, value), 0);
+      assert_eq!(number, 42);
+      JS_FreeValue(target.context, value);
     }
   }
 
