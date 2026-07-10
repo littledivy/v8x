@@ -1691,6 +1691,98 @@ fn v8_new_expr_column(line: &str, col: i32) -> i32 {
   }
 }
 
+/// QuickJS records a member call at the start of the receiver expression or
+/// on its member separator; V8 records it at the final property name
+/// (`Deno.bench()` -> `bench`).
+fn v8_member_call_column(line: &str, col: i32) -> i32 {
+  let chars: Vec<char> = line.chars().collect();
+  if col < 1 || col > chars.len() as i32 {
+    return col;
+  }
+  let is_ident_start = |c: char| c.is_alphabetic() || c == '_' || c == '$';
+  let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+  let mut i = (col - 1) as usize;
+  while i < chars.len() && chars[i].is_whitespace() {
+    i += 1;
+  }
+  if i < chars.len() && chars[i] == '?' {
+    i += 1;
+  }
+  if i < chars.len() && chars[i] == '.' {
+    i += 1;
+    while i < chars.len() && chars[i].is_whitespace() {
+      i += 1;
+    }
+    let member_start = i;
+    if i >= chars.len() || !is_ident_start(chars[i]) {
+      return col;
+    }
+    i += 1;
+    while i < chars.len() && is_ident(chars[i]) {
+      i += 1;
+    }
+    return if i < chars.len() && chars[i] == '(' {
+      member_start as i32 + 1
+    } else {
+      col
+    };
+  }
+  if i >= chars.len() || !is_ident_start(chars[i]) {
+    return col;
+  }
+  i += 1;
+  while i < chars.len() && is_ident(chars[i]) {
+    i += 1;
+  }
+
+  let mut member_start = None;
+  loop {
+    while i < chars.len() && chars[i].is_whitespace() {
+      i += 1;
+    }
+    if i < chars.len() && chars[i] == '?' {
+      i += 1;
+      if i >= chars.len() || chars[i] != '.' {
+        return col;
+      }
+    }
+    if i < chars.len() && chars[i] == '.' {
+      i += 1;
+      while i < chars.len() && chars[i].is_whitespace() {
+        i += 1;
+      }
+      if i >= chars.len() || !is_ident_start(chars[i]) {
+        return col;
+      }
+      member_start = Some(i);
+      i += 1;
+      while i < chars.len() && is_ident(chars[i]) {
+        i += 1;
+      }
+      continue;
+    }
+    return if i < chars.len() && chars[i] == '(' {
+      member_start.map_or(col, |start| start as i32 + 1)
+    } else {
+      col
+    };
+  }
+}
+
+#[cfg(test)]
+mod stack_column_tests {
+  use super::v8_member_call_column;
+
+  #[test]
+  fn member_call_uses_final_property_column() {
+    assert_eq!(v8_member_call_column("Deno.bench();", 1), 6);
+    assert_eq!(v8_member_call_column("Deno.bench();", 5), 6);
+    assert_eq!(v8_member_call_column("  obj.run()", 1), 7);
+    assert_eq!(v8_member_call_column("foo()", 1), 1);
+    assert_eq!(v8_member_call_column("Deno.bench();", 6), 6);
+  }
+}
+
 /// `Error.prepareStackTrace(error, callSites)` — see the module note above.
 unsafe extern "C" fn qjs_prepare_stack_trace(
   ctx: *mut JSContext,
@@ -1787,6 +1879,7 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     // Recover V8's `new`-keyword column for `new X()` frames.
     if let Some(src) = super::core::script_source_line(&file, line) {
       col = v8_new_expr_column(&src, col);
+      col = v8_member_call_column(&src, col);
     }
 
     // quickjs names top-level script frames `global code` / `<eval>`; V8

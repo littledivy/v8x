@@ -1,0 +1,39 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -8805,9 +8805,9 @@
+     if (unlikely(tag != JS_TAG_OBJECT)) {
+         switch(tag) {
+         case JS_TAG_NULL:
+-            return JS_ThrowTypeErrorAtom(ctx, "cannot read property '%s' of null", prop);
++            return JS_ThrowTypeErrorAtom(ctx, "Cannot read properties of null (reading '%s')", prop);
+         case JS_TAG_UNDEFINED:
+-            return JS_ThrowTypeErrorAtom(ctx, "cannot read property '%s' of undefined", prop);
++            return JS_ThrowTypeErrorAtom(ctx, "Cannot read properties of undefined (reading '%s')", prop);
+         case JS_TAG_EXCEPTION:
+             return JS_EXCEPTION;
+         case JS_TAG_STRING:
+@@ -9731,9 +9731,9 @@
+         if (unlikely(atom == JS_ATOM_NULL))
+             return JS_EXCEPTION;
+         if (tag == JS_TAG_NULL) {
+-            JS_ThrowTypeErrorAtom(ctx, "cannot read property '%s' of null", atom);
++            JS_ThrowTypeErrorAtom(ctx, "Cannot read properties of null (reading '%s')", atom);
+         } else {
+-            JS_ThrowTypeErrorAtom(ctx, "cannot read property '%s' of undefined", atom);
++            JS_ThrowTypeErrorAtom(ctx, "Cannot read properties of undefined (reading '%s')", atom);
+         }
+         JS_FreeAtom(ctx, atom);
+         return JS_EXCEPTION;
+@@ -10238,10 +10238,10 @@
+ 
+     switch(JS_VALUE_GET_TAG(this_obj)) {
+     case JS_TAG_NULL:
+-        JS_ThrowTypeErrorAtom(ctx, "cannot set property '%s' of null", prop);
++        JS_ThrowTypeErrorAtom(ctx, "Cannot set properties of null (setting '%s')", prop);
+         goto fail;
+     case JS_TAG_UNDEFINED:
+-        JS_ThrowTypeErrorAtom(ctx, "cannot set property '%s' of undefined", prop);
++        JS_ThrowTypeErrorAtom(ctx, "Cannot set properties of undefined (setting '%s')", prop);
+         goto fail;
+     case JS_TAG_OBJECT:
+         p = JS_VALUE_GET_OBJ(this_obj);
