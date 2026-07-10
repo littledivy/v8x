@@ -1,17 +1,111 @@
-diff --git a/quickjs.c b/quickjs.c
-index 11caae0..a5d29c7 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -62106,13 +62334,87 @@ static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int
-     return js_int32(*field);
+@@ -369,6 +369,7 @@
+ typedef struct JSStackFrame {
+     struct JSStackFrame *prev_frame; /* NULL if first stack frame */
+     JSValue cur_func; /* current function, JS_UNDEFINED if the frame is detached */
++    JSValue this_val; /* borrowed while the frame is active */
+     JSValue *arg_buf; /* arguments */
+     JSValue *var_buf; /* variables */
+     struct JSVarRef **var_refs; /* references to arguments or local variables */
+@@ -1195,6 +1196,7 @@
+     JSValue filename;
+     JSValue func;
+     JSValue func_name;
++    JSValue this_val;
+     bool native;
+     int line_num;
+     int col_num;
+@@ -6329,6 +6331,7 @@
+     // TODO(bnoordhuis) switch realms like js_call_c_function does
+     sf->is_strict_mode = false;
+     sf->cur_func = unsafe_unconst(func_obj);
++    sf->this_val = unsafe_unconst(this_val);
+     sf->arg_count = argc;
+     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
+     rt->current_stack_frame = sf->prev_frame;
+@@ -6454,6 +6457,7 @@
+     // TODO(bnoordhuis) switch realms like js_call_c_function does
+     sf->is_strict_mode = false;
+     sf->cur_func = unsafe_unconst(func_obj);
++    sf->this_val = unsafe_unconst(this_val);
+     sf->arg_count = argc;
+     ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
+     rt->current_stack_frame = sf->prev_frame;
+@@ -8024,6 +8028,7 @@
+             JS_FreeValue(ctx, csd[k].filename);
+             JS_FreeValue(ctx, csd[k].func);
+             JS_FreeValue(ctx, csd[k].func_name);
++            JS_FreeValue(ctx, csd[k].this_val);
+         }
+         JSValueConst args[] = {
+             error_obj,
+@@ -17511,6 +17516,7 @@
+ 
+     sf->is_strict_mode = false;
+     sf->cur_func = unsafe_unconst(func_obj);
++    sf->this_val = unsafe_unconst(this_obj);
+     sf->arg_count = argc;
+     arg_buf = argv;
+ 
+@@ -17731,6 +17737,7 @@
+             stack_buf = sf->var_buf + b->var_count;
+             sp = sf->cur_sp;
+             sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
++            sf->this_val = unsafe_unconst(this_obj);
+             pc = sf->cur_pc;
+             sf->prev_frame = rt->current_stack_frame;
+             rt->current_stack_frame = sf;
+@@ -17771,6 +17778,7 @@
+     arg_buf = (JSValue *)argv;
+     sf->arg_count = argc;
+     sf->cur_func = unsafe_unconst(func_obj);
++    sf->this_val = unsafe_unconst(this_obj);
+     var_refs = p->u.func.var_refs;
+ 
+     local_buf = alloca(alloca_size);
+@@ -64483,6 +64491,7 @@
+         JS_FreeValueRT(rt, csd->filename);
+         JS_FreeValueRT(rt, csd->func);
+         JS_FreeValueRT(rt, csd->func_name);
++        JS_FreeValueRT(rt, csd->this_val);
+         js_free_rt(rt, csd);
+     }
+ }
+@@ -64495,6 +64504,7 @@
+         JS_MarkValue(rt, csd->filename, mark_func);
+         JS_MarkValue(rt, csd->func, mark_func);
+         JS_MarkValue(rt, csd->func_name, mark_func);
++        JS_MarkValue(rt, csd->this_val, mark_func);
+     }
  }
  
+@@ -64522,6 +64532,7 @@
+     JSObject *p;
+ 
+     csd->func = js_dup(sf->cur_func);
++    csd->this_val = js_dup(sf->this_val);
+     /* func_name_str is UTF-8 encoded if needed */
+     func_name_str = get_func_name(ctx, sf->cur_func);
+     if (!func_name_str || func_name_str[0] == '\0')
+@@ -64559,6 +64570,7 @@
+ {
+     csd->func = JS_NULL;
+     csd->func_name = JS_NULL;
++    csd->this_val = JS_NULL;
+     csd->native = false;
+     csd->line_num = line_num;
+     csd->col_num = col_num;
+@@ -64594,15 +64606,228 @@
+         return JS_EXCEPTION;
+     int *field = (void *)((char *)csd + magic);
+     return js_int32(*field);
++}
++
 +// v82jsc patch: the rest of V8's CallSite API. QuickJS-ng ships only
 +// isNative/getFileName/getFunction/getFunctionName/get{Line,Column}Number, but
-+// many npm packages (depd, stack-trace, source-map-support, …) call the other
++// many npm packages (depd, stack-trace, source-map-support, ...) call the other
 +// methods on the CallSite objects passed to a user `Error.prepareStackTrace`.
-+// We don't track this/typeName/eval-origin/method distinctions, so return V8's
-+// documented defaults for a plain non-eval, non-constructor toplevel frame.
 +static JSValue js_callsite_ret_undefined(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 +{
 +    return JS_UNDEFINED;
@@ -25,6 +119,147 @@ index 11caae0..a5d29c7 100644
 +static JSValue js_callsite_ret_false(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 +{
 +    return js_bool(false);
++}
++
++// Read a data property without invoking getters or proxy traps. V8's CallSite
++// type-name lookup likewise ignores an accessor Symbol.toStringTag.
++static JSValue js_callsite_get_data_property(JSObject *p, JSAtom atom)
++{
++    while (p) {
++        JSProperty *pr;
++        JSShapeProperty *prs = find_own_property(&pr, p, atom);
++        if (prs) {
++            switch (prs->flags & JS_PROP_TMASK) {
++            case JS_PROP_NORMAL:
++                return js_dup(pr->u.value);
++            case JS_PROP_VARREF:
++                if (!JS_IsUninitialized(*pr->u.var_ref->pvalue))
++                    return js_dup(*pr->u.var_ref->pvalue);
++                break;
++            default:
++                break;
++            }
++            return JS_UNDEFINED;
++        }
++        p = p->shape->proto;
++    }
++    return JS_UNDEFINED;
+ }
+ 
++static JSValue js_callsite_gettypename(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
++{
++    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
++    JSValue name, ctor, tag;
++    JSAtom primitive_name;
++    JSObject *p;
++    const char *name_str;
++
++    if (!csd)
++        return JS_EXCEPTION;
++
++    switch (JS_VALUE_GET_TAG(csd->this_val)) {
++    case JS_TAG_NULL:
++    case JS_TAG_UNDEFINED:
++        return JS_NULL;
++    case JS_TAG_BOOL:
++        primitive_name = JS_ATOM_Boolean;
++        break;
++    case JS_TAG_INT:
++    case JS_TAG_FLOAT64:
++        primitive_name = JS_ATOM_Number;
++        break;
++    case JS_TAG_STRING:
++    case JS_TAG_STRING_ROPE:
++        primitive_name = JS_ATOM_String;
++        break;
++    case JS_TAG_SYMBOL:
++        primitive_name = JS_ATOM_Symbol;
++        break;
++    case JS_TAG_BIG_INT:
++        primitive_name = JS_ATOM_BigInt;
++        break;
++    case JS_TAG_OBJECT:
++        primitive_name = JS_ATOM_NULL;
++        break;
++    default:
++        return JS_NULL;
++    }
++    if (primitive_name != JS_ATOM_NULL)
++        return JS_AtomToString(ctx, primitive_name);
++
++    p = JS_VALUE_GET_OBJ(csd->this_val);
++    name = JS_NULL;
++    ctor = js_callsite_get_data_property(p, JS_ATOM_constructor);
++    if (JS_IsFunction(ctx, ctor)) {
++        name_str = get_func_name(ctx, ctor);
++        if (name_str && name_str[0]) {
++            name = JS_NewString(ctx, name_str);
++            if (strcmp(name_str, "Object") != 0) {
++                JS_FreeCString(ctx, name_str);
++                JS_FreeValue(ctx, ctor);
++                return name;
++            }
++        }
++        JS_FreeCString(ctx, name_str);
++    }
++    JS_FreeValue(ctx, ctor);
++
++    tag = js_callsite_get_data_property(p, JS_ATOM_Symbol_toStringTag);
++    if (JS_IsString(tag)) {
++        JS_FreeValue(ctx, name);
++        return tag;
++    }
++    JS_FreeValue(ctx, tag);
++    if (!JS_IsNull(name))
++        return name;
++    return JS_AtomToString(ctx, ctx->rt->class_array[p->class_id].class_name);
++}
++
++static JSValue js_callsite_getmethodname(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
++{
++    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
++    JSObject *func, *p;
++
++    if (!csd)
++        return JS_EXCEPTION;
++    if (JS_VALUE_GET_TAG(csd->this_val) != JS_TAG_OBJECT ||
++        JS_VALUE_GET_TAG(csd->func) != JS_TAG_OBJECT)
++        return JS_NULL;
++
++    func = JS_VALUE_GET_OBJ(csd->func);
++    for (p = JS_VALUE_GET_OBJ(csd->this_val); p; p = p->shape->proto) {
++        JSShape *shape = p->shape;
++        int i;
++        for (i = 0; i < shape->prop_count; i++) {
++            JSShapeProperty *prs = &shape->prop[i];
++            JSProperty *pr = &p->prop[i];
++            bool matches = false;
++
++            if (prs->atom == JS_ATOM_NULL ||
++                JS_AtomGetKind(ctx, prs->atom) != JS_ATOM_KIND_STRING)
++                continue;
++            switch (prs->flags & JS_PROP_TMASK) {
++            case JS_PROP_NORMAL:
++                matches = JS_VALUE_GET_TAG(pr->u.value) == JS_TAG_OBJECT &&
++                          JS_VALUE_GET_OBJ(pr->u.value) == func;
++                break;
++            case JS_PROP_VARREF:
++                matches = !JS_IsUninitialized(*pr->u.var_ref->pvalue) &&
++                          JS_VALUE_GET_TAG(*pr->u.var_ref->pvalue) == JS_TAG_OBJECT &&
++                          JS_VALUE_GET_OBJ(*pr->u.var_ref->pvalue) == func;
++                break;
++            case JS_PROP_GETSET:
++                matches = pr->u.getset.getter == func ||
++                          pr->u.getset.setter == func;
++                break;
++            default:
++                break;
++            }
++            if (matches)
++                return JS_AtomToString(ctx, prs->atom);
++        }
++    }
++    return JS_NULL;
 +}
 +
 +static JSValue js_callsite_tostring(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
@@ -69,12 +304,12 @@ index 11caae0..a5d29c7 100644
 +    JS_CFUNC_MAGIC_DEF("getScriptNameOrSourceURL", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),
      JS_CFUNC_MAGIC_DEF("getFunction", 0, js_callsite_getfield, offsetof(JSCallSiteData, func)),
      JS_CFUNC_MAGIC_DEF("getFunctionName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),
-+    JS_CFUNC_MAGIC_DEF("getMethodName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),
++    JS_CFUNC_DEF("getMethodName", 0, js_callsite_getmethodname),
      JS_CFUNC_MAGIC_DEF("getColumnNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, col_num)),
      JS_CFUNC_MAGIC_DEF("getLineNumber", 0, js_callsite_getnumber, offsetof(JSCallSiteData, line_num)),
-+    // v82jsc patch: remaining V8 CallSite surface (defaults for plain frames).
-+    JS_CFUNC_DEF("getThis", 0, js_callsite_ret_undefined),
-+    JS_CFUNC_DEF("getTypeName", 0, js_callsite_ret_null),
++    // v82jsc patch: remaining V8 CallSite surface.
++    JS_CFUNC_MAGIC_DEF("getThis", 0, js_callsite_getfield, offsetof(JSCallSiteData, this_val)),
++    JS_CFUNC_DEF("getTypeName", 0, js_callsite_gettypename),
 +    JS_CFUNC_DEF("getEvalOrigin", 0, js_callsite_ret_undefined),
 +    JS_CFUNC_DEF("getPromiseIndex", 0, js_callsite_ret_null),
 +    JS_CFUNC_DEF("getScriptHash", 0, js_callsite_ret_undefined),

@@ -60,6 +60,52 @@ mod raw_smoke_test {
       let _ = ptr::null::<u8>();
     }
   }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
+  fn callsite_preserves_receiver_type_and_method() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = CString::new(
+        "Error.prepareStackTrace = (_, sites) => {\n\
+         const site = sites[0];\n\
+         return [site.getTypeName(), site.getFunctionName(),\n\
+                 site.getMethodName(), site.getThis()[Symbol.toStringTag]].join(':');\n\
+         };\n\
+         const receiver = {\n\
+           [Symbol.toStringTag]: 'BenchContext',\n\
+           start() { return new Error().stack; },\n\
+         };\n\
+         receiver.start();",
+      )
+      .unwrap();
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.as_bytes().len(),
+        c"callsite-test.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "eval threw");
+
+      let mut len = 0;
+      let text = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!text.is_null());
+      let actual =
+        std::str::from_utf8(std::slice::from_raw_parts(text as *const u8, len))
+          .unwrap();
+      assert_eq!(actual, "BenchContext:start:start:BenchContext");
+
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
 }
 
 #[cfg(test)]

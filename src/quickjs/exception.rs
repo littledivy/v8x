@@ -1746,11 +1746,13 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
   };
 
   // Corrected frames, collected for deno's native (source-mapping) formatter:
-  // (file, line, column, function-name, is_top_level).
+  // (file, line, column, function-name, type-name, method-name, is_top_level).
   let mut frames: Vec<(
     std::string::String,
     i32,
     i32,
+    Option<std::string::String>,
+    Option<std::string::String>,
     Option<std::string::String>,
     bool,
   )> = Vec::new();
@@ -1778,6 +1780,8 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     let line = unsafe { call_site_int(ctx, site, c"getLineNumber") };
     let mut col = unsafe { call_site_int(ctx, site, c"getColumnNumber") };
     let func = unsafe { call_site_str(ctx, site, c"getFunctionName") };
+    let type_name = unsafe { call_site_str(ctx, site, c"getTypeName") };
+    let method_name = unsafe { call_site_str(ctx, site, c"getMethodName") };
     unsafe { JS_FreeValue(ctx, site) };
 
     // Recover V8's `new`-keyword column for `new X()` frames.
@@ -1792,13 +1796,42 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
       None | Some("") | Some("global code") | Some("<eval>")
     );
 
-    frames.push((file.clone(), line, col, func.clone(), is_top_level));
+    frames.push((
+      file.clone(),
+      line,
+      col,
+      func.clone(),
+      type_name.clone(),
+      method_name.clone(),
+      is_top_level,
+    ));
 
     out.push_str("\n    at ");
     if is_top_level {
       append_location(&mut out, &file, line, col);
     } else {
-      out.push_str(func.as_deref().unwrap_or("<anonymous>"));
+      if let Some(func) = func.as_deref() {
+        if let Some(type_name) = type_name.as_deref()
+          && !func.starts_with(type_name)
+        {
+          out.push_str(type_name);
+          out.push('.');
+        }
+        out.push_str(func);
+        if let Some(method_name) = method_name.as_deref()
+          && !func.ends_with(method_name)
+        {
+          out.push_str(" [as ");
+          out.push_str(method_name);
+          out.push(']');
+        }
+      } else {
+        if let Some(type_name) = type_name.as_deref() {
+          out.push_str(type_name);
+          out.push('.');
+        }
+        out.push_str(method_name.as_deref().unwrap_or("<anonymous>"));
+      }
       out.push_str(" (");
       append_location(&mut out, &file, line, col);
       out.push(')');
@@ -1818,19 +1851,20 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
   unsafe { JS_NewStringLen(ctx, bytes.as_ptr() as *const c_char, bytes.len()) }
 }
 
-/// JS factory that turns rows of `[file, line, col, funcOrNull, isTopLevel]`
+/// JS factory that turns rows of
+/// `[file, line, col, funcOrNull, typeOrNull, methodOrNull, isTopLevel]`
 /// into the V8-shaped CallSite objects deno's `from_callsite_object` consumes
 /// (it calls each accessor and applies source maps to file/line/column).
 const CALLSITE_FACTORY_SRC: &str = "(function(d){return d.map(function(f){\
-  var file=f[0],line=f[1],col=f[2],top=f[4],fn=top?null:f[3];\
+  var file=f[0],line=f[1],col=f[2],top=f[6],fn=top?null:f[3],type=top?null:f[4],method=top?null:f[5];\
   return {\
     getFileName:function(){return file||undefined;},\
     getScriptNameOrSourceURL:function(){return file||undefined;},\
     getLineNumber:function(){return line||undefined;},\
     getColumnNumber:function(){return col||undefined;},\
     getFunctionName:function(){return fn;},\
-    getMethodName:function(){return fn;},\
-    getTypeName:function(){return null;},\
+    getMethodName:function(){return method;},\
+    getTypeName:function(){return type;},\
     getEvalOrigin:function(){return undefined;},\
     getThis:function(){return undefined;},\
     getFunction:function(){return undefined;},\
@@ -1852,6 +1886,8 @@ unsafe fn build_callsites(
     std::string::String,
     i32,
     i32,
+    Option<std::string::String>,
+    Option<std::string::String>,
     Option<std::string::String>,
     bool,
   )],
@@ -1878,7 +1914,9 @@ unsafe fn build_callsites(
       JS_FreeValue(ctx, factory);
       return None;
     }
-    for (i, (file, line, col, func, top)) in frames.iter().enumerate() {
+    for (i, (file, line, col, func, type_name, method_name, top)) in
+      frames.iter().enumerate()
+    {
       let row = JS_NewArray(ctx);
       let fv = JS_NewStringLen(ctx, file.as_ptr() as *const c_char, file.len());
       JS_SetPropertyUint32(ctx, row, 0, fv);
@@ -1889,7 +1927,21 @@ unsafe fn build_callsites(
         None => jsv_null(),
       };
       JS_SetPropertyUint32(ctx, row, 3, fnv);
-      JS_SetPropertyUint32(ctx, row, 4, JS_NewBool(ctx, *top as c_int));
+      let typev = match type_name {
+        Some(name) => {
+          JS_NewStringLen(ctx, name.as_ptr() as *const c_char, name.len())
+        }
+        None => jsv_null(),
+      };
+      JS_SetPropertyUint32(ctx, row, 4, typev);
+      let methodv = match method_name {
+        Some(name) => {
+          JS_NewStringLen(ctx, name.as_ptr() as *const c_char, name.len())
+        }
+        None => jsv_null(),
+      };
+      JS_SetPropertyUint32(ctx, row, 5, methodv);
+      JS_SetPropertyUint32(ctx, row, 6, JS_NewBool(ctx, *top as c_int));
       JS_SetPropertyUint32(ctx, rows, i as u32, row);
     }
 
@@ -1959,6 +2011,8 @@ unsafe fn source_mapped_stack(
     std::string::String,
     i32,
     i32,
+    Option<std::string::String>,
+    Option<std::string::String>,
     Option<std::string::String>,
     bool,
   )],
