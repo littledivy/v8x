@@ -276,23 +276,6 @@ fn write_object_bytes(
   if buf.is_null() {
     // Clear the pending exception JS_WriteObject leaves behind.
     let exc = unsafe { JS_GetException(ctx) };
-    if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
-      let mut len = 0usize;
-      let text = unsafe { JS_ToCStringLen(ctx, &mut len, exc) };
-      let message = if text.is_null() {
-        "<unstringifiable>".into()
-      } else {
-        let bytes = unsafe { std::slice::from_raw_parts(text.cast::<u8>(), len) };
-        let message = String::from_utf8_lossy(bytes).into_owned();
-        unsafe { JS_FreeCString(ctx, text) };
-        message
-      };
-      let source = function_source(ctx, v).unwrap_or_default();
-      eprintln!(
-        "[qjs snapshot] value encode failed: {message}; value={:?}",
-        source.chars().take(160).collect::<String>()
-      );
-    }
     unsafe { JS_FreeValue(ctx, exc) };
     return None;
   }
@@ -1713,6 +1696,45 @@ mod tests {
       JS_FreeValue(test.context, namespace);
       JS_FreeValue(test.context, evaluated);
       JS_FreeValue(test.context, module);
+    }
+  }
+
+  #[test]
+  fn bytecode_class_roundtrips_prototype() {
+    let test = TestContext::new();
+    let source_value = test.eval(
+      "class Window { method() { return 42; } }; Window",
+    );
+    let bytes = serialize_value(test.context, source_value).unwrap();
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+
+    unsafe {
+      let prototype =
+        JS_GetPropertyStr(test.context, restored, c"prototype".as_ptr());
+      assert_eq!(prototype.tag, JS_TAG_OBJECT);
+      let constructor = JS_GetPropertyStr(
+        test.context,
+        prototype,
+        c"constructor".as_ptr(),
+      );
+      assert_eq!(constructor.tag, JS_TAG_OBJECT);
+      assert_eq!(constructor.u.ptr, restored.u.ptr);
+      let method =
+        JS_GetPropertyStr(test.context, prototype, c"method".as_ptr());
+      let result =
+        JS_Call(test.context, method, prototype, 0, ptr::null_mut());
+      assert!(!jsv_is_exception(&result));
+      let mut number = 0;
+      assert_eq!(JS_ToInt32(test.context, &mut number, result), 0);
+      assert_eq!(number, 42);
+
+      JS_FreeValue(test.context, result);
+      JS_FreeValue(test.context, method);
+      JS_FreeValue(test.context, constructor);
+      JS_FreeValue(test.context, prototype);
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, source_value);
     }
   }
 
