@@ -695,29 +695,89 @@ pub extern "C" fn cppgc__make_garbage_collectable(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn cppgc__Persistent__CONSTRUCT(
-  persistent: *mut *mut c_void,
+  obj: *mut c_void,
+) -> *mut c_void {
+  Box::into_raw(Box::new(obj)) as *mut c_void
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__Persistent__DESTRUCT(this: *mut c_void) {
+  if !this.is_null() {
+    unsafe { drop(Box::from_raw(this as *mut *mut c_void)) };
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__Persistent__Assign(
+  this: *mut c_void,
   obj: *mut c_void,
 ) {
-  if !persistent.is_null() {
-    unsafe { *persistent = obj };
+  if !this.is_null() {
+    unsafe { *(this as *mut *mut c_void) = obj };
   }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn cppgc__Persistent__DESTRUCT(persistent: *mut *mut c_void) {
-  if !persistent.is_null() {
-    unsafe { *persistent = ptr::null_mut() };
-  }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn cppgc__Persistent__Get(
-  persistent: *const *mut c_void,
-) -> *mut c_void {
-  if persistent.is_null() {
+pub extern "C" fn cppgc__Persistent__Get(this: *const c_void) -> *mut c_void {
+  if this.is_null() {
     return ptr::null_mut();
   }
-  unsafe { *persistent }
+  unsafe { *(this as *const *mut c_void) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__WeakPersistent__CONSTRUCT(
+  obj: *mut c_void,
+) -> *mut c_void {
+  cppgc__Persistent__CONSTRUCT(obj)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__WeakPersistent__DESTRUCT(this: *mut c_void) {
+  cppgc__Persistent__DESTRUCT(this)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__WeakPersistent__Assign(
+  this: *mut c_void,
+  obj: *mut c_void,
+) {
+  cppgc__Persistent__Assign(this, obj)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn cppgc__WeakPersistent__Get(
+  this: *const c_void,
+) -> *mut c_void {
+  cppgc__Persistent__Get(this)
+}
+
+#[cfg(test)]
+mod cppgc_persistent_tests {
+  use super::*;
+
+  #[test]
+  fn persistent_uses_an_independent_pointer_slot() {
+    let mut first = 1u8;
+    let mut second = 2u8;
+    let first = (&mut first as *mut u8).cast::<c_void>();
+    let second = (&mut second as *mut u8).cast::<c_void>();
+
+    let persistent = cppgc__Persistent__CONSTRUCT(first);
+    assert!(!persistent.is_null());
+    assert_ne!(persistent, first);
+    assert_eq!(cppgc__Persistent__Get(persistent), first);
+
+    cppgc__Persistent__Assign(persistent, second);
+    assert_eq!(cppgc__Persistent__Get(persistent), second);
+    cppgc__Persistent__DESTRUCT(persistent);
+
+    let weak = cppgc__WeakPersistent__CONSTRUCT(first);
+    assert_eq!(cppgc__WeakPersistent__Get(weak), first);
+    cppgc__WeakPersistent__Assign(weak, second);
+    assert_eq!(cppgc__WeakPersistent__Get(weak), second);
+    cppgc__WeakPersistent__DESTRUCT(weak);
+  }
 }
 
 #[unsafe(no_mangle)]
