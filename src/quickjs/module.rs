@@ -121,6 +121,16 @@ pub(crate) fn bc_key(source: &str) -> u64 {
   fast_content_hash(BC_MAGIC as u64, source.as_bytes())
 }
 
+/// QuickJS takes source as a pointer plus an explicit length, but its parser
+/// also reads a sentinel byte for lookahead. Keep embedded NULs intact while
+/// providing that trailing sentinel.
+fn eval_source_buffer(source: &str) -> Vec<u8> {
+  let mut buffer = Vec::with_capacity(source.len() + 1);
+  buffer.extend_from_slice(source.as_bytes());
+  buffer.push(0);
+  buffer
+}
+
 fn bc_path(key: u64) -> Option<std::path::PathBuf> {
   Some(bc_cache_dir()?.join(format!("{key:016x}.qbc")))
 }
@@ -2410,9 +2420,7 @@ pub(crate) unsafe extern "C" fn module_loader_callback(
     }
     return ptr::null_mut();
   };
-  let Ok(src_c) = CString::new(source.clone()) else {
-    return ptr::null_mut();
-  };
+  let source_buffer = eval_source_buffer(&source);
   let Ok(name_c) = CString::new(name) else {
     return ptr::null_mut();
   };
@@ -2458,8 +2466,8 @@ pub(crate) unsafe extern "C" fn module_loader_callback(
   let result = unsafe {
     JS_Eval(
       ctx,
-      src_c.as_ptr(),
-      src_c.as_bytes().len(),
+      source_buffer.as_ptr() as *const std::os::raw::c_char,
+      source.len(),
       name_c.as_ptr(),
       JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
     )
@@ -2791,14 +2799,12 @@ pub extern "C" fn v8__ScriptCompiler__Compile(
   let src_val = jsval_of(src);
   let text = unsafe { jsval_to_rust(ctx, src_val) };
   let source_map_url = unsafe { source_map_url_for_source(ctx, source, &text) };
-  let Ok(csrc) = CString::new(text) else {
-    return ptr::null();
-  };
-  let len = csrc.as_bytes().len();
+  let source_buffer = eval_source_buffer(&text);
+  let len = text.len();
   let compiled = unsafe {
     JS_Eval(
       ctx,
-      csrc.as_ptr(),
+      source_buffer.as_ptr() as *const std::os::raw::c_char,
       len,
       c"<compile>".as_ptr(),
       JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY,
@@ -2971,13 +2977,8 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
   } else {
     format!("(function({}) {{\n{}\n}})", arg_names.join(","), body)
   };
-  let Ok(csrc) = CString::new(wrapped) else {
-    unsafe {
-      JS_ThrowTypeError(ctx, c"compile_function: NUL in source".as_ptr())
-    };
-    return ptr::null();
-  };
-  let len = csrc.as_bytes().len();
+  let source_buffer = eval_source_buffer(&wrapped);
+  let len = wrapped.len();
 
   let name = unsafe { resource_name_of(ctx, source) };
   let name_c = CString::new(if name.is_empty() {
@@ -2989,7 +2990,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
   let compiled = unsafe {
     JS_Eval(
       ctx,
-      csrc.as_ptr(),
+      source_buffer.as_ptr() as *const std::os::raw::c_char,
       len,
       name_c.as_ptr(),
       JS_EVAL_TYPE_GLOBAL,
@@ -3089,14 +3090,12 @@ pub extern "C" fn v8__ScriptCompiler__CompileUnboundScript(
   let src_val = jsval_of(src);
   let text = unsafe { jsval_to_rust(ctx, src_val) };
   let source_map_url = unsafe { source_map_url_for_source(ctx, source, &text) };
-  let Ok(csrc) = CString::new(text) else {
-    return ptr::null();
-  };
-  let len = csrc.as_bytes().len();
+  let source_buffer = eval_source_buffer(&text);
+  let len = text.len();
   let compiled = unsafe {
     JS_Eval(
       ctx,
-      csrc.as_ptr(),
+      source_buffer.as_ptr() as *const std::os::raw::c_char,
       len,
       c"<compile>".as_ptr(),
       JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY,
@@ -3645,25 +3644,24 @@ unsafe fn materialize_module_def(
     }
   }
   if module_val.is_none() {
-    if let Ok(csrc) = CString::new(source_text.clone()) {
-      let c = unsafe {
-        JS_Eval(
-          ctx,
-          csrc.as_ptr(),
-          csrc.as_bytes().len(),
-          cname.as_ptr(),
-          JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
-        )
-      };
-      if c.tag == JS_TAG_MODULE {
-        unsafe { bc_write(ctx, key, c) };
-        module_val = Some(c);
-      } else if c.tag == JS_TAG_EXCEPTION {
-        let exc = unsafe { JS_GetException(ctx) };
-        unsafe { JS_FreeValue(ctx, exc) };
-      } else {
-        unsafe { JS_FreeValue(ctx, c) };
-      }
+    let source_buffer = eval_source_buffer(&source_text);
+    let c = unsafe {
+      JS_Eval(
+        ctx,
+        source_buffer.as_ptr() as *const std::os::raw::c_char,
+        source_text.len(),
+        cname.as_ptr(),
+        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+      )
+    };
+    if c.tag == JS_TAG_MODULE {
+      unsafe { bc_write(ctx, key, c) };
+      module_val = Some(c);
+    } else if c.tag == JS_TAG_EXCEPTION {
+      let exc = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exc) };
+    } else {
+      unsafe { JS_FreeValue(ctx, c) };
     }
   }
   let Some(mv) = module_val else {
@@ -4026,25 +4024,24 @@ pub extern "C" fn v8__Module__Evaluate(
         }
       }
       if module_val.is_none() {
-        if let Ok(csrc) = CString::new(source_text.clone()) {
-          let c = unsafe {
-            JS_Eval(
-              ctx,
-              csrc.as_ptr(),
-              csrc.as_bytes().len(),
-              cname.as_ptr(),
-              JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
-            )
-          };
-          if c.tag == JS_TAG_MODULE {
-            unsafe { bc_write(ctx, key, c) };
-            module_val = Some(c);
-          } else if c.tag == JS_TAG_EXCEPTION {
-            let exc = unsafe { JS_GetException(ctx) };
-            unsafe { JS_FreeValue(ctx, exc) };
-          } else {
-            unsafe { JS_FreeValue(ctx, c) };
-          }
+        let source_buffer = eval_source_buffer(&source_text);
+        let c = unsafe {
+          JS_Eval(
+            ctx,
+            source_buffer.as_ptr() as *const std::os::raw::c_char,
+            source_text.len(),
+            cname.as_ptr(),
+            JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+          )
+        };
+        if c.tag == JS_TAG_MODULE {
+          unsafe { bc_write(ctx, key, c) };
+          module_val = Some(c);
+        } else if c.tag == JS_TAG_EXCEPTION {
+          let exc = unsafe { JS_GetException(ctx) };
+          unsafe { JS_FreeValue(ctx, exc) };
+        } else {
+          unsafe { JS_FreeValue(ctx, c) };
         }
       }
 
@@ -4057,18 +4054,17 @@ pub extern "C" fn v8__Module__Evaluate(
         let result = unsafe { JS_EvalFunction(ctx, mv) };
         should_drain_jobs = eval_guard.should_drain_jobs();
         result
-      } else if let Ok(csrc) = CString::new(source_text.clone()) {
+      } else {
+        let source_buffer = eval_source_buffer(&source_text);
         unsafe {
           JS_Eval(
             ctx,
-            csrc.as_ptr(),
-            csrc.as_bytes().len(),
+            source_buffer.as_ptr() as *const std::os::raw::c_char,
+            source_text.len(),
             cname.as_ptr(),
             JS_EVAL_TYPE_MODULE,
           )
         }
-      } else {
-        jsv_undefined()
       };
 
       if std::env::var_os("QJS_DBG_UNINIT").is_some() {

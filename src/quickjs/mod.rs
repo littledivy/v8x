@@ -63,6 +63,36 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn eval_preserves_embedded_nul_raw() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = b"globalThis.value = 1; // virtual\0module\n\
+                     globalThis.value = 2; value;\0";
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr() as *const std::ffi::c_char,
+        source.len() - 1,
+        c"nul-source-test.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "eval threw");
+
+      let mut actual = 0;
+      assert_eq!(JS_ToInt32(ctx, &mut actual, result), 0);
+      assert_eq!(actual, 2);
+
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn callsite_preserves_receiver_type_and_method() {
     unsafe {
       let rt = JS_NewRuntime();
