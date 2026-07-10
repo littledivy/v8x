@@ -1710,6 +1710,14 @@ mod tests {
       deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
 
     unsafe {
+      assert!(JS_IsConstructor(test.context, restored));
+      let instance = JS_CallConstructor(
+        test.context,
+        restored,
+        0,
+        ptr::null_mut(),
+      );
+      assert_eq!(instance.tag, JS_TAG_OBJECT);
       let prototype =
         JS_GetPropertyStr(test.context, restored, c"prototype".as_ptr());
       assert_eq!(prototype.tag, JS_TAG_OBJECT);
@@ -1721,9 +1729,9 @@ mod tests {
       assert_eq!(constructor.tag, JS_TAG_OBJECT);
       assert_eq!(constructor.u.ptr, restored.u.ptr);
       let method =
-        JS_GetPropertyStr(test.context, prototype, c"method".as_ptr());
+        JS_GetPropertyStr(test.context, instance, c"method".as_ptr());
       let result =
-        JS_Call(test.context, method, prototype, 0, ptr::null_mut());
+        JS_Call(test.context, method, instance, 0, ptr::null_mut());
       assert!(!jsv_is_exception(&result));
       let mut number = 0;
       assert_eq!(JS_ToInt32(test.context, &mut number, result), 0);
@@ -1733,6 +1741,7 @@ mod tests {
       JS_FreeValue(test.context, method);
       JS_FreeValue(test.context, constructor);
       JS_FreeValue(test.context, prototype);
+      JS_FreeValue(test.context, instance);
       JS_FreeValue(test.context, restored);
       JS_FreeValue(test.context, source_value);
     }
