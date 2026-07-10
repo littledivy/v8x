@@ -4135,22 +4135,9 @@ pub extern "C" fn v8__Module__Evaluate(
     return make_resolved_promise(ctx);
   }
 
-  let already_evaluated = with_module_state(this, |m| {
-    if !m.module_def.is_null() {
-      m.status = ModuleStatus::Evaluated;
-      true
-    } else {
-      false
-    }
-  })
-  .unwrap_or(false);
-  if already_evaluated {
-    return make_resolved_promise(ctx);
-  }
-
   let (bytecode, source_text, source_name, module_name) =
     with_module_state(this, |m| {
-      m.status = ModuleStatus::Evaluated;
+      m.status = ModuleStatus::Evaluating;
       (
         m.bytecode.take(),
         m.source_text.clone(),
