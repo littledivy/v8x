@@ -1359,6 +1359,8 @@ unsafe extern "C" fn qjs_console_log(
       let mut len = 0usize;
       let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, value) };
       if cstr.is_null() {
+        let exception = unsafe { JS_GetException(ctx) };
+        unsafe { JS_FreeValue(ctx, exception) };
         continue;
       }
       let part = unsafe {
