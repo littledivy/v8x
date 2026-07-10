@@ -52,7 +52,7 @@ diff --git a/quickjs.c b/quickjs.c
  };
  
  static const char *bc_tag_name(uint8_t tag)
-@@ -38367,7 +38397,129 @@
+@@ -38367,7 +38397,142 @@
  }
  
  static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj);
@@ -65,12 +65,14 @@ diff --git a/quickjs.c b/quickjs.c
 +                                            const uint8_t *buf,
 +                                            size_t size,
 +                                            JSValue *obj);
++extern bool v82jsc_snapshot_host_object_has_prototype(JSValueConst obj);
 +
 +typedef struct JSSnapshotIntrinsicCollector {
 +    JSContext *ctx;
 +    JSValue registry;
 +    JSObject *registry_object;
 +    JSObjectList visited;
++    JSObjectList registered;
 +    uint32_t next_index;
 +} JSSnapshotIntrinsicCollector;
 +
@@ -83,7 +85,7 @@ diff --git a/quickjs.c b/quickjs.c
 +    JSValue proto;
 +    uint32_t len = 0, i;
 +    int ret;
-+
+ 
 +    if (JS_VALUE_GET_TAG(value) != JS_TAG_OBJECT || depth > 64)
 +        return;
 +    p = JS_VALUE_GET_OBJ(value);
@@ -95,10 +97,13 @@ diff --git a/quickjs.c b/quickjs.c
 +
 +    if (p->class_id == JS_CLASS_C_FUNCTION ||
 +        p->class_id == JS_CLASS_C_FUNCTION_DATA) {
-+        if (JS_SetPropertyUint32(s->ctx, s->registry, s->next_index++,
-+                                 JS_DupValue(s->ctx, value)) < 0) {
-+            JSValue exc = JS_GetException(s->ctx);
-+            JS_FreeValue(s->ctx, exc);
++        if (js_object_list_find(s->ctx, &s->registered, p) < 0) {
++            if (js_object_list_add(s->ctx, &s->registered, p) ||
++                JS_SetPropertyUint32(s->ctx, s->registry, s->next_index++,
++                                     JS_DupValue(s->ctx, value)) < 0) {
++                JSValue exc = JS_GetException(s->ctx);
++                JS_FreeValue(s->ctx, exc);
++            }
 +        }
 +    }
 +
@@ -135,11 +140,11 @@ diff --git a/quickjs.c b/quickjs.c
 +        JS_MKPTR(JS_TAG_OBJECT, p->shape->proto) : JS_NULL;
 +    JS_CollectSnapshotIntrinsics(s, proto, depth + 1);
 +}
- 
++
 +void v82jsc_snapshot_capture_intrinsics(JSContext *ctx, JSValue registry)
 +{
 +    JSSnapshotIntrinsicCollector s;
-+    JSValue global;
++    JSValue global, value;
 +    int64_t length = 0;
 +    uint32_t i;
 +
@@ -157,6 +162,13 @@ diff --git a/quickjs.c b/quickjs.c
 +    }
 +    s.next_index = length;
 +    js_object_list_init(&s.visited);
++    js_object_list_init(&s.registered);
++    for (i = 0; i < (uint32_t)length; i++) {
++        value = JS_GetPropertyUint32(ctx, registry, i);
++        if (JS_VALUE_GET_TAG(value) == JS_TAG_OBJECT)
++            js_object_list_add(ctx, &s.registered, JS_VALUE_GET_OBJ(value));
++        JS_FreeValue(ctx, value);
++    }
 +
 +    global = JS_GetGlobalObject(ctx);
 +    JS_CollectSnapshotIntrinsics(&s, global, 0);
@@ -177,16 +189,16 @@ diff --git a/quickjs.c b/quickjs.c
 +        JS_CollectSnapshotIntrinsics(&s, ctx->class_proto[i], 0);
 +
 +    js_object_list_end(ctx, &s.visited);
++    js_object_list_end(ctx, &s.registered);
 +}
 +
  static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
  {
      JSFunctionBytecode *b = JS_VALUE_GET_PTR(obj);
-@@ -38460,9 +38612,482 @@
-     }
+@@ -38461,8 +38626,503 @@
      return 0;
   fail:
-+    return -1;
+     return -1;
 +}
 +
 +static int JS_WriteVarRef(BCWriterState *s, JSVarRef *var_ref)
@@ -252,7 +264,7 @@ diff --git a/quickjs.c b/quickjs.c
 +
 + invalid:
 +    JS_ThrowTypeError(s->ctx, "invalid bytecode function object");
-     return -1;
++    return -1;
 +}
 +
 +/* Returns 1 when the embedder handled the object, 0 when it did not, and -1
@@ -260,8 +272,9 @@ diff --git a/quickjs.c b/quickjs.c
 +static int JS_WriteHostObject(BCWriterState *s, JSValueConst obj)
 +{
 +    uint8_t *buf;
++    JSValue prototype;
 +    size_t size = 0, written;
-+    int ret;
++    int has_prototype, ret;
 +
 +    ret = v82jsc_snapshot_write_host_object(s->ctx, obj, NULL, &size);
 +    if (ret <= 0)
@@ -281,6 +294,17 @@ diff --git a/quickjs.c b/quickjs.c
 +    bc_put_leb128(s, size);
 +    dbuf_put(&s->dbuf, buf, size);
 +    js_free(s->ctx, buf);
++    has_prototype = v82jsc_snapshot_host_object_has_prototype(obj);
++    bc_put_u8(s, has_prototype);
++    if (has_prototype) {
++        prototype = JS_GetProperty(s->ctx, obj, JS_ATOM_prototype);
++        if (JS_IsException(prototype))
++            return -1;
++        ret = JS_WriteObjectRec(s, prototype);
++        JS_FreeValue(s->ctx, prototype);
++        if (ret)
++            return -1;
++    }
 +    return 1;
 +}
 +
@@ -301,6 +325,7 @@ diff --git a/quickjs.c b/quickjs.c
 +    int16_t target_magic;
 +    bool match_metadata;
 +    bool found_exact;
++    bool prefer_named_root;
 +    uint8_t depth;
 +    uint8_t kinds[JS_INTRINSIC_PATH_MAX];
 +    JSAtom atoms[JS_INTRINSIC_PATH_MAX];
@@ -316,8 +341,8 @@ diff --git a/quickjs.c b/quickjs.c
 +    JSPropertyEnum *props = NULL;
 +    JSObject *p;
 +    JSValue proto;
-+    uint32_t len = 0, i;
-+    int kind, ret = 0;
++    uint32_t array_index, len = 0, i;
++    int kind, pass, passes, ret = 0;
 +
 +    if (JS_VALUE_GET_TAG(value) != JS_TAG_OBJECT)
 +        return 0;
@@ -350,30 +375,38 @@ diff --git a/quickjs.c b/quickjs.c
 +    if (JS_GetOwnPropertyNames(s->ctx, &props, &len, value,
 +                               JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK) < 0)
 +        goto done;
-+    for (i = 0; i < len; i++) {
-+        memset(&desc, 0, sizeof(desc));
-+        desc.value = JS_UNDEFINED;
-+        desc.getter = JS_UNDEFINED;
-+        desc.setter = JS_UNDEFINED;
-+        if (JS_GetOwnProperty(s->ctx, &desc, value, props[i].atom) < 0) {
-+            ret = -1;
-+            goto done;
-+        }
-+        for (kind = JS_INTRINSIC_VALUE; kind <= JS_INTRINSIC_SETTER; kind++) {
-+            JSValue child = kind == JS_INTRINSIC_VALUE ? desc.value :
-+                (kind == JS_INTRINSIC_GETTER ? desc.getter : desc.setter);
-+            s->kinds[s->depth] = kind;
-+            s->atoms[s->depth++] = props[i].atom;
-+            ret = JS_SearchIntrinsicFunctionPath(s, child);
-+            s->depth--;
++    passes = s->prefer_named_root && s->depth == 1 ? 2 : 1;
++    for (pass = 0; pass < passes; pass++) {
++        for (i = 0; i < len; i++) {
++            if (passes == 2 &&
++                JS_AtomIsArrayIndex(s->ctx, &array_index, props[i].atom) ==
++                    (pass == 0))
++                continue;
++            memset(&desc, 0, sizeof(desc));
++            desc.value = JS_UNDEFINED;
++            desc.getter = JS_UNDEFINED;
++            desc.setter = JS_UNDEFINED;
++            if (JS_GetOwnProperty(s->ctx, &desc, value, props[i].atom) < 0) {
++                ret = -1;
++                goto done;
++            }
++            for (kind = JS_INTRINSIC_VALUE;
++                 kind <= JS_INTRINSIC_SETTER; kind++) {
++                JSValue child = kind == JS_INTRINSIC_VALUE ? desc.value :
++                    (kind == JS_INTRINSIC_GETTER ? desc.getter : desc.setter);
++                s->kinds[s->depth] = kind;
++                s->atoms[s->depth++] = props[i].atom;
++                ret = JS_SearchIntrinsicFunctionPath(s, child);
++                s->depth--;
++                if (ret != 0)
++                    break;
++            }
++            JS_FreeValue(s->ctx, desc.value);
++            JS_FreeValue(s->ctx, desc.getter);
++            JS_FreeValue(s->ctx, desc.setter);
 +            if (ret != 0)
-+                break;
++                goto done;
 +        }
-+        JS_FreeValue(s->ctx, desc.value);
-+        JS_FreeValue(s->ctx, desc.getter);
-+        JS_FreeValue(s->ctx, desc.setter);
-+        if (ret != 0)
-+            goto done;
 +    }
 +    proto = p->shape->proto ?
 +        JS_MKPTR(JS_TAG_OBJECT, p->shape->proto) : JS_NULL;
@@ -418,6 +451,7 @@ diff --git a/quickjs.c b/quickjs.c
 +    path->atoms[0] = registry_atom;
 +    path->depth = 1;
 +    path->match_metadata = true;
++    path->prefer_named_root = true;
 +    ret = JS_SearchIntrinsicFunctionPath(path, registry);
 +    if (ret == 0 && path->target_class_id == JS_CLASS_C_FUNCTION) {
 +        js_object_list_end(ctx, &path->visited);
@@ -665,26 +699,36 @@ diff --git a/quickjs.c b/quickjs.c
  static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
  {
      JSModuleDef *m = JS_VALUE_GET_PTR(obj);
-@@ -38556,43 +39181,99 @@
+@@ -38554,43 +39214,99 @@
+     return 0;
+  fail1:
      return -1;
- }
- 
--static int JS_WriteObjectTag(BCWriterState *s, JSValueConst obj)
+-}
++}
++
 +static int JS_WriteSnapshotObjectState(BCWriterState *s, JSValueConst obj,
 +                                       bool skip_intrinsic_registry)
- {
--    JSObject *p = JS_VALUE_GET_OBJ(obj);
--    uint32_t i, prop_count;
--    JSShape *sh;
--    JSShapeProperty *pr;
--    int pass;
--    JSAtom atom;
++{
 +    JSPropertyDescriptor desc;
 +    JSPropertyEnum *props = NULL;
 +    JSValue proto = JS_UNDEFINED;
 +    JSAtom skip_atom = JS_ATOM_NULL;
 +    uint32_t len = 0, serialized_len, i;
 +    int extensible, ret = -1;
+ 
+-static int JS_WriteObjectTag(BCWriterState *s, JSValueConst obj)
+-{
+-    JSObject *p = JS_VALUE_GET_OBJ(obj);
+-    uint32_t i, prop_count;
+-    JSShape *sh;
+-    JSShapeProperty *pr;
+-    int pass;
+-    JSAtom atom;
++    proto = JS_GetPrototype(s->ctx, obj);
++    if (JS_IsException(proto) || JS_WriteObjectRec(s, proto))
++        goto fail;
++    JS_FreeValue(s->ctx, proto);
++    proto = JS_UNDEFINED;
  
 -    bc_put_u8(s, BC_TAG_OBJECT);
 -    prop_count = 0;
@@ -707,12 +751,6 @@ diff --git a/quickjs.c b/quickjs.c
 -                        goto fail;
 -                }
 -            }
-+    proto = JS_GetPrototype(s->ctx, obj);
-+    if (JS_IsException(proto) || JS_WriteObjectRec(s, proto))
-+        goto fail;
-+    JS_FreeValue(s->ctx, proto);
-+    proto = JS_UNDEFINED;
-+
 +    extensible = JS_IsExtensible(s->ctx, obj);
 +    if (extensible < 0)
 +        goto fail;
@@ -772,8 +810,8 @@ diff --git a/quickjs.c b/quickjs.c
 +    if (props)
 +        js_free_prop_enum(s->ctx, props, len);
 +    return ret;
- }
- 
++}
++
 +static int JS_WriteObjectTag(BCWriterState *s, JSValueConst obj)
 +{
 +    bc_put_u8(s, BC_TAG_SNAPSHOT_OBJECT);
@@ -790,12 +828,10 @@ diff --git a/quickjs.c b/quickjs.c
 +{
 +    bc_put_u8(s, BC_TAG_CONTEXT_GLOBAL);
 +    return JS_WriteSnapshotObjectState(s, obj, true);
-+}
-+
+ }
+ 
  static int JS_WriteTypedArray(BCWriterState *s, JSValueConst obj)
- {
-     JSObject *p = JS_VALUE_GET_OBJ(obj);
-@@ -38650,6 +39331,9 @@
+@@ -38650,6 +39366,9 @@
  
  static int JS_WriteMap(BCWriterState *s, struct JSMapState *map_state);
  static int JS_WriteSet(BCWriterState *s, struct JSMapState *map_state);
@@ -805,7 +841,7 @@ diff --git a/quickjs.c b/quickjs.c
  
  static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
  {
-@@ -38737,13 +39421,34 @@
+@@ -38737,13 +39456,34 @@
                  }
                  p->tmp_mark = 1;
              }
@@ -842,7 +878,7 @@ diff --git a/quickjs.c b/quickjs.c
              case JS_CLASS_ARRAY_BUFFER:
                  ret = JS_WriteArrayBuffer(s, obj);
                  break;
-@@ -38775,12 +39480,41 @@
+@@ -38775,12 +39515,41 @@
                  bc_put_u8(s, BC_TAG_SET);
                  ret = JS_WriteSet(s, p->u.map_state);
                  break;
@@ -886,7 +922,7 @@ diff --git a/quickjs.c b/quickjs.c
                  }
                  break;
              }
-@@ -38891,6 +39625,7 @@
+@@ -38891,6 +39660,7 @@
      if (JS_WriteObjectAtoms(s))
          goto fail;
      js_object_list_end(ctx, &s->object_list);
@@ -894,7 +930,7 @@ diff --git a/quickjs.c b/quickjs.c
      js_free(ctx, s->atom_to_idx);
      js_free(ctx, s->idx_to_atom);
      *psize = s->dbuf.size;
-@@ -38907,6 +39642,7 @@
+@@ -38907,6 +39677,7 @@
      return d->buf;
   fail:
      js_object_list_end(ctx, &s->object_list);
@@ -902,7 +938,7 @@ diff --git a/quickjs.c b/quickjs.c
      js_free(ctx, s->atom_to_idx);
      js_free(ctx, s->idx_to_atom);
      dbuf_free(&s->dbuf);
-@@ -38938,6 +39674,14 @@
+@@ -38938,6 +39709,14 @@
      JSObject **objects;
      int objects_count;
      int objects_size;
@@ -917,7 +953,7 @@ diff --git a/quickjs.c b/quickjs.c
      /* SAB references */
      uint8_t **sab_tab;
      int sab_tab_len;
-@@ -39289,6 +40033,16 @@
+@@ -39289,6 +40068,16 @@
  static int BC_add_object_ref(BCReaderState *s, JSValue obj)
  {
      return BC_add_object_ref1(s, JS_VALUE_GET_OBJ(obj));
@@ -934,10 +970,14 @@ diff --git a/quickjs.c b/quickjs.c
  }
  
  static JSValue JS_ReadFunctionTag(BCReaderState *s)
-@@ -39530,6 +40284,557 @@
-     return JS_EXCEPTION;
- }
+@@ -39526,10 +40315,585 @@
  
+  fail:
+     JS_FreeAtom(ctx, bc.func_name);
++    JS_FreeValue(ctx, obj);
++    return JS_EXCEPTION;
++}
++
 +static JSVarRef *JS_ReadVarRef(BCReaderState *s)
 +{
 +    JSContext *ctx = s->ctx;
@@ -1057,6 +1097,8 @@ diff --git a/quickjs.c b/quickjs.c
 +        goto fail;
 +    if (has_home_object) {
 +        home = JS_ReadObjectRec(s);
++        if (JS_IsException(home))
++            goto fail;
 +        if (JS_VALUE_GET_TAG(home) != JS_TAG_OBJECT) {
 +            JS_FreeValue(ctx, home);
 +            JS_ThrowSyntaxError(ctx, "function home object expected");
@@ -1074,10 +1116,10 @@ diff --git a/quickjs.c b/quickjs.c
 +
 + fail:
 +    JS_FreeValue(ctx, bfunc);
-+    JS_FreeValue(ctx, obj);
-+    return JS_EXCEPTION;
-+}
-+
+     JS_FreeValue(ctx, obj);
+     return JS_EXCEPTION;
+ }
+ 
 +static JSValue JS_ReadIntrinsicFunctionPath(BCReaderState *s,
 +                                            JSClassID expected_class_id)
 +{
@@ -1103,6 +1145,12 @@ diff --git a/quickjs.c b/quickjs.c
 +            desc.getter = JS_UNDEFINED;
 +            desc.setter = JS_UNDEFINED;
 +            if (JS_GetOwnProperty(s->ctx, &desc, obj, atom) <= 0) {
++                const char *name = JS_AtomToCString(s->ctx, atom);
++                JS_ThrowSyntaxError(s->ctx,
++                                    "intrinsic function path property missing "
++                                    "at step %u: %s",
++                                    i, name ? name : "<unknown>");
++                JS_FreeCString(s->ctx, name);
 +                JS_FreeAtom(s->ctx, atom);
 +                atom = JS_ATOM_NULL;
 +                goto fail;
@@ -1470,8 +1518,9 @@ diff --git a/quickjs.c b/quickjs.c
 +
 +static JSValue JS_ReadHostObject(BCReaderState *s)
 +{
-+    JSValue obj = JS_UNDEFINED;
++    JSValue obj = JS_UNDEFINED, prototype = JS_UNDEFINED;
 +    uint32_t size;
++    uint8_t has_prototype;
 +    int ret;
 +
 +    if (bc_get_leb128(s, &size))
@@ -1482,17 +1531,32 @@ diff --git a/quickjs.c b/quickjs.c
 +    if (ret != 1)
 +        return JS_ThrowSyntaxError(s->ctx, "invalid host object");
 +    s->ptr += size;
-+    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT || BC_add_object_ref(s, obj)) {
-+        JS_FreeValue(s->ctx, obj);
-+        return JS_EXCEPTION;
++    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT || BC_add_object_ref(s, obj))
++        goto fail;
++    if (bc_get_u8(s, &has_prototype) || has_prototype > 1)
++        goto fail;
++    if (has_prototype) {
++        prototype = JS_ReadObjectRec(s);
++        if (JS_IsException(prototype))
++            goto fail;
++        if (JS_DefinePropertyValue(s->ctx, obj, JS_ATOM_prototype,
++                                   prototype,
++                                   JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) < 0)
++            goto fail;
++        prototype = JS_UNDEFINED;
 +    }
 +    return obj;
++
++ fail:
++    JS_FreeValue(s->ctx, prototype);
++    JS_FreeValue(s->ctx, obj);
++    return JS_EXCEPTION;
 +}
 +
  static JSValue JS_ReadModule(BCReaderState *s)
  {
      JSContext *ctx = s->ctx;
-@@ -39694,6 +40999,108 @@
+@@ -39694,6 +41058,108 @@
      return JS_EXCEPTION;
  }
  
@@ -1601,7 +1665,7 @@ diff --git a/quickjs.c b/quickjs.c
  static JSValue JS_ReadArray(BCReaderState *s, int tag)
  {
      JSContext *ctx = s->ctx;
-@@ -39873,6 +41280,7 @@
+@@ -39873,6 +41339,7 @@
      JSContext *ctx = s->ctx;
      JSString *pattern;
      JSString *bc;
@@ -1609,7 +1673,7 @@ diff --git a/quickjs.c b/quickjs.c
  
      pattern = JS_ReadString(s);
      if (!pattern)
-@@ -39890,9 +41298,16 @@
+@@ -39890,9 +41357,16 @@
          return JS_ThrowInternalError(ctx, "bad regexp bytecode");
      }
  
@@ -1629,7 +1693,7 @@ diff --git a/quickjs.c b/quickjs.c
  }
  
  static JSValue JS_ReadDate(BCReaderState *s)
-@@ -39944,6 +41359,9 @@
+@@ -39944,6 +41418,9 @@
  
  static JSValue JS_ReadMap(BCReaderState *s);
  static JSValue JS_ReadSet(BCReaderState *s);
@@ -1639,7 +1703,7 @@ diff --git a/quickjs.c b/quickjs.c
  
  static JSValue JS_ReadObjectRec(BCReaderState *s)
  {
-@@ -40002,6 +41420,31 @@
+@@ -40002,6 +41479,31 @@
              goto no_allow_bytecode;
          obj = JS_ReadFunctionTag(s);
          break;
@@ -1671,7 +1735,7 @@ diff --git a/quickjs.c b/quickjs.c
      case BC_TAG_MODULE:
          if (!s->allow_bytecode) {
          no_allow_bytecode:
-@@ -40012,6 +41455,15 @@
+@@ -40012,6 +41514,15 @@
      case BC_TAG_OBJECT:
          obj = JS_ReadObjectTag(s);
          break;
@@ -1687,7 +1751,7 @@ diff --git a/quickjs.c b/quickjs.c
      case BC_TAG_ARRAY:
      case BC_TAG_TEMPLATE_OBJECT:
          obj = JS_ReadArray(s, tag);
-@@ -40060,17 +41512,27 @@
+@@ -40060,17 +41571,27 @@
      case BC_TAG_SET:
          obj = JS_ReadSet(s);
          break;
@@ -1721,7 +1785,7 @@ diff --git a/quickjs.c b/quickjs.c
          }
          break;
      default:
-@@ -40160,6 +41622,10 @@
+@@ -40160,6 +41681,10 @@
          js_free(s->ctx, s->idx_to_atom);
      }
      js_free(s->ctx, s->objects);
@@ -1732,7 +1796,7 @@ diff --git a/quickjs.c b/quickjs.c
  }
  
  JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
-@@ -53457,6 +54923,10 @@
+@@ -53457,6 +54982,10 @@
          rv = js_map_set(ctx, obj, countof(argv), vc(argv), magic);
          if (JS_IsException(rv))
              goto fail;
@@ -1743,7 +1807,7 @@ diff --git a/quickjs.c b/quickjs.c
          JS_FreeValue(ctx, rv);
          JS_FreeValue(ctx, argv[0]);
          JS_FreeValue(ctx, argv[1]);
-@@ -53481,6 +54951,8 @@
+@@ -53481,6 +55010,8 @@
      if (map_state) {
          list_for_each(el, &map_state->records) {
              mr = list_entry(el, JSMapRecord, link);
@@ -1752,7 +1816,7 @@ diff --git a/quickjs.c b/quickjs.c
              if (JS_WriteObjectRec(s, mr->key))
                  return -1;
              // mr->value is always JS_UNDEFINED for sets
-@@ -53501,6 +54973,16 @@
+@@ -53501,8 +55032,18 @@
  static JSValue JS_ReadSet(BCReaderState *s)
  {
      return js_map_read(s, MAGIC_SET);
@@ -1761,15 +1825,17 @@ diff --git a/quickjs.c b/quickjs.c
 +static JSValue JS_ReadWeakMap(BCReaderState *s)
 +{
 +    return js_map_read(s, MAGIC_WEAK);
-+}
-+
+ }
+ 
 +static JSValue JS_ReadWeakSet(BCReaderState *s)
 +{
 +    return js_map_read(s, MAGIC_SET | MAGIC_WEAK);
- }
- 
++}
++
  static int JS_WriteMap(BCWriterState *s, struct JSMapState *map_state)
-@@ -53511,8 +54993,18 @@
+ {
+     return js_map_write(s, map_state, 0);
+@@ -53511,6 +55052,16 @@
  static int JS_WriteSet(BCWriterState *s, struct JSMapState *map_state)
  {
      return js_map_write(s, map_state, MAGIC_SET);
@@ -1778,20 +1844,19 @@ diff --git a/quickjs.c b/quickjs.c
 +static int JS_WriteWeakMap(BCWriterState *s, struct JSMapState *map_state)
 +{
 +    return js_map_write(s, map_state, MAGIC_WEAK);
- }
- 
++}
++
 +static int JS_WriteWeakSet(BCWriterState *s, struct JSMapState *map_state)
 +{
 +    return js_map_write(s, map_state, MAGIC_SET | MAGIC_WEAK);
-+}
-+
+ }
+ 
  static int js_setlike_get_props(JSContext *ctx, JSValueConst setlike,
-                                 uint64_t *psize, JSValue *phas, JSValue *pkeys)
- {
-@@ -62365,6 +63857,125 @@
+@@ -62364,6 +63915,125 @@
+     JSContext *ctx;
      JSValue cb;
  } JSFinalizationRegistryData;
- 
++
 +static bool is_valid_weakref_target(JSValueConst val);
 +
 +static int JS_WriteFinalizationRegistry(BCWriterState *s, JSValueConst obj)
@@ -1910,7 +1975,6 @@ diff --git a/quickjs.c b/quickjs.c
 +    JS_FreeValue(ctx, obj);
 +    return JS_EXCEPTION;
 +}
-+
+ 
  static void delete_finrec_weakref(JSRuntime *rt, JSFinRecEntry *fre)
  {
-     JSWeakRefRecord **pwr, *wr;

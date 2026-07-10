@@ -330,6 +330,8 @@ struct DispatchEntry {
   callback: FunctionCallback,
 
   data: JSValue,
+  data_external: Option<*mut c_void>,
+  data_is_undefined: bool,
 
   instance: *const ObjTemplate,
   signature: *const FnTemplate,
@@ -484,18 +486,39 @@ pub(crate) mod timing {
 }
 
 fn register_dispatch(
+  ctx: *mut JSContext,
   callback: FunctionCallback,
   data: JSValue,
+  data_external: Option<*mut c_void>,
+  data_is_undefined: bool,
   instance: *const ObjTemplate,
   signature: *const FnTemplate,
   fast_overloads: Vec<RawCFunction>,
 ) -> c_int {
   DISPATCH.with(|t| {
     let mut t = t.borrow_mut();
+    if instance.is_null()
+      && signature.is_null()
+      && fast_overloads.is_empty()
+      && (data_is_undefined || data_external.is_some())
+      && let Some(index) = t.iter().position(|entry| {
+        entry.instance.is_null()
+          && entry.signature.is_null()
+          && entry.fast_overloads.is_empty()
+          && entry.callback as usize == callback as usize
+          && entry.data_external == data_external
+          && entry.data_is_undefined == data_is_undefined
+      })
+    {
+      unsafe { JS_FreeValue(ctx, data) };
+      return index as c_int;
+    }
     let idx = t.len() as c_int;
     t.push(DispatchEntry {
       callback,
       data,
+      data_external,
+      data_is_undefined,
       instance,
       signature,
       fast_overloads,
@@ -524,6 +547,11 @@ fn lookup_dispatch(
       )
     })
   })
+}
+
+#[cfg(test)]
+pub(crate) fn dispatch_entry_count() -> usize {
+  DISPATCH.with(|entries| entries.borrow().len())
 }
 
 fn register_named_getter(
@@ -3247,9 +3275,13 @@ unsafe fn make_function_len_with_instance(
   } else {
     unsafe { JS_DupValue(ctx, data) }
   };
+  let data_external = external_pointer_from_value(data);
   let magic = register_dispatch(
+    ctx,
     callback,
     data_owned,
+    data_external,
+    jsv_is_undefined(&data),
     instance,
     signature,
     fast_overloads,

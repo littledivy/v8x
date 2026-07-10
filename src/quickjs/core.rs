@@ -1223,7 +1223,7 @@ pub(crate) fn install_default_globals(
   }
   unsafe {
     let global = JS_GetGlobalObject(ctx);
-    capture_snapshot_intrinsics(ctx);
+    refresh_snapshot_intrinsics(ctx);
 
     let existing = JS_GetPropertyStr(ctx, global, c"console".as_ptr());
     let absent = jsv_is_undefined(&existing) || existing.tag == JS_TAG_NULL;
@@ -1269,7 +1269,7 @@ pub(crate) fn install_default_globals(
     super::module::install_dynamic_source_import_global(ctx, global);
     super::arraybuffer::install_array_buffer_constructor(isolate, ctx, global);
     install_atomics_wait_async_shim(ctx, global);
-    capture_snapshot_intrinsics(ctx);
+    refresh_snapshot_intrinsics(ctx);
     super::isolate::install_snapshot_intrinsics(ctx, global);
     JS_FreeValue(ctx, global);
   }
@@ -1279,7 +1279,7 @@ pub(crate) fn install_default_globals(
   super::exception::install_prepare_stack_trace(ctx);
 }
 
-unsafe fn capture_snapshot_intrinsics(ctx: *mut JSContext) {
+pub(crate) unsafe fn refresh_snapshot_intrinsics(ctx: *mut JSContext) {
   let global = unsafe { JS_GetGlobalObject(ctx) };
   let existing = unsafe {
     JS_GetPropertyStr(ctx, global, c"__v8x_snapshot_intrinsics".as_ptr())

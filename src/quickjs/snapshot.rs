@@ -510,6 +510,14 @@ pub unsafe extern "C" fn v82jsc_snapshot_write_host_object(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn v82jsc_snapshot_host_object_has_prototype(
+  value: JSValue,
+) -> bool {
+  super::function::snapshot_function_info(value)
+    .is_some_and(|info| info.constructable)
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn v82jsc_snapshot_read_host_object(
   ctx: *mut JSContext,
   input: *const u8,
@@ -886,6 +894,7 @@ pub(crate) fn capture_context(
   context_data: &[Vec<u8>],
 ) -> ContextSnapshot {
   let global_object = unsafe {
+    super::core::refresh_snapshot_intrinsics(ctx);
     let global = JS_GetGlobalObject(ctx);
     let bytes = write_object_bytes(ctx, global, external_refs);
     JS_FreeValue(ctx, global);
@@ -913,6 +922,7 @@ pub(crate) fn replay_context(
   if isolate.is_null() || ctx.is_null() {
     return;
   }
+  unsafe { super::core::refresh_snapshot_intrinsics(ctx) };
   if let Some(bytes) = &snapshot.global_object
     && let Some(global) = deserialize_value_with_refs(ctx, bytes, external_refs)
   {
@@ -1650,6 +1660,110 @@ mod tests {
     unsafe {
       JS_FreeValue(test.context, restored);
       JS_FreeValue(test.context, function);
+    }
+  }
+
+  #[test]
+  fn restored_host_functions_reuse_dispatch_entries() {
+    let test = TestContext::new();
+    let function = unsafe {
+      super::super::function::make_function_len(
+        test.context,
+        snapshot_callback_a,
+        jsv_undefined(),
+        0,
+        false,
+      )
+    };
+    let bytes = serialize_value(test.context, function).unwrap();
+    let dispatch_count = super::super::function::dispatch_entry_count();
+
+    for _ in 0..128 {
+      let restored =
+        deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+      unsafe { JS_FreeValue(test.context, restored) };
+    }
+
+    assert_eq!(
+      super::super::function::dispatch_entry_count(),
+      dispatch_count,
+    );
+    unsafe { JS_FreeValue(test.context, function) };
+  }
+
+  #[test]
+  fn host_function_constructor_prototypes_roundtrip() {
+    let source = TestContext::new();
+    let source_function = unsafe {
+      super::super::function::make_function_len(
+        source.context,
+        snapshot_callback_a,
+        jsv_undefined(),
+        0,
+        true,
+      )
+    };
+    let source_prototype = source.eval("({ log() { return 42; } })");
+    assert_eq!(
+      unsafe {
+        JS_DefinePropertyValueStr(
+          source.context,
+          source_function,
+          c"prototype".as_ptr(),
+          source_prototype,
+          JS_PROP_WRITABLE,
+        )
+      },
+      1,
+    );
+    let source_global = unsafe { JS_GetGlobalObject(source.context) };
+    assert_eq!(
+      unsafe {
+        JS_SetPropertyStr(
+          source.context,
+          source_global,
+          c"HostConstructor".as_ptr(),
+          JS_DupValue(source.context, source_function),
+        )
+      },
+      1,
+    );
+    unsafe { super::super::core::refresh_snapshot_intrinsics(source.context) };
+    let result =
+      source.eval("HostConstructor.prototype.constructor = HostConstructor");
+    unsafe { JS_FreeValue(source.context, result) };
+    let bytes = write_object_bytes(source.context, source_global, &[]).unwrap();
+
+    let target = TestContext::new();
+    let restored_global =
+      deserialize_value_with_refs(target.context, &bytes, &[]).unwrap();
+
+    unsafe {
+      let restored = JS_GetPropertyStr(
+        target.context,
+        restored_global,
+        c"HostConstructor".as_ptr(),
+      );
+      let prototype =
+        JS_GetPropertyStr(target.context, restored, c"prototype".as_ptr());
+      let constructor =
+        JS_GetPropertyStr(target.context, prototype, c"constructor".as_ptr());
+      assert_eq!(constructor.u.ptr, restored.u.ptr);
+      let log = JS_GetPropertyStr(target.context, prototype, c"log".as_ptr());
+      let result = JS_Call(target.context, log, prototype, 0, ptr::null_mut());
+      assert!(!jsv_is_exception(&result));
+      let mut number = 0;
+      assert_eq!(JS_ToInt32(target.context, &mut number, result), 0);
+      assert_eq!(number, 42);
+
+      JS_FreeValue(target.context, result);
+      JS_FreeValue(target.context, log);
+      JS_FreeValue(target.context, constructor);
+      JS_FreeValue(target.context, prototype);
+      JS_FreeValue(target.context, restored);
+      JS_FreeValue(target.context, restored_global);
+      JS_FreeValue(source.context, source_global);
+      JS_FreeValue(source.context, source_function);
     }
   }
 
