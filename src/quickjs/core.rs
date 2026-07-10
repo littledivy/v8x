@@ -1300,7 +1300,9 @@ pub(crate) unsafe fn refresh_snapshot_intrinsics(ctx: *mut JSContext) {
     registry
   };
   unsafe {
-    v82jsc_snapshot_capture_intrinsics(ctx, registry);
+    super::exception::with_prepare_stack_suppressed(|| {
+      v82jsc_snapshot_capture_intrinsics(ctx, registry);
+    });
     JS_FreeValue(ctx, registry);
     JS_FreeValue(ctx, global);
   };
@@ -2038,9 +2040,7 @@ pub extern "C" fn v8__Script__Run(
   if let Some(key) = bc_key
     && let Some(bytes) = super::module::bc_load(key)
   {
-    let obj = unsafe {
-      JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), 1 /* BYTECODE */)
-    };
+    let obj = super::module::read_cached_bytecode(ctx, &bytes);
     if obj.tag == JS_TAG_EXCEPTION {
       // Stale/corrupt cache entry: clear the error, fall through to a parse.
       let exc = unsafe { JS_GetException(ctx) };

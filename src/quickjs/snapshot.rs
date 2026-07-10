@@ -2552,11 +2552,67 @@ mod tests {
         .unwrap_or_else(|| panic!("failed to serialize {source}"));
       let restored = deserialize_value_with_refs(test.context, &bytes, &[])
         .unwrap_or_else(|| panic!("failed to deserialize {source}"));
-      assert!(unsafe { JS_IsFunction(test.context, restored) }, "{source}");
+      let mut description_len = 0;
+      let description_ptr = unsafe {
+        JS_ToCStringLen(test.context, &mut description_len, restored)
+      };
+      let description = if description_ptr.is_null() {
+        "<unstringifiable>".to_string()
+      } else {
+        let bytes = unsafe {
+          std::slice::from_raw_parts(
+            description_ptr as *const u8,
+            description_len,
+          )
+        };
+        let description = String::from_utf8_lossy(bytes).into_owned();
+        unsafe { JS_FreeCString(test.context, description_ptr) };
+        description
+      };
+      assert!(
+        unsafe { JS_IsFunction(test.context, restored) },
+        "{source}: restored tag {}, value {description}",
+        restored.tag,
+      );
       unsafe {
         JS_FreeValue(test.context, restored);
         JS_FreeValue(test.context, source_value);
       }
+    }
+  }
+
+  #[test]
+  fn bytecode_class_roundtrips_intrinsic_prototype_identity() {
+    let source = TestContext::new();
+    let source_class = source.eval("(class CustomError extends Error {})");
+    let bytes = serialize_value(source.context, source_class).unwrap();
+
+    let target = TestContext::new();
+    let restored =
+      deserialize_value_with_refs(target.context, &bytes, &[]).unwrap();
+    unsafe {
+      let global = JS_GetGlobalObject(target.context);
+      assert_eq!(
+        JS_SetPropertyStr(
+          target.context,
+          global,
+          c"CustomError".as_ptr(),
+          JS_DupValue(target.context, restored),
+        ),
+        1,
+      );
+      JS_FreeValue(target.context, global);
+
+      let result = target.eval(
+        "Object.getPrototypeOf(CustomError.prototype) === Error.prototype &&\
+         Object.getPrototypeOf(CustomError) === Error &&\
+         new CustomError() instanceof Error",
+      );
+      assert_ne!(JS_ToBool(target.context, result), 0);
+
+      JS_FreeValue(target.context, result);
+      JS_FreeValue(target.context, restored);
+      JS_FreeValue(source.context, source_class);
     }
   }
 

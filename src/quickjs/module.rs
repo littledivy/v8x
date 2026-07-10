@@ -167,6 +167,15 @@ pub(crate) fn bc_load(key: u64) -> Option<Vec<u8>> {
   std::fs::read(p).ok().filter(|b| !b.is_empty())
 }
 
+pub(crate) fn read_cached_bytecode(
+  ctx: *mut JSContext,
+  bytes: &[u8],
+) -> JSValue {
+  super::exception::with_prepare_stack_suppressed(|| unsafe {
+    JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), JS_READ_OBJ_BYTECODE)
+  })
+}
+
 fn bc_store(key: u64, bytes: &[u8]) {
   if bytes.is_empty() {
     return;
@@ -2424,9 +2433,7 @@ pub(crate) unsafe extern "C" fn module_loader_callback(
     if std::env::var_os("QJS_DEBUG_MOD").is_some() && name.contains("stream") {
       eprintln!("[loader] {name} -> BYTECODE path");
     }
-    let m = unsafe {
-      JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), JS_READ_OBJ_BYTECODE)
-    };
+    let m = read_cached_bytecode(ctx, &bytes);
     if m.tag == JS_TAG_MODULE {
       let def = unsafe { m.u.ptr } as *mut JSModuleDef;
       MODULE_DEF_CACHE.with(|c| {
@@ -3627,9 +3634,7 @@ unsafe fn materialize_module_def(
 
   let mut module_val: Option<JSValue> = None;
   if let Some(bytes) = bc_load(key) {
-    let m = unsafe {
-      JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), JS_READ_OBJ_BYTECODE)
-    };
+    let m = read_cached_bytecode(ctx, &bytes);
     if m.tag == JS_TAG_MODULE {
       module_val = Some(m);
     } else if m.tag == JS_TAG_EXCEPTION {
@@ -4010,9 +4015,7 @@ pub extern "C" fn v8__Module__Evaluate(
     if let Some(cname) = cname {
       let mut module_val: Option<JSValue> = None;
       if let Some(bytes) = bc_load(key) {
-        let m = unsafe {
-          JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), JS_READ_OBJ_BYTECODE)
-        };
+        let m = read_cached_bytecode(ctx, &bytes);
         if m.tag == JS_TAG_MODULE {
           module_val = Some(m);
         } else if m.tag == JS_TAG_EXCEPTION {
