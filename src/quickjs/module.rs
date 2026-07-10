@@ -86,18 +86,36 @@ fn bc_cache_dir() -> Option<std::path::PathBuf> {
       if std::env::var_os("V82JSC_NO_BC_CACHE").is_some() {
         return None;
       }
-      let base = std::env::var_os("DENO_DIR")
+      let dir = std::env::var_os("V82JSC_BC_CACHE_DIR")
         .map(std::path::PathBuf::from)
-        .or_else(|| {
-          std::env::var_os("HOME")
-            .map(|h| std::path::PathBuf::from(h).join("Library/Caches"))
-        })
-        .unwrap_or_else(std::env::temp_dir);
-      let dir = base.join("v82jsc_bc");
+        .unwrap_or_else(default_bc_cache_dir);
       std::fs::create_dir_all(&dir).ok()?;
       Some(dir)
     })
     .clone()
+}
+
+fn default_bc_cache_dir() -> std::path::PathBuf {
+  #[cfg(target_os = "macos")]
+  let base = std::env::var_os("HOME")
+    .map(std::path::PathBuf::from)
+    .map(|home| home.join("Library/Caches"));
+
+  #[cfg(target_os = "windows")]
+  let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+
+  #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+  let base = std::env::var_os("XDG_CACHE_HOME")
+    .map(std::path::PathBuf::from)
+    .or_else(|| {
+      std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join(".cache"))
+    });
+
+  base
+    .unwrap_or_else(std::env::temp_dir)
+    .join("v8x/quickjs-bytecode")
 }
 
 /// FNV-1a over 8-byte lanes. Cache keys hash multiple MB of extension source
