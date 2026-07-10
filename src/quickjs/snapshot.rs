@@ -1848,6 +1848,69 @@ mod tests {
   }
 
   #[test]
+  fn proxies_roundtrip_cycles_and_revocation() {
+    let test = TestContext::new();
+    let source_value = test.eval(
+      "(() => {\
+         const target = { value: 41 };\
+         const handler = {\
+           get(target, key, receiver) {\
+             if (key === 'answer') return target.value + 1;\
+             return Reflect.get(target, key, receiver);\
+           },\
+         };\
+         const proxy = new Proxy(target, handler);\
+         target.proxy = proxy;\
+         const revocable = Proxy.revocable({ value: 7 }, {});\
+         revocable.revoke();\
+         return {\
+           proxy,\
+           target,\
+           revokedProxy: revocable.proxy,\
+         };\
+       })()",
+    );
+    let bytes = serialize_value(test.context, source_value).unwrap();
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+
+    unsafe {
+      let proxy =
+        JS_GetPropertyStr(test.context, restored, c"proxy".as_ptr());
+      let target =
+        JS_GetPropertyStr(test.context, restored, c"target".as_ptr());
+      let answer =
+        JS_GetPropertyStr(test.context, proxy, c"answer".as_ptr());
+      let target_proxy =
+        JS_GetPropertyStr(test.context, target, c"proxy".as_ptr());
+      let mut answer_number = 0;
+      assert_eq!(JS_ToInt32(test.context, &mut answer_number, answer), 0);
+      assert_eq!(answer_number, 42);
+      assert_eq!(target_proxy.tag, JS_TAG_OBJECT);
+      assert_eq!(target_proxy.u.ptr, proxy.u.ptr);
+
+      let revoked_proxy = JS_GetPropertyStr(
+        test.context,
+        restored,
+        c"revokedProxy".as_ptr(),
+      );
+      let revoked_value =
+        JS_GetPropertyStr(test.context, revoked_proxy, c"value".as_ptr());
+      assert!(jsv_is_exception(&revoked_value));
+      let exception = JS_GetException(test.context);
+
+      JS_FreeValue(test.context, exception);
+      JS_FreeValue(test.context, revoked_proxy);
+      JS_FreeValue(test.context, target_proxy);
+      JS_FreeValue(test.context, answer);
+      JS_FreeValue(test.context, target);
+      JS_FreeValue(test.context, proxy);
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, source_value);
+    }
+  }
+
+  #[test]
   fn unsupported_object_roundtrips_data_properties_without_invoking_accessors()
   {
     let test = TestContext::new();

@@ -1,7 +1,7 @@
 diff --git a/quickjs.c b/quickjs.c
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -38087,6 +38087,15 @@
+@@ -38087,6 +38087,16 @@
      BC_TAG_MAP,
      BC_TAG_SET,
      BC_TAG_SYMBOL,
@@ -14,10 +14,11 @@ diff --git a/quickjs.c b/quickjs.c
 +    BC_TAG_WEAK_MAP,
 +    BC_TAG_WEAK_SET,
 +    BC_TAG_FINALIZATION_REGISTRY,
++    BC_TAG_PROXY,
  } BCTagEnum;
  
  #define BC_VERSION 26
-@@ -38110,6 +38119,10 @@
+@@ -38110,6 +38120,10 @@
      int sab_tab_size;
      /* list of referenced objects (used if allow_reference = true) */
      JSObjectList object_list;
@@ -28,7 +29,7 @@ diff --git a/quickjs.c b/quickjs.c
  } BCWriterState;
  
  #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
-@@ -38138,6 +38151,15 @@
+@@ -38138,6 +38152,16 @@
      "Map",
      "Set",
      "Symbol",
@@ -41,10 +42,11 @@ diff --git a/quickjs.c b/quickjs.c
 +    "WeakMap",
 +    "WeakSet",
 +    "FinalizationRegistry",
++    "Proxy",
  };
  
  static const char *bc_tag_name(uint8_t tag)
-@@ -38367,7 +38389,129 @@
+@@ -38367,7 +38391,129 @@
  }
  
  static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj);
@@ -75,7 +77,7 @@ diff --git a/quickjs.c b/quickjs.c
 +    JSValue proto;
 +    uint32_t len = 0, i;
 +    int ret;
- 
++
 +    if (JS_VALUE_GET_TAG(value) != JS_TAG_OBJECT || depth > 64)
 +        return;
 +    p = JS_VALUE_GET_OBJ(value);
@@ -121,7 +123,7 @@ diff --git a/quickjs.c b/quickjs.c
 +        }
 +    }
 +    js_free_prop_enum(s->ctx, props, len);
-+
+ 
 + proto:
 +    proto = p->shape->proto ?
 +        JS_MKPTR(JS_TAG_OBJECT, p->shape->proto) : JS_NULL;
@@ -174,11 +176,10 @@ diff --git a/quickjs.c b/quickjs.c
  static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
  {
      JSFunctionBytecode *b = JS_VALUE_GET_PTR(obj);
-@@ -38460,9 +38604,362 @@
-     }
+@@ -38461,8 +38607,377 @@
      return 0;
   fail:
-+    return -1;
+     return -1;
 +}
 +
 +static int JS_WriteVarRef(BCWriterState *s, JSVarRef *var_ref)
@@ -240,7 +241,7 @@ diff --git a/quickjs.c b/quickjs.c
 +
 + invalid:
 +    JS_ThrowTypeError(s->ctx, "invalid bytecode function object");
-     return -1;
++    return -1;
 +}
 +
 +/* Returns 1 when the embedder handled the object, 0 when it did not, and -1
@@ -371,8 +372,8 @@ diff --git a/quickjs.c b/quickjs.c
 +    if (props)
 +        js_free_prop_enum(s->ctx, props, len);
 +    return ret;
- }
- 
++}
++
 +static int JS_FindIntrinsicFunctionPath(JSContext *ctx, JSValueConst value,
 +                                        JSIntrinsicFunctionPath *path)
 +{
@@ -409,8 +410,8 @@ diff --git a/quickjs.c b/quickjs.c
 +    JS_FreeValue(ctx, global);
 +    js_object_list_end(ctx, &path->visited);
 +    return ret > 0 ? 0 : -1;
-+}
-+
+ }
+ 
 +static void JS_FreeIntrinsicFunctionPath(JSIntrinsicFunctionPath *path)
 +{
 +    int i;
@@ -534,10 +535,26 @@ diff --git a/quickjs.c b/quickjs.c
 +    return ret;
 +}
 +
++static int JS_WriteProxy(BCWriterState *s, JSValueConst obj)
++{
++    JSProxyData *proxy = JS_VALUE_GET_OBJ(obj)->u.proxy_data;
++
++    if (!proxy) {
++        JS_ThrowTypeError(s->ctx, "invalid proxy");
++        return -1;
++    }
++    bc_put_u8(s, BC_TAG_PROXY);
++    bc_put_u8(s, proxy->is_revoked);
++    if (JS_WriteObjectRec(s, proxy->target) ||
++        JS_WriteObjectRec(s, proxy->handler))
++        return -1;
++    return 0;
++}
++
  static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
  {
      JSModuleDef *m = JS_VALUE_GET_PTR(obj);
-@@ -38558,39 +39055,63 @@
+@@ -38558,39 +39073,63 @@
  
  static int JS_WriteObjectTag(BCWriterState *s, JSValueConst obj)
  {
@@ -630,7 +647,7 @@ diff --git a/quickjs.c b/quickjs.c
  }
  
  static int JS_WriteTypedArray(BCWriterState *s, JSValueConst obj)
-@@ -38650,6 +39171,9 @@
+@@ -38650,6 +39189,9 @@
  
  static int JS_WriteMap(BCWriterState *s, struct JSMapState *map_state);
  static int JS_WriteSet(BCWriterState *s, struct JSMapState *map_state);
@@ -640,10 +657,11 @@ diff --git a/quickjs.c b/quickjs.c
  
  static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
  {
-@@ -38744,6 +39268,21 @@
+@@ -38743,7 +39285,22 @@
+                 break;
              case JS_CLASS_OBJECT:
                  ret = JS_WriteObjectTag(s, obj);
-                 break;
++                break;
 +            case JS_CLASS_BYTECODE_FUNCTION:
 +            case JS_CLASS_GENERATOR_FUNCTION:
 +            case JS_CLASS_ASYNC_FUNCTION:
@@ -652,7 +670,7 @@ diff --git a/quickjs.c b/quickjs.c
 +                break;
 +            case JS_CLASS_C_FUNCTION:
 +                ret = JS_WriteCFunctionObject(s, obj);
-+                break;
+                 break;
 +            case JS_CLASS_C_FUNCTION_DATA:
 +                ret = JS_WriteCFunctionDataObject(s, obj);
 +                break;
@@ -662,7 +680,7 @@ diff --git a/quickjs.c b/quickjs.c
              case JS_CLASS_ARRAY_BUFFER:
                  ret = JS_WriteArrayBuffer(s, obj);
                  break;
-@@ -38775,12 +39314,35 @@
+@@ -38775,12 +39332,38 @@
                  bc_put_u8(s, BC_TAG_SET);
                  ret = JS_WriteSet(s, p->u.map_state);
                  break;
@@ -676,6 +694,9 @@ diff --git a/quickjs.c b/quickjs.c
 +                break;
 +            case JS_CLASS_FINALIZATION_REGISTRY:
 +                ret = JS_WriteFinalizationRegistry(s, obj);
++                break;
++            case JS_CLASS_PROXY:
++                ret = JS_WriteProxy(s, obj);
 +                break;
              default:
                  if (is_typed_array(p->class_id)) {
@@ -700,7 +721,7 @@ diff --git a/quickjs.c b/quickjs.c
                  }
                  break;
              }
-@@ -38891,6 +39453,7 @@
+@@ -38891,6 +39474,7 @@
      if (JS_WriteObjectAtoms(s))
          goto fail;
      js_object_list_end(ctx, &s->object_list);
@@ -708,7 +729,7 @@ diff --git a/quickjs.c b/quickjs.c
      js_free(ctx, s->atom_to_idx);
      js_free(ctx, s->idx_to_atom);
      *psize = s->dbuf.size;
-@@ -38907,6 +39470,7 @@
+@@ -38907,6 +39491,7 @@
      return d->buf;
   fail:
      js_object_list_end(ctx, &s->object_list);
@@ -716,7 +737,7 @@ diff --git a/quickjs.c b/quickjs.c
      js_free(ctx, s->atom_to_idx);
      js_free(ctx, s->idx_to_atom);
      dbuf_free(&s->dbuf);
-@@ -38938,6 +39502,14 @@
+@@ -38938,6 +39523,14 @@
      JSObject **objects;
      int objects_count;
      int objects_size;
@@ -731,7 +752,7 @@ diff --git a/quickjs.c b/quickjs.c
      /* SAB references */
      uint8_t **sab_tab;
      int sab_tab_len;
-@@ -39289,6 +39861,16 @@
+@@ -39289,6 +39882,16 @@
  static int BC_add_object_ref(BCReaderState *s, JSValue obj)
  {
      return BC_add_object_ref1(s, JS_VALUE_GET_OBJ(obj));
@@ -748,14 +769,10 @@ diff --git a/quickjs.c b/quickjs.c
  }
  
  static JSValue JS_ReadFunctionTag(BCReaderState *s)
-@@ -39526,10 +40108,397 @@
+@@ -39530,6 +40133,446 @@
+     return JS_EXCEPTION;
+ }
  
-  fail:
-     JS_FreeAtom(ctx, bc.func_name);
-+    JS_FreeValue(ctx, obj);
-+    return JS_EXCEPTION;
-+}
-+
 +static JSVarRef *JS_ReadVarRef(BCReaderState *s)
 +{
 +    JSContext *ctx = s->ctx;
@@ -910,10 +927,10 @@ diff --git a/quickjs.c b/quickjs.c
 +
 + fail:
 +    JS_FreeValue(ctx, bfunc);
-     JS_FreeValue(ctx, obj);
-     return JS_EXCEPTION;
- }
- 
++    JS_FreeValue(ctx, obj);
++    return JS_EXCEPTION;
++}
++
 +static JSValue JS_ReadIntrinsicFunctionPath(BCReaderState *s,
 +                                            JSClassID expected_class_id)
 +{
@@ -1122,6 +1139,59 @@ diff --git a/quickjs.c b/quickjs.c
 +    return JS_EXCEPTION;
 +}
 +
++static JSValue JS_ReadProxy(BCReaderState *s)
++{
++    JSContext *ctx = s->ctx;
++    JSProxyData *proxy = NULL;
++    JSValue obj = JS_UNDEFINED, target = JS_UNDEFINED;
++    JSValue handler = JS_UNDEFINED;
++    uint8_t is_revoked;
++
++    if (bc_get_u8(s, &is_revoked) || is_revoked > 1)
++        return JS_ThrowSyntaxError(ctx, "invalid proxy state");
++    obj = JS_NewObjectProtoClass(ctx, JS_NULL, JS_CLASS_PROXY);
++    if (JS_IsException(obj))
++        goto fail;
++    proxy = js_malloc(ctx, sizeof(*proxy));
++    if (!proxy)
++        goto fail;
++    proxy->target = JS_UNDEFINED;
++    proxy->handler = JS_UNDEFINED;
++    proxy->is_func = false;
++    proxy->is_revoked = is_revoked;
++    JS_SetOpaqueInternal(obj, proxy);
++    proxy = NULL;
++    if (BC_add_object_ref(s, obj))
++        goto fail;
++
++    target = JS_ReadObjectRec(s);
++    if (JS_IsException(target))
++        goto fail;
++    handler = JS_ReadObjectRec(s);
++    if (JS_IsException(handler))
++        goto fail;
++    if (JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT ||
++        JS_VALUE_GET_TAG(handler) != JS_TAG_OBJECT) {
++        JS_ThrowSyntaxError(ctx, "invalid proxy target or handler");
++        goto fail;
++    }
++    proxy = JS_VALUE_GET_OBJ(obj)->u.proxy_data;
++    proxy->target = target;
++    proxy->handler = handler;
++    proxy->is_func = JS_IsFunction(ctx, target);
++    target = JS_UNDEFINED;
++    handler = JS_UNDEFINED;
++    JS_SetConstructorBit(ctx, obj, JS_IsConstructor(ctx, proxy->target));
++    return obj;
++
++ fail:
++    js_free(ctx, proxy);
++    JS_FreeValue(ctx, target);
++    JS_FreeValue(ctx, handler);
++    JS_FreeValue(ctx, obj);
++    return JS_EXCEPTION;
++}
++
 +static JSValue JS_ReadHostObject(BCReaderState *s)
 +{
 +    JSValue obj = JS_UNDEFINED;
@@ -1146,7 +1216,7 @@ diff --git a/quickjs.c b/quickjs.c
  static JSValue JS_ReadModule(BCReaderState *s)
  {
      JSContext *ctx = s->ctx;
-@@ -39684,12 +40653,82 @@
+@@ -39684,12 +40727,82 @@
              goto fail;
          }
          ret = JS_DefinePropertyValue(ctx, obj, atom, val, JS_PROP_C_W_E);
@@ -1229,7 +1299,7 @@ diff --git a/quickjs.c b/quickjs.c
      JS_FreeValue(ctx, obj);
      return JS_EXCEPTION;
  }
-@@ -39873,6 +40912,7 @@
+@@ -39873,6 +40986,7 @@
      JSContext *ctx = s->ctx;
      JSString *pattern;
      JSString *bc;
@@ -1237,7 +1307,7 @@ diff --git a/quickjs.c b/quickjs.c
  
      pattern = JS_ReadString(s);
      if (!pattern)
-@@ -39890,9 +40930,16 @@
+@@ -39890,9 +41004,16 @@
          return JS_ThrowInternalError(ctx, "bad regexp bytecode");
      }
  
@@ -1257,7 +1327,7 @@ diff --git a/quickjs.c b/quickjs.c
  }
  
  static JSValue JS_ReadDate(BCReaderState *s)
-@@ -39944,6 +40991,9 @@
+@@ -39944,6 +41065,9 @@
  
  static JSValue JS_ReadMap(BCReaderState *s);
  static JSValue JS_ReadSet(BCReaderState *s);
@@ -1267,10 +1337,11 @@ diff --git a/quickjs.c b/quickjs.c
  
  static JSValue JS_ReadObjectRec(BCReaderState *s)
  {
-@@ -40002,6 +41052,31 @@
+@@ -40001,7 +41125,32 @@
+         if (!s->allow_bytecode)
              goto no_allow_bytecode;
          obj = JS_ReadFunctionTag(s);
-         break;
++        break;
 +    case BC_TAG_BYTECODE_FUNCTION_OBJECT:
 +        if (!s->allow_bytecode)
 +            goto no_allow_bytecode;
@@ -1290,7 +1361,7 @@ diff --git a/quickjs.c b/quickjs.c
 +        if (!s->allow_bytecode)
 +            goto no_allow_bytecode;
 +        obj = JS_ReadBoundFunctionObject(s);
-+        break;
+         break;
 +    case BC_TAG_HOST_OBJECT:
 +        if (!s->allow_bytecode)
 +            goto no_allow_bytecode;
@@ -1299,7 +1370,7 @@ diff --git a/quickjs.c b/quickjs.c
      case BC_TAG_MODULE:
          if (!s->allow_bytecode) {
          no_allow_bytecode:
-@@ -40012,6 +41087,9 @@
+@@ -40012,6 +41161,9 @@
      case BC_TAG_OBJECT:
          obj = JS_ReadObjectTag(s);
          break;
@@ -1309,7 +1380,7 @@ diff --git a/quickjs.c b/quickjs.c
      case BC_TAG_ARRAY:
      case BC_TAG_TEMPLATE_OBJECT:
          obj = JS_ReadArray(s, tag);
-@@ -40059,6 +41137,15 @@
+@@ -40059,6 +41211,18 @@
          break;
      case BC_TAG_SET:
          obj = JS_ReadSet(s);
@@ -1322,10 +1393,13 @@ diff --git a/quickjs.c b/quickjs.c
 +        break;
 +    case BC_TAG_FINALIZATION_REGISTRY:
 +        obj = JS_ReadFinalizationRegistry(s);
++        break;
++    case BC_TAG_PROXY:
++        obj = JS_ReadProxy(s);
          break;
      case BC_TAG_SYMBOL:
          {
-@@ -40160,6 +41247,10 @@
+@@ -40160,6 +41324,10 @@
          js_free(s->ctx, s->idx_to_atom);
      }
      js_free(s->ctx, s->objects);
@@ -1336,7 +1410,7 @@ diff --git a/quickjs.c b/quickjs.c
  }
  
  JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
-@@ -53456,7 +54547,11 @@
+@@ -53456,7 +54624,11 @@
          }
          rv = js_map_set(ctx, obj, countof(argv), vc(argv), magic);
          if (JS_IsException(rv))
@@ -1348,7 +1422,7 @@ diff --git a/quickjs.c b/quickjs.c
          JS_FreeValue(ctx, rv);
          JS_FreeValue(ctx, argv[0]);
          JS_FreeValue(ctx, argv[1]);
-@@ -53481,6 +54576,8 @@
+@@ -53481,6 +54653,8 @@
      if (map_state) {
          list_for_each(el, &map_state->records) {
              mr = list_entry(el, JSMapRecord, link);
@@ -1357,7 +1431,7 @@ diff --git a/quickjs.c b/quickjs.c
              if (JS_WriteObjectRec(s, mr->key))
                  return -1;
              // mr->value is always JS_UNDEFINED for sets
-@@ -53503,6 +54600,16 @@
+@@ -53503,6 +54677,16 @@
      return js_map_read(s, MAGIC_SET);
  }
  
@@ -1374,7 +1448,7 @@ diff --git a/quickjs.c b/quickjs.c
  static int JS_WriteMap(BCWriterState *s, struct JSMapState *map_state)
  {
      return js_map_write(s, map_state, 0);
-@@ -53513,6 +54620,16 @@
+@@ -53513,6 +54697,16 @@
      return js_map_write(s, map_state, MAGIC_SET);
  }
  
@@ -1391,11 +1465,10 @@ diff --git a/quickjs.c b/quickjs.c
  static int js_setlike_get_props(JSContext *ctx, JSValueConst setlike,
                                  uint64_t *psize, JSValue *phas, JSValue *pkeys)
  {
-@@ -62364,7 +63481,126 @@
-     JSContext *ctx;
+@@ -62365,6 +63559,125 @@
      JSValue cb;
  } JSFinalizationRegistryData;
-+
+ 
 +static bool is_valid_weakref_target(JSValueConst val);
 +
 +static int JS_WriteFinalizationRegistry(BCWriterState *s, JSValueConst obj)
@@ -1505,7 +1578,7 @@ diff --git a/quickjs.c b/quickjs.c
 +        target = JS_UNDEFINED;
 +    }
 +    return obj;
- 
++
 + fail:
 +    JS_FreeValue(ctx, cb);
 +    JS_FreeValue(ctx, target);
