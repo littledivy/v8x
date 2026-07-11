@@ -2021,6 +2021,42 @@ mod cdp {
           .map(|range| range.start_offset)
           .unwrap_or_default()
       });
+      let mut index = 0;
+      while index < functions.len() {
+        if functions[index].function_name != "<static_initializer>" {
+          index += 1;
+          continue;
+        }
+        let Some(root) = functions[index].ranges.first() else {
+          index += 1;
+          continue;
+        };
+        let mut cursor = root.end_offset;
+        let mut next = index + 1;
+        while next < functions.len() {
+          let Some(candidate_root) = functions[next].ranges.first() else {
+            next += 1;
+            continue;
+          };
+          let candidate_start = candidate_root.start_offset;
+          let candidate_end = candidate_root.end_offset;
+          let candidate_count = candidate_root.count;
+          if candidate_start > cursor.saturating_add(16) {
+            break;
+          }
+          cursor = cursor.max(candidate_end);
+          if functions[next].function_name == "<static_initializer>" {
+            functions[index].ranges[0].end_offset = cursor;
+            functions[index].ranges[0].count =
+              functions[index].ranges[0].count.min(candidate_count);
+            functions[index].ranges.truncate(1);
+            functions.remove(next);
+            continue;
+          }
+          next += 1;
+        }
+        index += 1;
+      }
       let script = unsafe { JS_NewObject(ctx) };
       let function_values = unsafe { JS_NewArray(ctx) };
       for (index, function) in functions.into_iter().enumerate() {
