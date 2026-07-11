@@ -1757,13 +1757,13 @@ mod cdp {
 
   fn utf16_offset(source: &str, line_number: i32, column_number: i32) -> usize {
     let target_line = line_number.max(1) as usize;
-    let target_column = column_number.max(1) as usize;
+    let target_column = column_number.max(0) as usize;
     let mut offset = 0usize;
     for (index, line) in source.split_inclusive('\n').enumerate() {
       if index + 1 == target_line {
         let column_offset = line
           .chars()
-          .take(target_column.saturating_sub(1))
+          .take(target_column)
           .map(char::len_utf16)
           .sum::<usize>();
         return offset.saturating_add(column_offset);
@@ -1818,7 +1818,6 @@ mod cdp {
           .or_insert(hit.count);
       }
     }
-
     let call_count = function.call_count;
     let mut ranges = vec![CoverageRangeData {
       start_offset,
@@ -1853,7 +1852,11 @@ mod cdp {
     }
 
     Some(FunctionCoverageData {
-      function_name: function.function_name,
+      function_name: if function.function_name == "<eval>" {
+        String::new()
+      } else {
+        function.function_name
+      },
       ranges,
     })
   }
