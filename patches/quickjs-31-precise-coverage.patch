@@ -244,7 +244,69 @@
  static void emit_atom(JSParseState *s, JSAtom name)
  {
      DynBuf *bc = &s->cur_func->byte_code;
-@@ -29321,7 +29498,8 @@
+@@ -25481,18 +25662,21 @@
+                 goto fail;
+             if (s->token.val == '{') {
+                 ClassFieldsDef *cf = &class_fields[is_static];
++                JSAtom init_name;
++                int parse_result;
+                 if (!cf->fields_init_fd)
+                     if (emit_class_init_start(s, cf))
+                         goto fail;
+                 s->cur_func = cf->fields_init_fd;
+                 // stack is now: <empty>
+                 JSFunctionDef *init;
+-                if (js_parse_function_decl2(s, JS_PARSE_FUNC_CLASS_STATIC_INIT,
+-                                            JS_FUNC_NORMAL, JS_ATOM_NULL,
+-                                            s->token.ptr,
+-                                            s->token.line_num,
+-                                            s->token.col_num,
+-                                            JS_PARSE_EXPORT_NONE, &init) < 0) {
++                init_name = JS_NewAtom(ctx, "<static_initializer>");
++                parse_result = js_parse_function_decl2(
++                    s, JS_PARSE_FUNC_CLASS_STATIC_INIT, JS_FUNC_NORMAL,
++                    init_name, s->token.ptr, s->token.line_num,
++                    s->token.col_num, JS_PARSE_EXPORT_NONE, &init);
++                JS_FreeAtom(ctx, init_name);
++                if (parse_result < 0) {
+                     goto fail;
+                 }
+                 // stack is now: fclosure
+@@ -25727,7 +25911,7 @@
+             if (is_private) {
+                 class_fields[is_static].need_brand = true;
+             }
+-            if (js_parse_function_decl2(s, func_type, func_kind, JS_ATOM_NULL,
++            if (js_parse_function_decl2(s, func_type, func_kind, name,
+                                         start_ptr,
+                                         s->token.line_num,
+                                         s->token.col_num,
+@@ -28864,7 +29048,7 @@
+     bool has_initializer, is_for_of, has_destructuring;
+     int tok, tok1, opcode, scope, block_scope_level;
+     int label_next, label_expr, label_cont, label_body, label_break;
+-    int pos_next, pos_expr;
++    int pos_next, pos_expr, coverage_pos;
+     BlockEnv break_entry;
+ 
+     has_initializer = false;
+@@ -29092,6 +29276,7 @@
+     }
+ 
+     emit_label(s, label_body);
++    coverage_pos = emit_coverage(s, s->token.ptr - s->buf_start);
+     {
+         bool scope_has_using = fd->scopes[fd->scope_level].has_using;
+         int using_scope_level = fd->scope_level;
+@@ -29108,6 +29293,7 @@
+ 
+         if (js_parse_statement(s))
+             return -1;
++        close_coverage(s, coverage_pos, s->last_ptr - s->buf_start);
+ 
+         if (had_using_be) {
+             pop_break_entry(fd);
+@@ -29321,7 +29507,8 @@
          break;
      case TOK_IF:
          {
