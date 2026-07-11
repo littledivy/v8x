@@ -197,17 +197,6 @@ pub unsafe extern "C" fn v82jsc_coverage_function(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v82jsc_coverage_function_hit(key: *const c_void) {
-  PRECISE_COVERAGE.with(|state| {
-    if let Some(function) =
-      state.borrow_mut().functions.get_mut(&(key as usize))
-    {
-      function.call_count = function.call_count.saturating_add(1);
-    }
-  });
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn v82jsc_coverage_location(
   key: *const c_void,
   line_number: i32,
@@ -233,6 +222,9 @@ pub extern "C" fn v82jsc_coverage_hit(
     if let Some(function) =
       state.borrow_mut().functions.get_mut(&(key as usize))
     {
+      if pc == 0 {
+        function.call_count = function.call_count.saturating_add(1);
+      }
       let hit = function.hits.entry(pc).or_insert(CoverageHit {
         line_number,
         column_number,
