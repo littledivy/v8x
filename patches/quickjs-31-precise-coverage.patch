@@ -1,0 +1,140 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -7833,8 +7833,100 @@
+ fail:
+     /* should never happen */
+     return b->line_num;
++}
++
++static _Thread_local bool v82jsc_precise_coverage_enabled;
++
++extern void v82jsc_coverage_function(const void *key,
++                                     const char *function_name,
++                                     const char *filename,
++                                     const char *source,
++                                     size_t source_len,
++                                     int line_num,
++                                     int column_num);
++extern void v82jsc_coverage_location(const void *key,
++                                     int line_num,
++                                     int column_num);
++extern void v82jsc_coverage_hit(const void *key,
++                                uint32_t pc,
++                                int line_num,
++                                int column_num);
++
++void JS_SetPreciseCoverageEnabled(bool enabled)
++{
++    v82jsc_precise_coverage_enabled = enabled;
++}
++
++static void js_coverage_register_function(JSFunctionBytecode *b)
++{
++    const uint8_t *p, *p_end;
++    const char *function_name = "";
++    const char *filename = "";
++    bool free_function_name = false;
++    bool free_filename = false;
++    int line_num, column_num, pc, value, ret;
++    unsigned int op;
++
++    if (b->func_name != JS_ATOM_NULL) {
++        function_name = JS_AtomToCString(b->realm, b->func_name);
++        free_function_name = function_name != NULL;
++    }
++    if (b->filename != JS_ATOM_NULL) {
++        filename = JS_AtomToCString(b->realm, b->filename);
++        free_filename = filename != NULL;
++    }
++    v82jsc_coverage_function(b, function_name ? function_name : "",
++                             filename ? filename : "", b->source,
++                             b->source_len, b->line_num, b->col_num);
++    if (free_function_name)
++        JS_FreeCString(b->realm, function_name);
++    if (free_filename)
++        JS_FreeCString(b->realm, filename);
++
++    line_num = b->line_num;
++    column_num = b->col_num;
++    v82jsc_coverage_location(b, line_num, column_num);
++    p = b->pc2line_buf;
++    if (!p)
++        return;
++    p_end = p + b->pc2line_len;
++    pc = 0;
++    while (p < p_end) {
++        op = *p++;
++        if (op == 0) {
++            uint32_t pc_delta;
++            ret = get_leb128(&pc_delta, p, p_end);
++            if (ret < 0)
++                return;
++            pc += pc_delta;
++            p += ret;
++            ret = get_sleb128(&value, p, p_end);
++            if (ret < 0)
++                return;
++            p += ret;
++            line_num += value;
++        } else {
++            op -= PC2LINE_OP_FIRST;
++            pc += op / PC2LINE_RANGE;
++            line_num += (op % PC2LINE_RANGE) + PC2LINE_BASE;
++        }
++        ret = get_sleb128(&value, p, p_end);
++        if (ret < 0)
++            return;
++        p += ret;
++        column_num += value;
++        v82jsc_coverage_location(b, line_num, column_num);
++    }
+ }
+ 
++static inline void js_coverage_record_hit(JSFunctionBytecode *b,
++                                          uint32_t pc)
++{
++    int column_num;
++    int line_num = find_line_num(b->realm, b, pc, &column_num);
++    v82jsc_coverage_hit(b, pc, line_num, column_num);
++}
++
+ /* in order to avoid executing arbitrary code during the stack trace
+    generation, we only look at simple 'name' properties containing a
+    string. */
+@@ -17787,7 +17879,7 @@
+ #endif
+ 
+ #if !DIRECT_DISPATCH
+-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
++#define SWITCH(pc)      do { if (unlikely(v82jsc_precise_coverage_enabled)) js_coverage_record_hit(b, (uint32_t)((pc) - b->byte_code_buf)); } while (0); DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
+ #define CASE(op)        case op
+ #define DEFAULT         default
+ #define BREAK           break
+@@ -17798,7 +17890,7 @@
+ #include "quickjs-opcode.h"
+         [ OP_COUNT ... 255 ] = &&case_default
+     };
+-#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
++#define SWITCH(pc)      do { if (unlikely(v82jsc_precise_coverage_enabled)) js_coverage_record_hit(b, (uint32_t)((pc) - b->byte_code_buf)); } while (0); DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
+ #define CASE(op)        case_ ## op
+ #define DEFAULT         case_default
+ #define BREAK           SWITCH(pc)
+@@ -17895,6 +17987,8 @@
+     sf->prev_frame = rt->current_stack_frame;
+     rt->current_stack_frame = sf;
+     ctx = b->realm; /* set the current realm */
++    if (unlikely(v82jsc_precise_coverage_enabled))
++        js_coverage_register_function(b);
+ 
+ #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
+     if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_STEP))
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1144,6 +1144,7 @@
+                                  int column_num);
+ JS_EXTERN void JS_VisitStackFrames(JSRuntime *rt, JSStackFrameVisitor *visitor,
+                                    void *opaque);
++JS_EXTERN void JS_SetPreciseCoverageEnabled(bool enabled);
+ /* if can_block is true, Atomics.wait() can be used */
+ JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
+ /* set the [IsHTMLDDA] internal slot */

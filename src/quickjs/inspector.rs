@@ -9,6 +9,8 @@ use crate::support::Opaque;
 use crate::support::UniquePtr;
 use crate::support::int;
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::mem::MaybeUninit;
 use std::time::Duration;
@@ -92,6 +94,158 @@ impl CpuProfilerState {
       samples: std::mem::take(&mut self.samples),
     }
   }
+}
+
+#[derive(Clone, Debug)]
+struct CoverageHit {
+  line_number: i32,
+  column_number: i32,
+  count: u64,
+}
+
+#[derive(Clone, Debug)]
+struct PreciseCoverageFunction {
+  function_name: String,
+  url: String,
+  source: String,
+  start_line: i32,
+  start_column: i32,
+  call_count: u64,
+  locations: HashSet<(i32, i32)>,
+  hits: HashMap<u32, CoverageHit>,
+}
+
+#[derive(Default)]
+struct PreciseCoverageState {
+  functions: HashMap<usize, PreciseCoverageFunction>,
+}
+
+thread_local! {
+  static PRECISE_COVERAGE: std::cell::RefCell<PreciseCoverageState> =
+    std::cell::RefCell::new(PreciseCoverageState::default());
+}
+
+unsafe fn borrowed_utf8(ptr: *const std::ffi::c_char, len: usize) -> String {
+  if ptr.is_null() || len == 0 {
+    return String::new();
+  }
+  String::from_utf8_lossy(unsafe {
+    std::slice::from_raw_parts(ptr.cast::<u8>(), len)
+  })
+  .into_owned()
+}
+
+unsafe fn borrowed_cstr(ptr: *const std::ffi::c_char) -> String {
+  if ptr.is_null() {
+    return String::new();
+  }
+  unsafe { std::ffi::CStr::from_ptr(ptr) }
+    .to_string_lossy()
+    .into_owned()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn v82jsc_coverage_function(
+  key: *const c_void,
+  function_name: *const std::ffi::c_char,
+  filename: *const std::ffi::c_char,
+  source: *const std::ffi::c_char,
+  source_len: usize,
+  line_number: i32,
+  column_number: i32,
+) {
+  let key = key as usize;
+  let function_name = unsafe { borrowed_cstr(function_name) };
+  let url = unsafe { borrowed_cstr(filename) };
+  let source = unsafe { borrowed_utf8(source, source_len) };
+  PRECISE_COVERAGE.with(|state| {
+    let mut state = state.borrow_mut();
+    let function =
+      state
+        .functions
+        .entry(key)
+        .or_insert_with(|| PreciseCoverageFunction {
+          function_name: function_name.clone(),
+          url: url.clone(),
+          source: source.clone(),
+          start_line: line_number,
+          start_column: column_number,
+          call_count: 0,
+          locations: HashSet::new(),
+          hits: HashMap::new(),
+        });
+    if function.url != url
+      || function.start_line != line_number
+      || function.start_column != column_number
+      || function.source != source
+    {
+      *function = PreciseCoverageFunction {
+        function_name,
+        url,
+        source,
+        start_line: line_number,
+        start_column: column_number,
+        call_count: 0,
+        locations: HashSet::new(),
+        hits: HashMap::new(),
+      };
+    }
+    function.call_count = function.call_count.saturating_add(1);
+  });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v82jsc_coverage_location(
+  key: *const c_void,
+  line_number: i32,
+  column_number: i32,
+) {
+  PRECISE_COVERAGE.with(|state| {
+    if let Some(function) =
+      state.borrow_mut().functions.get_mut(&(key as usize))
+    {
+      function.locations.insert((line_number, column_number));
+    }
+  });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v82jsc_coverage_hit(
+  key: *const c_void,
+  pc: u32,
+  line_number: i32,
+  column_number: i32,
+) {
+  PRECISE_COVERAGE.with(|state| {
+    if let Some(function) =
+      state.borrow_mut().functions.get_mut(&(key as usize))
+    {
+      let hit = function.hits.entry(pc).or_insert(CoverageHit {
+        line_number,
+        column_number,
+        count: 0,
+      });
+      hit.count = hit.count.saturating_add(1);
+    }
+  });
+}
+
+fn start_precise_coverage() {
+  PRECISE_COVERAGE.with(|state| state.borrow_mut().functions.clear());
+  unsafe { JS_SetPreciseCoverageEnabled(true) };
+}
+
+fn stop_precise_coverage() {
+  unsafe { JS_SetPreciseCoverageEnabled(false) };
+  PRECISE_COVERAGE.with(|state| state.borrow_mut().functions.clear());
+}
+
+fn take_precise_coverage() -> Vec<PreciseCoverageFunction> {
+  PRECISE_COVERAGE.with(|state| {
+    std::mem::take(&mut state.borrow_mut().functions)
+      .into_values()
+      .collect()
+  })
 }
 
 unsafe extern "C" fn collect_cpu_profile_frame(
@@ -803,6 +957,7 @@ pub extern "C" fn v8_inspector__V8StackTrace__DELETE(this: *mut V8StackTrace) {
 mod cdp {
   use super::CompletedCpuProfile;
   use super::CpuProfileFrame;
+  use super::PreciseCoverageFunction;
   use super::RawChannel;
   use super::RawV8InspectorClient;
   use super::RealStringBuffer;
@@ -810,9 +965,11 @@ mod cdp {
   use crate::quickjs::core::current_ctx;
   use crate::quickjs::core::current_iso;
   use crate::quickjs::core::iso_state;
+  use crate::quickjs::core::script_source;
   use crate::quickjs::quickjs_sys::*;
   use crate::support::UniquePtr;
   use crate::support::int;
+  use std::collections::BTreeMap;
   use std::collections::HashMap;
   use std::ffi::{CStr, CString};
   use std::os::raw::c_char;
@@ -1585,6 +1742,246 @@ mod cdp {
     value
   }
 
+  #[derive(Debug)]
+  struct CoverageRangeData {
+    start_offset: usize,
+    end_offset: usize,
+    count: u64,
+  }
+
+  #[derive(Debug)]
+  struct FunctionCoverageData {
+    function_name: String,
+    ranges: Vec<CoverageRangeData>,
+  }
+
+  fn utf16_offset(source: &str, line_number: i32, column_number: i32) -> usize {
+    let target_line = line_number.max(1) as usize;
+    let target_column = column_number.max(1) as usize;
+    let mut offset = 0usize;
+    for (index, line) in source.split_inclusive('\n').enumerate() {
+      if index + 1 == target_line {
+        let column_offset = line
+          .chars()
+          .take(target_column.saturating_sub(1))
+          .map(char::len_utf16)
+          .sum::<usize>();
+        return offset.saturating_add(column_offset);
+      }
+      offset = offset.saturating_add(line.encode_utf16().count());
+    }
+    source.encode_utf16().count()
+  }
+
+  fn source_for_url(url: &str) -> Option<String> {
+    script_source(url).or_else(|| {
+      let (base, suffix) = url.rsplit_once("#v8x:")?;
+      suffix.parse::<u32>().ok()?;
+      script_source(base)
+    })
+  }
+
+  fn function_coverage_data(
+    function: PreciseCoverageFunction,
+  ) -> Option<FunctionCoverageData> {
+    if function.url.is_empty() {
+      return None;
+    }
+    let script = source_for_url(&function.url)?;
+    let script_len = script.encode_utf16().count();
+    let start_offset =
+      utf16_offset(&script, function.start_line, function.start_column)
+        .min(script_len);
+    let source_len = function.source.encode_utf16().count();
+    let end_offset = if source_len == 0 {
+      script_len
+    } else {
+      start_offset.saturating_add(source_len).min(script_len)
+    };
+    if end_offset <= start_offset {
+      return None;
+    }
+
+    let mut location_counts = BTreeMap::<usize, u64>::new();
+    for (line, column) in function.locations {
+      let offset = utf16_offset(&script, line, column);
+      if offset >= start_offset && offset < end_offset {
+        location_counts.entry(offset).or_insert(0);
+      }
+    }
+    for hit in function.hits.into_values() {
+      let offset = utf16_offset(&script, hit.line_number, hit.column_number);
+      if offset >= start_offset && offset < end_offset {
+        location_counts
+          .entry(offset)
+          .and_modify(|count| *count = (*count).max(hit.count))
+          .or_insert(hit.count);
+      }
+    }
+
+    let call_count = function.call_count;
+    let mut ranges = vec![CoverageRangeData {
+      start_offset,
+      end_offset,
+      count: call_count,
+    }];
+    let points = location_counts.into_iter().collect::<Vec<_>>();
+    for (index, (range_start, count)) in points.iter().copied().enumerate() {
+      let range_end = points
+        .get(index + 1)
+        .map(|(offset, _)| *offset)
+        .unwrap_or(end_offset);
+      if range_start >= range_end
+        || count == call_count
+        || (range_start == start_offset && range_end == end_offset)
+      {
+        continue;
+      }
+      if let Some(previous) = ranges.last_mut()
+        && previous.end_offset == range_start
+        && previous.count == count
+        && previous.start_offset != start_offset
+      {
+        previous.end_offset = range_end;
+      } else {
+        ranges.push(CoverageRangeData {
+          start_offset: range_start,
+          end_offset: range_end,
+          count,
+        });
+      }
+    }
+
+    Some(FunctionCoverageData {
+      function_name: function.function_name,
+      ranges,
+    })
+  }
+
+  unsafe fn coverage_range_to_value(
+    ctx: *mut JSContext,
+    range: CoverageRangeData,
+  ) -> JSValue {
+    let value = unsafe { JS_NewObject(ctx) };
+    unsafe {
+      set_val(
+        ctx,
+        value,
+        c"startOffset",
+        JS_NewInt64(ctx, range.start_offset.min(i64::MAX as usize) as i64),
+      );
+      set_val(
+        ctx,
+        value,
+        c"endOffset",
+        JS_NewInt64(ctx, range.end_offset.min(i64::MAX as usize) as i64),
+      );
+      set_val(
+        ctx,
+        value,
+        c"count",
+        JS_NewInt64(ctx, range.count.min(i64::MAX as u64) as i64),
+      );
+    }
+    value
+  }
+
+  unsafe fn function_coverage_to_value(
+    ctx: *mut JSContext,
+    function: FunctionCoverageData,
+  ) -> JSValue {
+    let value = unsafe { JS_NewObject(ctx) };
+    let ranges = unsafe { JS_NewArray(ctx) };
+    for (index, range) in function.ranges.into_iter().enumerate() {
+      unsafe {
+        JS_SetPropertyUint32(
+          ctx,
+          ranges,
+          index as u32,
+          coverage_range_to_value(ctx, range),
+        )
+      };
+    }
+    unsafe {
+      set_str(ctx, value, c"functionName", &function.function_name);
+      set_val(ctx, value, c"ranges", ranges);
+      set_val(ctx, value, c"isBlockCoverage", JS_NewBool(ctx, 1));
+    }
+    value
+  }
+
+  unsafe fn precise_coverage_to_value(
+    ctx: *mut JSContext,
+    functions: Vec<PreciseCoverageFunction>,
+  ) -> JSValue {
+    let mut scripts = BTreeMap::<String, Vec<FunctionCoverageData>>::new();
+    for function in functions {
+      let url = function.url.clone();
+      if let Some(function) = function_coverage_data(function) {
+        scripts.entry(url).or_default().push(function);
+      }
+    }
+
+    let result = unsafe { JS_NewArray(ctx) };
+    for (script_index, (url, mut functions)) in scripts.into_iter().enumerate()
+    {
+      functions.sort_by_key(|function| {
+        function
+          .ranges
+          .first()
+          .map(|range| range.start_offset)
+          .unwrap_or_default()
+      });
+      let script = unsafe { JS_NewObject(ctx) };
+      let function_values = unsafe { JS_NewArray(ctx) };
+      for (index, function) in functions.into_iter().enumerate() {
+        unsafe {
+          JS_SetPropertyUint32(
+            ctx,
+            function_values,
+            index as u32,
+            function_coverage_to_value(ctx, function),
+          )
+        };
+      }
+      unsafe {
+        set_str(ctx, script, c"scriptId", &(script_index + 1).to_string());
+        set_str(ctx, script, c"url", &url);
+        set_val(ctx, script, c"functions", function_values);
+        JS_SetPropertyUint32(ctx, result, script_index as u32, script);
+      }
+    }
+    result
+  }
+
+  unsafe fn handle_start_precise_coverage(
+    sess: &CdpSession,
+    ctx: *mut JSContext,
+    call_id: i32,
+  ) {
+    super::start_precise_coverage();
+    unsafe { ack(sess, ctx, call_id) };
+  }
+
+  unsafe fn handle_take_precise_coverage(
+    sess: &CdpSession,
+    ctx: *mut JSContext,
+    call_id: i32,
+  ) {
+    let response = unsafe { JS_NewObject(ctx) };
+    let result =
+      unsafe { precise_coverage_to_value(ctx, super::take_precise_coverage()) };
+    let timestamp = std::time::SystemTime::now()
+      .duration_since(std::time::SystemTime::UNIX_EPOCH)
+      .unwrap_or_default()
+      .as_secs_f64();
+    unsafe {
+      set_val(ctx, response, c"result", result);
+      set_val(ctx, response, c"timestamp", JS_NewFloat64(ctx, timestamp));
+      send_obj(sess, ctx, response, Some(call_id));
+    }
+  }
+
   unsafe fn handle_profiler_set_sampling_interval(
     sess: &CdpSession,
     ctx: *mut JSContext,
@@ -1658,7 +2055,17 @@ mod cdp {
     let params = unsafe { JS_GetPropertyStr(ctx, parsed, c"params".as_ptr()) };
 
     match method.as_str() {
-      "Profiler.enable" | "Profiler.disable" => unsafe { ack(sess, ctx, id) },
+      "Profiler.enable" => unsafe { ack(sess, ctx, id) },
+      "Profiler.disable" | "Profiler.stopPreciseCoverage" => unsafe {
+        super::stop_precise_coverage();
+        ack(sess, ctx, id)
+      },
+      "Profiler.startPreciseCoverage" => unsafe {
+        handle_start_precise_coverage(sess, ctx, id)
+      },
+      "Profiler.takePreciseCoverage" => unsafe {
+        handle_take_precise_coverage(sess, ctx, id)
+      },
       "Profiler.setSamplingInterval" => unsafe {
         handle_profiler_set_sampling_interval(sess, ctx, params, id)
       },

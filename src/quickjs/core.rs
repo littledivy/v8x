@@ -1765,6 +1765,10 @@ pub(crate) fn register_script_source(filename: &str, source: &str) {
   });
 }
 
+pub(crate) fn script_source(filename: &str) -> Option<std::string::String> {
+  SCRIPT_SOURCES.with(|sources| sources.borrow().get(filename).cloned())
+}
+
 /// Return the 1-based `line` of the source registered for `filename`, if known.
 pub(crate) fn script_source_line(
   filename: &str,

@@ -329,6 +329,7 @@ unsafe extern "C" {
     visitor: Option<JSStackFrameVisitor>,
     opaque: *mut c_void,
   );
+  pub fn JS_SetPreciseCoverageEnabled(enabled: bool);
 
   // Marks an error value (must be a pending exception) so `try`/`catch` cannot
   // catch it — the same property QuickJS gives its own interrupt exception. Used
