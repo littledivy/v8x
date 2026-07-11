@@ -51,7 +51,7 @@
      pc = 0;
      line_num = b->line_num;
      col_num = b->col_num;
-@@ -7833,8 +7869,132 @@
+@@ -7833,8 +7869,133 @@
  fail:
      /* should never happen */
      return b->line_num;
@@ -79,6 +79,7 @@
 +extern void v82jsc_coverage_range_hit(const void *key,
 +                                      uint32_t start,
 +                                      uint32_t end);
++extern void v82jsc_coverage_function_hit(const void *key);
 +
 +void JS_SetPreciseCoverageEnabled(bool enabled)
 +{
@@ -202,12 +203,27 @@
  #define CASE(op)        case_ ## op
  #define DEFAULT         case_default
  #define BREAK           SWITCH(pc)
-@@ -17895,6 +18055,8 @@
+@@ -17825,6 +17986,11 @@
+             pc = sf->cur_pc;
+             sf->prev_frame = rt->current_stack_frame;
+             rt->current_stack_frame = sf;
++            if (unlikely(v82jsc_precise_coverage_enabled) &&
++                pc == b->byte_code_buf) {
++                js_coverage_register_function(b);
++                v82jsc_coverage_function_hit(b);
++            }
+             if (s->throw_flag)
+                 goto exception;
+             else
+@@ -17895,6 +18061,11 @@
      sf->prev_frame = rt->current_stack_frame;
      rt->current_stack_frame = sf;
      ctx = b->realm; /* set the current realm */
 +    if (unlikely(v82jsc_precise_coverage_enabled))
++    {
 +        js_coverage_register_function(b);
++        v82jsc_coverage_function_hit(b);
++    }
  
  #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
      if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_STEP))
