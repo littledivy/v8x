@@ -1789,9 +1789,13 @@ mod cdp {
     }
     let script = source_for_url(&function.url)?;
     let script_len = script.encode_utf16().count();
-    let start_offset =
+    let is_script_root = function.source.is_empty();
+    let start_offset = if is_script_root {
+      0
+    } else {
       utf16_offset(&script, function.start_line, function.start_column)
-        .min(script_len);
+        .min(script_len)
+    };
     let source_len = function.source.encode_utf16().count();
     let end_offset = if source_len == 0 {
       script_len
@@ -1803,19 +1807,21 @@ mod cdp {
     }
 
     let mut location_counts = BTreeMap::<usize, u64>::new();
-    for (line, column) in function.locations {
-      let offset = utf16_offset(&script, line, column);
-      if offset >= start_offset && offset < end_offset {
-        location_counts.entry(offset).or_insert(0);
+    if !is_script_root {
+      for (line, column) in function.locations {
+        let offset = utf16_offset(&script, line, column);
+        if offset >= start_offset && offset < end_offset {
+          location_counts.entry(offset).or_insert(0);
+        }
       }
-    }
-    for hit in function.hits.into_values() {
-      let offset = utf16_offset(&script, hit.line_number, hit.column_number);
-      if offset >= start_offset && offset < end_offset {
-        location_counts
-          .entry(offset)
-          .and_modify(|count| *count = (*count).max(hit.count))
-          .or_insert(hit.count);
+      for hit in function.hits.into_values() {
+        let offset = utf16_offset(&script, hit.line_number, hit.column_number);
+        if offset >= start_offset && offset < end_offset {
+          location_counts
+            .entry(offset)
+            .and_modify(|count| *count = (*count).max(hit.count))
+            .or_insert(hit.count);
+        }
       }
     }
     let call_count = function.call_count;
