@@ -1,6 +1,57 @@
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -7833,8 +7833,100 @@
+@@ -7783,7 +7783,37 @@
+     *pval = (val >> 1) ^ -(val & 1);
+     return ret;
+ }
++
++static const uint8_t js_coverage_magic[8] = {
++    'v', '8', 'x', '-', 'c', 'o', 'v', 0
++};
+ 
++static const uint8_t *js_coverage_data(JSFunctionBytecode *b,
++                                       uint32_t *count)
++{
++    const uint8_t *buf = b->pc2line_buf;
++    size_t len = b->pc2line_len;
++    size_t offset;
++
++    if (!buf || len < 12)
++        return NULL;
++    offset = len - 12;
++    for (;;) {
++        if (!memcmp(buf + offset, js_coverage_magic,
++                    sizeof(js_coverage_magic))) {
++            uint32_t n = get_u32(buf + offset + sizeof(js_coverage_magic));
++            if (offset + 12 + (size_t)n * 12 == len) {
++                *count = n;
++                return buf + offset;
++            }
++        }
++        if (offset == 0)
++            break;
++        offset--;
++    }
++    return NULL;
++}
++
+ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
+                          uint32_t pc_value, int *col)
+ {
+@@ -7796,6 +7826,12 @@
+     if (!p)
+         goto fail;
+     p_end = p + b->pc2line_len;
++    {
++        uint32_t coverage_count;
++        const uint8_t *coverage = js_coverage_data(b, &coverage_count);
++        if (coverage)
++            p_end = coverage;
++    }
+     pc = 0;
+     line_num = b->line_num;
+     col_num = b->col_num;
+@@ -7833,8 +7869,132 @@
  fail:
      /* should never happen */
      return b->line_num;
@@ -22,12 +73,18 @@
 +                                uint32_t pc,
 +                                int line_num,
 +                                int column_num);
++extern void v82jsc_coverage_range(const void *key,
++                                  uint32_t start,
++                                  uint32_t end);
++extern void v82jsc_coverage_range_hit(const void *key,
++                                      uint32_t start,
++                                      uint32_t end);
 +
 +void JS_SetPreciseCoverageEnabled(bool enabled)
 +{
 +    v82jsc_precise_coverage_enabled = enabled;
-+}
-+
+ }
+ 
 +static void js_coverage_register_function(JSFunctionBytecode *b)
 +{
 +    const uint8_t *p, *p_end;
@@ -61,6 +118,12 @@
 +    if (!p)
 +        return;
 +    p_end = p + b->pc2line_len;
++    {
++        uint32_t coverage_count;
++        const uint8_t *coverage = js_coverage_data(b, &coverage_count);
++        if (coverage)
++            p_end = coverage;
++    }
 +    pc = 0;
 +    while (p < p_end) {
 +        op = *p++;
@@ -88,20 +151,40 @@
 +        column_num += value;
 +        v82jsc_coverage_location(b, line_num, column_num);
 +    }
- }
- 
++
++    {
++        uint32_t count, i;
++        p = js_coverage_data(b, &count);
++        if (p) {
++            p += 12;
++            for (i = 0; i < count; i++, p += 12)
++                v82jsc_coverage_range(b, get_u32(p + 4), get_u32(p + 8));
++        }
++    }
++}
++
 +static inline void js_coverage_record_hit(JSFunctionBytecode *b,
 +                                          uint32_t pc)
 +{
++    const uint8_t *p;
++    uint32_t count, i;
 +    int column_num;
 +    int line_num = find_line_num(b->realm, b, pc, &column_num);
 +    v82jsc_coverage_hit(b, pc, line_num, column_num);
++    p = js_coverage_data(b, &count);
++    if (p) {
++        p += 12;
++        for (i = 0; i < count; i++, p += 12) {
++            if (get_u32(p) == pc)
++                v82jsc_coverage_range_hit(b, get_u32(p + 4), get_u32(p + 8));
++        }
++    }
 +}
 +
  /* in order to avoid executing arbitrary code during the stack trace
     generation, we only look at simple 'name' properties containing a
     string. */
-@@ -17787,7 +17879,7 @@
+@@ -17787,7 +17947,7 @@
  #endif
  
  #if !DIRECT_DISPATCH
@@ -110,7 +193,7 @@
  #define CASE(op)        case op
  #define DEFAULT         default
  #define BREAK           break
-@@ -17798,7 +17890,7 @@
+@@ -17798,7 +17958,7 @@
  #include "quickjs-opcode.h"
          [ OP_COUNT ... 255 ] = &&case_default
      };
@@ -119,7 +202,7 @@
  #define CASE(op)        case_ ## op
  #define DEFAULT         case_default
  #define BREAK           SWITCH(pc)
-@@ -17895,6 +17987,8 @@
+@@ -17895,6 +18055,8 @@
      sf->prev_frame = rt->current_stack_frame;
      rt->current_stack_frame = sf;
      ctx = b->realm; /* set the current realm */
@@ -128,6 +211,128 @@
  
  #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
      if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_STEP))
+@@ -22195,6 +22357,7 @@
+     int line_num;
+     int col_num;
+     DynBuf pc2line;
++    DynBuf coverage;
+ 
+     char *source;  /* raw source, utf-8 encoded */
+     int source_len;
+@@ -23872,6 +24035,20 @@
+     dbuf_putc(bc, val);
+ }
+ 
++static int emit_coverage(JSParseState *s, uint32_t start)
++{
++    int pos = s->cur_func->byte_code.size;
++    emit_op(s, OP_coverage);
++    emit_u32(s, start);
++    emit_u32(s, 0);
++    return pos;
++}
++
++static void close_coverage(JSParseState *s, int pos, uint32_t end)
++{
++    put_u32(s->cur_func->byte_code.buf + pos + 5, end);
++}
++
+ static void emit_atom(JSParseState *s, JSAtom name)
+ {
+     DynBuf *bc = &s->cur_func->byte_code;
+@@ -29321,7 +29498,8 @@
+         break;
+     case TOK_IF:
+         {
+-            int label1, label2, mask;
++            int label1, label2, mask, coverage_pos;
++            uint32_t branch_start = s->token.ptr - s->buf_start;
+             if (next_token(s))
+                 goto fail;
+             /* create a new scope for `let f;if(1) function f(){}` */
+@@ -29335,19 +29513,26 @@
+             else
+                 mask = DECL_MASK_FUNC; /* Annex B.3.4 */
+ 
++            coverage_pos = emit_coverage(s, branch_start);
+             if (js_parse_statement_or_decl(s, mask))
+                 goto fail;
+ 
+             if (s->token.val == TOK_ELSE) {
++                uint32_t else_start = s->token.ptr - s->buf_start;
++                close_coverage(s, coverage_pos, else_start);
+                 label2 = emit_goto(s, OP_goto, -1);
+                 if (next_token(s))
+                     goto fail;
+ 
+                 emit_label(s, label1);
++                coverage_pos = emit_coverage(s, else_start);
+                 if (js_parse_statement_or_decl(s, mask))
+                     goto fail;
++                close_coverage(s, coverage_pos, s->last_ptr - s->buf_start);
+ 
+                 label1 = label2;
++            } else {
++                close_coverage(s, coverage_pos, s->last_ptr - s->buf_start);
+             }
+             emit_label(s, label1);
+             pop_scope(s);
+@@ -32697,6 +32882,7 @@
+     fd->col_num = col_num;
+ 
+     js_dbuf_init(ctx, &fd->pc2line);
++    js_dbuf_init(ctx, &fd->coverage);
+     //fd->pc2line_last_line_num = line_num;
+     //fd->pc2line_last_pc = 0;
+ 
+@@ -32794,6 +32980,7 @@
+ 
+     JS_FreeAtom(ctx, fd->filename);
+     dbuf_free(&fd->pc2line);
++    dbuf_free(&fd->coverage);
+ 
+     js_free(ctx, fd->source);
+ 
+@@ -35540,6 +35727,13 @@
+             col_num = get_u32(bc_buf + pos + 5);
+             break;
+ 
++        case OP_coverage:
++            dbuf_put_u32(&s->coverage, bc_out.size);
++            dbuf_put_u32(&s->coverage, get_u32(bc_buf + pos + 1));
++            dbuf_put_u32(&s->coverage, get_u32(bc_buf + pos + 5));
++            dbuf_putc(&bc_out, OP_nop);
++            break;
++
+         case OP_label:
+             {
+                 label = get_u32(bc_buf + pos + 1);
+@@ -36295,6 +36489,11 @@
+                     if (s->source_loc_slots[j].pc > pos)
+                         s->source_loc_slots[j].pc -= delta;
+                 }
++                for (j = 0; j + 12 <= s->coverage.size; j += 12) {
++                    uint32_t coverage_pc = get_u32(s->coverage.buf + j);
++                    if (coverage_pc > (uint32_t)pos)
++                        put_u32(s->coverage.buf + j, coverage_pc - delta);
++                }
+                 continue;
+             }
+             break;
+@@ -36326,6 +36525,13 @@
+     s->label_slots = NULL;
+     /* XXX: should delay until copying to runtime bytecode function */
+     compute_pc2line_info(s);
++    if (s->coverage.size) {
++        dbuf_put(&s->pc2line, js_coverage_magic,
++                 sizeof(js_coverage_magic));
++        dbuf_put_u32(&s->pc2line, s->coverage.size / 12);
++        dbuf_put(&s->pc2line, s->coverage.buf, s->coverage.size);
++    }
++    dbuf_free(&s->coverage);
+     js_free(ctx, s->source_loc_slots);
+     s->source_loc_slots = NULL;
+     /* set the new byte code */
 --- a/quickjs.h
 +++ b/quickjs.h
 @@ -1144,6 +1144,7 @@
@@ -138,3 +343,13 @@
  /* if can_block is true, Atomics.wait() can be used */
  JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
  /* set the [IsHTMLDDA] internal slot */
+--- a/quickjs-opcode.h
++++ b/quickjs-opcode.h
+@@ -297,6 +297,7 @@
+ def( dispose_scope, 3, 0, 0, u16) /* emitted in phase 1, removed in phase 2 */
+ 
+ def(     source_loc, 9, 0, 0, u32x2) /* emitted in phase 1, removed in phase 3 */
++def(       coverage, 9, 0, 0, u32x2) /* emitted in phase 1, lowered to nop in phase 3 */
+ 
+ DEF(    push_minus1, 1, 0, 1, none_int)
+ DEF(         push_0, 1, 0, 1, none_int)

@@ -113,6 +113,7 @@ struct PreciseCoverageFunction {
   call_count: u64,
   locations: HashSet<(i32, i32)>,
   hits: HashMap<u32, CoverageHit>,
+  ranges: HashMap<(u32, u32), u64>,
 }
 
 #[derive(Default)]
@@ -173,6 +174,7 @@ pub unsafe extern "C" fn v82jsc_coverage_function(
           call_count: 0,
           locations: HashSet::new(),
           hits: HashMap::new(),
+          ranges: HashMap::new(),
         });
     if function.url != url
       || function.start_line != line_number
@@ -188,6 +190,7 @@ pub unsafe extern "C" fn v82jsc_coverage_function(
         call_count: 0,
         locations: HashSet::new(),
         hits: HashMap::new(),
+        ranges: HashMap::new(),
       };
     }
     function.call_count = function.call_count.saturating_add(1);
@@ -226,6 +229,37 @@ pub extern "C" fn v82jsc_coverage_hit(
         count: 0,
       });
       hit.count = hit.count.saturating_add(1);
+    }
+  });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v82jsc_coverage_range(
+  key: *const c_void,
+  start: u32,
+  end: u32,
+) {
+  PRECISE_COVERAGE.with(|state| {
+    if let Some(function) =
+      state.borrow_mut().functions.get_mut(&(key as usize))
+    {
+      function.ranges.entry((start, end)).or_insert(0);
+    }
+  });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v82jsc_coverage_range_hit(
+  key: *const c_void,
+  start: u32,
+  end: u32,
+) {
+  PRECISE_COVERAGE.with(|state| {
+    if let Some(function) =
+      state.borrow_mut().functions.get_mut(&(key as usize))
+    {
+      let count = function.ranges.entry((start, end)).or_insert(0);
+      *count = count.saturating_add(1);
     }
   });
 }
@@ -1781,6 +1815,14 @@ mod cdp {
     })
   }
 
+  fn utf16_offset_from_byte(source: &str, byte_offset: usize) -> usize {
+    let mut byte_offset = byte_offset.min(source.len());
+    while !source.is_char_boundary(byte_offset) {
+      byte_offset -= 1;
+    }
+    source[..byte_offset].encode_utf16().count()
+  }
+
   fn function_coverage_data(
     function: PreciseCoverageFunction,
   ) -> Option<FunctionCoverageData> {
@@ -1806,8 +1848,18 @@ mod cdp {
       return None;
     }
 
+    let mut range_counts = function
+      .ranges
+      .into_iter()
+      .filter_map(|((start, end), count)| {
+        let start = utf16_offset_from_byte(&script, start as usize);
+        let end = utf16_offset_from_byte(&script, end as usize);
+        (start < end && start >= start_offset && end <= end_offset)
+          .then_some(((start, end), count))
+      })
+      .collect::<BTreeMap<_, _>>();
     let mut location_counts = BTreeMap::<usize, u64>::new();
-    if !is_script_root {
+    if !is_script_root && range_counts.is_empty() {
       for (line, column) in function.locations {
         let offset = utf16_offset(&script, line, column);
         if offset >= start_offset && offset < end_offset {
@@ -1830,6 +1882,24 @@ mod cdp {
       end_offset,
       count: call_count,
     }];
+    for ((range_start, range_end), count) in std::mem::take(&mut range_counts) {
+      if count == call_count {
+        continue;
+      }
+      if let Some(previous) = ranges.last_mut()
+        && previous.end_offset == range_start
+        && previous.count == count
+        && previous.start_offset != start_offset
+      {
+        previous.end_offset = range_end;
+      } else {
+        ranges.push(CoverageRangeData {
+          start_offset: range_start,
+          end_offset: range_end,
+          count,
+        });
+      }
+    }
     let points = location_counts.into_iter().collect::<Vec<_>>();
     for (index, (range_start, count)) in points.iter().copied().enumerate() {
       let range_end = points
