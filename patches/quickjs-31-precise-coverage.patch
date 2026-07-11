@@ -51,7 +51,7 @@
      pc = 0;
      line_num = b->line_num;
      col_num = b->col_num;
-@@ -7833,8 +7869,132 @@
+@@ -7833,8 +7869,133 @@
  fail:
      /* should never happen */
      return b->line_num;
@@ -79,6 +79,7 @@
 +extern void v82jsc_coverage_range_hit(const void *key,
 +                                      uint32_t start,
 +                                      uint32_t end);
++extern void v82jsc_coverage_function_hit(const void *key);
 +
 +void JS_SetPreciseCoverageEnabled(bool enabled)
 +{
@@ -202,12 +203,15 @@
  #define CASE(op)        case_ ## op
  #define DEFAULT         case_default
  #define BREAK           SWITCH(pc)
-@@ -17895,6 +18055,8 @@
+@@ -17895,6 +18056,11 @@
      sf->prev_frame = rt->current_stack_frame;
      rt->current_stack_frame = sf;
      ctx = b->realm; /* set the current realm */
 +    if (unlikely(v82jsc_precise_coverage_enabled))
++    {
 +        js_coverage_register_function(b);
++        v82jsc_coverage_function_hit(b);
++    }
  
  #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
      if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_STEP))
@@ -333,6 +337,15 @@
      js_free(ctx, s->source_loc_slots);
      s->source_loc_slots = NULL;
      /* set the new byte code */
+@@ -36815,6 +37025,8 @@
+     b->realm = JS_DupContext(ctx);
+ 
+     add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
++    if (unlikely(v82jsc_precise_coverage_enabled))
++        js_coverage_register_function(b);
+ 
+ #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_FINAL
+     if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_FINAL))
 --- a/quickjs.h
 +++ b/quickjs.h
 @@ -1144,6 +1144,7 @@
