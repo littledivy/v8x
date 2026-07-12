@@ -685,6 +685,16 @@ pub extern "C" fn v8__StackTrace__CurrentStackTrace(
   let raw = unsafe { current_backtrace_string(ctx) };
   unsafe { restore_prepare_stack_trace(ctx, error_ctor, saved_prepare) };
   let mut frames = parse_qjs_backtrace(&raw);
+  for frame in &mut frames {
+    let Some(file) = frame.url.as_deref() else {
+      continue;
+    };
+    let Some(source) = super::core::script_source_line(file, frame.line) else {
+      continue;
+    };
+    frame.col = v8_new_expr_column(&source, frame.col);
+    frame.col = v8_member_call_column(&source, frame.col);
+  }
   frames.truncate(frame_limit.max(0) as usize);
   let boxed = Box::into_raw(Box::new(QjsStackTrace { frames }));
   LAST_STACK.with(|cell| cell.set(boxed));
@@ -1862,6 +1872,10 @@ mod stack_column_tests {
   #[test]
   fn member_call_uses_final_property_column() {
     assert_eq!(v8_member_call_column("Deno.bench();", 1), 6);
+    assert_eq!(
+      v8_member_call_column("Deno.test(\"name\", () => {});", 1),
+      6
+    );
     assert_eq!(v8_member_call_column("Deno.bench();", 5), 6);
     assert_eq!(v8_member_call_column("  obj.run()", 1), 7);
     assert_eq!(v8_member_call_column("foo()", 1), 1);
