@@ -87,6 +87,11 @@ unsafe extern "C" {
     line: int,
     column: int,
   );
+  fn v82jsc_module_stalled_location(
+    module: *mut JSModuleDef,
+    line: *mut int,
+    column: *mut int,
+  ) -> int;
 }
 
 #[repr(C)]
@@ -5192,7 +5197,18 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
     return 0;
   }
 
-  let message = build_stalled_tla_message(ctx, &source_name, &source_text);
+  let mut line = 1;
+  let mut column = 1;
+  unsafe {
+    v82jsc_module_stalled_location(def, &mut line, &mut column);
+  }
+  let message = build_stalled_tla_message(
+    ctx,
+    &source_name,
+    &source_text,
+    line.max(1),
+    column.max(1),
+  );
   if message.is_null() {
     return 0;
   }
@@ -5208,13 +5224,15 @@ pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage(
 /// `v8__Message__*` accessors read the value's string form (`.get()`) plus the
 /// `fileName`/`lineNumber`/`columnNumber` properties, so we hand back a plain
 /// object whose `toString` is V8's fixed text and whose location points at the
-/// start of the offending module (line 1, column 0 → deno reports column 1).
+/// suspended top-level await.
 fn build_stalled_tla_message(
   ctx: *mut JSContext,
   source_name: &str,
   source_text: &str,
+  line: i32,
+  column: i32,
 ) -> *const Message {
-  let factory_src = c"(file)=>{const o={fileName:file,lineNumber:1,columnNumber:0};o.toString=()=>\"Top-level await promise never resolved\";return o;}";
+  let factory_src = c"(file,line,column)=>{const o={fileName:file,lineNumber:line,columnNumber:column};o.toString=()=>\"Top-level await promise never resolved\";return o;}";
   let factory = unsafe {
     JS_Eval(
       ctx,
@@ -5229,11 +5247,17 @@ fn build_stalled_tla_message(
     return ptr::null();
   }
   let file = CString::new(source_name).unwrap_or_default();
-  let mut arg = [unsafe { JS_NewString(ctx, file.as_ptr()) }];
+  let mut args = [
+    unsafe { JS_NewString(ctx, file.as_ptr()) },
+    unsafe { JS_NewInt32(ctx, line) },
+    unsafe { JS_NewInt32(ctx, column - 1) },
+  ];
   let obj =
-    unsafe { JS_Call(ctx, factory, jsv_undefined(), 1, arg.as_mut_ptr()) };
+    unsafe { JS_Call(ctx, factory, jsv_undefined(), 3, args.as_mut_ptr()) };
   unsafe {
-    JS_FreeValue(ctx, arg[0]);
+    for arg in args {
+      JS_FreeValue(ctx, arg);
+    }
     JS_FreeValue(ctx, factory);
   }
   if obj.tag == JS_TAG_EXCEPTION {
@@ -5249,7 +5273,10 @@ fn build_stalled_tla_message(
     super::exception::set_message_source_line(
       ctx,
       obj,
-      source_text.lines().next().unwrap_or(source_text),
+      source_text
+        .lines()
+        .nth((line - 1) as usize)
+        .unwrap_or(source_text),
     );
   };
   intern::<Message>(obj)

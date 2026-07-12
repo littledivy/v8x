@@ -1,0 +1,121 @@
+diff --git a/quickjs.c b/quickjs.c
+index 11caae0..11caae0 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -983,6 +983,7 @@ struct JSModuleDef {
+     int pending_async_dependencies;
+     bool async_evaluation;
+     int64_t async_evaluation_timestamp;
++    JSAsyncFunctionData *async_func_state;
+     JSModuleDef *cycle_root;
+     JSValue promise; /* corresponds to spec field: capability */
+     JSValue resolving_funcs[2]; /* corresponds to spec field: capability */
+@@ -21594,13 +21595,17 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
+     return JS_UNDEFINED;
+ }
+ 
+-static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
+-                                      JSValueConst this_obj,
+-                                      int argc, JSValueConst *argv, int flags)
++static JSValue js_async_function_call_internal(
++    JSContext *ctx, JSValueConst func_obj, JSValueConst this_obj,
++    int argc, JSValueConst *argv, int flags,
++    JSAsyncFunctionData **state_out)
+ {
+     JSValue promise;
+     JSAsyncFunctionData *s;
+ 
++    if (state_out)
++        *state_out = NULL;
++
+     s = js_mallocz(ctx, sizeof(*s));
+     if (!s)
+         return JS_EXCEPTION;
+@@ -21625,11 +21630,50 @@ static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
+     if (!js_async_function_resume(ctx, s, NULL, 0, 0))
+         goto fail;
+ 
++    if (state_out && s->is_active)
++        *state_out = s;
++
+     js_async_function_free(ctx->rt, s);
+ 
+     return promise;
+ }
+ 
++static JSValue js_async_function_call(JSContext *ctx, JSValueConst func_obj,
++                                      JSValueConst this_obj,
++                                      int argc, JSValueConst *argv, int flags)
++{
++    return js_async_function_call_internal(ctx, func_obj, this_obj, argc, argv,
++                                           flags, NULL);
++}
++
++int v82jsc_module_stalled_location(JSModuleDef *m, int *line, int *column)
++{
++    JSAsyncFunctionData *s;
++    JSStackFrame *sf;
++    JSObject *p;
++    JSFunctionBytecode *b;
++    uint32_t pc;
++
++    if (!m || !line || !column)
++        return 0;
++    s = m->async_func_state;
++    if (!s || !s->is_active)
++        return 0;
++    sf = &s->func_state.frame;
++    if (!sf->cur_pc || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++        return 0;
++    p = JS_VALUE_GET_OBJ(sf->cur_func);
++    if (!js_class_has_bytecode(p->class_id))
++        return 0;
++    b = p->u.func.function_bytecode;
++    if (!b || sf->cur_pc <= b->byte_code_buf ||
++        sf->cur_pc > b->byte_code_buf + b->byte_code_len)
++        return 0;
++    pc = sf->cur_pc - b->byte_code_buf - 1;
++    *line = find_line_num(b->realm, b, pc, column);
++    return *line > 0;
++}
++
+ /* AsyncGenerator */
+ 
+ typedef enum JSAsyncGeneratorStateEnum {
+@@ -32047,6 +32091,7 @@ static JSValue js_async_module_execution_rejected(JSContext *ctx, JSValueConst t
+     assert(!module->eval_has_exception);
+     assert(module->async_evaluation);
+ 
++    module->async_func_state = NULL;
+     module->eval_has_exception = true;
+     module->eval_exception = js_dup(error);
+     module->status = JS_MODULE_STATUS_EVALUATED;
+@@ -32084,6 +32129,7 @@ static JSValue js_async_module_execution_fulfilled(JSContext *ctx, JSValueConst
+     assert(module->status == JS_MODULE_STATUS_EVALUATING_ASYNC);
+     assert(!module->eval_has_exception);
+     assert(module->async_evaluation);
++    module->async_func_state = NULL;
+     module->async_evaluation = false;
+     js_set_module_evaluated(ctx, module);
+ 
+@@ -32128,7 +32174,9 @@ static int js_execute_async_module(JSContext *ctx, JSModuleDef *m)
+ {
+     JSValue promise, m_obj;
+     JSValue resolve_funcs[2], ret_val;
+-    promise = js_async_function_call(ctx, m->func_obj, JS_UNDEFINED, 0, NULL, 0);
++    promise = js_async_function_call_internal(ctx, m->func_obj, JS_UNDEFINED,
++                                              0, NULL, 0,
++                                              &m->async_func_state);
+     if (JS_IsException(promise))
+         return -1;
+     m_obj = JS_NewModuleValue(ctx, m);
+@@ -32155,7 +32203,8 @@ static int js_execute_sync_module(JSContext *ctx, JSModuleDef *m,
+         JSValue promise;
+         JSPromiseStateEnum state;
+ 
+-        promise = js_async_function_call(ctx, m->func_obj, JS_UNDEFINED, 0, NULL, 0);
++        promise = js_async_function_call(ctx, m->func_obj, JS_UNDEFINED, 0,
++                                         NULL, 0);
+         if (JS_IsException(promise))
+             goto fail;
+         state = JS_PromiseState(ctx, promise);
