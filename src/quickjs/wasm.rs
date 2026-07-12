@@ -136,6 +136,13 @@ unsafe extern "C" {
     func_obj: JSValue,
     proto: JSValue,
   ) -> c_int;
+  fn JS_DefinePropertyValueStr(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: *const c_char,
+    val: JSValue,
+    flags: c_int,
+  ) -> c_int;
 
   pub fn wasm_engine_new() -> *mut wasm_engine_t;
   pub fn wasm_store_new(e: *mut wasm_engine_t) -> *mut wasm_store_t;
@@ -196,6 +203,7 @@ unsafe extern "C" {
   ) -> *mut wasm_trap_t;
   pub fn v82jsc_wasm_func_terminate(f: *const wasm_func_t);
   pub fn wasm_func_type(f: *const wasm_func_t) -> *mut wasm_functype_t;
+  pub fn v82jsc_wasm_func_index(f: *const wasm_func_t) -> u16;
   pub fn wasm_func_as_extern(f: *mut wasm_func_t) -> *mut wasm_extern_t;
 
   pub fn wasm_instance_new(
@@ -470,6 +478,67 @@ mod tests {
       assert_eq!(
         std::slice::from_raw_parts(actual as *const u8, len),
         b"true:true"
+      );
+
+      JS_FreeCString(ctx, actual);
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  fn exported_wasm_objects_have_standard_branding() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+      install_webassembly(ctx);
+
+      let source = CString::new(
+        r#"
+        const bytes = new Uint8Array([
+          0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+          0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02,
+          0x01, 0x00, 0x04, 0x04, 0x01, 0x70, 0x00, 0x00,
+          0x05, 0x03, 0x01, 0x00, 0x00, 0x06, 0x06, 0x01,
+          0x7f, 0x00, 0x41, 0x00, 0x0b, 0x07, 0x22, 0x04,
+          0x04, 0x66, 0x75, 0x6e, 0x63, 0x00, 0x00, 0x05,
+          0x74, 0x61, 0x62, 0x6c, 0x65, 0x01, 0x00, 0x06,
+          0x6d, 0x65, 0x6d, 0x6f, 0x72, 0x79, 0x02, 0x00,
+          0x06, 0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x03,
+          0x00, 0x0a, 0x05, 0x01, 0x03, 0x00, 0x00, 0x0b,
+        ]);
+        const { func, memory, table } = new WebAssembly.Instance(
+          new WebAssembly.Module(bytes),
+        ).exports;
+        [
+          func.name,
+          memory instanceof WebAssembly.Memory,
+          table instanceof WebAssembly.Table,
+          Object.prototype.toString.call(memory),
+          Object.prototype.toString.call(table),
+          Object.keys(memory).length,
+          Object.keys(table).length,
+        ].join('|');
+        "#,
+      )
+      .unwrap();
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.as_bytes().len(),
+        c"wasm-object-branding.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "eval threw");
+      let mut len = 0usize;
+      let actual = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!actual.is_null());
+      assert_eq!(
+        std::slice::from_raw_parts(actual as *const u8, len),
+        b"0|true|true|[object WebAssembly.Memory]|[object WebAssembly.Table]|0|0"
       );
 
       JS_FreeCString(ctx, actual);
@@ -971,9 +1040,22 @@ unsafe fn make_export_func(
   }));
   let data = unsafe { JS_NewBigInt64(ctx, env as i64) };
   let mut data_arr = [data];
-  unsafe {
+  let func = unsafe {
     JS_NewCFunctionData(ctx, call_export, 0, 0, 1, data_arr.as_mut_ptr())
+  };
+  let index = unsafe { v82jsc_wasm_func_index(f) }.to_string();
+  if let Ok(index) = CString::new(index) {
+    unsafe {
+      JS_DefinePropertyValueStr(
+        ctx,
+        func,
+        c"name".as_ptr(),
+        JS_NewString(ctx, index.as_ptr()),
+        JS_PROP_CONFIGURABLE,
+      )
+    };
   }
+  func
 }
 
 struct TableEnv {
@@ -1112,19 +1194,39 @@ unsafe fn make_table_obj(
   };
   unsafe {
     let g = mk(table_grow);
-    JS_SetPropertyStr(ctx, obj, c"grow".as_ptr(), g);
+    JS_DefinePropertyValueStr(
+      ctx,
+      obj,
+      c"grow".as_ptr(),
+      g,
+      JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE,
+    );
     let s = mk(table_set);
-    JS_SetPropertyStr(ctx, obj, c"set".as_ptr(), s);
+    JS_DefinePropertyValueStr(
+      ctx,
+      obj,
+      c"set".as_ptr(),
+      s,
+      JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE,
+    );
     let ge = mk(table_get);
-    JS_SetPropertyStr(ctx, obj, c"get".as_ptr(), ge);
+    JS_DefinePropertyValueStr(
+      ctx,
+      obj,
+      c"get".as_ptr(),
+      ge,
+      JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE,
+    );
     let len = wasm_table_size(table);
-    JS_SetPropertyStr(
+    JS_DefinePropertyValueStr(
       ctx,
       obj,
       c"length".as_ptr(),
       JS_NewInt32(ctx, len as i32),
+      JS_PROP_CONFIGURABLE,
     );
   }
+  unsafe { set_wasm_object_prototype(ctx, obj, c"Table") };
   obj
 }
 
@@ -1582,7 +1684,7 @@ unsafe fn make_global_obj(
       atom,
       getter,
       setter,
-      JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE,
+      JS_PROP_CONFIGURABLE,
     );
     JS_FreeAtom(ctx, atom);
   }
@@ -1806,15 +1908,33 @@ unsafe extern "C" fn wa_memory_ctor(
       atom,
       getter,
       jsv_undefined(),
-      JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE,
+      JS_PROP_CONFIGURABLE,
     );
     JS_FreeAtom(ctx, atom);
   }
   let mut gd = [unsafe { JS_NewBigInt64(ctx, env as i64) }];
   let grow_fn =
     unsafe { JS_NewCFunctionData(ctx, js_mem_grow, 1, 0, 1, gd.as_mut_ptr()) };
-  unsafe { JS_SetPropertyStr(ctx, obj, c"grow".as_ptr(), grow_fn) };
+  unsafe {
+    JS_DefinePropertyValueStr(
+      ctx,
+      obj,
+      c"grow".as_ptr(),
+      grow_fn,
+      JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE,
+    )
+  };
+  unsafe { set_wasm_object_prototype(ctx, obj, c"Memory") };
   obj
+}
+
+unsafe extern "C" fn wa_table_ctor(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  _argc: c_int,
+  _argv: *mut JSValue,
+) -> JSValue {
+  unsafe { throw(ctx, "WebAssembly.Table construction is not implemented") }
 }
 
 unsafe fn make_memory_obj(
@@ -1847,7 +1967,7 @@ unsafe fn make_memory_obj(
       atom,
       getter,
       jsv_undefined(),
-      JS_PROP_CONFIGURABLE | JS_PROP_ENUMERABLE,
+      JS_PROP_CONFIGURABLE,
     );
     JS_FreeAtom(ctx, atom);
   }
@@ -1855,7 +1975,16 @@ unsafe fn make_memory_obj(
   let grow_fn = unsafe {
     JS_NewCFunctionData(ctx, memory_grow, 1, 0, 1, gdata.as_mut_ptr())
   };
-  unsafe { JS_SetPropertyStr(ctx, obj, c"grow".as_ptr(), grow_fn) };
+  unsafe {
+    JS_DefinePropertyValueStr(
+      ctx,
+      obj,
+      c"grow".as_ptr(),
+      grow_fn,
+      JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE,
+    )
+  };
+  unsafe { set_wasm_object_prototype(ctx, obj, c"Memory") };
   obj
 }
 
@@ -2299,6 +2428,7 @@ pub(crate) fn install_webassembly(ctx: *mut JSContext) {
     set_ctor(wa, c"Instance", wa_instance_ctor, 2);
     set_ctor(wa, c"Memory", wa_memory_ctor, 1);
     set_ctor(wa, c"Global", wa_global_ctor, 2);
+    set_ctor(wa, c"Table", wa_table_ctor, 1);
     set_fn(wa, c"compile", wa_compile, 1);
     set_fn(wa, c"instantiate", wa_instantiate, 2);
 
@@ -2311,6 +2441,16 @@ pub(crate) fn install_webassembly(ctx: *mut JSContext) {
 
     JS_SetPropertyStr(ctx, global, c"WebAssembly".as_ptr(), wa);
     JS_FreeValue(ctx, global);
+
+    let brands = c"(()=>{const W=WebAssembly;for(const n of ['Module','Instance','Memory','Global','Table'])Object.defineProperty(W[n].prototype,Symbol.toStringTag,{value:`WebAssembly.${n}`,configurable:true});})()";
+    let brands_result = JS_Eval(
+      ctx,
+      brands.as_ptr(),
+      brands.to_bytes().len(),
+      c"<wasm-brands>".as_ptr(),
+      JS_EVAL_TYPE_GLOBAL,
+    );
+    JS_FreeValue(ctx, brands_result);
 
     // compile/instantiateStreaming: V8 installs these via a streaming callback
     // deno provides; we expose the standard buffering polyfill (await the
