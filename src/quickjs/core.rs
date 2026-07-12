@@ -517,6 +517,7 @@ pub(crate) fn current_ctx() -> *mut JSContext {
 }
 
 fn set_current(iso: *mut RealIsolate) {
+  super::module::switch_module_caches(iso);
   CURRENT_ISO.with(|c| *c.borrow_mut() = iso);
   if !iso.is_null() {
     LAST_ISO.with(|c| *c.borrow_mut() = iso);
@@ -961,11 +962,7 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
     super::isolate::drop_microtask_queue_state(st.default_microtask_queue);
     st.context_microtask_queues.clear();
   }
-  // The module registries are thread-locals keyed by NAME or by pointers into
-  // the runtime that was just freed. A later isolate on this thread (e.g. a
-  // runtime restored from the snapshot this isolate just created) would
-  // resolve its ext: modules to this isolate's dangling defs. Drop them all.
-  super::module::clear_thread_module_caches();
+  super::module::discard_module_caches(this);
   remove_current_iso(this);
 }
 

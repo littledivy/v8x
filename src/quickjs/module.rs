@@ -190,6 +190,29 @@ mod cache_key_tests {
     assert_eq!(first, reordered);
     assert_ne!(first, different);
   }
+
+  #[test]
+  fn module_caches_follow_nested_isolates() {
+    let outer = 1usize as *mut RealIsolate;
+    let inner = 2usize as *mut RealIsolate;
+
+    switch_module_caches(outer);
+    register_module_source("node:module", "outer");
+
+    switch_module_caches(inner);
+    assert_eq!(lookup_module_source_by_name("node:module"), None);
+    register_module_source("node:module", "inner");
+
+    switch_module_caches(outer);
+    assert_eq!(
+      lookup_module_source_by_name("node:module").as_deref(),
+      Some("outer")
+    );
+
+    discard_module_caches(inner);
+    discard_module_caches(outer);
+    switch_module_caches(ptr::null_mut());
+  }
 }
 
 /// QuickJS takes source as a pointer plus an explicit length, but its parser
@@ -504,6 +527,173 @@ thread_local! {
     static SOURCE_CB: std::cell::Cell<Option<ResolveSourceCallback<'static>>> =
         const { std::cell::Cell::new(None) };
 
+    static ACTIVE_MODULE_ISOLATE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+
+    static MODULE_CACHE_STATES: RefCell<HashMap<usize, ModuleCacheState>> =
+        RefCell::new(HashMap::new());
+
+}
+
+#[derive(Default)]
+struct ModuleCacheState {
+  module_state: HashMap<usize, ModuleState>,
+  module_sources_by_name: HashMap<std::string::String, std::string::String>,
+  module_def_cache: HashMap<std::string::String, usize>,
+  resolved_module_targets:
+    HashMap<(std::string::String, std::string::String), usize>,
+  attributed_module_defs: std::collections::HashSet<usize>,
+  synthetic_exports: HashMap<usize, Vec<(std::string::String, JSValue)>>,
+  synthetic_ns_exports: HashMap<usize, Vec<(std::string::String, JSValue)>>,
+  synthetic_defs: HashMap<usize, usize>,
+  synthetic_export_names:
+    HashMap<usize, std::collections::HashSet<std::string::String>>,
+  synthetic_eval_steps:
+    HashMap<usize, (SyntheticModuleEvaluationSteps<'static>, JSValue)>,
+  after_first_eval: bool,
+  module_eval_depth: u32,
+  resolved_specifiers:
+    HashMap<(std::string::String, std::string::String), std::string::String>,
+  script_source_map_urls: HashMap<usize, std::string::String>,
+  module_script_ids_by_name: HashMap<std::string::String, int>,
+  next_module_script_id: int,
+  import_meta_enabled: bool,
+  import_meta_cb:
+    Option<crate::isolate::HostInitializeImportMetaObjectCallback>,
+  module_wrapper_by_name: HashMap<std::string::String, JSValue>,
+  main_module_url: Option<std::string::String>,
+  dyn_import_cb: Option<crate::isolate::RawHostImportModuleDynamicallyCallback>,
+  dyn_import_phase_cb:
+    Option<crate::isolate::RawHostImportModuleWithPhaseDynamicallyCallback>,
+  dyn_import_chain: Option<JSValue>,
+  source_cb: Option<ResolveSourceCallback<'static>>,
+  src_phase_counter: u64,
+}
+
+impl ModuleCacheState {
+  fn empty() -> Self {
+    Self {
+      next_module_script_id: 1,
+      src_phase_counter: 1,
+      ..Self::default()
+    }
+  }
+}
+
+fn take_module_cache_state() -> ModuleCacheState {
+  ModuleCacheState {
+    module_state: MODULE_STATE.with(|v| std::mem::take(&mut *v.borrow_mut())),
+    module_sources_by_name: MODULE_SOURCES_BY_NAME
+      .with(|v| std::mem::take(&mut *v.borrow_mut())),
+    module_def_cache: MODULE_DEF_CACHE
+      .with(|v| std::mem::take(&mut *v.borrow_mut())),
+    resolved_module_targets: RESOLVED_MODULE_TARGETS
+      .with(|v| std::mem::take(&mut *v.borrow_mut())),
+    attributed_module_defs: ATTRIBUTED_MODULE_DEFS
+      .with(|v| std::mem::take(&mut *v.borrow_mut())),
+    synthetic_exports: SYNTHETIC_EXPORTS
+      .with(|v| std::mem::take(&mut *v.borrow_mut())),
+    synthetic_ns_exports: SYNTHETIC_NS_EXPORTS
+      .with(|v| std::mem::take(&mut *v.borrow_mut())),
+    synthetic_defs: SYNTHETIC_DEFS
+      .with(|v| std::mem::take(&mut *v.borrow_mut())),
+    synthetic_export_names: SYNTHETIC_EXPORT_NAMES
+      .with(|v| std::mem::take(&mut *v.borrow_mut())),
+    synthetic_eval_steps: SYNTHETIC_EVAL_STEPS
+      .with(|v| std::mem::take(&mut *v.borrow_mut())),
+    after_first_eval: AFTER_FIRST_EVAL.with(|v| v.replace(false)),
+    module_eval_depth: MODULE_EVAL_DEPTH.with(|v| v.replace(0)),
+    resolved_specifiers: RESOLVED_SPECIFIERS
+      .with(|v| std::mem::take(&mut *v.borrow_mut())),
+    script_source_map_urls: SCRIPT_SOURCE_MAP_URLS
+      .with(|v| std::mem::take(&mut *v.borrow_mut())),
+    module_script_ids_by_name: MODULE_SCRIPT_IDS_BY_NAME
+      .with(|v| std::mem::take(&mut *v.borrow_mut())),
+    next_module_script_id: NEXT_MODULE_SCRIPT_ID.with(|v| v.replace(1)),
+    import_meta_enabled: IMPORT_META_ENABLED.with(|v| v.replace(false)),
+    import_meta_cb: IMPORT_META_CB.with(|v| v.replace(None)),
+    module_wrapper_by_name: MODULE_WRAPPER_BY_NAME
+      .with(|v| std::mem::take(&mut *v.borrow_mut())),
+    main_module_url: MAIN_MODULE_URL.with(|v| v.borrow_mut().take()),
+    dyn_import_cb: DYN_IMPORT_CB.with(|v| v.replace(None)),
+    dyn_import_phase_cb: DYN_IMPORT_PHASE_CB.with(|v| v.replace(None)),
+    dyn_import_chain: DYN_IMPORT_CHAIN.with(|v| v.replace(None)),
+    source_cb: SOURCE_CB.with(|v| v.replace(None)),
+    src_phase_counter: SRC_PHASE_COUNTER.with(|v| v.replace(1)),
+  }
+}
+
+fn restore_module_cache_state(state: ModuleCacheState) {
+  MODULE_STATE.with(|v| *v.borrow_mut() = state.module_state);
+  MODULE_SOURCES_BY_NAME
+    .with(|v| *v.borrow_mut() = state.module_sources_by_name);
+  MODULE_DEF_CACHE.with(|v| *v.borrow_mut() = state.module_def_cache);
+  RESOLVED_MODULE_TARGETS
+    .with(|v| *v.borrow_mut() = state.resolved_module_targets);
+  ATTRIBUTED_MODULE_DEFS
+    .with(|v| *v.borrow_mut() = state.attributed_module_defs);
+  SYNTHETIC_EXPORTS.with(|v| *v.borrow_mut() = state.synthetic_exports);
+  SYNTHETIC_NS_EXPORTS.with(|v| *v.borrow_mut() = state.synthetic_ns_exports);
+  SYNTHETIC_DEFS.with(|v| *v.borrow_mut() = state.synthetic_defs);
+  SYNTHETIC_EXPORT_NAMES
+    .with(|v| *v.borrow_mut() = state.synthetic_export_names);
+  SYNTHETIC_EVAL_STEPS.with(|v| *v.borrow_mut() = state.synthetic_eval_steps);
+  AFTER_FIRST_EVAL.with(|v| v.set(state.after_first_eval));
+  MODULE_EVAL_DEPTH.with(|v| v.set(state.module_eval_depth));
+  RESOLVED_SPECIFIERS.with(|v| *v.borrow_mut() = state.resolved_specifiers);
+  SCRIPT_SOURCE_MAP_URLS
+    .with(|v| *v.borrow_mut() = state.script_source_map_urls);
+  MODULE_SCRIPT_IDS_BY_NAME
+    .with(|v| *v.borrow_mut() = state.module_script_ids_by_name);
+  NEXT_MODULE_SCRIPT_ID.with(|v| v.set(state.next_module_script_id));
+  IMPORT_META_ENABLED.with(|v| v.set(state.import_meta_enabled));
+  IMPORT_META_CB.with(|v| v.set(state.import_meta_cb));
+  MODULE_WRAPPER_BY_NAME
+    .with(|v| *v.borrow_mut() = state.module_wrapper_by_name);
+  MAIN_MODULE_URL.with(|v| *v.borrow_mut() = state.main_module_url);
+  DYN_IMPORT_CB.with(|v| v.set(state.dyn_import_cb));
+  DYN_IMPORT_PHASE_CB.with(|v| v.set(state.dyn_import_phase_cb));
+  DYN_IMPORT_CHAIN.with(|v| v.set(state.dyn_import_chain));
+  SOURCE_CB.with(|v| v.set(state.source_cb));
+  SRC_PHASE_COUNTER.with(|v| v.set(state.src_phase_counter));
+}
+
+pub(crate) fn switch_module_caches(isolate: *mut RealIsolate) {
+  let next = isolate as usize;
+  ACTIVE_MODULE_ISOLATE.with(|active| {
+    let current = active.get();
+    if current == next {
+      return;
+    }
+    if current != 0 {
+      let state = take_module_cache_state();
+      MODULE_CACHE_STATES.with(|states| {
+        states.borrow_mut().insert(current, state);
+      });
+    }
+    let state = if next == 0 {
+      ModuleCacheState::empty()
+    } else {
+      MODULE_CACHE_STATES
+        .with(|states| states.borrow_mut().remove(&next))
+        .unwrap_or_else(ModuleCacheState::empty)
+    };
+    restore_module_cache_state(state);
+    active.set(next);
+  });
+}
+
+pub(crate) fn discard_module_caches(isolate: *mut RealIsolate) {
+  let key = isolate as usize;
+  ACTIVE_MODULE_ISOLATE.with(|active| {
+    if active.get() == key {
+      drop(take_module_cache_state());
+      active.set(0);
+    }
+  });
+  MODULE_CACHE_STATES.with(|states| {
+    states.borrow_mut().remove(&key);
+  });
 }
 
 pub(crate) fn set_dynamic_import_callback(
@@ -2345,6 +2535,7 @@ pub(crate) fn clear_thread_module_caches() {
   SYNTHETIC_EVAL_STEPS.with(|c| c.borrow_mut().clear());
   AFTER_FIRST_EVAL.with(|c| c.set(false));
   RESOLVED_SPECIFIERS.with(|c| c.borrow_mut().clear());
+  SCRIPT_SOURCE_MAP_URLS.with(|c| c.borrow_mut().clear());
   MODULE_WRAPPER_BY_NAME.with(|c| c.borrow_mut().clear());
   MAIN_MODULE_URL.with(|c| c.borrow_mut().take());
   MODULE_SCRIPT_IDS_BY_NAME.with(|c| c.borrow_mut().clear());
