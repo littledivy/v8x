@@ -1781,9 +1781,63 @@ fn v8_member_call_column(line: &str, col: i32) -> i32 {
   }
 }
 
+fn v8_undefined_identifier_column(line: &str, col: i32, message: &str) -> i32 {
+  let Some(identifier) = message.strip_suffix(" is not defined") else {
+    return col;
+  };
+  if identifier.is_empty() {
+    return col;
+  }
+
+  let reported = col.saturating_sub(1) as usize;
+  let Some((identifier_start, _)) = line
+    .match_indices(identifier)
+    .min_by_key(|(start, _)| start.abs_diff(reported))
+  else {
+    return col;
+  };
+
+  let bytes = line.as_bytes();
+  let mut parens = Vec::new();
+  for (index, byte) in bytes[..identifier_start].iter().copied().enumerate() {
+    match byte {
+      b'(' => parens.push(index),
+      b')' => {
+        parens.pop();
+      }
+      _ => {}
+    }
+  }
+  let Some(open) = parens.last().copied() else {
+    return identifier_start as i32 + 1;
+  };
+
+  let mut end = open;
+  while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+    end -= 1;
+  }
+  let mut start = end;
+  while start > 0
+    && (bytes[start - 1].is_ascii_alphanumeric()
+      || matches!(bytes[start - 1], b'_' | b'$'))
+  {
+    start -= 1;
+  }
+  let mut before = start;
+  while before > 0 && bytes[before - 1].is_ascii_whitespace() {
+    before -= 1;
+  }
+  if start < end && before > 0 && bytes[before - 1] == b'.' {
+    start as i32 + 1
+  } else {
+    identifier_start as i32 + 1
+  }
+}
+
 #[cfg(test)]
 mod stack_column_tests {
   use super::v8_member_call_column;
+  use super::v8_undefined_identifier_column;
 
   #[test]
   fn member_call_uses_final_property_column() {
@@ -1792,6 +1846,26 @@ mod stack_column_tests {
     assert_eq!(v8_member_call_column("  obj.run()", 1), 7);
     assert_eq!(v8_member_call_column("foo()", 1), 1);
     assert_eq!(v8_member_call_column("Deno.bench();", 6), 6);
+  }
+
+  #[test]
+  fn undefined_identifier_uses_v8_expression_column() {
+    assert_eq!(
+      v8_undefined_identifier_column(
+        "const { add } = require(\"./add\");",
+        1,
+        "require is not defined",
+      ),
+      17,
+    );
+    assert_eq!(
+      v8_undefined_identifier_column(
+        "console.log(require(\"./add\").add(1, 2));",
+        13,
+        "require is not defined",
+      ),
+      9,
+    );
   }
 }
 
@@ -1832,9 +1906,9 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
   let message =
     unsafe { read_str_prop(ctx, error, c"message") }.unwrap_or_default();
   let mut out = if message.is_empty() {
-    name
+    name.clone()
   } else if name.is_empty() {
-    message
+    message.clone()
   } else {
     format!("{name}: {message}")
   };
@@ -1883,6 +1957,9 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     };
     // Recover V8's `new`-keyword column for `new X()` frames.
     if let Some(src) = super::core::script_source_line(&file, line) {
+      if name == "ReferenceError" {
+        col = v8_undefined_identifier_column(&src, col, &message);
+      }
       col = v8_new_expr_column(&src, col);
       col = v8_member_call_column(&src, col);
     }
