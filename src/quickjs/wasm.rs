@@ -155,6 +155,9 @@ unsafe extern "C" {
   pub fn wasm_externtype_as_functype_const(
     t: *const wasm_externtype_t,
   ) -> *const wasm_functype_t;
+  pub fn wasm_externtype_as_globaltype_const(
+    t: *const wasm_externtype_t,
+  ) -> *const wasm_globaltype_t;
   pub fn wasm_exporttype_name(
     et: *const wasm_exporttype_t,
   ) -> *const wasm_vec_t;
@@ -1139,6 +1142,24 @@ unsafe fn instantiate(
     } else if kind == WASM_EXTERN_GLOBAL {
       if let Some(global) = unsafe { obj_global_ptr(ctx, val) } {
         externs.push(unsafe { wasm_global_as_extern(global) });
+      } else if !jsv_is_undefined(&val) {
+        let global_type =
+          unsafe { wasm_externtype_as_globaltype_const(ext_ty) };
+        if global_type.is_null()
+          || unsafe { wasm_globaltype_mutability(global_type) } != 0
+        {
+          externs.push(ptr::null_mut());
+        } else {
+          let value_type = unsafe { wasm_globaltype_content(global_type) };
+          let value_kind = unsafe { wasm_valtype_kind(value_type) };
+          let initial = unsafe { js_to_wasm_val(ctx, value_kind, val) };
+          let global = unsafe { wasm_global_new(store, global_type, &initial) };
+          externs.push(if global.is_null() {
+            ptr::null_mut()
+          } else {
+            unsafe { wasm_global_as_extern(global) }
+          });
+        }
       } else {
         externs.push(ptr::null_mut());
       }
@@ -1331,6 +1352,9 @@ unsafe fn obj_global_ptr(
   ctx: *mut JSContext,
   obj: JSValue,
 ) -> Option<*mut wasm_global_t> {
+  if !jsv_is_object(&obj) {
+    return None;
+  }
   let v = unsafe { JS_GetPropertyStr(ctx, obj, c"__wasm_global_ptr".as_ptr()) };
   let mut ptr_value = 0i64;
   let ok = unsafe { JS_ToBigInt64(ctx, &mut ptr_value, v) } == 0;
