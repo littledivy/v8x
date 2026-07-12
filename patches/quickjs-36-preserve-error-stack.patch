@@ -1,0 +1,45 @@
+diff --git a/quickjs.c b/quickjs.c
+index 11caae0..11caae0 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -8128,6 +8128,18 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+     rt = ctx->rt;
+     if (rt->in_build_stack_trace)
+         return;
++    if (JS_VALUE_GET_TAG(error_val) == JS_TAG_OBJECT) {
++        p = JS_VALUE_GET_OBJ(error_val);
++        if (p->class_id == JS_CLASS_ERROR &&
++            !(backtrace_flags & JS_BACKTRACE_FLAG_FILTER_FUNC) &&
++            (!JS_IsUndefined(p->u.object_data) ||
++             find_own_property1(p, JS_ATOM_stack))) {
++            if (JS_IsUndefined(ctx->error_back_trace) &&
++                !JS_IsUndefined(p->u.object_data))
++                ctx->error_back_trace = js_dup(p->u.object_data);
++            return;
++        }
++    }
+     rt->in_build_stack_trace = true;
+     error_obj = js_dup(error_val);
+ 
+@@ -66719,6 +66730,21 @@ uintptr_t js_std_cmd(int cmd, ...) {
+     va_end(ap);
+ 
+     return rv;
++}
++
++void v82jsc_clear_error_backtrace(JSContext *ctx, JSValueConst error)
++{
++    JSObject *p;
++
++    if (JS_VALUE_GET_TAG(error) == JS_TAG_OBJECT) {
++        p = JS_VALUE_GET_OBJ(error);
++        if (p->class_id == JS_CLASS_ERROR) {
++            JS_FreeValue(ctx, p->u.object_data);
++            p->u.object_data = JS_UNDEFINED;
++        }
++    }
++    JS_FreeValue(ctx, ctx->error_back_trace);
++    ctx->error_back_trace = JS_UNDEFINED;
+ }
+ 
+ #undef malloc

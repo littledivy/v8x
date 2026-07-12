@@ -38,6 +38,10 @@ use crate::{
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
+unsafe extern "C" {
+  fn v82jsc_clear_error_backtrace(ctx: *mut JSContext, error: JSValue);
+}
+
 const MESSAGE_TEXT_PROP: &std::ffi::CStr = c"__v8qjs_message_text";
 const MESSAGE_TEXT_VERBATIM_PROP: &std::ffi::CStr =
   c"__v8qjs_message_text_verbatim";
@@ -121,6 +125,7 @@ unsafe fn make_named_error(message: *const String, name: &str) -> JSValue {
     clear_pending(ctx);
     return jsv_undefined();
   }
+  v82jsc_clear_error_backtrace(ctx, err);
   err
 }
 
@@ -162,6 +167,7 @@ unsafe fn make_named_error_from_str(
     clear_pending(ctx);
     return jsv_undefined();
   }
+  v82jsc_clear_error_backtrace(ctx, err);
   err
 }
 
@@ -675,7 +681,9 @@ pub extern "C" fn v8__StackTrace__CurrentStackTrace(
   if ctx.is_null() {
     return ptr::null();
   }
+  let (error_ctor, saved_prepare) = unsafe { take_prepare_stack_trace(ctx) };
   let raw = unsafe { current_backtrace_string(ctx) };
+  unsafe { restore_prepare_stack_trace(ctx, error_ctor, saved_prepare) };
   let mut frames = parse_qjs_backtrace(&raw);
   frames.truncate(frame_limit.max(0) as usize);
   let boxed = Box::into_raw(Box::new(QjsStackTrace { frames }));
