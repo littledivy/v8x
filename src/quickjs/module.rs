@@ -79,6 +79,7 @@ unsafe extern "C" {
     obj: JSValue,
     flags: int,
   ) -> int;
+  fn v82jsc_link_module(ctx: *mut JSContext, module: *mut JSModuleDef) -> int;
 }
 
 #[repr(C)]
@@ -4170,6 +4171,96 @@ pub extern "C" fn v8__Module__GetIdentityHash(this: *const Module) -> int {
   (handle_key(this) as int) ^ 0x4d4f_44
 }
 
+unsafe fn compile_module_for_instantiation(
+  ctx: *mut JSContext,
+  this: *const Module,
+) -> *mut JSModuleDef {
+  let Some((existing, bytecode_def, source_text, module_name)) =
+    with_module_state(this, |m| {
+      (
+        m.module_def,
+        m.bytecode
+          .map(|value| unsafe { value.u.ptr } as *mut JSModuleDef)
+          .unwrap_or(ptr::null_mut()),
+        m.source_text.clone(),
+        m.module_name.clone(),
+      )
+    })
+  else {
+    return ptr::null_mut();
+  };
+  if !existing.is_null() {
+    return existing;
+  }
+  if !bytecode_def.is_null() {
+    with_module_state(this, |m| m.module_def = bytecode_def);
+    return bytecode_def;
+  }
+  if source_text.is_empty() {
+    return ptr::null_mut();
+  }
+
+  let cache_name = if module_name.is_empty() {
+    "<module>"
+  } else {
+    module_name.as_str()
+  };
+  let key = bc_key(&source_text, cache_name);
+  let Ok(cname) = CString::new(cache_name) else {
+    return ptr::null_mut();
+  };
+
+  let mut module_value = None;
+  if let Some(bytes) = bc_load(key) {
+    let cached = unsafe { read_cached_bytecode(ctx, &bytes) };
+    if cached.tag == JS_TAG_MODULE {
+      module_value = Some(cached);
+    } else if cached.tag == JS_TAG_EXCEPTION {
+      let exception = unsafe { JS_GetException(ctx) };
+      unsafe { JS_FreeValue(ctx, exception) };
+    } else {
+      unsafe { JS_FreeValue(ctx, cached) };
+    }
+  }
+  if module_value.is_none() {
+    let source_buffer = eval_source_buffer(&source_text);
+    let compiled = unsafe {
+      JS_Eval(
+        ctx,
+        source_buffer.as_ptr() as *const std::os::raw::c_char,
+        source_text.len(),
+        cname.as_ptr(),
+        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+      )
+    };
+    if compiled.tag == JS_TAG_EXCEPTION {
+      return ptr::null_mut();
+    }
+    if compiled.tag != JS_TAG_MODULE {
+      unsafe { JS_FreeValue(ctx, compiled) };
+      return ptr::null_mut();
+    }
+    unsafe { bc_write(ctx, key, compiled) };
+    module_value = Some(compiled);
+  }
+
+  let module_value = module_value.unwrap();
+  let module_def = unsafe { module_value.u.ptr } as *mut JSModuleDef;
+  with_module_state(this, |m| {
+    m.module_def = module_def;
+    m.bytecode = Some(module_value);
+  });
+  if !module_name.is_empty() {
+    MODULE_DEF_CACHE.with(|cache| {
+      cache
+        .borrow_mut()
+        .insert(module_name.clone(), module_def as usize);
+    });
+  }
+  unsafe { populate_import_meta(ctx, module_def, &module_name) };
+  module_def
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__InstantiateModule(
   this: *const Module,
@@ -4185,6 +4276,13 @@ pub extern "C" fn v8__Module__InstantiateModule(
     super::snapshot::restore_snapshot_module_exports(ctx);
     if !unsafe { build_resolution_map(ctx, context, cb, source_callback, this) }
     {
+      return MaybeBool::Nothing;
+    }
+    let module_def = unsafe { compile_module_for_instantiation(ctx, this) };
+    if module_def.is_null()
+      || unsafe { v82jsc_link_module(ctx, module_def) } < 0
+    {
+      with_module_state(this, |m| m.status = ModuleStatus::Errored);
       return MaybeBool::Nothing;
     }
   }
