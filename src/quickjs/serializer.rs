@@ -27,10 +27,6 @@ const JS_READ_OBJ_SAB: c_int = 1 << 2;
 const MAGIC: &[u8; 4] = b"QJSV";
 
 const TAG_VALUE: u8 = b'V';
-const TAG_U32: u8 = 4;
-const TAG_U64: u8 = 8;
-const TAG_DOUBLE: u8 = b'D';
-const TAG_RAW: u8 = b'R';
 
 // Graph-mode tags: used only when the value carries transferred ArrayBuffers
 // (and, later, host objects), which `JS_WriteObject` can't express. The default
@@ -457,9 +453,7 @@ pub extern "C" fn v8__ValueSerializer__WriteHeader(
   this: *mut CxxValueSerializer,
 ) {
   let st = unsafe { ser_state(this) };
-  if st.buf.is_empty() {
-    st.buf.extend_from_slice(MAGIC);
-  }
+  st.buf.extend_from_slice(MAGIC);
 }
 
 #[unsafe(no_mangle)]
@@ -699,7 +693,6 @@ pub extern "C" fn v8__ValueSerializer__WriteUint32(
   value: u32,
 ) {
   let st = unsafe { ser_state(this) };
-  st.buf.push(TAG_U32);
   st.buf.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -709,7 +702,6 @@ pub extern "C" fn v8__ValueSerializer__WriteUint64(
   value: u64,
 ) {
   let st = unsafe { ser_state(this) };
-  st.buf.push(TAG_U64);
   st.buf.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -719,7 +711,6 @@ pub extern "C" fn v8__ValueSerializer__WriteDouble(
   value: f64,
 ) {
   let st = unsafe { ser_state(this) };
-  st.buf.push(TAG_DOUBLE);
   st.buf.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -730,8 +721,6 @@ pub extern "C" fn v8__ValueSerializer__WriteRawBytes(
   length: usize,
 ) {
   let st = unsafe { ser_state(this) };
-  st.buf.push(TAG_RAW);
-  st.buf.extend_from_slice(&(length as u32).to_le_bytes());
   if !source.is_null() && length > 0 {
     let slice =
       unsafe { std::slice::from_raw_parts(source as *const u8, length) };
@@ -839,8 +828,10 @@ pub extern "C" fn v8__ValueDeserializer__ReadHeader(
 
   if st.buf.len() - st.pos >= 4 && &st.buf[st.pos..st.pos + 4] == &MAGIC[..] {
     st.pos += 4;
+    MaybeBool::JustTrue
+  } else {
+    MaybeBool::JustFalse
   }
-  MaybeBool::JustTrue
 }
 
 #[unsafe(no_mangle)]
@@ -1000,20 +991,12 @@ pub extern "C" fn v8__ValueDeserializer__ReadUint32(
   value: *mut u32,
 ) -> bool {
   let st = unsafe { de_state(this) };
-  let save = st.pos;
-  if read_u8(&st.buf, &mut st.pos) != Some(TAG_U32) {
-    st.pos = save;
-    return false;
-  }
   match read_le_u32(&st.buf, &mut st.pos) {
     Some(v) => {
       unsafe { *value = v };
       true
     }
-    None => {
-      st.pos = save;
-      false
-    }
+    None => false,
   }
 }
 
@@ -1023,10 +1006,7 @@ pub extern "C" fn v8__ValueDeserializer__ReadUint64(
   value: *mut u64,
 ) -> bool {
   let st = unsafe { de_state(this) };
-  let save = st.pos;
-  if read_u8(&st.buf, &mut st.pos) != Some(TAG_U64) || st.pos + 8 > st.buf.len()
-  {
-    st.pos = save;
+  if st.pos + 8 > st.buf.len() {
     return false;
   }
   let v = u64::from_le_bytes(st.buf[st.pos..st.pos + 8].try_into().unwrap());
@@ -1041,11 +1021,7 @@ pub extern "C" fn v8__ValueDeserializer__ReadDouble(
   value: *mut f64,
 ) -> bool {
   let st = unsafe { de_state(this) };
-  let save = st.pos;
-  if read_u8(&st.buf, &mut st.pos) != Some(TAG_DOUBLE)
-    || st.pos + 8 > st.buf.len()
-  {
-    st.pos = save;
+  if st.pos + 8 > st.buf.len() {
     return false;
   }
   let v = f64::from_le_bytes(st.buf[st.pos..st.pos + 8].try_into().unwrap());
@@ -1061,22 +1037,7 @@ pub extern "C" fn v8__ValueDeserializer__ReadRawBytes(
   data: *mut *const c_void,
 ) -> bool {
   let st = unsafe { de_state(this) };
-  let save = st.pos;
-
-  if read_u8(&st.buf, &mut st.pos) != Some(TAG_RAW) {
-    st.pos = save;
-    return false;
-  }
-  let stored = match read_le_u32(&st.buf, &mut st.pos) {
-    Some(l) => l as usize,
-    None => {
-      st.pos = save;
-      return false;
-    }
-  };
-  let _ = stored;
   if st.pos + length > st.buf.len() {
-    st.pos = save;
     return false;
   }
   let p = unsafe { st.buf.as_ptr().add(st.pos) } as *const c_void;
