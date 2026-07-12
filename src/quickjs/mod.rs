@@ -93,6 +93,38 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn strict_class_method_allows_reserved_property_name() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = CString::new(
+        "'use strict'; class Scheduler { yield() { return 1; } } new Scheduler().yield();",
+      )
+      .unwrap();
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.as_bytes().len(),
+        c"strict-class-method.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "eval threw");
+
+      let mut actual = 0;
+      assert_eq!(JS_ToInt32(ctx, &mut actual, result), 0);
+      assert_eq!(actual, 1);
+
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn callsite_preserves_receiver_type_and_method() {
     unsafe {
       let rt = JS_NewRuntime();

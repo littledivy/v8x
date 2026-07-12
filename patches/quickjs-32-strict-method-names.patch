@@ -1,0 +1,16 @@
+diff --git a/quickjs.c b/quickjs.c
+index 11caae0..11caae0 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -37210,7 +37210,10 @@ static int js_parse_function_check_names(JSParseState *s, JSFunctionDef *fd,
+         if (!fd->has_simple_parameter_list && fd->has_use_strict) {
+             return js_parse_error(s, "\"use strict\" not allowed in function with default or destructuring parameter");
+         }
+-        if (js_invalid_strict_name(func_name)) {
++        if ((fd->func_type == JS_PARSE_FUNC_STATEMENT ||
++             fd->func_type == JS_PARSE_FUNC_VAR ||
++             fd->func_type == JS_PARSE_FUNC_EXPR) &&
++            js_invalid_strict_name(func_name)) {
+             return js_parse_error(s, "invalid function name in strict code");
+         }
+         for (idx = 0; idx < fd->arg_count; idx++) {
