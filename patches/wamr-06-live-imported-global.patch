@@ -1,0 +1,158 @@
+diff --git a/core/iwasm/interpreter/wasm_runtime.h b/core/iwasm/interpreter/wasm_runtime.h
+index 0d9d445..0d9d445 100644
+--- a/core/iwasm/interpreter/wasm_runtime.h
++++ b/core/iwasm/interpreter/wasm_runtime.h
+@@ -201,6 +201,8 @@ struct WASMGlobalInstance {
+     uint32 data_offset;
+     /* initial value */
+     WASMValue initial_value;
++    /* v82jsc: live storage for an instance-backed C API global import. */
++    uint8 *c_api_import_global_data;
+ #if WASM_ENABLE_GC != 0
+     WASMRefType *ref_type;
+ #endif
+diff --git a/core/iwasm/interpreter/wasm_runtime.c b/core/iwasm/interpreter/wasm_runtime.c
+index 5ccf542..5ccf542 100644
+--- a/core/iwasm/interpreter/wasm_runtime.c
++++ b/core/iwasm/interpreter/wasm_runtime.c
+@@ -1264,6 +1264,7 @@ globals_instantiate(WASMModule *module, WASMModuleInstance *module_inst,
+         WASMGlobalImport *global_import = &import->u.global;
+         global->type = global_import->type.val_type;
+         global->is_mutable = global_import->type.is_mutable;
++        global->c_api_import_global_data = NULL;
+ #if WASM_ENABLE_GC != 0
+         global->ref_type = global_import->ref_type;
+ #endif
+diff --git a/core/iwasm/interpreter/wasm_interp_fast.c b/core/iwasm/interpreter/wasm_interp_fast.c
+index b1b9c15..b1b9c15 100644
+--- a/core/iwasm/interpreter/wasm_interp_fast.c
++++ b/core/iwasm/interpreter/wasm_interp_fast.c
+@@ -1482,5 +1482,8 @@ static inline uint8 *
+ get_global_addr(uint8 *global_data, WASMGlobalInstance *global)
+ {
++    if (global->c_api_import_global_data)
++        return global->c_api_import_global_data;
++
+ #if WASM_ENABLE_MULTI_MODULE == 0
+     return global_data + global->data_offset;
+ #else
+diff --git a/core/iwasm/interpreter/wasm_interp_classic.c b/core/iwasm/interpreter/wasm_interp_classic.c
+index f3dba4b..f3dba4b 100644
+--- a/core/iwasm/interpreter/wasm_interp_classic.c
++++ b/core/iwasm/interpreter/wasm_interp_classic.c
+@@ -1536,5 +1536,8 @@ static inline uint8 *
+ get_global_addr(uint8 *global_data, WASMGlobalInstance *global)
+ {
++    if (global->c_api_import_global_data)
++        return global->c_api_import_global_data;
++
+ #if WASM_ENABLE_MULTI_MODULE == 0
+     return global_data + global->data_offset;
+ #else
+diff --git a/core/iwasm/common/wasm_c_api.c b/core/iwasm/common/wasm_c_api.c
+index 9fba0a0..9fba0a0 100644
+--- a/core/iwasm/common/wasm_c_api.c
++++ b/core/iwasm/common/wasm_c_api.c
+@@ -3655,6 +3655,22 @@ wasm_global_delete(wasm_global_t *global)
+ }
+ 
+ #if WASM_ENABLE_INTERP != 0
++static uint8 *
++interp_global_addr(const WASMModuleInstance *inst_interp,
++                   uint16 global_idx_rt)
++{
++    WASMGlobalInstance *global_interp =
++        inst_interp->e->globals + global_idx_rt;
++    if (global_interp->c_api_import_global_data)
++        return global_interp->c_api_import_global_data;
++#if WASM_ENABLE_MULTI_MODULE != 0
++    if (global_interp->import_global_inst)
++        return global_interp->import_module_inst->global_data
++               + global_interp->import_global_inst->data_offset;
++#endif
++    return inst_interp->global_data + global_interp->data_offset;
++}
++
+ static bool
+ interp_global_set(const WASMModuleInstance *inst_interp, uint16 global_idx_rt,
+                   const wasm_val_t *v)
+@@ -3662,14 +3678,7 @@ interp_global_set(const WASMModuleInstance *inst_interp, uint16 global_idx_rt,
+     const WASMGlobalInstance *global_interp =
+         inst_interp->e->globals + global_idx_rt;
+     uint8 val_type_rt = global_interp->type;
+-#if WASM_ENABLE_MULTI_MODULE != 0
+-    uint8 *data = global_interp->import_global_inst
+-                      ? global_interp->import_module_inst->global_data
+-                            + global_interp->import_global_inst->data_offset
+-                      : inst_interp->global_data + global_interp->data_offset;
+-#else
+-    uint8 *data = inst_interp->global_data + global_interp->data_offset;
+-#endif
++    uint8 *data = interp_global_addr(inst_interp, global_idx_rt);
+ 
+     return wasm_val_to_rt_val((WASMModuleInstanceCommon *)inst_interp,
+                               val_type_rt, v, data);
+@@ -3681,13 +3690,6 @@ interp_global_get(const WASMModuleInstance *inst_interp, uint16 global_idx_rt,
+     WASMGlobalInstance *global_interp = inst_interp->e->globals + global_idx_rt;
+     uint8 val_type_rt = global_interp->type;
+-#if WASM_ENABLE_MULTI_MODULE != 0
+-    uint8 *data = global_interp->import_global_inst
+-                      ? global_interp->import_module_inst->global_data
+-                            + global_interp->import_global_inst->data_offset
+-                      : inst_interp->global_data + global_interp->data_offset;
+-#else
+-    uint8 *data = inst_interp->global_data + global_interp->data_offset;
+-#endif
++    uint8 *data = interp_global_addr(inst_interp, global_idx_rt);
+ 
+     return rt_val_to_wasm_val(data, val_type_rt, out);
+ }
+@@ -4653,7 +4655,9 @@ interp_link_global(const WASMModule *module_interp, uint16 global_idx_rt,
+             return false;
+     }
+ 
+-    import->global_idx_rt = global_idx_rt;
++    /* Preserve the source instance/index for an exported Wasm global. */
++    if (!import->inst_comm_rt)
++        import->global_idx_rt = global_idx_rt;
+     imported_global_interp->u.global.is_linked = true;
+     return true;
+ }
+@@ -5146,6 +5150,7 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
+     }
+ 
+     /* fill with inst */
++    uint32 import_global_i = 0;
+     for (i = 0; imports && imports->data && i < imports->num_elems; ++i) {
+         wasm_extern_t *import = imports->data[i];
+         bh_assert(import);
+@@ -5155,9 +5160,27 @@ wasm_instance_new_with_args_ex(wasm_store_t *store, const wasm_module_t *module,
+                     instance->inst_comm_rt;
+                 break;
+             case WASM_EXTERN_GLOBAL:
+-                wasm_extern_as_global(import)->inst_comm_rt =
+-                    instance->inst_comm_rt;
++            {
++                wasm_global_t *global = wasm_extern_as_global(import);
++#if WASM_ENABLE_INTERP != 0
++                if (global->inst_comm_rt
++                    && global->inst_comm_rt->module_type
++                           == Wasm_Module_Bytecode
++                    && instance->inst_comm_rt->module_type
++                           == Wasm_Module_Bytecode) {
++                    WASMModuleInstance *target =
++                        (WASMModuleInstance *)instance->inst_comm_rt;
++                    target->e->globals[import_global_i]
++                        .c_api_import_global_data = interp_global_addr(
++                            (WASMModuleInstance *)global->inst_comm_rt,
++                            global->global_idx_rt);
++                }
++                else
++#endif
++                    global->inst_comm_rt = instance->inst_comm_rt;
++                import_global_i++;
+                 break;
++            }
+             case WASM_EXTERN_MEMORY:
+                 wasm_extern_as_memory(import)->inst_comm_rt =
+                     instance->inst_comm_rt;
