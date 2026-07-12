@@ -125,6 +125,43 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn class_method_name_does_not_shadow_outer_binding() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = CString::new(
+        "function record(value) { return value + 1; }\n\
+         class Gauge {\n\
+           #value = 1;\n\
+           record() { return record(this.#value); }\n\
+         }\n\
+         new Gauge().record();",
+      )
+      .unwrap();
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.as_bytes().len(),
+        c"method-outer-binding.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "eval threw");
+
+      let mut actual = 0;
+      assert_eq!(JS_ToInt32(ctx, &mut actual, result), 0);
+      assert_eq!(actual, 2);
+
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn callsite_preserves_receiver_type_and_method() {
     unsafe {
       let rt = JS_NewRuntime();

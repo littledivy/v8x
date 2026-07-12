@@ -1,0 +1,14 @@
+diff --git a/quickjs.c b/quickjs.c
+index 11caae0..11caae0 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -37400,7 +37400,8 @@ static __exception int js_parse_function_decl2(JSParseState *s,
+         }
+     }
+ 
+-    fd = js_new_function_def(ctx, fd, false, is_expr, s->filename,
++    fd = js_new_function_def(ctx, fd, false,
++                             func_type == JS_PARSE_FUNC_EXPR, s->filename,
+                              function_line_num, function_col_num);
+     if (!fd) {
+         JS_FreeAtom(ctx, func_name);
