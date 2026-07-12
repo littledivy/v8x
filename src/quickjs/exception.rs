@@ -43,6 +43,7 @@ const MESSAGE_TEXT_VERBATIM_PROP: &std::ffi::CStr =
   c"__v8qjs_message_text_verbatim";
 const MESSAGE_SOURCE_LINE_PROP: &std::ffi::CStr = c"__v8qjs_source_line";
 const MESSAGE_STACK_PTR_PROP: &std::ffi::CStr = c"__v8qjs_stack_ptr";
+const MODULE_LINK_FRAME_PROP: &std::ffi::CStr = c"__v8qjs_module_link_frame";
 const JS_CLASS_PROMISE: JSClassID = 52;
 
 #[repr(C)]
@@ -429,6 +430,17 @@ pub(crate) unsafe fn set_message_source_line(
   value: &str,
 ) {
   unsafe { set_message_str_prop(ctx, obj, MESSAGE_SOURCE_LINE_PROP, value) };
+}
+
+pub(crate) unsafe fn set_module_link_frame(ctx: *mut JSContext, obj: JSValue) {
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      obj,
+      MODULE_LINK_FRAME_PROP.as_ptr(),
+      JS_NewBool(ctx, 1),
+    )
+  };
 }
 
 unsafe fn set_message_int_prop(
@@ -1545,7 +1557,7 @@ unsafe fn js_string_value(
   Some(out)
 }
 
-unsafe fn read_str_prop(
+pub(crate) unsafe fn read_str_prop(
   ctx: *mut JSContext,
   obj: JSValue,
   prop: &std::ffi::CStr,
@@ -1905,6 +1917,8 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     .unwrap_or_else(|| "Error".to_string());
   let message =
     unsafe { read_str_prop(ctx, error, c"message") }.unwrap_or_default();
+  let is_module_link_frame =
+    unsafe { read_bool_prop(ctx, error, MODULE_LINK_FRAME_PROP) };
   let mut out = if message.is_empty() {
     name.clone()
   } else if name.is_empty() {
@@ -1966,10 +1980,11 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
 
     // quickjs names top-level script frames `global code` / `<eval>`; V8
     // reports none, so deno prints them as `at file:line:col` (no wrapper).
-    let is_top_level = matches!(
-      func.as_deref(),
-      None | Some("") | Some("global code") | Some("<eval>")
-    );
+    let is_top_level = !is_module_link_frame
+      && matches!(
+        func.as_deref(),
+        None | Some("") | Some("global code") | Some("<eval>")
+      );
 
     frames.push((
       file.clone(),

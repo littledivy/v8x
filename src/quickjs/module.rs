@@ -80,6 +80,13 @@ unsafe extern "C" {
     flags: int,
   ) -> int;
   fn v82jsc_link_module(ctx: *mut JSContext, module: *mut JSModuleDef) -> int;
+  fn v82jsc_set_module_error_backtrace(
+    ctx: *mut JSContext,
+    error: JSValue,
+    filename: *const std::os::raw::c_char,
+    line: int,
+    column: int,
+  );
 }
 
 #[repr(C)]
@@ -213,6 +220,22 @@ mod cache_key_tests {
     discard_module_caches(inner);
     discard_module_caches(outer);
     switch_module_caches(ptr::null_mut());
+  }
+
+  #[test]
+  fn missing_export_location_points_to_import_name() {
+    let source = "import { add } from \"./add.js\";\nconsole.log(add);";
+    let message = "SyntaxError: The requested module './add.js' does not provide an export named 'add'";
+    assert_eq!(
+      missing_export_location(source, message),
+      Some((1, 9, Some("import { add } from \"./add.js\";".to_string())))
+    );
+  }
+
+  #[test]
+  fn missing_export_location_falls_back_for_non_text_modules() {
+    let message = "SyntaxError: The requested module './math.ts' does not provide an export named 'add'";
+    assert_eq!(missing_export_location("", message), Some((1, 0, None)));
   }
 }
 
@@ -4261,6 +4284,112 @@ unsafe fn compile_module_for_instantiation(
   module_def
 }
 
+fn missing_export_location(
+  source: &str,
+  message: &str,
+) -> Option<(i32, i32, Option<std::string::String>)> {
+  const REQUEST_START: &str = "The requested module '";
+  const EXPORT_START: &str = "does not provide an export named '";
+
+  let request_start = message.find(REQUEST_START)? + REQUEST_START.len();
+  let specifier_end = message[request_start..].find('\'')? + request_start;
+  let specifier = &message[request_start..specifier_end];
+  let export_start = message.find(EXPORT_START)? + EXPORT_START.len();
+  let export_end = message[export_start..].find('\'')? + export_start;
+  let export_name = &message[export_start..export_end];
+
+  let exact = (|| {
+    let single_quoted = format!("'{specifier}'");
+    let double_quoted = format!("\"{specifier}\"");
+    let specifier_offset = source
+      .find(&single_quoted)
+      .or_else(|| source.find(&double_quoted))?;
+    let name_offset = source[..specifier_offset].rfind(export_name)?;
+    let line_start = source[..name_offset].rfind('\n').map_or(0, |i| i + 1);
+    let line_end = source[name_offset..]
+      .find(['\n', '\r'])
+      .map_or(source.len(), |i| name_offset + i);
+    let line = source[..line_start].bytes().filter(|b| *b == b'\n').count() + 1;
+    let column = source[line_start..name_offset].chars().count();
+    Some((
+      line as i32,
+      column as i32,
+      Some(source[line_start..line_end].to_string()),
+    ))
+  })();
+  Some(exact.unwrap_or((1, 0, None)))
+}
+
+unsafe fn annotate_module_link_exception(
+  ctx: *mut JSContext,
+  this: *const Module,
+) {
+  if !unsafe { JS_HasException(ctx) } {
+    return;
+  }
+  let exception = unsafe { JS_GetException(ctx) };
+  let message = unsafe { jsval_to_rust(ctx, exception) };
+  let importer_name =
+    unsafe { super::exception::read_str_prop(ctx, exception, c"fileName") };
+  let location = if let Some(importer_name) = importer_name {
+    let source_name = source_name_for_module_name(&importer_name);
+    let source_text = lookup_module_source_by_name(&importer_name)
+      .or_else(|| lookup_module_source_by_name(&source_name))
+      .unwrap_or_default();
+    missing_export_location(&source_text, &message).map(
+      |(line, column, source_line)| (source_name, line, column, source_line),
+    )
+  } else {
+    with_module_state(this, |module| {
+      missing_export_location(&module.source_text, &message).map(
+        |(line, column, source_line)| {
+          (module.source_name.clone(), line, column, source_line)
+        },
+      )
+    })
+    .flatten()
+  };
+  if let Some((file_name, line, column, source_line)) = location {
+    let stack_file_name = std::ffi::CString::new(file_name.as_bytes()).ok();
+    let file_name_value = unsafe {
+      JS_NewStringLen(
+        ctx,
+        file_name.as_ptr() as *const std::os::raw::c_char,
+        file_name.len(),
+      )
+    };
+    unsafe {
+      JS_SetPropertyStr(ctx, exception, c"fileName".as_ptr(), file_name_value);
+      JS_SetPropertyStr(
+        ctx,
+        exception,
+        c"lineNumber".as_ptr(),
+        JS_NewInt32(ctx, line),
+      );
+      JS_SetPropertyStr(
+        ctx,
+        exception,
+        c"columnNumber".as_ptr(),
+        JS_NewInt32(ctx, column),
+      );
+      if let Some(source_line) = source_line {
+        super::exception::set_message_source_line(ctx, exception, &source_line);
+      }
+      super::exception::set_module_link_frame(ctx, exception);
+      if let Some(file_name) = stack_file_name {
+        v82jsc_set_module_error_backtrace(
+          ctx,
+          exception,
+          file_name.as_ptr(),
+          line,
+          column + 1,
+        );
+      }
+    }
+  }
+  unsafe { JS_Throw(ctx, exception) };
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__InstantiateModule(
   this: *const Module,
@@ -4282,6 +4411,7 @@ pub extern "C" fn v8__Module__InstantiateModule(
     if module_def.is_null()
       || unsafe { v82jsc_link_module(ctx, module_def) } < 0
     {
+      unsafe { annotate_module_link_exception(ctx, this) };
       with_module_state(this, |m| m.status = ModuleStatus::Errored);
       return MaybeBool::Nothing;
     }

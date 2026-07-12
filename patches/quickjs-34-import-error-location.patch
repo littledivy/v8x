@@ -2,8 +2,7 @@ diff --git a/quickjs.c b/quickjs.c
 index 11caae0..11caae0 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -30949,7 +30949,52 @@ static void js_resolve_export_throw_error(JSContext *ctx,
-         break;
+@@ -30950,7 +30950,42 @@ static void js_resolve_export_throw_error(JSContext *ctx,
      }
  }
  
@@ -14,10 +13,8 @@ index 11caae0..11caae0 100644
 +{
 +    const char *specifier;
 +    const char *export_name;
-+    const char *filename;
-+    char *frame_name;
-+    size_t frame_name_len;
-+
++    JSValue exception;
+ 
 +    if (res != JS_RESOLVE_RES_NOT_FOUND) {
 +        JSModuleDef *target =
 +            importer->req_module_entries[mi->req_module_idx].module;
@@ -28,34 +25,27 @@ index 11caae0..11caae0 100644
 +    specifier = JS_AtomToCString(
 +        ctx, importer->req_module_entries[mi->req_module_idx].module_name);
 +    export_name = JS_AtomToCString(ctx, mi->import_name);
-+    filename = JS_AtomToCString(ctx, importer->module_name);
-+    if (specifier && export_name && filename) {
++    if (specifier && export_name) {
 +        JS_ThrowSyntaxError(
 +            ctx,
 +            "The requested module '%s' does not provide an export named '%s'",
 +            specifier, export_name);
-+        frame_name_len = strlen(filename) + 32;
-+        frame_name = js_malloc(ctx, frame_name_len);
-+        if (frame_name) {
-+            snprintf(frame_name, frame_name_len, "<anonymous> (%s:1:1)",
-+                     filename);
-+            build_backtrace(ctx, ctx->rt->current_exception, JS_UNDEFINED,
-+                            frame_name, -1, -1, JS_BACKTRACE_FLAG_SINGLE_LEVEL);
-+            js_free(ctx, frame_name);
-+        }
++        exception = JS_GetException(ctx);
++        JS_SetPropertyStr(ctx, exception, "fileName",
++                          JS_AtomToString(ctx, importer->module_name));
++        JS_Throw(ctx, exception);
 +    }
 +    if (specifier)
 +        JS_FreeCString(ctx, specifier);
 +    if (export_name)
 +        JS_FreeCString(ctx, export_name);
-+    if (filename)
-+        JS_FreeCString(ctx, filename);
 +}
 +
- 
++
  typedef enum {
      EXPORTED_NAME_AMBIGUOUS,
-@@ -31470,7 +31514,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
+     EXPORTED_NAME_NORMAL,
+@@ -31470,7 +31505,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
                  ret = js_resolve_export(ctx, &res_m,
                                          &res_me, m1, mi->import_name);
                  if (ret != JS_RESOLVE_RES_FOUND) {
@@ -64,10 +54,33 @@ index 11caae0..11caae0 100644
                      goto fail;
                  }
                  if (res_me->local_name == JS_ATOM__star_) {
-@@ -38336,6 +38380,22 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj)
+@@ -38292,6 +38327,45 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj)
      return 0;
  }
  
++void v82jsc_set_module_error_backtrace(JSContext *ctx,
++                                       JSValueConst error,
++                                       const char *filename,
++                                       int line,
++                                       int column)
++{
++    JSObject *p;
++
++    if (JS_VALUE_GET_TAG(error) == JS_TAG_OBJECT) {
++        p = JS_VALUE_GET_OBJ(error);
++        if (p->class_id == JS_CLASS_ERROR) {
++            JS_FreeValue(ctx, p->u.object_data);
++            p->u.object_data = JS_UNDEFINED;
++        }
++    }
++    JS_FreeValue(ctx, ctx->error_back_trace);
++    ctx->error_back_trace = JS_UNDEFINED;
++    JS_Throw(ctx, js_dup(error));
++    build_backtrace(ctx, error, JS_UNDEFINED, filename, line, column,
++                    JS_BACKTRACE_FLAG_SINGLE_LEVEL);
++    JS_FreeValue(ctx, JS_GetException(ctx));
++}
++
 +int v82jsc_link_module(JSContext *ctx, JSModuleDef *m)
 +{
 +    if (!m)
