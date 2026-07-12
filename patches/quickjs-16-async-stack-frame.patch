@@ -1,7 +1,7 @@
 diff --git a/quickjs.c b/quickjs.c
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21019,7 +21019,185 @@
+@@ -21019,7 +21019,234 @@
      return 0;
  }
  
@@ -81,6 +81,53 @@ diff --git a/quickjs.c b/quickjs.c
 +    return atom;
 +}
 +
++static bool js_v82jsc_has_same_async_site(JSContext *ctx,
++                                           JSValueConst error,
++                                           const char *file, int line)
++{
++    JSAtom key_atom;
++    JSValue existing, site, method, file_value, line_value;
++    const char *site_file;
++    int32_t site_line = 0;
++    bool same = false;
++
++    key_atom = js_v82jsc_private_atom(ctx,
++        "v82jsc_private:deno_core::call_site_evals");
++    if (key_atom == JS_ATOM_NULL)
++        return false;
++    existing = JS_GetProperty(ctx, error, key_atom);
++    JS_FreeAtom(ctx, key_atom);
++    if (!JS_IsArray(existing)) {
++        JS_FreeValue(ctx, existing);
++        return false;
++    }
++    site = JS_GetPropertyUint32(ctx, existing, 0);
++    JS_FreeValue(ctx, existing);
++    if (!JS_IsObject(site)) {
++        JS_FreeValue(ctx, site);
++        return false;
++    }
++    method = JS_GetPropertyStr(ctx, site, "getFileName");
++    file_value = JS_IsFunction(ctx, method)
++        ? JS_Call(ctx, method, site, 0, NULL) : JS_UNDEFINED;
++    JS_FreeValue(ctx, method);
++    method = JS_GetPropertyStr(ctx, site, "getLineNumber");
++    line_value = JS_IsFunction(ctx, method)
++        ? JS_Call(ctx, method, site, 0, NULL) : JS_UNDEFINED;
++    JS_FreeValue(ctx, method);
++    JS_FreeValue(ctx, site);
++    site_file = JS_ToCString(ctx, file_value);
++    if (site_file && JS_ToInt32(ctx, &site_line, line_value) == 0)
++        same = !strcmp(site_file, file) && site_line == line;
++    if (site_file)
++        JS_FreeCString(ctx, site_file);
++    JS_FreeValue(ctx, file_value);
++    JS_FreeValue(ctx, line_value);
++    if (JS_HasException(ctx))
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    return same;
++}
++
 +/* v82jsc: append "    at async <file>:<line>:<col>" to the error's stack
 +   property so an unhandled rejection propagating through an async function's
 +   await surfaces the awaiting frame (V8-style async stack stitching). Also
@@ -98,6 +145,8 @@ diff --git a/quickjs.c b/quickjs.c
 +    size_t len;
 +
 +    if (!file || JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
++        return;
++    if (js_v82jsc_has_same_async_site(ctx, error, file, line))
 +        return;
 +    stack = JS_GetProperty(ctx, error, JS_ATOM_stack);
 +    if (JS_IsException(stack)) {
@@ -188,7 +237,7 @@ diff --git a/quickjs.c b/quickjs.c
  {
      bool is_success = true;
      JSValue func_ret, ret2;
-@@ -21031,6 +21209,9 @@
+@@ -21031,6 +21258,9 @@
              is_success = false;
          } else {
              JSValue error = JS_GetException(ctx);
@@ -198,7 +247,7 @@ diff --git a/quickjs.c b/quickjs.c
              ret2 = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED,
                             1, vc(&error));
              JS_FreeValue(ctx, error);
-@@ -21097,6 +21278,9 @@
+@@ -21097,6 +21327,9 @@
      JSObject *p = JS_VALUE_GET_OBJ(func_obj);
      JSAsyncFunctionData *s = p->u.async_function_data;
      bool is_reject = p->class_id - JS_CLASS_ASYNC_FUNCTION_RESOLVE;
@@ -208,7 +257,7 @@ diff --git a/quickjs.c b/quickjs.c
      JSValueConst arg;
  
      if (argc > 0)
-@@ -21110,7 +21294,34 @@
+@@ -21110,7 +21343,34 @@
          /* return value of await */
          s->func_state.frame.cur_sp[-1] = js_dup(arg);
      }
@@ -244,7 +293,7 @@ diff --git a/quickjs.c b/quickjs.c
          return JS_EXCEPTION;
      return JS_UNDEFINED;
  }
-@@ -21143,7 +21354,7 @@
+@@ -21143,7 +21403,7 @@
      }
      s->is_active = true;
  
@@ -253,7 +302,7 @@ diff --git a/quickjs.c b/quickjs.c
          goto fail;
  
      js_async_function_free(ctx->rt, s);
-@@ -27389,19 +27600,27 @@
+@@ -27389,19 +27649,27 @@
              return -1;
          parse_flags = 0;
          break;
