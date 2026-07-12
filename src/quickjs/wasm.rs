@@ -316,9 +316,9 @@ unsafe fn js_to_externref(ctx: *mut JSContext, v: JSValue) -> u64 {
 unsafe fn externref_to_js(ctx: *mut JSContext, of: u64) -> JSValue {
   if of == 0 {
     if std::env::var("V82_WASM_TRACE").is_ok() {
-      eprintln!("[wasm] externref_to_js of=0 -> undefined");
+      eprintln!("[wasm] externref_to_js of=0 -> null");
     }
-    return jsv_undefined();
+    return jsv_null();
   }
   let r = of as *mut wasm_ref_t;
   let hi = unsafe { wasm_ref_get_host_info(r) };
@@ -329,6 +329,28 @@ unsafe fn externref_to_js(ctx: *mut JSContext, of: u64) -> JSValue {
     return jsv_undefined();
   }
   unsafe { JS_DupValue(ctx, unbox_externref(hi)) }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn null_reference_converts_to_js_null() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let value = externref_to_js(ctx, 0);
+      assert!(jsv_is_null(&value));
+
+      JS_FreeValue(ctx, value);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
 }
 
 struct WasmState {
