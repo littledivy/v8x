@@ -101,6 +101,7 @@ pub const WASM_I32: u8 = 0;
 pub const WASM_I64: u8 = 1;
 pub const WASM_F32: u8 = 2;
 pub const WASM_F64: u8 = 3;
+pub const WASM_V128: u8 = 4;
 pub const WASM_EXTERNREF: u8 = 128;
 pub const WASM_FUNCREF: u8 = 129;
 
@@ -125,6 +126,17 @@ pub type wasm_func_callback_with_env_t =
   ) -> *mut wasm_trap_t;
 
 unsafe extern "C" {
+  fn JS_SetPrototype(
+    ctx: *mut JSContext,
+    obj: JSValue,
+    proto_val: JSValue,
+  ) -> c_int;
+  fn JS_SetConstructor(
+    ctx: *mut JSContext,
+    func_obj: JSValue,
+    proto: JSValue,
+  ) -> c_int;
+
   pub fn wasm_engine_new() -> *mut wasm_engine_t;
   pub fn wasm_store_new(e: *mut wasm_engine_t) -> *mut wasm_store_t;
 
@@ -407,6 +419,60 @@ mod tests {
       assert_eq!(result.tag, JS_TAG_INT);
       assert_eq!(result.u.int32, 2);
 
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  fn v128_global_value_throws_and_wrapper_is_branded() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+      install_webassembly(ctx);
+
+      let source = CString::new(
+        r#"
+        const bytes = new Uint8Array([
+          0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+          0x06, 0x16, 0x01, 0x7b, 0x00, 0xfd, 0x0c, 0x00,
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b,
+          0x07, 0x05, 0x01, 0x01, 0x76, 0x03, 0x00,
+        ]);
+        const value = new WebAssembly.Instance(
+          new WebAssembly.Module(bytes),
+        ).exports.v;
+        let threw = false;
+        try {
+          value.value;
+        } catch {
+          threw = true;
+        }
+        `${value instanceof WebAssembly.Global}:${threw}`;
+        "#,
+      )
+      .unwrap();
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.as_bytes().len(),
+        c"v128-global.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "eval threw");
+      let mut len = 0usize;
+      let actual = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!actual.is_null());
+      assert_eq!(
+        std::slice::from_raw_parts(actual as *const u8, len),
+        b"true:true"
+      );
+
+      JS_FreeCString(ctx, actual);
       JS_FreeValue(ctx, result);
       JS_FreeContext(ctx);
       JS_FreeRuntime(rt);
@@ -1438,6 +1504,16 @@ unsafe extern "C" fn global_value_get(
     return jsv_undefined();
   }
   let env = unsafe { &*(envp as *const GlobalEnv) };
+  let global_type = unsafe { wasm_global_type(env.global) };
+  let value_type = unsafe { wasm_globaltype_content(global_type) };
+  if unsafe { wasm_valtype_kind(value_type) } == WASM_V128 {
+    return unsafe {
+      throw(
+        ctx,
+        "WebAssembly.Global.value: v128 cannot be exposed to JS",
+      )
+    };
+  }
   let mut v = wasm_val_t {
     kind: 0,
     _pad: [0; 7],
@@ -1510,7 +1586,31 @@ unsafe fn make_global_obj(
     );
     JS_FreeAtom(ctx, atom);
   }
+  unsafe { set_wasm_object_prototype(ctx, obj, c"Global") };
   obj
+}
+
+unsafe fn set_wasm_object_prototype(
+  ctx: *mut JSContext,
+  obj: JSValue,
+  constructor_name: &std::ffi::CStr,
+) {
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let webassembly =
+    unsafe { JS_GetPropertyStr(ctx, global, c"WebAssembly".as_ptr()) };
+  let constructor =
+    unsafe { JS_GetPropertyStr(ctx, webassembly, constructor_name.as_ptr()) };
+  let prototype =
+    unsafe { JS_GetPropertyStr(ctx, constructor, c"prototype".as_ptr()) };
+  if jsv_is_object(&prototype) {
+    unsafe { JS_SetPrototype(ctx, obj, prototype) };
+  }
+  unsafe {
+    JS_FreeValue(ctx, prototype);
+    JS_FreeValue(ctx, constructor);
+    JS_FreeValue(ctx, webassembly);
+    JS_FreeValue(ctx, global);
+  }
 }
 
 unsafe fn wasm_value_type_from_js(
@@ -2189,6 +2289,9 @@ pub(crate) fn install_webassembly(ctx: *mut JSContext) {
                     argc: c_int| {
       let func =
         JS_NewCFunction2(ctx, f, name.as_ptr(), argc, JS_CFUNC_CONSTRUCTOR, 0);
+      let prototype = JS_NewObject(ctx);
+      JS_SetConstructor(ctx, func, prototype);
+      JS_FreeValue(ctx, prototype);
       JS_SetPropertyStr(ctx, obj, name.as_ptr(), func);
     };
     set_fn(wa, c"validate", wa_validate, 1);
