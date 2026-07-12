@@ -64,13 +64,20 @@ index 11caae0..11caae0 100644
                      goto fail;
                  }
                  if (res_me->local_name == JS_ATOM__star_) {
-@@ -38336,6 +38380,15 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj)
+@@ -38336,6 +38380,22 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj)
      return 0;
  }
  
 +int v82jsc_link_module(JSContext *ctx, JSModuleDef *m)
 +{
-+    if (!m || js_create_module_function(ctx, m) < 0)
++    if (!m)
++        return -1;
++    if (m->status == JS_MODULE_STATUS_LINKED ||
++        m->status == JS_MODULE_STATUS_EVALUATING ||
++        m->status == JS_MODULE_STATUS_EVALUATING_ASYNC ||
++        m->status == JS_MODULE_STATUS_EVALUATED)
++        return 0;
++    if (js_create_module_function(ctx, m) < 0)
 +        return -1;
 +    if (js_link_module(ctx, m) < 0)
 +        return -1;
