@@ -1,0 +1,36 @@
+--- a/core/iwasm/common/wasm_c_api.c
++++ b/core/iwasm/common/wasm_c_api.c
+@@ -2256,11 +2256,24 @@ quit:
+ }
+ #endif /* WASM_ENABLE_WASM_CACHE != 0 */
+ 
++#ifdef os_thread_local_attribute
++static os_thread_local_attribute char v82jsc_module_error[128];
++#else
++static char v82jsc_module_error[128];
++#endif
++
++const char *
++v82jsc_wasm_module_error(void)
++{
++    return v82jsc_module_error;
++}
++
+ wasm_module_t *
+ wasm_module_new_ex(wasm_store_t *store, wasm_byte_vec_t *binary, LoadArgs *args)
+ {
+     char error_buf[128] = { 0 };
+     wasm_module_ex_t *module_ex = NULL;
++    v82jsc_module_error[0] = '\0';
+ #if WASM_ENABLE_WASM_CACHE != 0
+     char binary_hash[SHA256_DIGEST_LENGTH] = { 0 };
+ #endif
+@@ -2314,6 +2327,8 @@ wasm_module_new_ex(wasm_store_t *store, wasm_byte_vec_t *binary, LoadArgs *args)
+         error_buf, (uint32)sizeof(error_buf));
+     if (!(module_ex->module_comm_rt)) {
+         LOG_ERROR("%s", error_buf);
++        snprintf(v82jsc_module_error, sizeof(v82jsc_module_error), "%s",
++                 error_buf);
+         goto free_vec;
+     }
+ 

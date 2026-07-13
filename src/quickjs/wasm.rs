@@ -14,7 +14,7 @@
 #![allow(non_camel_case_types)]
 
 use std::cell::RefCell;
-use std::ffi::{CString, c_char, c_void};
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::os::raw::c_int;
 use std::ptr;
 
@@ -150,6 +150,8 @@ unsafe extern "C" {
 
   pub fn wasm_engine_new() -> *mut wasm_engine_t;
   pub fn wasm_store_new(e: *mut wasm_engine_t) -> *mut wasm_store_t;
+  pub fn wasm_runtime_set_log_level(level: c_int);
+  pub fn v82jsc_wasm_module_error() -> *const c_char;
 
   pub fn wasm_byte_vec_new(out: *mut wasm_vec_t, size: usize, data: *const u8);
   pub fn wasm_byte_vec_delete(v: *mut wasm_vec_t);
@@ -680,6 +682,7 @@ fn with_state<R>(f: impl FnOnce(&mut WasmState) -> R) -> R {
     let mut b = w.borrow_mut();
     if b.is_none() {
       let engine = unsafe { wasm_engine_new() };
+      unsafe { wasm_runtime_set_log_level(0) };
       let store = unsafe { wasm_store_new(engine) };
       *b = Some(WasmState {
         store,
@@ -703,13 +706,14 @@ unsafe fn throw_wasm_error(
   ctx: *mut JSContext,
   class_name: &std::ffi::CStr,
   message: &str,
+  stackless: bool,
 ) -> JSValue {
   let global = unsafe { JS_GetGlobalObject(ctx) };
   let webassembly =
     unsafe { JS_GetPropertyStr(ctx, global, c"WebAssembly".as_ptr()) };
   let constructor =
     unsafe { JS_GetPropertyStr(ctx, webassembly, class_name.as_ptr()) };
-  let Ok(message) = CString::new(message) else {
+  let Ok(message_c) = CString::new(message) else {
     unsafe {
       JS_FreeValue(ctx, constructor);
       JS_FreeValue(ctx, webassembly);
@@ -717,7 +721,7 @@ unsafe fn throw_wasm_error(
     }
     return jsv_exception();
   };
-  let mut args = [unsafe { JS_NewString(ctx, message.as_ptr()) }];
+  let mut args = [unsafe { JS_NewString(ctx, message_c.as_ptr()) }];
   let error =
     unsafe { JS_CallConstructor(ctx, constructor, 1, args.as_mut_ptr()) };
   unsafe {
@@ -729,6 +733,20 @@ unsafe fn throw_wasm_error(
   if error.tag == JS_TAG_EXCEPTION {
     error
   } else {
+    if stackless {
+      let stack = format!("{}: {message}", class_name.to_string_lossy());
+      if let Ok(stack) = CString::new(stack) {
+        unsafe {
+          JS_DefinePropertyValueStr(
+            ctx,
+            error,
+            c"stack".as_ptr(),
+            JS_NewString(ctx, stack.as_ptr()),
+            JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE,
+          );
+        }
+      }
+    }
     unsafe { JS_Throw(ctx, error) }
   }
 }
@@ -1237,7 +1255,8 @@ unsafe extern "C" fn call_export(
     let message = unsafe { trap_message(trap) };
     unsafe { wasm_trap_delete(trap) };
     let message = message.strip_prefix("Exception: ").unwrap_or(&message);
-    let result = unsafe { throw_wasm_error(ctx, c"RuntimeError", message) };
+    let result =
+      unsafe { throw_wasm_error(ctx, c"RuntimeError", message, false) };
     if result.tag == JS_TAG_EXCEPTION {
       let exception = unsafe { JS_GetException(ctx) };
       unsafe {
@@ -1497,6 +1516,7 @@ unsafe fn make_table_obj(
 unsafe fn compile_module(
   ctx: *mut JSContext,
   bytes: &[u8],
+  operation: &str,
 ) -> Result<usize, JSValue> {
   with_state(|st| {
     let mut bin = wasm_vec_t::empty();
@@ -1504,7 +1524,33 @@ unsafe fn compile_module(
     let m = unsafe { wasm_module_new(st.store, &bin) };
     unsafe { wasm_byte_vec_delete(&mut bin) };
     if m.is_null() {
-      return Err(unsafe { throw(ctx, "WebAssembly.Module: compile failed") });
+      let error = unsafe { v82jsc_wasm_module_error() };
+      let detail = if error.is_null() {
+        "validation failed"
+      } else {
+        let error = unsafe { CStr::from_ptr(error) }
+          .to_str()
+          .unwrap_or("validation failed");
+        error
+          .strip_prefix("WASM module load failed: ")
+          .unwrap_or(error)
+      };
+      let message = if detail == "unexpected end" {
+        format!(
+          "{operation}: reached end while decoding length @+{}",
+          bytes.len()
+        )
+      } else {
+        format!("{operation}: {detail}")
+      };
+      return Err(unsafe {
+        throw_wasm_error(
+          ctx,
+          c"CompileError",
+          &message,
+          operation != "WebAssembly.Module()",
+        )
+      });
     }
     st.modules.push(ModuleEntry {
       module: m,
@@ -1519,7 +1565,7 @@ pub(crate) unsafe fn compile_module_object(
   ctx: *mut JSContext,
   bytes: &[u8],
 ) -> JSValue {
-  match unsafe { compile_module(ctx, bytes) } {
+  match unsafe { compile_module(ctx, bytes, "WebAssembly.Module()") } {
     Ok(id) => unsafe { make_module_obj(ctx, id) },
     Err(e) => e,
   }
@@ -2330,7 +2376,7 @@ unsafe extern "C" fn wa_module_ctor(
   let Some(bytes) = (unsafe { read_wasm_bytes(ctx, *argv) }) else {
     return unsafe { throw(ctx, "WebAssembly.Module: invalid bytes") };
   };
-  match unsafe { compile_module(ctx, &bytes) } {
+  match unsafe { compile_module(ctx, &bytes, "WebAssembly.Module()") } {
     Ok(id) => unsafe { make_module_obj(ctx, id) },
     Err(e) => e,
   }
@@ -2368,7 +2414,16 @@ unsafe extern "C" fn wa_compile(
   argc: c_int,
   argv: *mut JSValue,
 ) -> JSValue {
-  let result = unsafe { wa_module_ctor(ctx, jsv_undefined(), argc, argv) };
+  let result = if argc < 1 {
+    unsafe { throw(ctx, "WebAssembly.compile: missing bytes") }
+  } else if let Some(bytes) = unsafe { read_wasm_bytes(ctx, *argv) } {
+    match unsafe { compile_module(ctx, &bytes, "WebAssembly.compile()") } {
+      Ok(id) => unsafe { make_module_obj(ctx, id) },
+      Err(error) => error,
+    }
+  } else {
+    unsafe { throw(ctx, "WebAssembly.compile: invalid bytes") }
+  };
   unsafe { settle_promise(ctx, result) }
 }
 
@@ -2400,10 +2455,11 @@ unsafe extern "C" fn wa_instantiate(
     let e = unsafe { throw(ctx, "WebAssembly.instantiate: invalid source") };
     return unsafe { settle_promise(ctx, e) };
   };
-  let mid = match unsafe { compile_module(ctx, &bytes) } {
-    Ok(id) => id,
-    Err(e) => return unsafe { settle_promise(ctx, e) },
-  };
+  let mid =
+    match unsafe { compile_module(ctx, &bytes, "WebAssembly.instantiate()") } {
+      Ok(id) => id,
+      Err(e) => return unsafe { settle_promise(ctx, e) },
+    };
   match unsafe { instantiate(ctx, mid, imports) } {
     Ok(inst) => {
       let res = unsafe { JS_NewObject(ctx) };
@@ -3152,10 +3208,11 @@ pub(crate) fn module_object_from_compiled_module(
     return ptr::null();
   }
   let cm = unsafe { &*(compiled_module as *const CompiledModule) };
-  let id = match unsafe { compile_module(ctx, &cm.bytes) } {
-    Ok(id) => id,
-    Err(_) => return ptr::null(),
-  };
+  let id =
+    match unsafe { compile_module(ctx, &cm.bytes, "WebAssembly.Module()") } {
+      Ok(id) => id,
+      Err(_) => return ptr::null(),
+    };
   with_state(|st| {
     if let Some(entry) = st.modules.get_mut(id) {
       entry.source_url = cm.source_url.clone();
@@ -3273,10 +3330,11 @@ pub(crate) fn module_compilation_finish(
     .last()
     .copied()
     .unwrap_or(iso_state(iso).ctx);
-  let id = match unsafe { compile_module(ctx, &c.bytes) } {
-    Ok(id) => id,
-    Err(_) => return,
-  };
+  let id =
+    match unsafe { compile_module(ctx, &c.bytes, "WebAssembly.Module()") } {
+      Ok(id) => id,
+      Err(_) => return,
+    };
   with_state(|st| {
     if let Some(entry) = st.modules.get_mut(id) {
       if !c.source_url.is_empty() {
@@ -3371,7 +3429,9 @@ pub(crate) fn streaming_finish(
     return;
   }
   st.done = true;
-  let id = match unsafe { compile_module(st.ctx, &st.bytes) } {
+  let id = match unsafe {
+    compile_module(st.ctx, &st.bytes, "WebAssembly.compileStreaming()")
+  } {
     Ok(id) => id,
     Err(_) => return,
   };
