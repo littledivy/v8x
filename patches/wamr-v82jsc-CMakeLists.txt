@@ -34,6 +34,7 @@ set(WAMR_BUILD_MULTI_MODULE 0)
 set(WAMR_BUILD_REF_TYPES 1)
 set(WAMR_BUILD_SIMD 1)
 set(WAMR_BUILD_BULK_MEMORY 1)
+set(WAMR_BUILD_DUMP_CALL_STACK 1)
 # Hardware bound-check uses SIGSEGV/SIGBUS handlers + mmap tricks that conflict
 # with deno/tokio's signal handling and macOS hardening (instant SIGKILL on
 # `deno run`). Use software bounds checks instead.

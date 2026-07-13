@@ -2279,6 +2279,16 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
 
   // Corrected frames, collected for deno's native (source-mapping) formatter.
   let mut frames: Vec<PreparedFrame> = Vec::new();
+  let (wasm_frames, wasm_after_first) =
+    unsafe { attached_wasm_frames(ctx, error) };
+  let mut wasm_frames_inserted = false;
+  if !wasm_after_first {
+    for frame in &wasm_frames {
+      append_prepared_frame(&mut out, frame);
+    }
+    frames.extend(wasm_frames.iter().cloned());
+    wasm_frames_inserted = true;
+  }
 
   for i in 0..len as u32 {
     let site = unsafe { JS_GetPropertyUint32(ctx, sites, i) };
@@ -2357,6 +2367,7 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
       frame_method,
       is_top_level,
       is_constructor,
+      false,
     ));
 
     out.push_str("\n    at ");
@@ -2395,9 +2406,22 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
       append_location(&mut out, &file, line, col);
       out.push(')');
     }
+    if wasm_after_first && !wasm_frames_inserted {
+      for frame in &wasm_frames {
+        append_prepared_frame(&mut out, frame);
+      }
+      frames.extend(wasm_frames.iter().cloned());
+      wasm_frames_inserted = true;
+    }
     if stop_at_host_boundary {
       break;
     }
+  }
+  if !wasm_frames_inserted {
+    for frame in &wasm_frames {
+      append_prepared_frame(&mut out, frame);
+    }
+    frames.extend(wasm_frames);
   }
 
   // Prefer deno's native formatter when it's registered: it applies source maps
@@ -2435,7 +2459,121 @@ type PreparedFrame = (
   Option<std::string::String>,
   bool,
   bool,
+  bool,
 );
+
+unsafe fn attached_wasm_frames(
+  ctx: *mut JSContext,
+  error: JSValue,
+) -> (Vec<PreparedFrame>, bool) {
+  let rows = unsafe {
+    JS_GetPropertyStr(ctx, error, c"__v82_wasm_stack_frames".as_ptr())
+  };
+  if rows.tag == JS_TAG_EXCEPTION || !jsv_is_object(&rows) {
+    if rows.tag == JS_TAG_EXCEPTION {
+      unsafe { clear_pending(ctx) };
+    }
+    unsafe { JS_FreeValue(ctx, rows) };
+    return (Vec::new(), false);
+  }
+  let length = unsafe { JS_GetPropertyStr(ctx, rows, c"length".as_ptr()) };
+  let mut len = 0i32;
+  if unsafe { JS_ToInt32(ctx, &mut len, length) } < 0 {
+    unsafe { clear_pending(ctx) };
+  }
+  unsafe { JS_FreeValue(ctx, length) };
+
+  let mut frames = Vec::with_capacity(len.max(0) as usize);
+  for i in 0..len.max(0) as u32 {
+    let row = unsafe { JS_GetPropertyUint32(ctx, rows, i) };
+    if !jsv_is_object(&row) {
+      unsafe { JS_FreeValue(ctx, row) };
+      continue;
+    }
+    let source_value = unsafe { JS_GetPropertyUint32(ctx, row, 0) };
+    let function_value = unsafe { JS_GetPropertyUint32(ctx, row, 1) };
+    let function_index = unsafe { JS_GetPropertyUint32(ctx, row, 2) };
+    let function_offset = unsafe { JS_GetPropertyUint32(ctx, row, 3) };
+    let module_offset = unsafe { JS_GetPropertyUint32(ctx, row, 4) };
+    let source = unsafe { js_string_value(ctx, source_value) };
+    let function = unsafe { js_string_value(ctx, function_value) };
+    let mut index = 0i64;
+    let mut func_offset = 0i64;
+    let mut module_offset_value = 0i64;
+    unsafe {
+      JS_ToInt64(ctx, &mut index, function_index);
+      JS_ToInt64(ctx, &mut func_offset, function_offset);
+      JS_ToInt64(ctx, &mut module_offset_value, module_offset);
+      JS_FreeValue(ctx, source_value);
+      JS_FreeValue(ctx, function_value);
+      JS_FreeValue(ctx, function_index);
+      JS_FreeValue(ctx, function_offset);
+      JS_FreeValue(ctx, module_offset);
+      JS_FreeValue(ctx, row);
+    }
+    let Some(source) = source else {
+      continue;
+    };
+    let is_wasm = source.starts_with("wasm://");
+    frames.push(if is_wasm {
+      (
+        source,
+        index.saturating_add(1) as i32,
+        func_offset.saturating_add(1) as i32,
+        function,
+        None,
+        None,
+        false,
+        false,
+        true,
+      )
+    } else {
+      (
+        source,
+        1,
+        module_offset_value.saturating_add(1) as i32,
+        None,
+        None,
+        None,
+        false,
+        false,
+        false,
+      )
+    });
+  }
+  unsafe { JS_FreeValue(ctx, rows) };
+  let after_first =
+    unsafe { read_bool_prop(ctx, error, c"__v82_wasm_stack_after_first") };
+  (frames, after_first)
+}
+
+fn append_prepared_frame(out: &mut std::string::String, frame: &PreparedFrame) {
+  let (file, line, col, function, _, _, top, constructor, is_wasm) = frame;
+  out.push_str("\n    at ");
+  if *constructor {
+    out.push_str("new ");
+  }
+  if let Some(function) = function {
+    out.push_str(function);
+  } else if !*top {
+    out.push_str("<anonymous>");
+  }
+  if function.is_some() || !*top {
+    out.push_str(" (");
+  }
+  if *is_wasm {
+    out.push_str(file);
+    out.push_str(":wasm-function[");
+    out.push_str(&line.saturating_sub(1).to_string());
+    out.push_str("]:0x");
+    out.push_str(&format!("{:x}", col.saturating_sub(1)));
+  } else {
+    append_location(out, file, *line, *col);
+  }
+  if function.is_some() || !*top {
+    out.push(')');
+  }
+}
 
 unsafe fn take_prepare_stack_trace(ctx: *mut JSContext) -> JSValue {
   unsafe {
@@ -2454,11 +2592,11 @@ unsafe fn restore_prepare_stack_trace(ctx: *mut JSContext, saved: JSValue) {
 
 /// JS factory that turns rows of
 /// `[file, line, col, funcOrNull, typeOrNull, methodOrNull, isTopLevel,
-/// isConstructor]`
+/// isConstructor, isWasm]`
 /// into the V8-shaped CallSite objects deno's `from_callsite_object` consumes
 /// (it calls each accessor and applies source maps to file/line/column).
 const CALLSITE_FACTORY_SRC: &str = "(function(d){return d.map(function(f){\
-  var file=f[0],line=f[1],col=f[2],top=f[6],constructor=f[7],fn=f[3],type=f[4],method=f[5];\
+  var file=f[0],line=f[1],col=f[2],top=f[6],constructor=f[7],wasm=f[8],fn=f[3],type=f[4],method=f[5];\
   return {\
     getFileName:function(){return file||undefined;},\
     getScriptNameOrSourceURL:function(){return file||undefined;},\
@@ -2477,7 +2615,7 @@ const CALLSITE_FACTORY_SRC: &str = "(function(d){return d.map(function(f){\
     isAsync:function(){return false;},\
     isPromiseAll:function(){return false;},\
     getPromiseIndex:function(){return null;},\
-    toString:function(){return fn?(fn+' ('+file+':'+line+':'+col+')'):(file+':'+line+':'+col);}\
+    toString:function(){var loc=wasm?(file+':wasm-function['+(line-1)+']:0x'+(col-1).toString(16)):(file+':'+line+':'+col);return fn?(fn+' ('+loc+')'):(top?loc:('<anonymous> ('+loc+')'));}\
   };});})\0";
 
 /// Build the synthetic CallSite array (one entry per corrected frame). Returns
@@ -2510,7 +2648,17 @@ unsafe fn build_callsites(
     }
     for (
       i,
-      (file, line, col, func, type_name, method_name, top, constructor),
+      (
+        file,
+        line,
+        col,
+        func,
+        type_name,
+        method_name,
+        top,
+        constructor,
+        is_wasm,
+      ),
     ) in frames.iter().enumerate()
     {
       let row = JS_NewArray(ctx);
@@ -2539,6 +2687,7 @@ unsafe fn build_callsites(
       JS_SetPropertyUint32(ctx, row, 5, methodv);
       JS_SetPropertyUint32(ctx, row, 6, JS_NewBool(ctx, *top as c_int));
       JS_SetPropertyUint32(ctx, row, 7, JS_NewBool(ctx, *constructor as c_int));
+      JS_SetPropertyUint32(ctx, row, 8, JS_NewBool(ctx, *is_wasm as c_int));
       JS_SetPropertyUint32(ctx, rows, i as u32, row);
     }
 

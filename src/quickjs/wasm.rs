@@ -57,6 +57,10 @@ pub struct wasm_trap_t {
   _p: [u8; 0],
 }
 #[repr(C)]
+pub struct wasm_frame_t {
+  _p: [u8; 0],
+}
+#[repr(C)]
 pub struct wasm_functype_t {
   _p: [u8; 0],
 }
@@ -225,6 +229,11 @@ unsafe extern "C" {
 
   pub fn wasm_trap_delete(t: *mut wasm_trap_t);
   pub fn wasm_trap_message(t: *const wasm_trap_t, out: *mut wasm_vec_t);
+  pub fn wasm_trap_trace(t: *const wasm_trap_t, out: *mut wasm_vec_t);
+  pub fn wasm_frame_func_index(frame: *const wasm_frame_t) -> u32;
+  pub fn wasm_frame_func_offset(frame: *const wasm_frame_t) -> usize;
+  pub fn wasm_frame_module_offset(frame: *const wasm_frame_t) -> usize;
+  pub fn wasm_frame_vec_delete(frames: *mut wasm_vec_t);
   pub fn wasm_trap_new(
     store: *mut wasm_store_t,
     message: *const wasm_vec_t,
@@ -613,6 +622,15 @@ struct ModuleEntry {
   source_url: std::string::String,
 }
 
+#[derive(Clone)]
+struct WasmStackFrame {
+  source_url: std::string::String,
+  function_name: Option<std::string::String>,
+  function_index: u32,
+  function_offset: usize,
+  module_offset: usize,
+}
+
 struct CompiledModule {
   bytes: Vec<u8>,
   source_url: std::string::String,
@@ -721,6 +739,105 @@ unsafe fn trap_message(trap: *const wasm_trap_t) -> std::string::String {
   let message = vec_name_to_string(&bytes);
   unsafe { wasm_byte_vec_delete(&mut bytes) };
   message
+}
+
+unsafe fn trap_frames(
+  trap: *const wasm_trap_t,
+  source_url: &str,
+  function_names: &std::collections::HashMap<u32, std::string::String>,
+  imported_function_count: u32,
+  module_bytes: &[u8],
+) -> Vec<WasmStackFrame> {
+  let mut trace = wasm_vec_t::empty();
+  unsafe { wasm_trap_trace(trap, &mut trace) };
+  let mut frames = Vec::with_capacity(trace.num_elems);
+  let data = trace.data as *const *mut wasm_frame_t;
+  if !data.is_null() {
+    for i in 0..trace.num_elems {
+      let frame = unsafe { *data.add(i) };
+      if frame.is_null() {
+        continue;
+      }
+      let function_index = unsafe { wasm_frame_func_index(frame) };
+      if function_index < imported_function_count {
+        continue;
+      }
+      let module_offset = unsafe { wasm_frame_module_offset(frame) };
+      frames.push(WasmStackFrame {
+        source_url: source_url.to_string(),
+        function_name: function_names.get(&function_index).cloned(),
+        function_index,
+        function_offset: unsafe { wasm_frame_func_offset(frame) },
+        module_offset: if module_offset == 0 {
+          wasm_function_body_end(
+            module_bytes,
+            function_index - imported_function_count,
+          )
+          .unwrap_or(0)
+        } else {
+          module_offset
+        },
+      });
+    }
+  }
+  unsafe { wasm_frame_vec_delete(&mut trace) };
+  frames
+}
+
+unsafe fn attach_wasm_stack_frames(
+  ctx: *mut JSContext,
+  error: JSValue,
+  frames: &[WasmStackFrame],
+  after_first_js_frame: bool,
+) {
+  if frames.is_empty() || !jsv_is_object(&error) {
+    return;
+  }
+  let rows = unsafe { JS_NewArray(ctx) };
+  for (i, frame) in frames.iter().enumerate() {
+    let row = unsafe { JS_NewArray(ctx) };
+    unsafe {
+      JS_SetPropertyUint32(ctx, row, 0, js_str(ctx, &frame.source_url));
+      JS_SetPropertyUint32(
+        ctx,
+        row,
+        1,
+        frame
+          .function_name
+          .as_deref()
+          .map(|name| js_str(ctx, name))
+          .unwrap_or_else(jsv_null),
+      );
+      JS_SetPropertyUint32(
+        ctx,
+        row,
+        2,
+        JS_NewInt32(ctx, frame.function_index as i32),
+      );
+      JS_SetPropertyUint32(
+        ctx,
+        row,
+        3,
+        JS_NewInt64(ctx, frame.function_offset as i64),
+      );
+      JS_SetPropertyUint32(
+        ctx,
+        row,
+        4,
+        JS_NewInt64(ctx, frame.module_offset as i64),
+      );
+      JS_SetPropertyUint32(ctx, rows, i as u32, row);
+    }
+  }
+  unsafe {
+    JS_SetPropertyStr(ctx, error, c"__v82_wasm_stack_frames".as_ptr(), rows);
+    JS_SetPropertyStr(
+      ctx,
+      error,
+      c"__v82_wasm_stack_after_first".as_ptr(),
+      JS_NewBool(ctx, after_first_js_frame as c_int),
+    );
+  }
 }
 
 unsafe fn read_wasm_bytes(ctx: *mut JSContext, v: JSValue) -> Option<Vec<u8>> {
@@ -956,6 +1073,10 @@ struct ExportFuncEnv {
   param_kinds: Vec<u8>,
   result_kinds: Vec<u8>,
   name: std::string::String,
+  source_url: std::string::String,
+  function_names: std::collections::HashMap<u32, std::string::String>,
+  imported_function_count: u32,
+  module_bytes: Vec<u8>,
 }
 
 pub(crate) fn terminate_active_call(iso: *mut RealIsolate) {
@@ -1095,7 +1216,17 @@ unsafe extern "C" fn call_export(
         return JS_Throw(ctx, exc);
       }
     }
+    let frames = unsafe {
+      trap_frames(
+        trap,
+        &env.source_url,
+        &env.function_names,
+        env.imported_function_count,
+        &env.module_bytes,
+      )
+    };
     if let Some(exception) = pending_import_exception {
+      unsafe { attach_wasm_stack_frames(ctx, exception, &frames, true) };
       unsafe { wasm_trap_delete(trap) };
       return unsafe { JS_Throw(ctx, exception) };
     }
@@ -1106,7 +1237,16 @@ unsafe extern "C" fn call_export(
     let message = unsafe { trap_message(trap) };
     unsafe { wasm_trap_delete(trap) };
     let message = message.strip_prefix("Exception: ").unwrap_or(&message);
-    return unsafe { throw_wasm_error(ctx, c"RuntimeError", message) };
+    let result = unsafe { throw_wasm_error(ctx, c"RuntimeError", message) };
+    if result.tag == JS_TAG_EXCEPTION {
+      let exception = unsafe { JS_GetException(ctx) };
+      unsafe {
+        attach_wasm_stack_frames(ctx, exception, &frames, false);
+        super::exception::mark_host_stack_boundary(ctx, exception);
+      }
+      return unsafe { JS_Throw(ctx, exception) };
+    }
+    return result;
   }
   if let Some(exception) = pending_import_exception {
     return unsafe { JS_Throw(ctx, exception) };
@@ -1134,15 +1274,33 @@ unsafe fn make_export_func(
   ctx: *mut JSContext,
   f: *mut wasm_func_t,
   name: &str,
+  module_id: usize,
+  imported_function_count: u32,
 ) -> JSValue {
   let ft = unsafe { wasm_func_type(f) };
   let param_kinds = valtype_kinds(unsafe { wasm_functype_params(ft) });
   let result_kinds = valtype_kinds(unsafe { wasm_functype_results(ft) });
+  let (source_url, function_names, module_bytes) = with_state(|st| {
+    st.modules
+      .get(module_id)
+      .map(|entry| {
+        (
+          entry.source_url.clone(),
+          wasm_function_names(&entry.bytes),
+          entry.bytes.clone(),
+        )
+      })
+      .unwrap_or_default()
+  });
   let env = Box::into_raw(Box::new(ExportFuncEnv {
     func: f,
     param_kinds,
     result_kinds,
     name: name.to_string(),
+    source_url,
+    function_names,
+    imported_function_count,
+    module_bytes,
   }));
   let data = unsafe { JS_NewBigInt64(ctx, env as i64) };
   let mut data_arr = [data];
@@ -1440,6 +1598,7 @@ unsafe fn instantiate(
   unsafe { wasm_module_imports(m, &mut imp_types) };
   let n = imp_types.size;
   let mut externs: Vec<*mut wasm_extern_t> = Vec::with_capacity(n);
+  let mut imported_function_count = 0u32;
   let it_data = imp_types.data as *const *const wasm_importtype_t;
   for i in 0..n {
     let it = unsafe { *it_data.add(i) };
@@ -1453,6 +1612,7 @@ unsafe fn instantiate(
     unsafe { JS_FreeValue(ctx, modobj) };
 
     if kind == WASM_EXTERN_FUNC && unsafe { JS_IsFunction(ctx, val) } {
+      imported_function_count += 1;
       let ft = unsafe { wasm_externtype_as_functype_const(ext_ty) };
       let result_kinds = valtype_kinds(unsafe { wasm_functype_results(ft) });
       let env = Box::into_raw(Box::new(ImportEnv {
@@ -1545,7 +1705,7 @@ unsafe fn instantiate(
     }
     let jv = if ekind == WASM_EXTERN_FUNC {
       let f = unsafe { wasm_extern_as_func(ext) };
-      unsafe { make_export_func(ctx, f, &name) }
+      unsafe { make_export_func(ctx, f, &name, mid, imported_function_count) }
     } else if ekind == WASM_EXTERN_MEMORY {
       let mem = unsafe { wasm_extern_as_memory(ext) };
       unsafe { make_memory_obj(ctx, mem) }
@@ -2329,6 +2489,95 @@ fn read_leb(bytes: &[u8], mut off: usize) -> Option<(u32, usize)> {
       return Some((result, off - start));
     }
     shift += 7;
+  }
+  None
+}
+
+fn wasm_function_names(
+  bytes: &[u8],
+) -> std::collections::HashMap<u32, std::string::String> {
+  let mut names = std::collections::HashMap::new();
+  for section in custom_sections(bytes, "name") {
+    let mut off = 0usize;
+    while off < section.len() {
+      let subsection = section[off];
+      off += 1;
+      let Some((size, size_len)) = read_leb(&section, off) else {
+        break;
+      };
+      off += size_len;
+      let end = off.saturating_add(size as usize);
+      if end > section.len() {
+        break;
+      }
+      if subsection == 1 {
+        let payload = &section[off..end];
+        let Some((count, count_len)) = read_leb(payload, 0) else {
+          break;
+        };
+        let mut name_off = count_len;
+        for _ in 0..count {
+          let Some((index, index_len)) = read_leb(payload, name_off) else {
+            break;
+          };
+          name_off += index_len;
+          let Some((name_len, name_len_len)) = read_leb(payload, name_off)
+          else {
+            break;
+          };
+          name_off += name_len_len;
+          let name_end = name_off.saturating_add(name_len as usize);
+          if name_end > payload.len() {
+            break;
+          }
+          if let Ok(name) = std::str::from_utf8(&payload[name_off..name_end]) {
+            names.insert(index, name.to_string());
+          }
+          name_off = name_end;
+        }
+      }
+      off = end;
+    }
+  }
+  names
+}
+
+fn wasm_function_body_end(bytes: &[u8], defined_index: u32) -> Option<usize> {
+  if bytes.len() < 8 || &bytes[..4] != b"\0asm" {
+    return None;
+  }
+  let mut off = 8usize;
+  while off < bytes.len() {
+    let id = *bytes.get(off)?;
+    off += 1;
+    let (size, size_len) = read_leb(bytes, off)?;
+    off += size_len;
+    let section_end = off.checked_add(size as usize)?;
+    if section_end > bytes.len() {
+      return None;
+    }
+    if id != 10 {
+      off = section_end;
+      continue;
+    }
+    let (count, count_len) = read_leb(bytes, off)?;
+    if defined_index >= count {
+      return None;
+    }
+    off += count_len;
+    for index in 0..count {
+      let (body_size, body_size_len) = read_leb(bytes, off)?;
+      off += body_size_len;
+      let body_end = off.checked_add(body_size as usize)?;
+      if body_end > section_end {
+        return None;
+      }
+      if index == defined_index {
+        return body_end.checked_sub(1);
+      }
+      off = body_end;
+    }
+    return None;
   }
   None
 }
