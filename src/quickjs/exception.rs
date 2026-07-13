@@ -1898,6 +1898,15 @@ fn v8_undefined_identifier_column(line: &str, col: i32, message: &str) -> i32 {
   };
 
   let bytes = line.as_bytes();
+  let identifier_end = identifier_start + identifier.len();
+  let identifier_is_called = bytes[identifier_end..]
+    .iter()
+    .copied()
+    .find(|byte| !byte.is_ascii_whitespace())
+    == Some(b'(');
+  if !identifier_is_called {
+    return identifier_start as i32 + 1;
+  }
   let mut parens = Vec::new();
   for (index, byte) in bytes[..identifier_start].iter().copied().enumerate() {
     match byte {
@@ -2207,6 +2216,14 @@ mod stack_column_tests {
 
   #[test]
   fn undefined_identifier_uses_v8_expression_column() {
+    assert_eq!(
+      v8_undefined_identifier_column(
+        "Object.defineProperty(exports, \"__esModule\", { value: true });",
+        23,
+        "exports is not defined",
+      ),
+      23,
+    );
     assert_eq!(
       v8_undefined_identifier_column(
         "const { add } = require(\"./add\");",
