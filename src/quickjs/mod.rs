@@ -42,6 +42,11 @@ mod raw_smoke_test {
   static UNHANDLED_REJECTIONS: AtomicUsize = AtomicUsize::new(0);
   static HANDLED_REJECTIONS: AtomicUsize = AtomicUsize::new(0);
 
+  unsafe extern "C" {
+    fn v82jsc_clear_error_backtrace(ctx: *mut JSContext, error: JSValue);
+    fn v82jsc_ensure_error_backtrace(ctx: *mut JSContext, error: JSValue);
+  }
+
   unsafe extern "C" fn test_prepare_stack_trace(
     ctx: *mut JSContext,
     _this: JSValue,
@@ -63,6 +68,26 @@ mod raw_smoke_test {
       UNHANDLED_REJECTIONS.fetch_add(1, Ordering::SeqCst);
     } else {
       HANDLED_REJECTIONS.fetch_add(1, Ordering::SeqCst);
+    }
+  }
+
+  unsafe extern "C" fn test_thrower(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    _argc: std::ffi::c_int,
+    _argv: *mut JSValue,
+  ) -> JSValue {
+    unsafe {
+      let global = JS_GetGlobalObject(ctx);
+      let constructor = JS_GetPropertyStr(ctx, global, c"TypeError".as_ptr());
+      JS_FreeValue(ctx, global);
+      let mut message = JS_NewString(ctx, c"boom".as_ptr());
+      let error = JS_CallConstructor(ctx, constructor, 1, &mut message);
+      JS_FreeValue(ctx, message);
+      JS_FreeValue(ctx, constructor);
+      v82jsc_clear_error_backtrace(ctx, error);
+      v82jsc_ensure_error_backtrace(ctx, error);
+      JS_Throw(ctx, error)
     }
   }
 
@@ -89,6 +114,50 @@ mod raw_smoke_test {
       JS_FreeContext(ctx);
       JS_FreeRuntime(rt);
       let _ = ptr::null::<u8>();
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
+  fn nested_call_error_uses_inner_call_location() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let global = JS_GetGlobalObject(ctx);
+      let thrower = JS_NewCFunction(ctx, test_thrower, c"thrower".as_ptr(), 0);
+      assert_eq!(
+        JS_SetPropertyStr(ctx, global, c"thrower".as_ptr(), thrower),
+        1
+      );
+      JS_FreeValue(ctx, global);
+
+      let source = c"function wrapper() { thrower() }\nconst api = { wrapper }; function outer(value) {}\nouter(api.wrapper())";
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"nested-call.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert_eq!(result.tag, JS_TAG_EXCEPTION);
+      let error = JS_GetException(ctx);
+      let stack = JS_GetPropertyStr(ctx, error, c"stack".as_ptr());
+      let mut len = 0;
+      let text = JS_ToCStringLen(ctx, &mut len, stack);
+      assert!(!text.is_null());
+      let actual =
+        std::str::from_utf8(std::slice::from_raw_parts(text as *const u8, len))
+          .unwrap();
+      assert!(actual.contains("nested-call.js:3:11"), "{actual}");
+
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, stack);
+      JS_FreeValue(ctx, error);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
     }
   }
 

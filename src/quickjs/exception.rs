@@ -1784,6 +1784,23 @@ fn v8_member_call_column(line: &str, col: i32) -> i32 {
   let is_ident_start = |c: char| c.is_alphabetic() || c == '_' || c == '$';
   let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
   let mut i = (col - 1) as usize;
+  if is_ident_start(chars[i]) {
+    let mut before = i;
+    while before > 0 && chars[before - 1].is_whitespace() {
+      before -= 1;
+    }
+    let mut after = i + 1;
+    while after < chars.len() && is_ident(chars[after]) {
+      after += 1;
+    }
+    while after < chars.len() && chars[after].is_whitespace() {
+      after += 1;
+    }
+    if before > 0 && chars[before - 1] == '.' && chars.get(after) == Some(&'(')
+    {
+      return col;
+    }
+  }
   for open in (0..=i).rev().filter(|index| chars[*index] == '(') {
     if chars[open..=i]
       .windows(2)
@@ -2166,6 +2183,13 @@ mod stack_column_tests {
       27
     );
     assert_eq!(v8_member_call_column("Deno.bench();", 6), 6);
+    assert_eq!(
+      v8_member_call_column(
+        "console.log(\"worker3\", Deno.env.get(\"AWS_HELLO\"));",
+        33,
+      ),
+      33,
+    );
   }
 
   #[test]

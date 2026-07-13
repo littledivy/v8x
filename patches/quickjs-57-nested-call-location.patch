@@ -1,0 +1,64 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -27671,13 +27671,16 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+ {
+     FuncCallType call_type;
+     int optional_chaining_label, constructor_line_num, constructor_col_num;
++    int call_line_num, call_col_num;
+     int constructor_generation;
+     bool constructor_is_nested;
+     bool accept_lparen = (parse_flags & PF_POSTFIX_CALL) != 0;
+ 
+     call_type = FUNC_CALL_NORMAL;
+     constructor_line_num = 0;
+     constructor_col_num = 0;
++    call_line_num = 0;
++    call_col_num = 0;
+     constructor_generation = 0;
+     constructor_is_nested = false;
+     switch(s->token.val) {
+@@ -27810,6 +27813,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+                 identifier_line_start--;
+             int identifier_col_num =
+                 (int)(s->token.ptr - identifier_line_start) + 1;
++            call_line_num = identifier_line_num;
++            call_col_num = identifier_col_num;
+             if (s->token.u.ident.is_reserved) {
+                 return js_parse_error_reserved_identifier(s);
+             }
+@@ -28243,6 +28248,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+                 case OP_scope_get_private_field:
+                 case OP_get_array_el:
+                 case OP_scope_get_ref:
++                    if (call_line_num > 0)
++                        emit_source_loc_at(s, call_line_num, call_col_num);
+                     emit_op(s, OP_call_method);
+                     emit_u16(s, arg_count);
+                     break;
+@@ -28272,6 +28279,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+                         emit_op(s, OP_call_constructor);
+                         emit_u16(s, arg_count);
+                     } else {
++                        if (call_line_num > 0)
++                            emit_source_loc_at(s, call_line_num, call_col_num);
+                         emit_op(s, OP_call);
+                         emit_u16(s, arg_count);
+                     }
+@@ -28300,9 +28309,17 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+                 emit_atom(s, s->token.u.ident.atom);
+                 emit_u16(s, s->cur_func->scope_level);
+             } else {
++                const uint8_t *property_line_start = s->token.ptr;
+                 if (!token_is_ident(s->token.val)) {
+                     return js_parse_error(s, "expecting field name");
+                 }
++                while (property_line_start > s->buf_start &&
++                       property_line_start[-1] != '\n' &&
++                       property_line_start[-1] != '\r')
++                    property_line_start--;
++                call_line_num = s->token.line_num;
++                call_col_num =
++                    (int)(s->token.ptr - property_line_start) + 1;
+                 if (get_prev_opcode(fd) == OP_get_super) {
+                     JSValue val;
+                     int ret;
