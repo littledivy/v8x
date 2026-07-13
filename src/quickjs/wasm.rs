@@ -1560,12 +1560,14 @@ fn wasm_hash(bytes: &[u8]) -> u32 {
 unsafe fn make_module_obj(ctx: *mut JSContext, id: usize) -> JSValue {
   let obj = unsafe { JS_NewObject(ctx) };
   unsafe {
-    JS_SetPropertyStr(
+    JS_DefinePropertyValueStr(
       ctx,
       obj,
       c"__wasm_module_id".as_ptr(),
       JS_NewInt32(ctx, id as i32),
-    )
+      0,
+    );
+    set_wasm_object_prototype(ctx, obj, c"Module");
   };
   obj
 }
