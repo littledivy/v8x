@@ -81,6 +81,23 @@ const JS_GPN_STRING_MASK: c_int = 1 << 0;
 const JS_GPN_SYMBOL_MASK: c_int = 1 << 1;
 const JS_GPN_ENUM_ONLY: c_int = 1 << 4;
 
+fn is_private_atom(ctx: *mut JSContext, atom: JSAtom) -> bool {
+  let iso = current_iso();
+  if iso.is_null() {
+    return false;
+  }
+
+  iso_state(iso).private_symbols.iter().any(|&(symbol, _)| {
+    let private_atom = unsafe { JS_ValueToAtom(ctx, symbol) };
+    if private_atom == 0 {
+      return false;
+    }
+    let matches = private_atom == atom;
+    unsafe { JS_FreeAtom(ctx, private_atom) };
+    matches
+  })
+}
+
 #[inline]
 fn iso_ctx(isolate: *mut RealIsolate) -> *mut JSContext {
   if isolate.is_null() {
@@ -1153,6 +1170,9 @@ unsafe fn append_own_property_names(
   unsafe {
     for i in 0..len as usize {
       let atom = (*tab.add(i)).atom;
+      if is_private_atom(ctx, atom) {
+        continue;
+      }
       let is_index = (atom & JS_ATOM_TAG_INT) != 0;
       if skip_indices || key_conversion as u32 == 2 {
         if is_index {
