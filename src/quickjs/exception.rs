@@ -47,6 +47,25 @@ const MESSAGE_TEXT_VERBATIM_PROP: &std::ffi::CStr =
   c"__v8qjs_message_text_verbatim";
 const MESSAGE_SOURCE_LINE_PROP: &std::ffi::CStr = c"__v8qjs_source_line";
 const MESSAGE_STACK_PTR_PROP: &std::ffi::CStr = c"__v8qjs_stack_ptr";
+const HOST_STACK_BOUNDARY_PROP: &std::ffi::CStr =
+  c"__v8qjs_host_stack_boundary";
+
+pub(crate) unsafe fn mark_host_stack_boundary(
+  ctx: *mut JSContext,
+  error: JSValue,
+) {
+  if ctx.is_null() || !jsv_is_object(&error) {
+    return;
+  }
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      error,
+      HOST_STACK_BOUNDARY_PROP.as_ptr(),
+      JS_NewBool(ctx, 1),
+    );
+  }
+}
 const MODULE_LINK_FRAME_PROP: &std::ffi::CStr = c"__v8qjs_module_link_frame";
 const JS_CLASS_PROMISE: JSClassID = 52;
 
@@ -2238,6 +2257,8 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     unsafe { read_str_prop(ctx, error, c"message") }.unwrap_or_default();
   let is_module_link_frame =
     unsafe { read_bool_prop(ctx, error, MODULE_LINK_FRAME_PROP) };
+  let stop_at_host_boundary =
+    unsafe { read_bool_prop(ctx, error, HOST_STACK_BOUNDARY_PROP) };
   let mut out = if message.is_empty() {
     name.clone()
   } else if name.is_empty() {
@@ -2373,6 +2394,9 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
       out.push_str(" (");
       append_location(&mut out, &file, line, col);
       out.push(')');
+    }
+    if stop_at_host_boundary {
+      break;
     }
   }
 

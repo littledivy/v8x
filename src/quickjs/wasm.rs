@@ -2489,22 +2489,221 @@ unsafe extern "C" fn wa_compile_streaming(
   }));
   STREAMING_PENDING.with(|p| p.set(p.get() + 1));
   let data = unsafe { JS_NewBigInt64(ctx, state as i64) };
-  let source = unsafe { JS_DupValue(ctx, *argv) };
+  let mut function_data = [data];
+  let fulfilled = unsafe {
+    JS_NewCFunctionData(
+      ctx,
+      streaming_source_fulfilled,
+      1,
+      0,
+      1,
+      function_data.as_mut_ptr(),
+    )
+  };
+  let rejected = unsafe {
+    JS_NewCFunctionData(
+      ctx,
+      streaming_source_rejected,
+      1,
+      0,
+      1,
+      function_data.as_mut_ptr(),
+    )
+  };
+  unsafe {
+    JS_FreeValue(ctx, data);
+  }
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let promise_constructor =
+    unsafe { JS_GetPropertyStr(ctx, global, c"Promise".as_ptr()) };
+  let resolve =
+    unsafe { JS_GetPropertyStr(ctx, promise_constructor, c"resolve".as_ptr()) };
+  let mut resolve_args = [unsafe { JS_DupValue(ctx, *argv) }];
+  let source_promise = unsafe {
+    JS_Call(
+      ctx,
+      resolve,
+      promise_constructor,
+      1,
+      resolve_args.as_mut_ptr(),
+    )
+  };
+  let then =
+    unsafe { JS_GetPropertyStr(ctx, source_promise, c"then".as_ptr()) };
+  let mut then_args = [fulfilled, rejected];
+  let chained =
+    unsafe { JS_Call(ctx, then, source_promise, 2, then_args.as_mut_ptr()) };
+  unsafe {
+    JS_FreeValue(ctx, chained);
+    JS_FreeValue(ctx, then_args[0]);
+    JS_FreeValue(ctx, then_args[1]);
+    JS_FreeValue(ctx, then);
+    JS_FreeValue(ctx, source_promise);
+    JS_FreeValue(ctx, resolve_args[0]);
+    JS_FreeValue(ctx, resolve);
+    JS_FreeValue(ctx, promise_constructor);
+    JS_FreeValue(ctx, global);
+  }
+  promise
+}
+
+unsafe extern "C" fn wa_instantiate_streaming(
+  ctx: *mut JSContext,
+  this_value: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  let compile_promise =
+    unsafe { wa_compile_streaming(ctx, this_value, argc, argv) };
+  if compile_promise.tag == JS_TAG_EXCEPTION {
+    return compile_promise;
+  }
+  let imports = if argc >= 2 {
+    unsafe { *argv.add(1) }
+  } else {
+    jsv_undefined()
+  };
+  let mut function_data = [imports];
+  let instantiate = unsafe {
+    JS_NewCFunctionData(
+      ctx,
+      streaming_instantiate_fulfilled,
+      1,
+      0,
+      1,
+      function_data.as_mut_ptr(),
+    )
+  };
+  let then =
+    unsafe { JS_GetPropertyStr(ctx, compile_promise, c"then".as_ptr()) };
+  let mut args = [instantiate];
+  let result =
+    unsafe { JS_Call(ctx, then, compile_promise, 1, args.as_mut_ptr()) };
+  unsafe {
+    JS_FreeValue(ctx, instantiate);
+    JS_FreeValue(ctx, then);
+    JS_FreeValue(ctx, compile_promise);
+  }
+  result
+}
+
+unsafe extern "C" fn streaming_instantiate_fulfilled(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  _magic: c_int,
+  data: *mut JSValue,
+) -> JSValue {
+  if argc < 1 || argv.is_null() || data.is_null() {
+    return unsafe {
+      throw(ctx, "WebAssembly.instantiateStreaming: invalid module")
+    };
+  }
+  let module = unsafe { *argv };
+  let Some(module_id) = (unsafe { obj_module_id(ctx, module) }) else {
+    return unsafe {
+      throw(ctx, "WebAssembly.instantiateStreaming: invalid module")
+    };
+  };
+  let instance = match unsafe { instantiate(ctx, module_id, *data) } {
+    Ok(instance) => instance,
+    Err(error) => return error,
+  };
+  let result = unsafe { JS_NewObject(ctx) };
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      result,
+      c"module".as_ptr(),
+      JS_DupValue(ctx, module),
+    );
+    JS_SetPropertyStr(ctx, result, c"instance".as_ptr(), instance);
+  }
+  result
+}
+
+unsafe fn streaming_state_from_function_data(
+  ctx: *mut JSContext,
+  data: *mut JSValue,
+) -> Option<&'static mut StreamingState> {
+  if data.is_null() {
+    return None;
+  }
+  let mut pointer = 0i64;
+  if unsafe { JS_ToBigInt64(ctx, &mut pointer, *data) } < 0 || pointer == 0 {
+    return None;
+  }
+  Some(unsafe { &mut *(pointer as *mut StreamingState) })
+}
+
+unsafe extern "C" fn streaming_source_fulfilled(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  _magic: c_int,
+  data: *mut JSValue,
+) -> JSValue {
+  let Some(state) = (unsafe { streaming_state_from_function_data(ctx, data) })
+  else {
+    return jsv_undefined();
+  };
+  let Some(callback) = STREAMING_CALLBACK.with(|callback| callback.get())
+  else {
+    return jsv_undefined();
+  };
+  let source = if argc > 0 {
+    unsafe { *argv }
+  } else {
+    jsv_undefined()
+  };
+  let callback_data = unsafe { JS_NewBigInt64(ctx, state as *mut _ as i64) };
   let mut args = [source];
-  let r = unsafe {
+  let result = unsafe {
     crate::quickjs::function::call_callback_for_wasm(
       ctx,
-      cb.unwrap(),
-      data,
+      callback,
+      callback_data,
       &mut args,
     )
   };
   unsafe {
-    JS_FreeValue(ctx, source);
-    JS_FreeValue(ctx, data);
-    JS_FreeValue(ctx, r);
+    JS_FreeValue(ctx, result);
+    JS_FreeValue(ctx, callback_data);
   }
-  promise
+  jsv_undefined()
+}
+
+unsafe extern "C" fn streaming_source_rejected(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+  _magic: c_int,
+  data: *mut JSValue,
+) -> JSValue {
+  let Some(state) = (unsafe { streaming_state_from_function_data(ctx, data) })
+  else {
+    return jsv_undefined();
+  };
+  if state.done {
+    return jsv_undefined();
+  }
+  state.done = true;
+  let reason = if argc > 0 {
+    unsafe { *argv }
+  } else {
+    jsv_undefined()
+  };
+  let mut args = [reason];
+  let result = unsafe {
+    JS_Call(ctx, state.reject, jsv_undefined(), 1, args.as_mut_ptr())
+  };
+  unsafe { JS_FreeValue(ctx, result) };
+  STREAMING_PENDING
+    .with(|pending| pending.set(pending.get().saturating_sub(1)));
+  jsv_undefined()
 }
 
 pub(crate) fn install_webassembly(ctx: *mut JSContext) {
@@ -2579,19 +2778,7 @@ W.instantiateStreaming=async (s,i)=>W.instantiate(await check(s),i);})()";
     JS_FreeValue(ctx, r);
 
     set_fn(wa, c"compileStreaming", wa_compile_streaming, 1);
-    let instantiate_poly = c"(()=>{const W=globalThis.WebAssembly;\
-W.instantiateStreaming=async(s,i)=>{\
-const module=await W.compileStreaming(s);\
-const instance=await W.instantiate(module,i);\
-return {module,instance};};})()";
-    let r = JS_Eval(
-      ctx,
-      instantiate_poly.as_ptr(),
-      instantiate_poly.to_bytes().len(),
-      c"<wasm-instantiate-streaming>".as_ptr(),
-      JS_EVAL_TYPE_GLOBAL,
-    );
-    JS_FreeValue(ctx, r);
+    set_fn(wa, c"instantiateStreaming", wa_instantiate_streaming, 2);
   }
 }
 
@@ -2918,6 +3105,9 @@ pub(crate) fn streaming_abort(this: *mut c_void, exception: *const Value) {
   }
   st.done = true;
   if !exception.is_null() {
+    unsafe {
+      super::exception::mark_host_stack_boundary(st.ctx, jsval_of(exception))
+    };
     let mut args = [unsafe { JS_DupValue(st.ctx, jsval_of(exception)) }];
     unsafe {
       let r = JS_Call(st.ctx, st.reject, jsv_undefined(), 1, args.as_mut_ptr());
