@@ -25,6 +25,10 @@ struct QuickJsPlatform {
   custom_context: *mut c_void,
 }
 
+struct QuickJsForegroundTask {
+  isolate: *mut crate::RealIsolate,
+}
+
 static ENTROPY_SOURCE: AtomicPtr<std::ffi::c_void> =
   AtomicPtr::new(ptr::null_mut());
 static CURRENT_PLATFORM: AtomicPtr<std::ffi::c_void> =
@@ -44,8 +48,12 @@ pub(crate) fn fill_entropy(buf: &mut [u8]) -> bool {
 }
 
 pub(crate) fn post_foreground_task() {
+  post_foreground_task_for(super::core::current_iso());
+}
+
+pub(crate) fn post_foreground_task_for(isolate: *mut crate::RealIsolate) {
   let platform = CURRENT_PLATFORM.load(Ordering::SeqCst);
-  if platform.is_null() {
+  if platform.is_null() || isolate.is_null() {
     return;
   }
   let platform = platform as *mut QuickJsPlatform;
@@ -53,12 +61,27 @@ pub(crate) fn post_foreground_task() {
   if context.is_null() {
     return;
   }
+  let task = Box::into_raw(Box::new(QuickJsForegroundTask { isolate }));
   unsafe {
     v8__Platform__CustomPlatform__BASE__PostTask(
       context,
-      super::core::current_iso() as *mut c_void,
-      ptr::null_mut(),
+      isolate as *mut c_void,
+      task as *mut c_void,
     );
+  }
+}
+
+pub(crate) unsafe fn run_foreground_task(task: *mut c_void) {
+  let Some(task) = (unsafe { (task as *mut QuickJsForegroundTask).as_ref() })
+  else {
+    return;
+  };
+  super::core::drain_atomics_waiters(task.isolate);
+}
+
+pub(crate) unsafe fn delete_foreground_task(task: *mut c_void) {
+  if !task.is_null() {
+    unsafe { drop(Box::from_raw(task as *mut QuickJsForegroundTask)) };
   }
 }
 
@@ -296,9 +319,11 @@ pub extern "C" fn v8__Platform__PumpMessageLoop(
   if st.rt.is_null() {
     return false;
   }
+  let resolved_waiters = super::core::drain_atomics_waiters(isolate);
   unsafe {
     let mut pctx = std::ptr::null_mut();
-    super::quickjs_sys::JS_ExecutePendingJob(st.rt, &mut pctx) > 0
+    resolved_waiters
+      | (super::quickjs_sys::JS_ExecutePendingJob(st.rt, &mut pctx) > 0)
   }
 }
 

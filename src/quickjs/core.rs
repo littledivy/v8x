@@ -43,7 +43,7 @@ use crate::{
   ObjectTemplate, Primitive, RealIsolate, String as V8String, Value,
 };
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{
@@ -301,6 +301,8 @@ pub(crate) struct IsoState {
   pub persistent_handles: Vec<PersistentHandle>,
 
   pub private_symbols: Vec<(JSValue, JSValue)>,
+
+  pub atomics_waiter_resolvers: HashMap<u64, (*mut JSContext, JSValue)>,
 
   pub data_slots: [*mut c_void; 4],
 
@@ -677,6 +679,27 @@ fn sab_refcounts()
   T.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+#[derive(Clone, Copy)]
+struct AtomicsWaiterTarget {
+  id: u64,
+  isolate: usize,
+}
+
+#[derive(Default)]
+struct AtomicsWaiterRegistry {
+  by_location: HashMap<usize, VecDeque<AtomicsWaiterTarget>>,
+  ready_by_isolate: HashMap<usize, Vec<u64>>,
+}
+
+fn atomics_waiter_registry() -> &'static Mutex<AtomicsWaiterRegistry> {
+  static REGISTRY: std::sync::OnceLock<Mutex<AtomicsWaiterRegistry>> =
+    std::sync::OnceLock::new();
+  REGISTRY.get_or_init(|| Mutex::new(AtomicsWaiterRegistry::default()))
+}
+
+static NEXT_ATOMICS_WAITER_ID: std::sync::atomic::AtomicU64 =
+  std::sync::atomic::AtomicU64::new(1);
+
 unsafe extern "C" {
   fn malloc(size: usize) -> *mut c_void;
   fn free(ptr: *mut c_void);
@@ -806,6 +829,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     handles: Vec::new(),
     persistent_handles: Vec::new(),
     private_symbols: Vec::new(),
+    atomics_waiter_resolvers: HashMap::new(),
     data_slots: [ptr::null_mut(); 4],
     ext_class_id,
     named_handler_class_id,
@@ -929,6 +953,10 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
     while let Some((symbol, name)) = st.private_symbols.pop() {
       JS_FreeValue(st.ctx, symbol);
       JS_FreeValue(st.ctx, name);
+    }
+    remove_atomics_waiters_for_isolate(this);
+    for (_, (ctx, resolver)) in st.atomics_waiter_resolvers.drain() {
+      JS_FreeValue(ctx, resolver);
     }
     for (ctx, slots) in st.snap_context_data_values.drain() {
       for value in slots.into_iter().flatten() {
@@ -1382,6 +1410,231 @@ unsafe extern "C" fn qjs_post_foreground_task(
   jsv_undefined()
 }
 
+unsafe fn atomics_location(
+  ctx: *mut JSContext,
+  view: JSValue,
+  index: JSValue,
+) -> Option<usize> {
+  let mut index_value = 0i64;
+  if unsafe { JS_ToInt64(ctx, &mut index_value, index) } < 0 || index_value < 0
+  {
+    return None;
+  }
+  let mut byte_offset = 0usize;
+  let mut byte_length = 0usize;
+  let mut bytes_per_element = 0usize;
+  let buffer = unsafe {
+    JS_GetTypedArrayBuffer(
+      ctx,
+      view,
+      &mut byte_offset,
+      &mut byte_length,
+      &mut bytes_per_element,
+    )
+  };
+  if buffer.tag == JS_TAG_EXCEPTION {
+    return None;
+  }
+  let mut buffer_length = 0usize;
+  let base = unsafe { JS_GetArrayBuffer(ctx, &mut buffer_length, buffer) };
+  unsafe { JS_FreeValue(ctx, buffer) };
+  let index = usize::try_from(index_value).ok()?;
+  let element_offset = index.checked_mul(bytes_per_element)?;
+  if element_offset >= byte_length || base.is_null() {
+    return None;
+  }
+  (base as usize)
+    .checked_add(byte_offset)?
+    .checked_add(element_offset)
+}
+
+unsafe extern "C" fn qjs_atomics_register_waiter(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  if argc < 3 || argv.is_null() {
+    return jsv_exception();
+  }
+  let isolate = current_iso();
+  if isolate.is_null() {
+    return jsv_exception();
+  }
+  let Some(location) = (unsafe { atomics_location(ctx, *argv, *argv.add(1)) })
+  else {
+    return jsv_exception();
+  };
+  let resolver = unsafe { *argv.add(2) };
+  if !unsafe { JS_IsFunction(ctx, resolver) } {
+    return jsv_exception();
+  }
+  let id = NEXT_ATOMICS_WAITER_ID.fetch_add(1, Ordering::Relaxed);
+  iso_state(isolate)
+    .atomics_waiter_resolvers
+    .insert(id, (ctx, unsafe { JS_DupValue(ctx, resolver) }));
+  atomics_waiter_registry()
+    .lock()
+    .unwrap_or_else(|poison| poison.into_inner())
+    .by_location
+    .entry(location)
+    .or_default()
+    .push_back(AtomicsWaiterTarget {
+      id,
+      isolate: isolate as usize,
+    });
+  unsafe { JS_NewInt64(ctx, id as i64) }
+}
+
+unsafe extern "C" fn qjs_atomics_notify_waiters(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  if argc < 3 || argv.is_null() {
+    return jsv_exception();
+  }
+  let Some(location) = (unsafe { atomics_location(ctx, *argv, *argv.add(1)) })
+  else {
+    return jsv_exception();
+  };
+  let mut requested = 0i64;
+  if unsafe { JS_ToInt64(ctx, &mut requested, *argv.add(2)) } < 0 {
+    return jsv_exception();
+  }
+  let requested = usize::try_from(requested.max(0)).unwrap_or(usize::MAX);
+  let _lifecycle_guard = runtime_lifecycle_lock();
+  let (notified, isolates) = {
+    let mut registry = atomics_waiter_registry()
+      .lock()
+      .unwrap_or_else(|poison| poison.into_inner());
+    let mut targets = Vec::new();
+    if let Some(waiters) = registry.by_location.get_mut(&location) {
+      for _ in 0..requested {
+        let Some(waiter) = waiters.pop_front() else {
+          break;
+        };
+        targets.push(waiter);
+      }
+      if waiters.is_empty() {
+        registry.by_location.remove(&location);
+      }
+    }
+    let mut isolates = std::collections::HashSet::new();
+    for waiter in &targets {
+      registry
+        .ready_by_isolate
+        .entry(waiter.isolate)
+        .or_default()
+        .push(waiter.id);
+      isolates.insert(waiter.isolate);
+    }
+    (targets.len(), isolates)
+  };
+  for isolate in isolates {
+    super::init::post_foreground_task_for(isolate as *mut RealIsolate);
+  }
+  unsafe { JS_NewInt64(ctx, notified as i64) }
+}
+
+unsafe extern "C" fn qjs_atomics_cancel_waiter(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  argc: c_int,
+  argv: *mut JSValue,
+) -> JSValue {
+  if argc < 1 || argv.is_null() {
+    return JS_NewBool(ctx, 0);
+  }
+  let mut id = 0i64;
+  if unsafe { JS_ToInt64(ctx, &mut id, *argv) } < 0 || id < 0 {
+    return jsv_exception();
+  }
+  let id = id as u64;
+  let isolate = current_iso();
+  if isolate.is_null() {
+    return JS_NewBool(ctx, 0);
+  }
+  let mut removed = false;
+  {
+    let mut registry = atomics_waiter_registry()
+      .lock()
+      .unwrap_or_else(|poison| poison.into_inner());
+    registry.by_location.retain(|_, waiters| {
+      let before = waiters.len();
+      waiters.retain(|waiter| waiter.id != id);
+      removed |= before != waiters.len();
+      !waiters.is_empty()
+    });
+    if let Some(ready) = registry.ready_by_isolate.get_mut(&(isolate as usize))
+    {
+      let before = ready.len();
+      ready.retain(|ready_id| *ready_id != id);
+      removed |= before != ready.len();
+      if ready.is_empty() {
+        registry.ready_by_isolate.remove(&(isolate as usize));
+      }
+    }
+  }
+  if let Some((owner_ctx, resolver)) =
+    iso_state(isolate).atomics_waiter_resolvers.remove(&id)
+  {
+    unsafe { JS_FreeValue(owner_ctx, resolver) };
+    removed = true;
+  }
+  JS_NewBool(ctx, removed as c_int)
+}
+
+pub(crate) fn drain_atomics_waiters(isolate: *mut RealIsolate) -> bool {
+  if isolate.is_null() {
+    return false;
+  }
+  let ids = atomics_waiter_registry()
+    .lock()
+    .unwrap_or_else(|poison| poison.into_inner())
+    .ready_by_isolate
+    .remove(&(isolate as usize))
+    .unwrap_or_default();
+  if ids.is_empty() {
+    return false;
+  }
+  for id in ids {
+    let Some((ctx, resolver)) =
+      iso_state(isolate).atomics_waiter_resolvers.remove(&id)
+    else {
+      continue;
+    };
+    let mut arg = unsafe { JS_NewString(ctx, c"ok".as_ptr()) };
+    let result = unsafe {
+      JS_Call(ctx, resolver, jsv_undefined(), 1, &mut arg as *mut JSValue)
+    };
+    unsafe {
+      JS_FreeValue(ctx, arg);
+      JS_FreeValue(ctx, resolver);
+      if result.tag == JS_TAG_EXCEPTION {
+        let exception = JS_GetException(ctx);
+        JS_FreeValue(ctx, exception);
+      } else {
+        JS_FreeValue(ctx, result);
+      }
+    }
+  }
+  true
+}
+
+fn remove_atomics_waiters_for_isolate(isolate: *mut RealIsolate) {
+  let isolate = isolate as usize;
+  let mut registry = atomics_waiter_registry()
+    .lock()
+    .unwrap_or_else(|poison| poison.into_inner());
+  registry.by_location.retain(|_, waiters| {
+    waiters.retain(|waiter| waiter.isolate != isolate);
+    !waiters.is_empty()
+  });
+  registry.ready_by_isolate.remove(&isolate);
+}
+
 fn install_atomics_wait_async_shim(ctx: *mut JSContext, global: JSValue) {
   const SRC: &[u8] = br#"
     (function(g) {
@@ -1403,38 +1656,47 @@ fn install_atomics_wait_async_shim(ctx: *mut JSContext, global: JSValue) {
         value: function() { return state.unresolved; },
         configurable: true
       });
-      atomics.waitAsync = function(_view, _index, _expected, _timeout) {
+      atomics.waitAsync = function(view, index, expected, timeout) {
+        if (atomics.load(view, index) !== expected) {
+          return { async: false, value: "not-equal" };
+        }
+        const timeoutNumber = timeout === undefined ? Infinity : Number(timeout);
+        if (timeoutNumber <= 0) {
+          return { async: false, value: "timed-out" };
+        }
         let resolve;
-        const waiter = { done: false, resolve: undefined };
         const promise = new Promise(function(r) { resolve = r; });
-        waiter.resolve = resolve;
-        state.waiters.push(waiter);
+        const id = g.__v8xAtomicsRegisterWaiter(view, index, resolve);
+        state.waiters.push(id);
         state.unresolved++;
         promise.then(function() {
-          if (!waiter.done) {
-            waiter.done = true;
-            state.unresolved--;
-          }
+          const position = state.waiters.indexOf(id);
+          if (position !== -1) state.waiters.splice(position, 1);
+          state.unresolved--;
         }, function() {
-          if (!waiter.done) {
-            waiter.done = true;
-            state.unresolved--;
-          }
+          const position = state.waiters.indexOf(id);
+          if (position !== -1) state.waiters.splice(position, 1);
+          state.unresolved--;
         });
+        if (Number.isFinite(timeoutNumber) && typeof g.setTimeout === "function") {
+          g.setTimeout(function() {
+            if (g.__v8xAtomicsCancelWaiter(id)) resolve("timed-out");
+          }, timeoutNumber);
+        }
         return { async: true, value: promise };
       };
       const originalNotify = atomics.notify;
       atomics.notify = function(view, index, count) {
-        const limit = count === undefined
-          ? state.waiters.length
-          : Math.max(0, Math.min(state.waiters.length, Number(count) || 0));
-        const pending = state.waiters.splice(0, limit);
-        for (let i = 0; i < pending.length; i++) pending[i].resolve("ok");
-        if (pending.length) g.__v8xPostForegroundTask();
-        if (pending.length || typeof originalNotify !== "function") {
-          return pending.length;
-        }
-        return originalNotify.call(this, view, index, count);
+        const nativeCount = typeof originalNotify === "function"
+          ? originalNotify.call(this, view, index, count)
+          : 0;
+        const requested = count === undefined
+          ? 0x7fffffff
+          : Math.max(0, Math.min(0x7fffffff, Number(count) || 0));
+        const syntheticCount = g.__v8xAtomicsNotifyWaiters(
+          view, index, Math.max(0, requested - nativeCount));
+        if (syntheticCount) state.waiters.splice(0, syntheticCount);
+        return nativeCount + syntheticCount;
       };
     })(globalThis);
   "#;
@@ -1446,6 +1708,42 @@ fn install_atomics_wait_async_shim(ctx: *mut JSContext, global: JSValue) {
       0,
     );
     JS_SetPropertyStr(ctx, global, c"__v8xPostForegroundTask".as_ptr(), post);
+    let register = JS_NewCFunction(
+      ctx,
+      qjs_atomics_register_waiter,
+      c"__v8xAtomicsRegisterWaiter".as_ptr(),
+      3,
+    );
+    JS_SetPropertyStr(
+      ctx,
+      global,
+      c"__v8xAtomicsRegisterWaiter".as_ptr(),
+      register,
+    );
+    let notify = JS_NewCFunction(
+      ctx,
+      qjs_atomics_notify_waiters,
+      c"__v8xAtomicsNotifyWaiters".as_ptr(),
+      3,
+    );
+    JS_SetPropertyStr(
+      ctx,
+      global,
+      c"__v8xAtomicsNotifyWaiters".as_ptr(),
+      notify,
+    );
+    let cancel = JS_NewCFunction(
+      ctx,
+      qjs_atomics_cancel_waiter,
+      c"__v8xAtomicsCancelWaiter".as_ptr(),
+      1,
+    );
+    JS_SetPropertyStr(
+      ctx,
+      global,
+      c"__v8xAtomicsCancelWaiter".as_ptr(),
+      cancel,
+    );
 
     let csrc = std::ffi::CString::new(SRC).unwrap();
     let r = JS_Eval(

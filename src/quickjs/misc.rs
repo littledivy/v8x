@@ -1412,10 +1412,14 @@ pub extern "C" fn udata_setCommonData_77(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Task__Run(_task: *mut c_void) {}
+pub unsafe extern "C" fn v8__Task__Run(task: *mut c_void) {
+  unsafe { super::init::run_foreground_task(task) };
+}
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Task__DELETE(_task: *mut c_void) {}
+pub unsafe extern "C" fn v8__Task__DELETE(task: *mut c_void) {
+  unsafe { super::init::delete_foreground_task(task) };
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__IdleTask__Run(
