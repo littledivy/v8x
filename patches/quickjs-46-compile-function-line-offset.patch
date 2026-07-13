@@ -1,0 +1,43 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -65572,6 +65572,40 @@
+         csd->filename = JS_NULL;
+     }
+ }
++
++static void v82jsc_adjust_bytecode_line_number(JSFunctionBytecode *b,
++                                                int line_delta)
++{
++    int i;
++
++    b->line_num += line_delta;
++    for (i = 0; i < b->cpool_count; i++) {
++        JSValueConst value = b->cpool[i];
++        int tag = JS_VALUE_GET_TAG(value);
++
++        if (tag == JS_TAG_FUNCTION_BYTECODE) {
++            v82jsc_adjust_bytecode_line_number(JS_VALUE_GET_PTR(value),
++                                               line_delta);
++        } else if (tag == JS_TAG_OBJECT) {
++            JSObject *p = JS_VALUE_GET_OBJ(value);
++            if (js_class_has_bytecode(p->class_id))
++                v82jsc_adjust_bytecode_line_number(
++                    p->u.func.function_bytecode, line_delta);
++        }
++    }
++}
++
++void v82jsc_adjust_function_line_number(JSValueConst func_obj, int line_delta)
++{
++    JSObject *p;
++
++    if (line_delta == 0 || JS_VALUE_GET_TAG(func_obj) != JS_TAG_OBJECT)
++        return;
++    p = JS_VALUE_GET_OBJ(func_obj);
++    if (js_class_has_bytecode(p->class_id))
++        v82jsc_adjust_bytecode_line_number(p->u.func.function_bytecode,
++                                           line_delta);
++}
+ 
+ static void js_new_callsite_data2(JSContext *ctx, JSCallSiteData *csd, const char *filename, int line_num, int col_num)
+ {

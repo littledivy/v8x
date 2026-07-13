@@ -470,6 +470,8 @@ struct RawScriptOrigin {
   resource_name: usize,
   source_map_url: usize,
   script_id: int,
+  resource_line_offset: int,
+  resource_column_offset: int,
   host_defined_options: usize,
 }
 
@@ -3117,8 +3119,8 @@ pub extern "C" fn v8__Script__GetUnboundScript(
 pub extern "C" fn v8__ScriptOrigin__CONSTRUCT(
   buf: *mut MaybeUninit<ScriptOrigin>,
   resource_name: *const Value,
-  _resource_line_offset: i32,
-  _resource_column_offset: i32,
+  resource_line_offset: i32,
+  resource_column_offset: i32,
   _resource_is_shared_cross_origin: bool,
   script_id: i32,
   source_map_url: *const Value,
@@ -3134,6 +3136,8 @@ pub extern "C" fn v8__ScriptOrigin__CONSTRUCT(
       (*raw).resource_name = resource_name as usize;
       (*raw).source_map_url = source_map_url as usize;
       (*raw).script_id = script_id;
+      (*raw).resource_line_offset = resource_line_offset;
+      (*raw).resource_column_offset = resource_column_offset;
       (*raw).host_defined_options = host_defined_options as usize;
     }
   }
@@ -3157,6 +3161,8 @@ pub extern "C" fn v8__ScriptCompiler__Source__CONSTRUCT(
     if !origin.is_null() {
       let origin = origin as *const RawScriptOrigin;
       (*raw).resource_name = (*origin).resource_name;
+      (*raw).resource_line_offset = (*origin).resource_line_offset;
+      (*raw).resource_column_offset = (*origin).resource_column_offset;
       (*raw).source_map_url = (*origin).source_map_url;
       (*raw).host_defined_options = (*origin).host_defined_options;
     }
@@ -3538,10 +3544,18 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
   } else {
     format!("(function({}) {{\n{}\n}})", arg_names.join(","), body)
   };
+  let wrapper_line_count = if has_extensions {
+    extension_names.len() as i32 + 2
+  } else {
+    1
+  };
   let source_buffer = eval_source_buffer(&wrapped);
   let len = wrapped.len();
 
   let name = unsafe { resource_name_of(ctx, source) };
+  if !name.is_empty() {
+    super::core::register_script_source(&name, &body);
+  }
   let name_c = CString::new(if name.is_empty() {
     "<function>".to_string()
   } else {
@@ -3594,6 +3608,14 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
   if unsafe { !JS_IsFunction(ctx, result) } {
     unsafe { JS_FreeValue(ctx, result) };
     return ptr::null();
+  }
+  let resource_line_offset =
+    unsafe { (*(source as *const RawSource)).resource_line_offset };
+  unsafe {
+    v82jsc_adjust_function_line_number(
+      result,
+      resource_line_offset.saturating_sub(wrapper_line_count),
+    );
   }
   intern::<Function>(result)
 }

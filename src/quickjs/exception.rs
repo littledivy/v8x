@@ -2315,10 +2315,11 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     // quickjs names top-level script frames `global code` / `<eval>`; V8
     // reports none, so deno prints them as `at file:line:col` (no wrapper).
     let is_script_frame = !is_module_link_frame
-      && matches!(
-        func.as_deref(),
-        None | Some("") | Some("global code") | Some("<eval>")
-      );
+      && match func.as_deref() {
+        None | Some("") => type_name.is_none() && method_name.is_none(),
+        Some("global code") | Some("<eval>") => true,
+        _ => false,
+      };
     let is_top_level = callsite_is_top_level || is_script_frame;
     let (frame_func, frame_type, frame_method) = if is_script_frame {
       (None, None, None)

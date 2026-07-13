@@ -621,6 +621,10 @@ unsafe extern "C" {
   ) -> c_int;
 
   pub fn js_v82jsc_function_kind(v: JSValue) -> std::os::raw::c_int;
+  pub fn v82jsc_adjust_function_line_number(
+    func_obj: JSValue,
+    line_delta: std::os::raw::c_int,
+  );
 
   pub fn js_v82jsc_iterator_preview(
     ctx: *mut JSContext,
