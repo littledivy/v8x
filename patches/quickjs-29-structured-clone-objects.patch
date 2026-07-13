@@ -1,6 +1,6 @@
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -39538,9 +39538,40 @@
+@@ -39604,8 +39604,40 @@
      return -1;
  }
  
@@ -10,7 +10,7 @@
 +    JSValue value = JS_UNDEFINED;
 +    uint32_t len = 0, i;
 +    int ret = -1;
- 
++
 +    bc_put_u8(s, BC_TAG_OBJECT);
 +    if (JS_GetOwnPropertyNames(s->ctx, &props, &len, obj,
 +                               JS_GPN_STRING_MASK | JS_GPN_ENUM_ONLY) < 0)
