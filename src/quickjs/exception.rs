@@ -1590,6 +1590,21 @@ pub(crate) unsafe fn read_str_prop(
   out
 }
 
+unsafe fn error_constructor_name(
+  ctx: *mut JSContext,
+  error: JSValue,
+) -> Option<std::string::String> {
+  let constructor =
+    unsafe { JS_GetPropertyStr(ctx, error, c"constructor".as_ptr()) };
+  if constructor.tag == JS_TAG_EXCEPTION {
+    unsafe { clear_pending(ctx) };
+    return None;
+  }
+  let name = unsafe { read_str_prop(ctx, constructor, c"name") };
+  unsafe { JS_FreeValue(ctx, constructor) };
+  name
+}
+
 unsafe fn read_bool_prop(
   ctx: *mut JSContext,
   obj: JSValue,
@@ -1744,8 +1759,19 @@ fn v8_member_call_column(line: &str, col: i32) -> i32 {
   let is_ident_start = |c: char| c.is_alphabetic() || c == '_' || c == '$';
   let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
   let mut i = (col - 1) as usize;
-  if chars[i] == '(' {
-    let mut end = i;
+  for open in (0..=i).rev().filter(|index| chars[*index] == '(') {
+    let balance =
+      chars[open..=i]
+        .iter()
+        .fold(0i32, |balance, char| match char {
+          '(' => balance + 1,
+          ')' => balance - 1,
+          _ => balance,
+        });
+    if balance <= 0 {
+      continue;
+    }
+    let mut end = open;
     while end > 0 && chars[end - 1].is_whitespace() {
       end -= 1;
     }
@@ -1753,11 +1779,7 @@ fn v8_member_call_column(line: &str, col: i32) -> i32 {
     while member_start > 0 && is_ident(chars[member_start - 1]) {
       member_start -= 1;
     }
-    let mut dot = member_start;
-    while dot > 0 && chars[dot - 1].is_whitespace() {
-      dot -= 1;
-    }
-    if member_start < end && dot > 0 && chars[dot - 1] == '.' {
+    if member_start < end {
       return member_start as i32 + 1;
     }
   }
@@ -1891,8 +1913,94 @@ fn v8_error_column(line: &str, col: i32, name: &str, message: &str) -> i32 {
   }
 }
 
+fn v8_constructor_location(
+  source: &str,
+  line: i32,
+  col: i32,
+  error_name: &str,
+) -> Option<(i32, i32)> {
+  if line < 1 || col < 1 {
+    return None;
+  }
+  let line_start = if line == 1 {
+    0
+  } else {
+    source
+      .match_indices('\n')
+      .map(|(index, _)| index + 1)
+      .nth((line - 2) as usize)?
+  };
+  let current_line = source.get(line_start..)?.split('\n').next()?;
+  let column_offset = current_line
+    .char_indices()
+    .nth((col - 1) as usize)
+    .map_or(current_line.len(), |(index, _)| index);
+  let reported_offset =
+    line_start.saturating_add(column_offset).min(source.len());
+  let prefix = &source[..reported_offset];
+  let bytes = source.as_bytes();
+  let is_ident =
+    |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$');
+  let source_location = |offset: usize| {
+    let before = &source[..offset];
+    let line = before.bytes().filter(|byte| *byte == b'\n').count() as i32 + 1;
+    let line_prefix = before.rsplit('\n').next().unwrap_or(before);
+    (line, line_prefix.chars().count() as i32 + 1)
+  };
+
+  for (new_offset, _) in prefix.rmatch_indices("new") {
+    let before = new_offset
+      .checked_sub(1)
+      .and_then(|index| bytes.get(index))
+      .copied();
+    let after = bytes.get(new_offset + 3).copied();
+    if before.is_some_and(is_ident) || after.is_some_and(is_ident) {
+      continue;
+    }
+
+    let mut open = new_offset + 3;
+    while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
+      open += 1;
+    }
+    let callee_start = open;
+    while bytes.get(open).is_some_and(|byte| {
+      byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$' | b'.')
+    }) {
+      open += 1;
+    }
+    let callee = source.get(callee_start..open)?;
+    if callee.rsplit('.').next() != Some(error_name) {
+      continue;
+    }
+    while bytes.get(open).is_some_and(u8::is_ascii_whitespace) {
+      open += 1;
+    }
+    if bytes.get(open) != Some(&b'(') {
+      continue;
+    }
+    if reported_offset <= open {
+      return Some(source_location(new_offset));
+    }
+    let balance = bytes[open..reported_offset].iter().fold(
+      0i32,
+      |balance, byte| match byte {
+        b'(' => balance + 1,
+        b')' => balance - 1,
+        _ => balance,
+      },
+    );
+    if balance <= 0 {
+      continue;
+    }
+
+    return Some(source_location(new_offset));
+  }
+  None
+}
+
 #[cfg(test)]
 mod stack_column_tests {
+  use super::v8_constructor_location;
   use super::v8_error_column;
   use super::v8_member_call_column;
   use super::v8_undefined_identifier_column;
@@ -1911,7 +2019,26 @@ mod stack_column_tests {
     assert_eq!(v8_member_call_column("Deno.bench();", 5), 6);
     assert_eq!(v8_member_call_column("  obj.run()", 1), 7);
     assert_eq!(v8_member_call_column("foo()", 1), 1);
+    assert_eq!(v8_member_call_column("    assertEquals(1, 2)", 17), 5);
+    assert_eq!(
+      v8_member_call_column("    assertEquals(div(1, 2), 3)", 18),
+      5
+    );
     assert_eq!(v8_member_call_column("Deno.bench();", 6), 6);
+  }
+
+  #[test]
+  fn multiline_constructor_uses_new_keyword() {
+    let source = "function fail() {\n  throw new AssertionError(\n    `value ${format(1)}`,\n  );\n}";
+    assert_eq!(
+      v8_constructor_location(source, 3, 24, "AssertionError"),
+      Some((2, 9))
+    );
+    assert_eq!(v8_constructor_location(source, 3, 24, "Error"), None);
+    assert_eq!(
+      v8_constructor_location("new Something()", 1, 5, "Something"),
+      Some((1, 1))
+    );
   }
 
   #[test]
@@ -1978,6 +2105,12 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
   // Header: `name: message` (V8's first stack line).
   let name = unsafe { read_str_prop(ctx, error, c"name") }
     .unwrap_or_else(|| "Error".to_string());
+  let location_error_name = if name == "Error" {
+    unsafe { error_constructor_name(ctx, error) }
+      .unwrap_or_else(|| name.clone())
+  } else {
+    name.clone()
+  };
   let message =
     unsafe { read_str_prop(ctx, error, c"message") }.unwrap_or_default();
   let is_module_link_frame =
@@ -2010,7 +2143,7 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
       continue;
     }
     let file = unsafe { call_site_str(ctx, site, c"getFileName") };
-    let line = unsafe { call_site_int(ctx, site, c"getLineNumber") };
+    let mut line = unsafe { call_site_int(ctx, site, c"getLineNumber") };
     let mut col = unsafe { call_site_int(ctx, site, c"getColumnNumber") };
     let func = unsafe { call_site_str(ctx, site, c"getFunctionName") };
     let type_name = unsafe { call_site_str(ctx, site, c"getTypeName") };
@@ -2032,8 +2165,14 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     } else {
       file
     };
-    // Recover V8-compatible expression columns from quickjs's call positions.
-    if let Some(src) = super::core::script_source_line(&file, line) {
+    // Recover V8-compatible expression locations from quickjs's call positions.
+    if let Some(source) = super::core::script_source(&file)
+      && let Some((constructor_line, constructor_col)) =
+        v8_constructor_location(&source, line, col, &location_error_name)
+    {
+      line = constructor_line;
+      col = constructor_col;
+    } else if let Some(src) = super::core::script_source_line(&file, line) {
       col = v8_error_column(&src, col, &name, &message);
     }
 

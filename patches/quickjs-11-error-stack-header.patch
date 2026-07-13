@@ -1,21 +1,50 @@
-diff --git a/quickjs.c b/quickjs.c
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -7830,6 +7830,13 @@
+@@ -7843,7 +7843,15 @@
  /* only taken into account if filename is provided */
  #define JS_BACKTRACE_FLAG_SINGLE_LEVEL     (1 << 1)
  #define JS_BACKTRACE_FLAG_FILTER_FUNC      (1 << 2)
-+
++#define JS_BACKTRACE_FLAG_FILTER_CONSTRUCTOR (1 << 3)
+ 
 +/* v82jsc: defined with js_error_get_stack below; used by build_backtrace to
 +   prepend the v8 `name: message` header to captureStackTrace/DOMException
 +   stacks (which shadow the Error.prototype accessor). */
 +static JSValue js_error_prepend_stack_header(JSContext *ctx,
 +                                             JSValueConst error_obj,
 +                                             JSValue frames_v);
- 
++
  /* if filename != NULL, an additional level is added with the filename
     and line number information (used for parse error). */
-@@ -8024,16 +8031,22 @@
+ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+@@ -7857,7 +7865,7 @@
+     const char *str1;
+     JSObject *p;
+     JSFunctionBytecode *b;
+-    bool backtrace_barrier, has_prepare, has_filter_func;
++    bool backtrace_barrier, has_prepare, has_filter_func, has_frame_filter;
+     JSRuntime *rt;
+     JSCallSiteData csd[64];
+     uint32_t i;
+@@ -7892,6 +7900,9 @@
+     stack_trace_limit = max_int(stack_trace_limit, 0);
+     has_prepare = false;
+     has_filter_func = backtrace_flags & JS_BACKTRACE_FLAG_FILTER_FUNC;
++    has_frame_filter = backtrace_flags &
++        (JS_BACKTRACE_FLAG_FILTER_FUNC |
++         JS_BACKTRACE_FLAG_FILTER_CONSTRUCTOR);
+     i = 0;
+ 
+     if (!JS_IsNull(ctx->error_ctor)) {
+@@ -7925,7 +7936,7 @@
+ 
+     /* Find the frame we want to start from. Note that when a filter is used the filter
+        function will be the first, but we also specify we want to skip the first one. */
+-    if (has_filter_func) {
++    if (has_frame_filter) {
+         for (sf = sf_start; sf != NULL && i < stack_trace_limit; sf = sf->prev_frame) {
+             if (js_same_value(ctx, sf->cur_func, filter_func)) {
+                 sf_start = sf;
+@@ -8038,16 +8049,22 @@
          ctx->error_back_trace = js_dup(stack);
      if (has_filter_func) {
          /* Error.captureStackTrace(target, ...): install an own data property
@@ -41,11 +70,23 @@ diff --git a/quickjs.c b/quickjs.c
          JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack,
                                 JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
      } else {
-@@ -42165,7 +42178,82 @@
-         name = JS_ConcatString3(ctx, "", name, ": ");
+@@ -42146,8 +42163,10 @@
+                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+     }
+ 
+-    /* skip the Error() function in the backtrace */
+-    build_backtrace(ctx, obj, JS_UNDEFINED, NULL, 0, 0, JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL);
++    /* Skip both Error() and a derived constructor in the backtrace. */
++    build_backtrace(ctx, obj, new_target, NULL, 0, 0,
++                    JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL |
++                    JS_BACKTRACE_FLAG_FILTER_CONSTRUCTOR);
+     return obj;
+  exception:
+     JS_FreeValue(ctx, obj);
+@@ -42183,6 +42202,81 @@
      return JS_ConcatString(ctx, name, msg);
  }
-+
+ 
 +/* v82jsc: v8's `Error.prototype.stack` is `<name>: <message>\n<frames>`, with
 +   the header computed lazily from the error's current name/message at access
 +   time. quickjs-ng stores only the (already v8-format `    at ...`) frames in
@@ -67,7 +108,7 @@ diff --git a/quickjs.c b/quickjs.c
 +    const char *frames_s, *name_s, *msg_s, *nm, *mg, *q;
 +    size_t frames_len, name_len, msg_len, nml, mgl;
 +    DynBuf dbuf;
- 
++
 +    if (!JS_IsString(frames_v))
 +        return frames_v;
 +    frames_s = JS_ToCStringLen(ctx, &frames_len, frames_v);
@@ -124,7 +165,7 @@ diff --git a/quickjs.c b/quickjs.c
  static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
  {
      JSObject *p;
-@@ -42175,7 +42263,8 @@
+@@ -42192,7 +42286,8 @@
      p = JS_VALUE_GET_OBJ(this_val);
      if (p->class_id != JS_CLASS_ERROR)
          return JS_UNDEFINED;
@@ -134,3 +175,4 @@ diff --git a/quickjs.c b/quickjs.c
  }
  
  static JSValue js_error_set_stack(JSContext *ctx, JSValueConst this_val,
+
