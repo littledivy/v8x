@@ -1386,7 +1386,7 @@ fn mark_all_modules_evaluated() {
     });
   MODULE_STATE.with(|t| {
     for m in t.borrow_mut().values_mut() {
-      if m.status == ModuleStatus::Evaluated {
+      if m.status == ModuleStatus::Errored {
         continue;
       }
       let def_evaluated = !m.module_def.is_null()
@@ -4667,32 +4667,37 @@ pub extern "C" fn v8__Module__Evaluate(
         with_module_state(this, |m| m.module_def = def);
         return make_resolved_promise(ctx);
       }
-      if unsafe { v82jsc_module_is_evaluated(def) } == 0 {
-      } else {
-        with_module_state(this, |m| m.module_def = def);
-        let mv = make_value(
-          JS_TAG_MODULE,
-          JSValueUnion {
-            ptr: def as *mut std::os::raw::c_void,
-          },
-        );
-        let mv = unsafe { JS_DupValue(ctx, mv) };
-        let eval_guard = enter_module_eval();
-        let result = unsafe { JS_EvalFunction(ctx, mv) };
-        if eval_guard.should_drain_jobs() {
-          unsafe { drain_jobs(rt) };
+      with_module_state(this, |m| m.module_def = def);
+      let mv = make_value(
+        JS_TAG_MODULE,
+        JSValueUnion {
+          ptr: def as *mut std::os::raw::c_void,
+        },
+      );
+      let mv = unsafe { JS_DupValue(ctx, mv) };
+      let eval_guard = enter_module_eval();
+      let result = unsafe { JS_EvalFunction(ctx, mv) };
+      if eval_guard.should_drain_jobs() {
+        unsafe { drain_jobs(rt) };
+      }
+      if result.tag == JS_TAG_EXCEPTION {
+        let exc = unsafe { JS_GetException(ctx) };
+        if std::env::var_os("QJS_DEBUG_MOD").is_some() {
+          let s = unsafe { jsval_to_rust(ctx, exc) };
+          eprintln!("[qjs Evaluate reuse {module_name}] exception: {s}");
         }
-        if result.tag == JS_TAG_EXCEPTION {
-          let exc = unsafe { JS_GetException(ctx) };
-          if std::env::var_os("QJS_DEBUG_MOD").is_some() {
-            let s = unsafe { jsval_to_rust(ctx, exc) };
-            eprintln!("[qjs Evaluate reuse {module_name}] exception: {s}");
-          }
-          with_module_state(this, |m| m.status = ModuleStatus::Errored);
-          return make_rejected_promise(ctx, exc);
-        }
+        with_module_state(this, |m| m.status = ModuleStatus::Errored);
+        return make_rejected_promise(ctx, exc);
+      }
+      if result.tag == JS_TAG_OBJECT
+        && unsafe { JS_IsPromise(result) }
+        && unsafe { JS_PromiseState(ctx, result) } == 2
+      {
+        with_module_state(this, |m| m.status = ModuleStatus::Errored);
         return intern::<Value>(result);
       }
+      mark_all_modules_evaluated();
+      return intern::<Value>(result);
     }
   }
 
