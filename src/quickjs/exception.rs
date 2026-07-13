@@ -1925,6 +1925,64 @@ fn v8_error_column(line: &str, col: i32, name: &str, message: &str) -> i32 {
   }
 }
 
+fn not_a_function_callee(line: &str, column: i32) -> Option<&str> {
+  if column < 1 {
+    return None;
+  }
+  let bytes = line.as_bytes();
+  let is_ident =
+    |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$');
+  let mut start = (column - 1) as usize;
+  if bytes.get(start) == Some(&b'.') {
+    start += 1;
+  }
+  if !bytes.get(start).copied().is_some_and(is_ident) {
+    return None;
+  }
+
+  let mut end = start;
+  while bytes.get(end).copied().is_some_and(is_ident) {
+    end += 1;
+  }
+  while start > 0 && bytes[start - 1] == b'.' {
+    let prefix_end = start - 1;
+    let mut prefix_start = prefix_end;
+    while prefix_start > 0 && is_ident(bytes[prefix_start - 1]) {
+      prefix_start -= 1;
+    }
+    if prefix_start == prefix_end {
+      break;
+    }
+    start = prefix_start;
+  }
+  line.get(start..end)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn v82jsc_throw_type_error_not_a_function_at(
+  ctx: *mut JSContext,
+  filename: *const c_char,
+  line: c_int,
+  column: c_int,
+) -> JSValue {
+  let callee = (!filename.is_null())
+    .then(|| unsafe { std::ffi::CStr::from_ptr(filename) }.to_str().ok())
+    .flatten()
+    .and_then(|filename| super::core::script_source_line(filename, line))
+    .and_then(|source| {
+      not_a_function_callee(&source, column).map(str::to_string)
+    });
+  let Some(callee) = callee else {
+    return unsafe { JS_ThrowTypeError(ctx, c"not a function".as_ptr()) };
+  };
+  let Ok(message) =
+    std::ffi::CString::new(format!("{callee} is not a function"))
+  else {
+    return unsafe { JS_ThrowTypeError(ctx, c"not a function".as_ptr()) };
+  };
+  unsafe { JS_ThrowTypeError(ctx, c"%s".as_ptr(), message.as_ptr()) }
+}
+
 fn v8_constructor_location(
   source: &str,
   line: i32,
@@ -2013,6 +2071,7 @@ fn v8_constructor_location(
 #[cfg(test)]
 mod stack_column_tests {
   use super::normalize_function_name;
+  use super::not_a_function_callee;
   use super::v8_constructor_location;
   use super::v8_error_column;
   use super::v8_member_call_column;
@@ -2042,6 +2101,16 @@ mod stack_column_tests {
       27
     );
     assert_eq!(v8_member_call_column("Deno.bench();", 6), 6);
+  }
+
+  #[test]
+  fn missing_call_uses_member_expression() {
+    assert_eq!(not_a_function_callee("Deno.cron();", 6), Some("Deno.cron"));
+    assert_eq!(
+      not_a_function_callee("const db = await Deno.openKv();", 23),
+      Some("Deno.openKv")
+    );
+    assert_eq!(not_a_function_callee("missing();", 1), Some("missing"));
   }
 
   #[test]

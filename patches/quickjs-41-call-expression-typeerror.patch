@@ -1,0 +1,58 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -8626,7 +8626,46 @@
+ {
+     return JS_ThrowTypeError(ctx, "not a function");
+ }
++
++extern JSValue v82jsc_throw_type_error_not_a_function_at(JSContext *ctx,
++                                                         const char *filename,
++                                                         int line,
++                                                         int column);
++
++static JSValue JS_ThrowTypeErrorNotAFunctionAtCall(JSContext *ctx)
++{
++    JSStackFrame *sf = ctx->rt->current_stack_frame;
++    JSFunctionBytecode *b;
++    JSObject *p;
++    const char *filename;
++    JSValue result;
++    uint32_t pc;
++    int line, column;
+ 
++    if (!sf || !sf->cur_pc || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
++        return JS_ThrowTypeErrorNotAFunction(ctx);
++    p = JS_VALUE_GET_OBJ(sf->cur_func);
++    if (!js_class_has_bytecode(p->class_id))
++        return JS_ThrowTypeErrorNotAFunction(ctx);
++    b = p->u.func.function_bytecode;
++    if (!b || b->filename == JS_ATOM_NULL ||
++        sf->cur_pc <= b->byte_code_buf ||
++        sf->cur_pc > b->byte_code_buf + b->byte_code_len)
++        return JS_ThrowTypeErrorNotAFunction(ctx);
++
++    pc = sf->cur_pc - b->byte_code_buf - 1;
++    line = find_line_num(ctx, b, pc, &column);
++    if (line < 1 || column < 1)
++        return JS_ThrowTypeErrorNotAFunction(ctx);
++    filename = JS_AtomToCString(ctx, b->filename);
++    if (!filename)
++        return JS_ThrowTypeErrorNotAFunction(ctx);
++    result = v82jsc_throw_type_error_not_a_function_at(ctx, filename,
++                                                       line, column);
++    JS_FreeCString(ctx, filename);
++    return result;
++}
++
+ static JSValue JS_ThrowTypeErrorNotAnObject(JSContext *ctx)
+ {
+     return JS_ThrowTypeError(ctx, "not an object");
+@@ -18107,7 +18146,7 @@
+         call_func = rt->class_array[p->class_id].call;
+         if (!call_func) {
+         not_a_function:
+-            return JS_ThrowTypeErrorNotAFunction(caller_ctx);
++            return JS_ThrowTypeErrorNotAFunctionAtCall(caller_ctx);
+         }
+         return call_func(caller_ctx, func_obj, this_obj, argc,
+                          argv, flags);

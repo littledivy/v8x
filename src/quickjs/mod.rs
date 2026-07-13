@@ -287,6 +287,46 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn missing_member_call_names_callee() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = c"globalThis.Deno = {}; Deno.openKv();";
+      super::core::register_script_source(
+        "missing-member.js",
+        source.to_str().unwrap(),
+      );
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"missing-member.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert_eq!(result.tag, JS_TAG_EXCEPTION);
+
+      let exception = JS_GetException(ctx);
+      let message = JS_GetPropertyStr(ctx, exception, c"message".as_ptr());
+      let message_text = JS_ToCString(ctx, message);
+      assert!(!message_text.is_null());
+      assert_eq!(
+        CStr::from_ptr(message_text).to_bytes(),
+        b"Deno.openKv is not a function"
+      );
+
+      JS_FreeCString(ctx, message_text);
+      JS_FreeValue(ctx, message);
+      JS_FreeValue(ctx, exception);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn eval_preserves_embedded_nul_raw() {
     unsafe {
       let rt = JS_NewRuntime();
