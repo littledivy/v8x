@@ -35,11 +35,19 @@ patch_already_applied() {
 
 apply_series() {
   local sub="$1" prefix="$2"
+  local stamp_dir="$sub/.v8x-patches"
   if [ ! -e "$sub/.git" ]; then
     git submodule update --init "$sub"
   fi
+  mkdir -p "$stamp_dir"
   for p in patches/"$prefix"-[0-9]*.patch; do
+    local stamp="$stamp_dir/$(basename "$p")"
+    local checksum
     [ -e "$p" ] || continue
+    checksum=$(cksum < "$p")
+    if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$checksum" ]; then
+      continue
+    fi
     if ! git -C "$sub" apply --reverse --check "../../$p" 2>/dev/null; then
       if ! git -C "$sub" apply "../../$p"; then
         if patch --batch --dry-run --forward -p1 -d "$sub" < "$p" \
@@ -52,6 +60,7 @@ apply_series() {
         fi
       fi
     fi
+    printf '%s\n' "$checksum" > "$stamp"
   done
 }
 
