@@ -100,7 +100,15 @@ const JS_GPN_ENUM_ONLY: int = 1 << 4;
 const JS_WRITE_OBJ_BYTECODE: int = 1 << 0;
 const JS_READ_OBJ_BYTECODE: int = 1 << 0;
 
-const BC_MAGIC: u32 = 0x5142_4303;
+const BC_MAGIC: u32 = 0x5142_4305;
+
+unsafe extern "C" {
+  fn v82jsc_mark_skip_next_async_frame(
+    ctx: *mut JSContext,
+    error: JSValue,
+    filename: JSValue,
+  );
+}
 
 unsafe fn new_synthetic_namespace(ctx: *mut JSContext) -> JSValue {
   unsafe { v82jsc_new_module_namespace(ctx) }
@@ -1119,6 +1127,7 @@ unsafe extern "C" fn dynamic_import_hook(
   if promise_ptr.is_null() {
     if unsafe { JS_HasException(ctx) } {
       let mut a = [unsafe { JS_GetException(ctx) }];
+      unsafe { v82jsc_mark_skip_next_async_frame(ctx, a[0], basename) };
       let r =
         unsafe { JS_Call(ctx, reject, jsv_undefined(), 1, a.as_mut_ptr()) };
       unsafe { JS_FreeValue(ctx, r) };
@@ -1134,7 +1143,7 @@ unsafe extern "C" fn dynamic_import_hook(
     if let Some(cur) = c.get() {
       return cur;
     }
-    let src = c"(d,res,rej)=>{Promise.resolve(d).then(res,rej);}";
+    let src = c"(d,res,rej,mark,base)=>{Promise.resolve(d).then(res,e=>mark(e,base,rej));}";
     let f = unsafe {
       JS_Eval(
         ctx,
@@ -1153,9 +1162,42 @@ unsafe extern "C" fn dynamic_import_hook(
     reject_with("dynamic import: chain helper failed");
     return;
   }
-  let mut args = [d, resolve, reject];
-  let r = unsafe { JS_Call(ctx, chain, jsv_undefined(), 3, args.as_mut_ptr()) };
-  unsafe { JS_FreeValue(ctx, r) };
+  let mark = unsafe {
+    JS_NewCFunction(
+      ctx,
+      dynamic_import_reject,
+      c"markDynamicImportReject".as_ptr(),
+      3,
+    )
+  };
+  if mark.tag == JS_TAG_EXCEPTION {
+    reject_with("dynamic import: reject helper failed");
+    return;
+  }
+  let mut args = [d, resolve, reject, mark, basename];
+  let r = unsafe { JS_Call(ctx, chain, jsv_undefined(), 5, args.as_mut_ptr()) };
+  unsafe {
+    JS_FreeValue(ctx, mark);
+    JS_FreeValue(ctx, r);
+  }
+}
+
+unsafe extern "C" fn dynamic_import_reject(
+  ctx: *mut JSContext,
+  _this: JSValue,
+  argc: int,
+  argv: *mut JSValue,
+) -> JSValue {
+  if argc < 3 || argv.is_null() {
+    return jsv_undefined();
+  }
+  let reason = unsafe { *argv };
+  let basename = unsafe { *argv.add(1) };
+  let reject = unsafe { *argv.add(2) };
+  unsafe {
+    v82jsc_mark_skip_next_async_frame(ctx, reason, basename);
+    JS_Call(ctx, reject, jsv_undefined(), 1, argv)
+  }
 }
 
 /// Tape replay: bytecode-born module defs bypass the loader, so their

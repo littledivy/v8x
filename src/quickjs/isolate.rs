@@ -15,6 +15,10 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::Ordering;
 
+unsafe extern "C" {
+  fn v82jsc_ensure_error_backtrace(ctx: *mut JSContext, error: JSValue);
+}
+
 // --- code generation from strings (V8 `Context::AllowCodeGenerationFromStrings`)
 //
 // QuickJS has no native toggle for `eval` / `new Function`, so we emulate V8's
@@ -1084,6 +1088,7 @@ pub extern "C" fn v8__Isolate__ThrowException(
     return exception;
   }
   let v = jsval_of(exception);
+  unsafe { v82jsc_ensure_error_backtrace(ctx, v) };
   let dup = unsafe { JS_DupValue(ctx, v) };
   unsafe { JS_Throw(ctx, dup) };
   intern_dup::<Value>(ctx, v)
