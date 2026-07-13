@@ -1,0 +1,20 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -22920,5 +22920,16 @@ int JS_PRINTF_FORMAT_ATTR(2, 3) js_parse_error(JSParseState *s, JS_PRINTF_FORMAT
+         err_col_num = (int)(s->token.ptr - line_start) + 1;
+     }
++    /* V8 folds this dynamic-module parse location into the SyntaxError message
++       and does not expose it as a stack frame. Async import stitching can then
++       append the awaiting caller as the first structured frame. */
++    if (!strcmp(fmt, "unexpected 'await' keyword")) {
++        JSValue old_exception = JS_GetException(ctx);
++        JS_FreeValue(ctx, old_exception);
++        JS_ThrowSyntaxError(ctx, "Unexpected reserved word at %s:%d:%d",
++                            s->filename ? s->filename : "<input>",
++                            s->token.line_num, err_col_num);
++        return -1;
++    }
+     build_backtrace(ctx, ctx->rt->current_exception, JS_UNDEFINED, s->filename,
+                     s->token.line_num, err_col_num, backtrace_flags);
+     return -1;
