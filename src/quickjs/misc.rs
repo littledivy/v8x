@@ -69,6 +69,7 @@ const HEAP_SNAPSHOT_MAX_DEPTH: usize = 5;
 const HEAP_SNAPSHOT_ARRAY_SAMPLE: u32 = 64;
 
 unsafe extern "C" {
+  fn v82jsc_clear_error_backtrace(ctx: *mut JSContext, error: JSValue);
   fn JS_GetOwnPropertyNames(
     ctx: *mut JSContext,
     ptab: *mut *mut JSPropertyEnum,
@@ -1039,16 +1040,47 @@ pub extern "C" fn v8__JSON__Parse(
     let mut len: usize = 0;
     let cstr = JS_ToCStringLen(ctx, &mut len, jsval_of(json_string));
     if cstr.is_null() {
-      let exc = JS_GetException(ctx);
-      JS_FreeValue(ctx, exc);
       return ptr::null();
     }
     let fname = c"<json>";
     let parsed = JS_ParseJSON(ctx, cstr, len, fname.as_ptr());
+    let input = std::slice::from_raw_parts(cstr as *const u8, len);
+    let invalid_leading_token = input
+      .iter()
+      .copied()
+      .find(|byte| !byte.is_ascii_whitespace())
+      .filter(|byte| {
+        !matches!(
+          byte,
+          b'{' | b'[' | b'"' | b't' | b'f' | b'n' | b'-' | b'0'..=b'9'
+        )
+      });
+    let input_preview = invalid_leading_token.map(|token| {
+      let preview_len = input.len().min(10);
+      let preview = std::string::String::from_utf8_lossy(&input[..preview_len]);
+      let suffix = if input.len() > preview_len { "..." } else { "" };
+      format!(
+        "Unexpected token '{}', {:?}{} is not valid JSON",
+        char::from(token).escape_default(),
+        preview,
+        suffix,
+      )
+    });
     JS_FreeCString(ctx, cstr);
     if parsed.tag == JS_TAG_EXCEPTION {
-      let exc = JS_GetException(ctx);
-      JS_FreeValue(ctx, exc);
+      let exception = JS_GetException(ctx);
+      if let Some(message) = input_preview
+        && let Ok(message) = std::ffi::CString::new(message)
+      {
+        JS_SetPropertyStr(
+          ctx,
+          exception,
+          c"message".as_ptr(),
+          JS_NewString(ctx, message.as_ptr()),
+        );
+      }
+      v82jsc_clear_error_backtrace(ctx, exception);
+      JS_Throw(ctx, exception);
       return ptr::null();
     }
 
