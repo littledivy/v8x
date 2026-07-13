@@ -1,0 +1,44 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21527,12 +21527,19 @@
+                                          const char *func)
+ {
+     JSValue stack, new_stack;
++    JSObject *error_obj;
++    JSShapeProperty *stack_prop;
+     DynBuf dbuf;
+     const char *cs;
+     size_t len;
+ 
+     if (!file || JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
+         return;
++    error_obj = JS_VALUE_GET_OBJ(error);
++    stack_prop = find_own_property1(error_obj, JS_ATOM_stack);
++    if (stack_prop &&
++        (stack_prop->flags & JS_PROP_TMASK) == JS_PROP_GETSET)
++        return;
+     if (js_v82jsc_has_same_async_site(ctx, error, file, line))
+         return;
+     stack = JS_GetProperty(ctx, error, JS_ATOM_stack);
+@@ -21572,12 +21579,15 @@
+         JS_FreeValue(ctx, JS_GetException(ctx));
+         return;
+     }
+-    /* Install as an own data property; shadows js_error_get_stack so the
+-       header isn't re-prepended (our string already carries it via the
+-       prior accessor read). */
+-    if (JS_DefinePropertyValue(ctx, error, JS_ATOM_stack, new_stack,
+-                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0) {
+-        JS_FreeValue(ctx, JS_GetException(ctx));
++    if (error_obj->class_id == JS_CLASS_ERROR && !stack_prop) {
++        /* Preserve the prototype accessor and its lazily generated header. */
++        JS_FreeValue(ctx, error_obj->u.object_data);
++        error_obj->u.object_data = new_stack;
++    } else {
++        if (JS_DefinePropertyValue(ctx, error, JS_ATOM_stack, new_stack,
++                                   JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0) {
++            JS_FreeValue(ctx, JS_GetException(ctx));
++        }
+     }
+ 
+     /* Mirror the frame into the embedder's structured-frames array so

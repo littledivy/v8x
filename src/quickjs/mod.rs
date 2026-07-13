@@ -132,6 +132,65 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn async_rejection_preserves_custom_stack_getter() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = c"let getter = () => 'custom stack';
+        globalThis.result = 'pending';
+        (async function outer() {
+          const error = new Error('boom');
+          Object.defineProperty(error, 'stack', { get: getter });
+          try {
+            await Promise.reject(error);
+          } catch (error) {
+            const descriptor = Object.getOwnPropertyDescriptor(error, 'stack');
+            globalThis.result = `${descriptor.get === getter}:${error.stack}`;
+          }
+        })();";
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"custom-async-stack.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "eval threw");
+      JS_FreeValue(ctx, result);
+
+      let mut job_ctx = ptr::null_mut();
+      while JS_IsJobPending(rt) {
+        assert!(JS_ExecutePendingJob(rt, &mut job_ctx) >= 0);
+      }
+
+      let result = JS_Eval(
+        ctx,
+        c"result".as_ptr(),
+        c"result".to_bytes().len(),
+        c"custom-async-stack.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "result access threw");
+      let mut len = 0;
+      let text = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!text.is_null());
+      let actual =
+        std::str::from_utf8(std::slice::from_raw_parts(text as *const u8, len))
+          .unwrap();
+      assert_eq!(actual, "true:custom stack");
+
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn eval_preserves_embedded_nul_raw() {
     unsafe {
       let rt = JS_NewRuntime();
