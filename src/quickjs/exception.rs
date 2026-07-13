@@ -1744,6 +1744,23 @@ fn v8_member_call_column(line: &str, col: i32) -> i32 {
   let is_ident_start = |c: char| c.is_alphabetic() || c == '_' || c == '$';
   let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
   let mut i = (col - 1) as usize;
+  if chars[i] == '(' {
+    let mut end = i;
+    while end > 0 && chars[end - 1].is_whitespace() {
+      end -= 1;
+    }
+    let mut member_start = end;
+    while member_start > 0 && is_ident(chars[member_start - 1]) {
+      member_start -= 1;
+    }
+    let mut dot = member_start;
+    while dot > 0 && chars[dot - 1].is_whitespace() {
+      dot -= 1;
+    }
+    if member_start < end && dot > 0 && chars[dot - 1] == '.' {
+      return member_start as i32 + 1;
+    }
+  }
   while i < chars.len() && chars[i].is_whitespace() {
     i += 1;
   }
@@ -1874,6 +1891,10 @@ mod stack_column_tests {
     assert_eq!(v8_member_call_column("Deno.bench();", 1), 6);
     assert_eq!(
       v8_member_call_column("Deno.test(\"name\", () => {});", 1),
+      6
+    );
+    assert_eq!(
+      v8_member_call_column("Deno.test(function named() {});", 10),
       6
     );
     assert_eq!(v8_member_call_column("Deno.bench();", 5), 6);
