@@ -205,6 +205,18 @@ mod cache_key_tests {
   }
 
   #[test]
+  fn parses_import_specifier_with_semicolon() {
+    let source = r#"import * as value from "data:application/typescript;base64,ZXhwb3J0";"#;
+    assert_eq!(
+      parse_import_specifiers(source),
+      vec![(
+        "data:application/typescript;base64,ZXhwb3J0".to_string(),
+        None
+      )]
+    );
+  }
+
+  #[test]
   fn module_caches_follow_nested_isolates() {
     let outer = 1usize as *mut RealIsolate;
     let inner = 2usize as *mut RealIsolate;
@@ -1700,6 +1712,14 @@ fn parse_import_specifiers(
       let mut end = n;
       while j < n {
         match bytes[j] {
+          b'"' | b'\'' => {
+            j = skip_string(bytes, j, bytes[j]);
+            continue;
+          }
+          b'`' => {
+            j = skip_template(bytes, j);
+            continue;
+          }
           b'{' => depth += 1,
           b'}' => depth -= 1,
           b';' if depth <= 0 => {
