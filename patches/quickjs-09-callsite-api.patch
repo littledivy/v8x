@@ -96,7 +96,7 @@
      csd->native = false;
      csd->line_num = line_num;
      csd->col_num = col_num;
-@@ -64594,15 +64606,243 @@
+@@ -64594,15 +64606,242 @@
          return JS_EXCEPTION;
      int *field = (void *)((char *)csd + magic);
      return js_int32(*field);
