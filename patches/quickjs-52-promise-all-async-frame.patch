@@ -1,0 +1,191 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21464,35 +21464,38 @@
+    self-contained object; the embedder reads file/line/col via methods. */
+ static JSValue js_v82jsc_make_async_callsite(JSContext *ctx, const char *file,
+                                              int line, int col,
+-                                             const char *func)
++                                             const char *func,
++                                             int promise_index)
+ {
+     static const char src[] =
+-        "(function(file, line, col, func) { return {\n"
+-        "  getFileName: function () { return file; },\n"
++        "(function(file, line, col, func, promiseIndex) {\n"
++        " const promiseAll = promiseIndex >= 0; return {\n"
++        "  getFileName: function () { return promiseAll ? null : file; },\n"
+         "  getLineNumber: function () { return line; },\n"
+         "  getColumnNumber: function () { return col; },\n"
+         "  getFunctionName: function () { return func; },\n"
+         "  getMethodName: function () { return null; },\n"
+         "  getTypeName: function () { return null; },\n"
+         "  getEvalOrigin: function () { return null; },\n"
+-        "  getPromiseIndex: function () { return null; },\n"
+-        "  isToplevel: function () { return !func; },\n"
++        "  getPromiseIndex: function () { return promiseAll ? promiseIndex : null; },\n"
++        "  isToplevel: function () { return !func && !promiseAll; },\n"
+         "  isEval: function () { return false; },\n"
+         "  isNative: function () { return false; },\n"
+         "  isConstructor: function () { return false; },\n"
+         "  isAsync: function () { return true; },\n"
+-        "  isPromiseAll: function () { return false; },\n"
++        "  isPromiseAll: function () { return promiseAll; },\n"
+         "}; })";
+     JSValue factory = JS_Eval(ctx, src, sizeof(src) - 1,
+                               "<v82jsc-async-callsite>", JS_EVAL_TYPE_GLOBAL);
+     if (JS_IsException(factory))
+         return JS_NULL;
+-    JSValue argv[4];
++    JSValue argv[5];
+     argv[0] = JS_NewString(ctx, file ? file : "");
+     argv[1] = js_int32(line);
+     argv[2] = js_int32(col);
+     argv[3] = func ? JS_NewString(ctx, func) : JS_NULL;
+-    JSValue cs = JS_Call(ctx, factory, JS_UNDEFINED, 4, vc(argv));
++    argv[4] = js_int32(promise_index);
++    JSValue cs = JS_Call(ctx, factory, JS_UNDEFINED, 5, vc(argv));
+     JS_FreeValue(ctx, factory);
+     JS_FreeValue(ctx, argv[0]);
+     JS_FreeValue(ctx, argv[3]);
+@@ -21737,7 +21740,7 @@
+             }
+         }
+         JSValue cs_obj = js_v82jsc_make_async_callsite(ctx, file, line, col,
+-                                                       func);
++                                                       func, -1);
+         if (!JS_IsNull(cs_obj)) {
+             JS_DefinePropertyValueUint32(ctx, arr, next_idx, cs_obj,
+                                          JS_PROP_C_W_E);
+@@ -21750,7 +21753,91 @@
+         JS_FreeAtom(ctx, key_atom);
+     }
+ }
++
++static void js_v82jsc_append_promise_all_frame(JSContext *ctx,
++                                                JSValueConst error,
++                                                int index)
++{
++    JSValue stack, new_stack;
++    JSObject *error_obj;
++    JSShapeProperty *stack_prop;
++    DynBuf dbuf;
++    const char *cs;
++    size_t len;
+ 
++    if (JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
++        return;
++    error_obj = JS_VALUE_GET_OBJ(error);
++    stack_prop = find_own_property1(error_obj, JS_ATOM_stack);
++    if (stack_prop && (stack_prop->flags & JS_PROP_TMASK) == JS_PROP_GETSET)
++        return;
++    stack = JS_GetProperty(ctx, error, JS_ATOM_stack);
++    if (JS_IsException(stack)) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        return;
++    }
++    js_dbuf_init(ctx, &dbuf);
++    if (JS_IsString(stack)) {
++        cs = JS_ToCStringLen(ctx, &len, stack);
++        if (cs) {
++            dbuf_put(&dbuf, (const uint8_t *)cs, len);
++            if (len == 0 || cs[len - 1] != '\n')
++                dbuf_putc(&dbuf, '\n');
++            JS_FreeCString(ctx, cs);
++        }
++    }
++    JS_FreeValue(ctx, stack);
++    dbuf_printf(&dbuf, "    at async Promise.all (index %d)", index);
++    if (dbuf_error(&dbuf)) {
++        dbuf_free(&dbuf);
++        return;
++    }
++    new_stack = JS_NewStringLen(ctx, (const char *)dbuf.buf, dbuf.size);
++    dbuf_free(&dbuf);
++    if (JS_IsException(new_stack)) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        return;
++    }
++    if (error_obj->class_id == JS_CLASS_ERROR && !stack_prop) {
++        JS_FreeValue(ctx, error_obj->u.object_data);
++        error_obj->u.object_data = new_stack;
++    } else if (JS_DefinePropertyValue(ctx, error, JS_ATOM_stack, new_stack,
++                                      JS_PROP_WRITABLE |
++                                      JS_PROP_CONFIGURABLE) < 0) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    }
++
++    JSAtom key_atom = js_v82jsc_private_atom(ctx,
++        "v82jsc_private:deno_core::call_site_evals");
++    if (key_atom != JS_ATOM_NULL) {
++        JSValue existing = JS_GetProperty(ctx, error, key_atom);
++        JSValue arr;
++        uint32_t next_idx = 0;
++        if (JS_IsArray(existing)) {
++            arr = existing;
++            JSValue len_v = JS_GetPropertyStr(ctx, arr, "length");
++            JS_ToUint32(ctx, &next_idx, len_v);
++            JS_FreeValue(ctx, len_v);
++        } else {
++            JS_FreeValue(ctx, existing);
++            arr = JS_NewArray(ctx);
++        }
++        if (!JS_IsException(arr)) {
++            JSValue callsite =
++                js_v82jsc_make_async_callsite(ctx, NULL, 0, 0, NULL, index);
++            if (!JS_IsNull(callsite))
++                JS_DefinePropertyValueUint32(ctx, arr, next_idx, callsite,
++                                             JS_PROP_C_W_E);
++            if (JS_DefinePropertyValue(ctx, error, key_atom, arr,
++                                       JS_PROP_C_W_E) < 0)
++                JS_FreeValue(ctx, JS_GetException(ctx));
++        } else {
++            JS_FreeValue(ctx, JS_GetException(ctx));
++        }
++        JS_FreeAtom(ctx, key_atom);
++    }
++}
++
+ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
+ {
+     bool is_success = true;
+@@ -58275,6 +58362,21 @@
+         JS_FreeValue(ctx, ret);
+     }
+     return JS_UNDEFINED;
++}
++
++static JSValue js_v82jsc_promise_all_reject_element(
++    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
++    int magic, JSValueConst *func_data)
++{
++    int index;
++    JSValueConst error = argc > 0 ? argv[0] : JS_UNDEFINED;
++
++    (void)this_val;
++    (void)magic;
++    if (JS_ToInt32(ctx, &index, func_data[0]))
++        return JS_EXCEPTION;
++    js_v82jsc_append_promise_all_frame(ctx, error, index);
++    return JS_Call(ctx, func_data[1], JS_UNDEFINED, 1, &error);
+ }
+ 
+ /* magic = 0: Promise.all 1: Promise.allSettled */
+@@ -58368,7 +58470,16 @@
+                 reject_element = resolve_element;
+                 resolve_element = js_dup(resolving_funcs[0]);
+             } else {
+-                reject_element = js_dup(resolving_funcs[1]);
++                JSValueConst reject_data[2] = {
++                    js_int32(index), resolving_funcs[1]
++                };
++                reject_element = JS_NewCFunctionData(
++                    ctx, js_v82jsc_promise_all_reject_element, 1, 0, 2,
++                    reject_data);
++                if (JS_IsException(reject_element)) {
++                    JS_FreeValue(ctx, next_promise);
++                    goto fail_reject1;
++                }
+             }
+ 
+             if (remainingElementsCount_add(ctx, resolve_element_env, 1) < 0) {
