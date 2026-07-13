@@ -1,0 +1,58 @@
+diff --git a/quickjs.c b/quickjs.c
+index 0000000..0000000 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -6294,7 +6294,8 @@ static JSValue JS_NewCFunction3(JSContext *ctx, JSCFunction *func,
+     p->is_constructor = (cproto == JS_CFUNC_constructor ||
+                          cproto == JS_CFUNC_constructor_magic ||
+                          cproto == JS_CFUNC_constructor_or_func ||
+-                         cproto == JS_CFUNC_constructor_or_func_magic);
++                         cproto == JS_CFUNC_constructor_or_func_magic ||
++                         cproto == JS_CFUNC_constructor_or_func_magic_receiver);
+     name_atom = JS_ATOM_empty_string;
+     if (name && *name) {
+         name_atom = JS_NewAtom(ctx, name);
+@@ -12077,6 +12078,12 @@ bool JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, bool val)
+     return true;
+ }
+ 
++bool v82jsc_is_constructor_call(JSContext *ctx)
++{
++    JSStackFrame *sf = ctx->rt->current_stack_frame;
++    return sf && sf->is_constructor;
++}
++
+ bool JS_IsRegExp(JSValueConst val)
+ {
+     return JS_CLASS_REGEXP == JS_GetClassID(val);
+@@ -17951,6 +17958,10 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
+         ret_val = func.generic_magic(ctx, this_obj, argc, arg_buf,
+                                      p->u.cfunc.magic);
+         break;
++    case JS_CFUNC_constructor_or_func_magic_receiver:
++        ret_val = func.generic_magic(ctx, this_obj, argc, arg_buf,
++                                     p->u.cfunc.magic);
++        break;
+     case JS_CFUNC_getter:
+         ret_val = func.getter(ctx, this_obj);
+         break;
+diff --git a/quickjs.h b/quickjs.h
+index 0000000..0000000 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -924,6 +924,7 @@ JS_EXTERN bool JS_IsFunction(JSContext* ctx, JSValueConst val);
+ JS_EXTERN bool JS_IsAsyncFunction(JSValueConst val);
+ JS_EXTERN bool JS_IsConstructor(JSContext* ctx, JSValueConst val);
+ JS_EXTERN bool JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, bool val);
++JS_EXTERN bool v82jsc_is_constructor_call(JSContext *ctx);
+ 
+ JS_EXTERN bool JS_IsRegExp(JSValueConst val);
+ JS_EXTERN bool JS_IsMap(JSValueConst val);
+@@ -1283,6 +1284,7 @@ typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
+     JS_CFUNC_getter_magic,
+     JS_CFUNC_setter_magic,
+     JS_CFUNC_iterator_next,
++    JS_CFUNC_constructor_or_func_magic_receiver,
+ } JSCFunctionEnum;
+ 
+ typedef union JSCFunctionType {

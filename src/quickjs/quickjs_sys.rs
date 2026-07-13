@@ -683,6 +683,7 @@ unsafe extern "C" {
     ...
   ) -> JSValue;
   pub fn JS_ThrowOutOfMemory(ctx: *mut JSContext) -> JSValue;
+  pub fn v82jsc_is_constructor_call(ctx: *mut JSContext) -> bool;
 
   pub fn JS_NewAtom(ctx: *mut JSContext, str: *const c_char) -> JSAtom;
 
@@ -704,6 +705,7 @@ pub const JS_CFUNC_GENERIC: c_int = 0;
 pub const JS_CFUNC_GENERIC_MAGIC: c_int = 1;
 pub const JS_CFUNC_CONSTRUCTOR: c_int = 2;
 pub const JS_CFUNC_CONSTRUCTOR_OR_FUNC: c_int = 4;
+pub const JS_CFUNC_CONSTRUCTOR_OR_FUNC_MAGIC_RECEIVER: c_int = 13;
 
 #[inline]
 pub unsafe fn JS_NewCFunction(

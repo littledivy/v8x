@@ -2590,7 +2590,7 @@ unsafe extern "C" fn fn_trampoline(
 
 unsafe extern "C" fn fn_construct_trampoline(
   ctx: *mut JSContext,
-  new_target: JSValue,
+  this_or_new_target: JSValue,
   argc: c_int,
   argv: *mut JSValue,
   magic: c_int,
@@ -2601,13 +2601,13 @@ unsafe extern "C" fn fn_construct_trampoline(
     return unsafe { JS_NewObject(ctx) };
   };
 
-  if jsv_is_undefined(&new_target) {
+  if !unsafe { v82jsc_is_constructor_call(ctx) } {
     return unsafe {
       dispatch(
         ctx,
         callback,
         data,
-        jsv_undefined(),
+        this_or_new_target,
         jsv_undefined(),
         false,
         argc,
@@ -2615,6 +2615,7 @@ unsafe extern "C" fn fn_construct_trampoline(
       )
     };
   }
+  let new_target = this_or_new_target;
 
   let this = if !instance.is_null() {
     let t = unsafe { &*instance };
@@ -3287,7 +3288,7 @@ unsafe fn make_function_len_with_instance(
     fast_overloads,
   );
   let cproto = if construct {
-    JS_CFUNC_CONSTRUCTOR_OR_FUNC_MAGIC
+    JS_CFUNC_CONSTRUCTOR_OR_FUNC_MAGIC_RECEIVER
   } else {
     JS_CFUNC_GENERIC_MAGIC
   };
@@ -3303,9 +3304,6 @@ unsafe fn make_function_len_with_instance(
   unsafe { install_native_function_to_string(ctx, f) };
   f
 }
-
-const JS_CFUNC_CONSTRUCTOR_MAGIC: c_int = 3;
-const JS_CFUNC_CONSTRUCTOR_OR_FUNC_MAGIC: c_int = 5;
 
 #[inline]
 fn cbinfo<'a>(this: *const FunctionCallbackInfo) -> &'a mut CbInfo {
