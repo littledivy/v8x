@@ -2103,15 +2103,22 @@ fn v8_constructor_location(
     if reported_offset <= open {
       return Some(source_location(new_offset));
     }
-    let balance = bytes[open..reported_offset].iter().fold(
-      0i32,
-      |balance, byte| match byte {
-        b'(' => balance + 1,
-        b')' => balance - 1,
-        _ => balance,
-      },
-    );
-    if balance <= 0 {
+    let mut balance = 0i32;
+    let mut closed = false;
+    for byte in &bytes[open..reported_offset] {
+      match byte {
+        b'(' => balance += 1,
+        b')' => {
+          balance -= 1;
+          if balance == 0 {
+            closed = true;
+            break;
+          }
+        }
+        _ => {}
+      }
+    }
+    if closed || balance <= 0 {
       continue;
     }
 
@@ -2205,6 +2212,14 @@ mod stack_column_tests {
       v8_constructor_location(source, 1, 35, "Error"),
       Some((1, 35))
     );
+  }
+
+  #[test]
+  fn constructor_location_does_not_cross_a_closed_call() {
+    let source = "function wrapper() { throw new Error(\"x\"); }\n\
+      function outer(value) {}\n\
+      outer(wrapper());";
+    assert_eq!(v8_constructor_location(source, 3, 7, "Error"), None);
   }
 
   #[test]
