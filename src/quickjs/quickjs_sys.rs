@@ -635,6 +635,11 @@ unsafe extern "C" {
   pub fn JS_IsProxy(val: JSValue) -> bool;
   pub fn JS_GetProxyTarget(ctx: *mut JSContext, proxy: JSValue) -> JSValue;
   pub fn JS_GetProxyHandler(ctx: *mut JSContext, proxy: JSValue) -> JSValue;
+  pub fn JS_NewProxy(
+    ctx: *mut JSContext,
+    target: JSValue,
+    handler: JSValue,
+  ) -> JSValue;
 
   pub fn JS_Throw(ctx: *mut JSContext, obj: JSValue) -> JSValue;
   pub fn JS_GetException(ctx: *mut JSContext) -> JSValue;

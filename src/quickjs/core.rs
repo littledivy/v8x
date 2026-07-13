@@ -169,7 +169,7 @@ fn maybe_report_strict_mode_use(source: &[u8]) {
 fn rewrite_script_source(source: &str) -> Option<String> {
   let mut rewritten = rewrite_v8_native_intrinsics(source);
   let input = rewritten.as_deref().unwrap_or(source);
-  if let Some(text) = super::module::rewrite_dynamic_source_phase_imports(input)
+  if let Some(text) = super::module::rewrite_dynamic_phase_imports(input, false)
   {
     rewritten = Some(text);
   }
@@ -2112,6 +2112,11 @@ pub extern "C" fn v8__Script__Compile(
       let rewritten = std::str::from_utf8(source_bytes)
         .ok()
         .and_then(rewrite_script_source);
+      if rewritten.is_some()
+        && source_bytes.windows(12).any(|w| w == b"import.defer")
+      {
+        super::module::ensure_dynamic_defer_import_global(ctx);
+      }
       let rewritten_bytes = rewritten.as_ref().map(|text| {
         let mut bytes = Vec::with_capacity(text.len() + 1);
         bytes.extend_from_slice(text.as_bytes());

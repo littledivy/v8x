@@ -804,11 +804,60 @@ pub(crate) unsafe fn install_dynamic_source_import_global(
   }
 }
 
+pub(crate) unsafe fn ensure_dynamic_defer_import_global(ctx: *mut JSContext) {
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let existing =
+    unsafe { JS_GetPropertyStr(ctx, global, c"__v8x_import_defer".as_ptr()) };
+  let absent = jsv_is_undefined(&existing) || jsv_is_null(&existing);
+  unsafe { JS_FreeValue(ctx, existing) };
+  if absent {
+    let import_defer = unsafe {
+      JS_NewCFunction(
+        ctx,
+        dynamic_defer_import_js_cb,
+        c"__v8x_import_defer".as_ptr(),
+        1,
+      )
+    };
+    unsafe {
+      JS_SetPropertyStr(
+        ctx,
+        global,
+        c"__v8x_import_defer".as_ptr(),
+        import_defer,
+      );
+    }
+  }
+  unsafe { JS_FreeValue(ctx, global) };
+}
+
 unsafe extern "C" fn dynamic_source_import_js_cb(
   ctx: *mut JSContext,
   _this_val: JSValue,
   argc: int,
   argv: *mut JSValue,
+) -> JSValue {
+  unsafe {
+    dynamic_phase_import_js_cb(ctx, argc, argv, ModuleImportPhase::kSource)
+  }
+}
+
+unsafe extern "C" fn dynamic_defer_import_js_cb(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  argc: int,
+  argv: *mut JSValue,
+) -> JSValue {
+  unsafe {
+    dynamic_phase_import_js_cb(ctx, argc, argv, ModuleImportPhase::kDefer)
+  }
+}
+
+unsafe fn dynamic_phase_import_js_cb(
+  ctx: *mut JSContext,
+  argc: int,
+  argv: *mut JSValue,
+  phase: ModuleImportPhase,
 ) -> JSValue {
   let Some(cb) = DYN_IMPORT_PHASE_CB.with(|c| c.get()) else {
     return unsafe {
@@ -827,7 +876,9 @@ unsafe extern "C" fn dynamic_source_import_js_cb(
     };
   }
 
-  let spec = unsafe { jsval_to_rust(ctx, *argv) };
+  let has_explicit_referrer = argc >= 2;
+  let spec_index = usize::from(has_explicit_referrer);
+  let spec = unsafe { jsval_to_rust(ctx, *argv.add(spec_index)) };
   let Ok(cspec) = CString::new(spec.as_str()) else {
     return unsafe {
       JS_ThrowTypeError(
@@ -846,7 +897,11 @@ unsafe extern "C" fn dynamic_source_import_js_cb(
     host_opts
   };
 
-  let referrer_name = current_script_name_or_source_url().unwrap_or_default();
+  let referrer_name = if has_explicit_referrer {
+    unsafe { jsval_to_rust(ctx, *argv) }
+  } else {
+    current_script_name_or_source_url().unwrap_or_default()
+  };
   let referrer = if referrer_name == "<eval>" || referrer_name == "<anonymous>"
   {
     unsafe { JS_NewString(ctx, c"".as_ptr()) }
@@ -874,16 +929,7 @@ unsafe extern "C" fn dynamic_source_import_js_cb(
     };
   };
 
-  let promise_ptr = unsafe {
-    cb(
-      ctx_l,
-      ho_l,
-      ref_l,
-      spec_l,
-      ModuleImportPhase::kSource,
-      attr_l,
-    )
-  };
+  let promise_ptr = unsafe { cb(ctx_l, ho_l, ref_l, spec_l, phase, attr_l) };
   if promise_ptr.is_null() {
     if unsafe { JS_HasException(ctx) } {
       return jsv_exception();
@@ -899,10 +945,11 @@ unsafe extern "C" fn dynamic_source_import_js_cb(
   unsafe { JS_DupValue(ctx, jsval_of(promise_ptr as *const Value)) }
 }
 
-pub(crate) fn rewrite_dynamic_source_phase_imports(
+pub(crate) fn rewrite_dynamic_phase_imports(
   body: &str,
+  module: bool,
 ) -> Option<std::string::String> {
-  if !body.contains("import.source") {
+  if !body.contains("import.source") && !body.contains("import.defer") {
     return None;
   }
 
@@ -912,16 +959,41 @@ pub(crate) fn rewrite_dynamic_source_phase_imports(
   let is_ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_' || c == b'$';
   let mut changed = false;
   while i < bytes.len() {
+    let replacement = if bytes[i] == b'i' {
+      if body[i..].starts_with("import.source") {
+        Some((
+          "import.source",
+          if module {
+            "globalThis.__v8x_import_source(import.meta.url,"
+          } else {
+            "globalThis.__v8x_import_source("
+          },
+        ))
+      } else if body[i..].starts_with("import.defer") {
+        Some((
+          "import.defer",
+          if module {
+            "globalThis.__v8x_import_defer(import.meta.url,"
+          } else {
+            "globalThis.__v8x_import_defer("
+          },
+        ))
+      } else {
+        None
+      }
+    } else {
+      None
+    };
     if bytes[i] == b'i'
-      && body[i..].starts_with("import.source")
       && (i == 0 || !is_ident(bytes[i - 1]))
+      && let Some((syntax, replacement)) = replacement
     {
-      let mut j = i + "import.source".len();
+      let mut j = i + syntax.len();
       while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
         j += 1;
       }
       if j < bytes.len() && bytes[j] == b'(' {
-        out.extend_from_slice(b"globalThis.__v8x_import_source(");
+        out.extend_from_slice(replacement.as_bytes());
         i = j + 1;
         changed = true;
         continue;
@@ -3413,7 +3485,12 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   let src_val = jsval_of(src);
   let raw_text = unsafe { jsval_to_rust(ctx, src_val) };
 
-  let (text, source_imports) = rewrite_source_phase(&raw_text);
+  let dynamic_text = rewrite_dynamic_phase_imports(&raw_text, true);
+  if dynamic_text.is_some() && raw_text.contains("import.defer") {
+    unsafe { ensure_dynamic_defer_import_global(ctx) };
+  }
+  let input = dynamic_text.as_deref().unwrap_or(&raw_text);
+  let (text, source_imports) = rewrite_source_phase(input);
   let specifier = unsafe { resource_name_of(ctx, source) };
   let fname = if specifier.is_empty() {
     "<module>".to_string()
@@ -3498,6 +3575,12 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
     return ptr::null();
   }
   let mut body = unsafe { jsval_to_rust(ctx, jsval_of(src)) };
+  if let Some(rewritten) = rewrite_dynamic_phase_imports(&body, false) {
+    if body.contains("import.defer") {
+      unsafe { ensure_dynamic_defer_import_global(ctx) };
+    }
+    body = rewritten;
+  }
 
   if body.starts_with("#!") {
     body.replace_range(0..2, "//");
@@ -4304,17 +4387,136 @@ unsafe fn materialize_module_def(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__GetModuleNamespace2(
   this: *const Module,
-  _phase: ModuleImportPhase,
+  phase: ModuleImportPhase,
 ) -> *const Value {
-  v8__Module__GetModuleNamespace(this)
+  if phase != ModuleImportPhase::kDefer {
+    return v8__Module__GetModuleNamespace(this);
+  }
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let target = unsafe { JS_NewObject(ctx) };
+  let handler = unsafe { JS_NewObject(ctx) };
+  if target.tag == JS_TAG_EXCEPTION || handler.tag == JS_TAG_EXCEPTION {
+    unsafe {
+      JS_FreeValue(ctx, target);
+      JS_FreeValue(ctx, handler);
+    }
+    return ptr::null();
+  }
+  let data = unsafe { JS_NewBigInt64(ctx, this as i64) };
+  let mut func_data = [data];
+  let get = unsafe {
+    JS_NewCFunctionData(
+      ctx,
+      deferred_namespace_get,
+      3,
+      0,
+      1,
+      func_data.as_mut_ptr(),
+    )
+  };
+  unsafe {
+    JS_FreeValue(ctx, data);
+    JS_SetPropertyStr(ctx, handler, c"get".as_ptr(), get);
+  }
+  let proxy = unsafe { JS_NewProxy(ctx, target, handler) };
+  unsafe {
+    JS_FreeValue(ctx, target);
+    JS_FreeValue(ctx, handler);
+  }
+  if proxy.tag == JS_TAG_EXCEPTION {
+    return ptr::null();
+  }
+  intern::<Value>(proxy)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__EvaluateForImportDefer(
   _this: *const Module,
-  _context: *const Context,
+  context: *const Context,
 ) -> *const Value {
-  ptr::null()
+  let ctx = ctx_of(context);
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  make_resolved_promise(ctx)
+}
+
+unsafe extern "C" fn deferred_namespace_get(
+  ctx: *mut JSContext,
+  _this_val: JSValue,
+  argc: int,
+  argv: *mut JSValue,
+  _magic: int,
+  func_data: *mut JSValue,
+) -> JSValue {
+  if ctx.is_null() || argc < 2 || argv.is_null() || func_data.is_null() {
+    return jsv_undefined();
+  }
+  let mut module_ptr = 0i64;
+  if unsafe { JS_ToBigInt64(ctx, &mut module_ptr, *func_data) } < 0 {
+    return jsv_exception();
+  }
+  let module = module_ptr as *const Module;
+  if module.is_null() {
+    return jsv_undefined();
+  }
+  let property = unsafe { *argv.add(1) };
+  if jsv_is_string(&property)
+    && unsafe { jsval_to_rust(ctx, property) } == "then"
+  {
+    return jsv_undefined();
+  }
+  let evaluated = with_module_state(module, |state| {
+    matches!(state.status, ModuleStatus::Evaluated)
+  })
+  .unwrap_or(false);
+  if !evaluated {
+    let context = intern_ctx(ctx);
+    let promise = v8__Module__Evaluate(module, context);
+    if promise.is_null() {
+      return if unsafe { JS_HasException(ctx) } {
+        jsv_exception()
+      } else {
+        jsv_undefined()
+      };
+    }
+    let promise = jsval_of(promise);
+    if unsafe { JS_IsPromise(promise) } {
+      match unsafe { JS_PromiseState(ctx, promise) } {
+        2 => {
+          let reason = unsafe { JS_PromiseResult(ctx, promise) };
+          return unsafe { JS_Throw(ctx, reason) };
+        }
+        0 => {
+          return unsafe {
+            JS_ThrowTypeError(
+              ctx,
+              c"deferred module evaluation is still pending".as_ptr(),
+            )
+          };
+        }
+        _ => {}
+      }
+    }
+  }
+  let namespace = v8__Module__GetModuleNamespace(module);
+  if namespace.is_null() {
+    return jsv_undefined();
+  }
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let reflect = unsafe { JS_GetPropertyStr(ctx, global, c"Reflect".as_ptr()) };
+  let get = unsafe { JS_GetPropertyStr(ctx, reflect, c"get".as_ptr()) };
+  let mut args = [jsval_of(namespace), property];
+  let value = unsafe { JS_Call(ctx, get, reflect, 2, args.as_mut_ptr()) };
+  unsafe {
+    JS_FreeValue(ctx, get);
+    JS_FreeValue(ctx, reflect);
+    JS_FreeValue(ctx, global);
+  }
+  value
 }
 
 #[unsafe(no_mangle)]
