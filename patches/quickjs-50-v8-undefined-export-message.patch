@@ -1,0 +1,14 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -37315,8 +37315,8 @@ static int add_module_variables(JSContext *ctx, JSModuleDef *m,
+             idx = find_closure_var(ctx, fd, me->local_name);
+             if (idx < 0) {
+                 // XXX: add_module_variables() should take JSParseState *s and use js_parse_error_atom
+-                JS_ThrowSyntaxErrorAtom(ctx, "exported variable '%s' does not exist",
+-                                        me->local_name);
++                JS_ThrowSyntaxErrorAtom(ctx, "Export '%s' is not defined in module",
++                                        me->local_name);
+                 return -1;
+             }
+             me->u.local.var_idx = idx;
