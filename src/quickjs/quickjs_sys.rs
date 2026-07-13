@@ -544,6 +544,7 @@ unsafe extern "C" {
   pub fn JS_PromiseState(ctx: *mut JSContext, promise: JSValue) -> c_int;
   pub fn JS_PromiseResult(ctx: *mut JSContext, promise: JSValue) -> JSValue;
   pub fn JS_IsPromise(v: JSValue) -> bool;
+  pub fn JS_PromiseMarkAsHandled(ctx: *mut JSContext, promise: JSValue);
   pub fn JS_SetHostPromiseRejectionTracker(
     rt: *mut JSRuntime,
     cb: Option<JSHostPromiseRejectionTracker>,

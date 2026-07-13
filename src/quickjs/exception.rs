@@ -808,7 +808,11 @@ pub extern "C" fn v8__Promise__State(this: *const Promise) -> PromiseState {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Promise__MarkAsHandled(this: *const Promise) {
-  let _ = this;
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return;
+  }
+  unsafe { JS_PromiseMarkAsHandled(ctx, jsval_of(this)) };
 }
 
 #[unsafe(no_mangle)]

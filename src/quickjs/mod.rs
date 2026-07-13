@@ -38,6 +38,8 @@ mod raw_smoke_test {
   use std::sync::atomic::Ordering;
 
   static PREPARE_STACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+  static UNHANDLED_REJECTIONS: AtomicUsize = AtomicUsize::new(0);
+  static HANDLED_REJECTIONS: AtomicUsize = AtomicUsize::new(0);
 
   unsafe extern "C" fn test_prepare_stack_trace(
     ctx: *mut JSContext,
@@ -47,6 +49,20 @@ mod raw_smoke_test {
   ) -> JSValue {
     PREPARE_STACK_CALLS.fetch_add(1, Ordering::SeqCst);
     unsafe { JS_NewString(ctx, c"embedder stack".as_ptr()) }
+  }
+
+  unsafe extern "C" fn test_promise_rejection_tracker(
+    _ctx: *mut JSContext,
+    _promise: JSValue,
+    _reason: JSValue,
+    is_handled: std::ffi::c_int,
+    _opaque: *mut std::ffi::c_void,
+  ) {
+    if is_handled == 0 {
+      UNHANDLED_REJECTIONS.fetch_add(1, Ordering::SeqCst);
+    } else {
+      HANDLED_REJECTIONS.fetch_add(1, Ordering::SeqCst);
+    }
   }
 
   #[test]
@@ -184,6 +200,45 @@ mod raw_smoke_test {
 
       JS_FreeCString(ctx, text);
       JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
+  fn marking_rejected_promise_handled_notifies_tracker() {
+    unsafe {
+      UNHANDLED_REJECTIONS.store(0, Ordering::SeqCst);
+      HANDLED_REJECTIONS.store(0, Ordering::SeqCst);
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      JS_SetHostPromiseRejectionTracker(
+        rt,
+        Some(test_promise_rejection_tracker),
+        ptr::null_mut(),
+      );
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = c"Promise.reject('boom')";
+      let promise = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"mark-promise-handled.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(promise.tag != JS_TAG_EXCEPTION, "eval threw");
+      assert_eq!(UNHANDLED_REJECTIONS.load(Ordering::SeqCst), 1);
+      assert_eq!(HANDLED_REJECTIONS.load(Ordering::SeqCst), 0);
+
+      JS_PromiseMarkAsHandled(ctx, promise);
+      JS_PromiseMarkAsHandled(ctx, promise);
+      assert_eq!(UNHANDLED_REJECTIONS.load(Ordering::SeqCst), 1);
+      assert_eq!(HANDLED_REJECTIONS.load(Ordering::SeqCst), 1);
+
+      JS_FreeValue(ctx, promise);
       JS_FreeContext(ctx);
       JS_FreeRuntime(rt);
     }
