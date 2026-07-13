@@ -1032,6 +1032,7 @@ mod api_test {
 
     assert_temporal_support();
     assert_finalization_registry_token_is_weak();
+    assert_unbound_script_preserves_origin();
     assert_continuation_data_survives_await();
     assert_snapshot_context_data_preserves_global_identity();
 
@@ -1082,6 +1083,73 @@ mod api_test {
     let script = v8::Script::compile(scope, check, None).unwrap();
     let result = script.run(scope).unwrap();
     assert_eq!(result.to_rust_string_lossy(scope), "closed,token-collected");
+  }
+
+  fn assert_unbound_script_preserves_origin() {
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let resource_name = "/some/path/to/file/users-source-code.js";
+    let resource_name_value = v8::String::new(scope, resource_name).unwrap();
+    let origin = v8::ScriptOrigin::new(
+      scope,
+      resource_name_value.into(),
+      0,
+      0,
+      false,
+      -1,
+      None,
+      false,
+      false,
+      false,
+      None,
+    );
+    let code = v8::String::new(scope, "new Error().stack").unwrap();
+    let mut source = v8::script_compiler::Source::new(code, Some(&origin));
+    let unbound = v8::script_compiler::compile_unbound_script(
+      scope,
+      &mut source,
+      v8::script_compiler::CompileOptions::NoCompileOptions,
+      v8::script_compiler::NoCacheReason::NoReason,
+    )
+    .unwrap();
+    let other_resource_name = "/some/other/source.js";
+    let other_resource_name_value =
+      v8::String::new(scope, other_resource_name).unwrap();
+    let other_origin = v8::ScriptOrigin::new(
+      scope,
+      other_resource_name_value.into(),
+      0,
+      0,
+      false,
+      -1,
+      None,
+      false,
+      false,
+      false,
+      None,
+    );
+    let mut other_source =
+      v8::script_compiler::Source::new(code, Some(&other_origin));
+    let other_unbound = v8::script_compiler::compile_unbound_script(
+      scope,
+      &mut other_source,
+      v8::script_compiler::CompileOptions::NoCompileOptions,
+      v8::script_compiler::NoCacheReason::NoReason,
+    )
+    .unwrap();
+
+    for (script, expected_name) in [
+      (unbound, resource_name),
+      (other_unbound, other_resource_name),
+    ] {
+      let script = script.bind_to_current_context(scope);
+      let result = script.run(scope).unwrap().to_rust_string_lossy(scope);
+      assert!(result.contains(expected_name), "unexpected stack: {result}");
+    }
   }
 
   fn assert_temporal_support() {

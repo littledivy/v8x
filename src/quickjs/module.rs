@@ -38,8 +38,9 @@ use std::ptr;
 use crate::quickjs::core::{
   ctx_of, current_ctx, current_host_defined_options, current_iso,
   current_script_name_or_source_url, intern, intern_ctx, intern_dup, iso_state,
-  jsval_of, note_compilation_cache_miss, note_compiled_bytecode,
-  record_script_host_defined_options,
+  jsval_of, new_script_value, note_compilation_cache_miss,
+  note_compiled_bytecode, record_script_host_defined_options,
+  record_script_resource_name, script_source_value,
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::{
@@ -212,8 +213,16 @@ pub(crate) fn bc_key(source: &str, module_name: &str) -> u64 {
   fast_content_hash(seed, source.as_bytes())
 }
 
-pub(crate) fn script_bc_key(eval_flags: u64, source: &[u8]) -> u64 {
-  fast_content_hash(versioned_bc_seed(0x5343_5249 ^ eval_flags), source)
+pub(crate) fn script_bc_key(
+  eval_flags: u64,
+  source: &[u8],
+  resource_name: &[u8],
+) -> u64 {
+  let seed = fast_content_hash(
+    versioned_bc_seed(0x5343_5249 ^ eval_flags),
+    resource_name,
+  );
+  fast_content_hash(seed, source)
 }
 
 #[cfg(test)]
@@ -225,6 +234,14 @@ mod cache_key_tests {
     assert_ne!(
       bc_key("export const value = 1;", "file:///a.ts"),
       bc_key("export const value = 1;", "file:///b.ts")
+    );
+  }
+
+  #[test]
+  fn script_bytecode_cache_key_includes_name() {
+    assert_ne!(
+      script_bc_key(0, b"1 + 1", b"file:///a.ts"),
+      script_bc_key(0, b"1 + 1", b"file:///b.ts")
     );
   }
 
@@ -3764,11 +3781,17 @@ pub extern "C" fn v8__ScriptCompiler__Compile(
   note_compilation_cache_miss();
   unsafe { JS_FreeValue(ctx, compiled) };
 
-  record_script_source_map_url(src_val, source_map_url);
-  let script = intern_dup::<Script>(ctx, src_val);
+  let script_value = new_script_value(ctx, text.as_bytes());
+  if script_value.tag == JS_TAG_EXCEPTION {
+    return ptr::null();
+  }
+  record_script_source_map_url(script_value, source_map_url);
+  let script = intern::<Script>(script_value);
   unsafe {
     record_script_host_defined_options(script, host_defined_options_of(source));
   }
+  let name = unsafe { resource_name_of(ctx, source) };
+  record_script_resource_name(script, &name);
   script
 }
 
@@ -4082,8 +4105,18 @@ pub extern "C" fn v8__ScriptCompiler__CompileUnboundScript(
   }
   note_compiled_bytecode(isolate, len);
   unsafe { JS_FreeValue(ctx, compiled) };
-  record_script_source_map_url(src_val, source_map_url);
-  intern_dup::<UnboundScript>(ctx, src_val)
+  let script_value = new_script_value(ctx, text.as_bytes());
+  if script_value.tag == JS_TAG_EXCEPTION {
+    return ptr::null();
+  }
+  record_script_source_map_url(script_value, source_map_url);
+  let script = intern::<UnboundScript>(script_value);
+  unsafe {
+    record_script_host_defined_options(script, host_defined_options_of(source));
+  }
+  let name = unsafe { resource_name_of(ctx, source) };
+  record_script_resource_name(script, &name);
+  script
 }
 
 #[unsafe(no_mangle)]
@@ -4110,7 +4143,12 @@ pub extern "C" fn v8__UnboundScript__GetSourceMappingURL(
     if ctx.is_null() {
       return None;
     }
-    let text = unsafe { jsval_to_rust(ctx, value) };
+    let source = script_source_value(ctx, script);
+    if source.tag == JS_TAG_EXCEPTION {
+      return None;
+    }
+    let text = unsafe { jsval_to_rust(ctx, source) };
+    unsafe { JS_FreeValue(ctx, source) };
     extract_source_mapping_url(&text)
   });
   if let Some(url) = url {

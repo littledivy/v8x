@@ -55,6 +55,13 @@ pub(crate) type WeakCallback = unsafe extern "C" fn(*const c_void);
 
 unsafe extern "C" {
   fn v82jsc_snapshot_capture_intrinsics(ctx: *mut JSContext, registry: JSValue);
+  fn JS_DefinePropertyValueStr(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: *const c_char,
+    val: JSValue,
+    flags: c_int,
+  ) -> c_int;
 }
 
 pub(crate) struct WeakHandle {
@@ -2047,15 +2054,114 @@ fn push_current_host_defined_options(
 }
 
 pub(crate) fn record_script_host_defined_options(
-  script: *const crate::Script,
+  script: *const impl Sized,
   options: *const Data,
 ) {
-  if script.is_null() || options.is_null() {
+  let Some(key) = script_metadata_key(script) else {
     return;
-  }
+  };
   SCRIPT_HOST_DEFINED_OPTIONS.with(|m| {
-    m.borrow_mut().insert(script as usize, options as usize);
+    let mut options_by_script = m.borrow_mut();
+    if options_by_script.len() > 256 && !options_by_script.contains_key(&key) {
+      options_by_script.clear();
+    }
+    if options.is_null() {
+      options_by_script.remove(&key);
+    } else {
+      options_by_script.insert(key, options as usize);
+    }
   });
+}
+
+pub(crate) fn record_script_resource_name(
+  script: *const impl Sized,
+  name: &str,
+) {
+  let Some(key) = script_metadata_key(script) else {
+    return;
+  };
+  SCRIPT_RESOURCE_NAMES.with(|names| {
+    let mut names = names.borrow_mut();
+    if names.len() > 256 && !names.contains_key(&key) {
+      names.clear();
+    }
+    if name.is_empty() {
+      names.remove(&key);
+    } else if let Ok(name) = std::ffi::CString::new(name) {
+      names.insert(key, name);
+    }
+  });
+}
+
+fn script_metadata_key(script: *const impl Sized) -> Option<usize> {
+  if script.is_null() {
+    return None;
+  }
+  let value = jsval_of(script);
+  match value.tag {
+    JS_TAG_STRING | JS_TAG_STRING_ROPE | JS_TAG_OBJECT => {
+      let key = jsv_get_ptr(&value) as usize;
+      (key != 0).then_some(key)
+    }
+    _ => Some(script as usize),
+  }
+}
+
+pub(crate) fn new_script_value(ctx: *mut JSContext, source: &[u8]) -> JSValue {
+  if ctx.is_null() {
+    return jsv_exception();
+  }
+  let script = unsafe { JS_NewObject(ctx) };
+  if script.tag == JS_TAG_EXCEPTION {
+    return script;
+  }
+  let source = unsafe {
+    JS_NewStringLen(
+      ctx,
+      source.as_ptr() as *const std::ffi::c_char,
+      source.len(),
+    )
+  };
+  if source.tag == JS_TAG_EXCEPTION {
+    unsafe { JS_FreeValue(ctx, script) };
+    return source;
+  }
+  let result = unsafe {
+    JS_DefinePropertyValueStr(
+      ctx,
+      script,
+      c"__v8x_script_source".as_ptr(),
+      source,
+      0,
+    )
+  };
+  if result < 0 {
+    unsafe { JS_FreeValue(ctx, script) };
+    return jsv_exception();
+  }
+  script
+}
+
+pub(crate) fn script_source_value(
+  ctx: *mut JSContext,
+  script: *const impl Sized,
+) -> JSValue {
+  if ctx.is_null() || script.is_null() {
+    return jsv_exception();
+  }
+  let value = jsval_of(script);
+  if value.tag == JS_TAG_OBJECT {
+    let source =
+      unsafe { JS_GetPropertyStr(ctx, value, c"__v8x_script_source".as_ptr()) };
+    if source.tag == JS_TAG_EXCEPTION
+      || source.tag == JS_TAG_STRING
+      || source.tag == JS_TAG_STRING_ROPE
+    {
+      return source;
+    }
+    unsafe { JS_FreeValue(ctx, source) };
+  }
+  unsafe { JS_DupValue(ctx, value) }
 }
 
 pub(crate) fn current_host_defined_options() -> *const Data {
@@ -2200,38 +2306,34 @@ pub extern "C" fn v8__Script__Compile(
         url_ptr,
         global_eval_flags() | JS_EVAL_FLAG_COMPILE_ONLY,
       );
-      JS_FreeCString(ctx, cstr);
       if compiled.tag == JS_TAG_EXCEPTION {
+        JS_FreeCString(ctx, cstr);
         stamp_syntax_error_location(ctx, name.as_ref());
         return ptr::null();
       }
       note_compiled_bytecode(current_iso(), compile_len);
       note_compilation_cache_miss();
+      let script_source = new_script_value(
+        ctx,
+        std::slice::from_raw_parts(compile_ptr as *const u8, compile_len),
+      );
       JS_FreeValue(ctx, compiled);
-      if let Some(text) = rewritten {
-        let script_source =
-          JS_NewStringLen(ctx, text.as_ptr() as *const c_char, text.len());
-        let handle = intern::<crate::Script>(script_source);
-        record_script_host_defined_options(handle, host_defined_options);
-        if !handle.is_null()
-          && let Some(name) = name
-        {
-          SCRIPT_RESOURCE_NAMES
-            .with(|m| m.borrow_mut().insert(handle as usize, name));
-        }
-        return handle;
+      JS_FreeCString(ctx, cstr);
+      if script_source.tag == JS_TAG_EXCEPTION {
+        return ptr::null();
       }
+      let handle = intern::<crate::Script>(script_source);
+      record_script_host_defined_options(handle, host_defined_options);
+      let name = name.and_then(|name| name.into_string().ok());
+      record_script_resource_name(handle, name.as_deref().unwrap_or(""));
+      return handle;
     }
   }
 
   let handle = intern_dup::<crate::Script>(ctx, jsval_of(source));
   record_script_host_defined_options(handle, host_defined_options);
-  if !handle.is_null()
-    && let Some(name) = name
-  {
-    SCRIPT_RESOURCE_NAMES
-      .with(|m| m.borrow_mut().insert(handle as usize, name));
-  }
+  let name = name.and_then(|name| name.into_string().ok());
+  record_script_resource_name(handle, name.as_deref().unwrap_or(""));
   handle
 }
 
@@ -2321,7 +2423,10 @@ pub extern "C" fn v8__Script__Run(
   if !iso.is_null() {
     super::isolate::run_pending_interrupts(iso);
   }
-  let src_val = jsval_of(script);
+  let src_val = script_source_value(ctx, script);
+  if src_val.tag == JS_TAG_EXCEPTION {
+    return ptr::null();
+  }
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
     let mut l = 0usize;
     let s = unsafe { JS_ToCStringLen(ctx, &mut l, src_val) };
@@ -2341,6 +2446,7 @@ pub extern "C" fn v8__Script__Run(
 
   let mut len: usize = 0;
   let cstr = unsafe { JS_ToCStringLen(ctx, &mut len, src_val) };
+  unsafe { JS_FreeValue(ctx, src_val) };
   if cstr.is_null() {
     return ptr::null();
   }
@@ -2349,10 +2455,13 @@ pub extern "C" fn v8__Script__Run(
   // Use the compile-time resource name (script URL) as the eval filename so
   // `import()` inside this script resolves relative to it; fall back to
   // `<eval>` for scripts compiled without a ScriptOrigin.
-  let fname_owned =
-    SCRIPT_RESOURCE_NAMES.with(|m| m.borrow_mut().remove(&(script as usize)));
-  let host_defined_options = SCRIPT_HOST_DEFINED_OPTIONS
-    .with(|m| m.borrow().get(&(script as usize)).copied());
+  let script_key = script_metadata_key(script);
+  let fname_owned = script_key.and_then(|key| {
+    SCRIPT_RESOURCE_NAMES.with(|m| m.borrow().get(&key).cloned())
+  });
+  let host_defined_options = script_key.and_then(|key| {
+    SCRIPT_HOST_DEFINED_OPTIONS.with(|m| m.borrow().get(&key).copied())
+  });
   let fname_ptr = match fname_owned.as_ref() {
     Some(name) => name.as_ptr(),
     None => c"<eval>".as_ptr(),
@@ -2374,8 +2483,13 @@ pub extern "C" fn v8__Script__Run(
   // sloppy-mode bytecode.
   let eval_flags = global_eval_flags();
   let src_str = std::str::from_utf8(source_bytes).ok();
-  let bc_key = src_str
-    .map(|s| super::module::script_bc_key(eval_flags as u64, s.as_bytes()));
+  let resource_name = fname_owned
+    .as_ref()
+    .map(|name| name.as_bytes())
+    .unwrap_or(b"<eval>");
+  let bc_key = src_str.map(|s| {
+    super::module::script_bc_key(eval_flags as u64, s.as_bytes(), resource_name)
+  });
   let mut result = JSValue {
     u: JSValueUnion { int32: 0 },
     tag: JS_TAG_UNINITIALIZED,

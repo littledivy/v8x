@@ -1825,6 +1825,14 @@ mod cdp {
     })
   }
 
+  fn inspector_script_url(url: &str) -> String {
+    if url.starts_with('/') {
+      format!("file://{url}")
+    } else {
+      url.to_string()
+    }
+  }
+
   fn utf16_offset_from_byte(source: &str, byte_offset: usize) -> usize {
     let mut byte_offset = byte_offset.min(source.len());
     while !source.is_char_boundary(byte_offset) {
@@ -2009,7 +2017,7 @@ mod cdp {
   ) -> JSValue {
     let mut scripts = BTreeMap::<String, Vec<FunctionCoverageData>>::new();
     for function in functions {
-      let url = function.url.clone();
+      let url = inspector_script_url(&function.url);
       if let Some(function) = function_coverage_data(function) {
         scripts.entry(url).or_default().push(function);
       }
