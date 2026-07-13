@@ -381,6 +381,14 @@ pub(crate) unsafe fn bc_write(ctx: *mut JSContext, key: u64, obj: JSValue) {
 
 type ImportAttribute = (std::string::String, std::string::String, i32);
 
+#[derive(Clone)]
+struct DeferredImport {
+  id: u64,
+  specifier: std::string::String,
+  source_offset: i32,
+  attributes: Vec<ImportAttribute>,
+}
+
 struct ModuleState {
   context: *mut JSContext,
   status: ModuleStatus,
@@ -398,6 +406,7 @@ struct ModuleState {
   import_attributes: Vec<Vec<ImportAttribute>>,
 
   source_imports: Vec<(u64, std::string::String)>,
+  deferred_imports: Vec<DeferredImport>,
 
   synthetic: bool,
   engine_synthetic: bool,
@@ -2074,6 +2083,172 @@ fn rewrite_source_phase(
   (out, records)
 }
 
+fn rewrite_deferred_imports(
+  src: &str,
+) -> (std::string::String, Vec<DeferredImport>) {
+  if !src.contains("import defer") {
+    return (src.to_string(), Vec::new());
+  }
+  let bytes = src.as_bytes();
+  let mut out = std::string::String::with_capacity(src.len());
+  let mut records = Vec::new();
+  let mut i = 0usize;
+  let mut last = 0usize;
+  while i < bytes.len() {
+    let boundary = i == 0
+      || matches!(
+        bytes[i - 1],
+        b'\n' | b'\r' | b';' | b'{' | b'}' | b' ' | b'\t'
+      );
+    if boundary
+      && src[i..].starts_with("import")
+      && let Some((consumed, binding, specifier, specifier_offset)) =
+        parse_deferred_import_at(&src[i..])
+    {
+      out.push_str(&src[last..i]);
+      let id = next_src_phase_id();
+      out.push_str(&format!(
+        "const {binding}=globalThis.__v82jsc_defer_ns.get({id});"
+      ));
+      let statement = &src[i..i + consumed];
+      let mut attributes =
+        compute_import_attributes(statement, std::slice::from_ref(&specifier))
+          .pop()
+          .unwrap_or_default();
+      for (_, _, offset) in &mut attributes {
+        *offset += i as i32;
+      }
+      records.push(DeferredImport {
+        id,
+        specifier,
+        source_offset: (i + specifier_offset) as i32,
+        attributes,
+      });
+      i += consumed;
+      last = i;
+      continue;
+    }
+    i += 1;
+  }
+  out.push_str(&src[last..]);
+  (out, records)
+}
+
+fn parse_deferred_import_at(
+  s: &str,
+) -> Option<(usize, std::string::String, std::string::String, usize)> {
+  let bytes = s.as_bytes();
+  let len = bytes.len();
+  let skip_ws = |mut p: usize| {
+    while p < len && bytes[p].is_ascii_whitespace() {
+      p += 1;
+    }
+    p
+  };
+  let consume_keyword = |p: usize, keyword: &str| {
+    s.get(p..)?.strip_prefix(keyword).and_then(|rest| {
+      let end = p + keyword.len();
+      let boundary = rest
+        .as_bytes()
+        .first()
+        .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_' && *c != b'$');
+      boundary.then_some(end)
+    })
+  };
+
+  let mut p = consume_keyword(0, "import")?;
+  let next = skip_ws(p);
+  if next == p {
+    return None;
+  }
+  p = consume_keyword(next, "defer")?;
+  let next = skip_ws(p);
+  if next == p || bytes.get(next) != Some(&b'*') {
+    return None;
+  }
+  p = skip_ws(next + 1);
+  p = consume_keyword(p, "as")?;
+  let next = skip_ws(p);
+  if next == p {
+    return None;
+  }
+  p = next;
+  let binding_start = p;
+  while p < len
+    && (bytes[p].is_ascii_alphanumeric()
+      || bytes[p] == b'_'
+      || bytes[p] == b'$')
+  {
+    p += 1;
+  }
+  if p == binding_start {
+    return None;
+  }
+  let binding = s[binding_start..p].to_string();
+  p = skip_ws(p);
+  p = consume_keyword(p, "from")?;
+  let next = skip_ws(p);
+  if next == p {
+    return None;
+  }
+  p = next;
+  let quote = *bytes.get(p)?;
+  if quote != b'"' && quote != b'\'' {
+    return None;
+  }
+  let specifier_offset = p;
+  p += 1;
+  let specifier_start = p;
+  while p < len && bytes[p] != quote {
+    if bytes[p] == b'\\' {
+      p += 1;
+    }
+    p += 1;
+  }
+  if p >= len {
+    return None;
+  }
+  let specifier = s[specifier_start..p].to_string();
+  p += 1;
+
+  let after_specifier = p;
+  let maybe_attributes = skip_ws(p);
+  if let Some(after_keyword) = consume_keyword(maybe_attributes, "with") {
+    p = skip_ws(after_keyword);
+    if bytes.get(p) != Some(&b'{') {
+      return None;
+    }
+    let mut depth = 1usize;
+    p += 1;
+    while p < len && depth != 0 {
+      match bytes[p] {
+        b'"' | b'\'' => p = skip_string(bytes, p, bytes[p]),
+        b'{' => {
+          depth += 1;
+          p += 1;
+        }
+        b'}' => {
+          depth -= 1;
+          p += 1;
+        }
+        _ => p += 1,
+      }
+    }
+    if depth != 0 {
+      return None;
+    }
+  } else {
+    p = after_specifier;
+  }
+  while p < len && matches!(bytes[p], b' ' | b'\t' | b'\r') {
+    p += 1;
+  }
+  if bytes.get(p) == Some(&b';') {
+    p += 1;
+  }
+  Some((p, binding, specifier, specifier_offset))
+}
+
 fn parse_source_phase_at(
   s: &str,
 ) -> Option<(usize, std::string::String, std::string::String)> {
@@ -2536,6 +2711,7 @@ pub(crate) fn tape_make_module_handle(
       import_offsets: Vec::new(),
       import_attributes: Vec::new(),
       source_imports: Vec::new(),
+      deferred_imports: Vec::new(),
       synthetic: false,
       engine_synthetic: false,
       is_async: has_top_level_await(&source),
@@ -2662,6 +2838,7 @@ fn restore_module_from_snapshot_exports_for_wrapper(
       import_offsets: Vec::new(),
       import_attributes: Vec::new(),
       source_imports: Vec::new(),
+      deferred_imports: Vec::new(),
       synthetic,
       engine_synthetic: true,
       is_async: false,
@@ -2822,18 +2999,22 @@ unsafe fn build_resolution_map(
   use std::collections::HashSet;
   let mut visited: HashSet<usize> = HashSet::new();
   let mut stack: Vec<*const Module> = vec![root];
+  let mut deferred_targets = Vec::new();
   while let Some(m) = stack.pop() {
     if !visited.insert(handle_key(m)) {
       continue;
     }
-    let Some((base, specs, attrs, src_imports)) = with_module_state(m, |st| {
-      (
-        st.module_name.clone(),
-        st.import_specifiers.clone(),
-        st.import_attributes.clone(),
-        st.source_imports.clone(),
-      )
-    }) else {
+    let Some((base, specs, attrs, src_imports, deferred_imports)) =
+      with_module_state(m, |st| {
+        (
+          st.module_name.clone(),
+          st.import_specifiers.clone(),
+          st.import_attributes.clone(),
+          st.source_imports.clone(),
+          st.deferred_imports.clone(),
+        )
+      })
+    else {
       continue;
     };
 
@@ -2842,48 +3023,37 @@ unsafe fn build_resolution_map(
         unsafe { resolve_source_import(ctx, context, scb, m, *id, spec) };
       }
     }
+    for deferred in deferred_imports {
+      let Some(resolved) = (unsafe {
+        resolve_module_import(
+          ctx,
+          context,
+          cb,
+          m,
+          &deferred.specifier,
+          &deferred.attributes,
+        )
+      }) else {
+        return false;
+      };
+      if let Some(rname) =
+        with_module_state(resolved, |st| st.module_name.clone())
+      {
+        record_resolved_module_target(&rname, &deferred.attributes, resolved);
+        if !rname.is_empty() && rname != deferred.specifier {
+          record_resolved_specifier(&base, &deferred.specifier, &rname);
+        }
+        stack.push(resolved);
+      }
+      deferred_targets.push((deferred.id, resolved));
+    }
     for (si, (spec, _ty)) in specs.into_iter().enumerate() {
-      let Ok(cspec) = CString::new(spec.as_str()) else {
-        continue;
-      };
-      let sval = unsafe { JS_NewString(ctx, cspec.as_ptr()) };
-      if sval.tag == JS_TAG_EXCEPTION {
-        let exc = unsafe { JS_GetException(ctx) };
-        unsafe { JS_FreeValue(ctx, exc) };
-        continue;
-      }
-      let spec_handle = intern::<V8String>(sval);
       let attr_pairs = attrs.get(si).map(Vec::as_slice).unwrap_or(&[]);
-      let attrs_handle = intern::<FixedArray>(unsafe {
-        build_static_import_attrs(ctx, attr_pairs)
-      });
-      if spec_handle.is_null() || attrs_handle.is_null() {
-        return false;
-      }
-
-      let (
-        Some(ctx_local),
-        Some(spec_local),
-        Some(attrs_local),
-        Some(ref_local),
-      ) = (
-        unsafe { crate::Local::from_raw(context) },
-        unsafe { crate::Local::from_raw(spec_handle) },
-        unsafe { crate::Local::from_raw(attrs_handle) },
-        unsafe { crate::Local::from_raw(m) },
-      )
-      else {
+      let Some(resolved) = (unsafe {
+        resolve_module_import(ctx, context, cb, m, &spec, attr_pairs)
+      }) else {
         return false;
       };
-      let ret = unsafe { cb(ctx_local, spec_local, attrs_local, ref_local) };
-
-      if unsafe { JS_HasException(ctx) } {
-        return false;
-      }
-      let resolved: *const Module = unsafe { std::mem::transmute(ret) };
-      if resolved.is_null() {
-        return false;
-      }
       if let Some(rname) =
         with_module_state(resolved, |st| st.module_name.clone())
       {
@@ -2895,7 +3065,107 @@ unsafe fn build_resolution_map(
       }
     }
   }
+  let mut linked = HashSet::new();
+  for (id, module) in deferred_targets {
+    if linked.insert(handle_key(module)) {
+      let module_def = unsafe { compile_module_for_instantiation(ctx, module) };
+      if module_def.is_null()
+        || unsafe { v82jsc_link_module(ctx, module_def) } < 0
+      {
+        unsafe { annotate_module_link_exception(ctx, module) };
+        with_module_state(module, |state| state.status = ModuleStatus::Errored);
+        return false;
+      }
+      with_module_state(module, |state| {
+        if state.status == ModuleStatus::Uninstantiated {
+          state.status = ModuleStatus::Instantiated;
+        }
+      });
+    }
+    if !unsafe { store_deferred_namespace(ctx, id, module) } {
+      return false;
+    }
+  }
   true
+}
+
+unsafe fn resolve_module_import(
+  ctx: *mut JSContext,
+  context: *const Context,
+  cb: ResolveModuleCallback,
+  referrer: *const Module,
+  specifier: &str,
+  attributes: &[ImportAttribute],
+) -> Option<*const Module> {
+  let specifier = CString::new(specifier).ok()?;
+  let value = unsafe { JS_NewString(ctx, specifier.as_ptr()) };
+  if value.tag == JS_TAG_EXCEPTION {
+    return None;
+  }
+  let specifier = intern::<V8String>(value);
+  let attributes =
+    intern::<FixedArray>(unsafe { build_static_import_attrs(ctx, attributes) });
+  let (Some(context), Some(specifier), Some(attributes), Some(referrer)) = (
+    unsafe { crate::Local::from_raw(context) },
+    unsafe { crate::Local::from_raw(specifier) },
+    unsafe { crate::Local::from_raw(attributes) },
+    unsafe { crate::Local::from_raw(referrer) },
+  ) else {
+    return None;
+  };
+  let resolved = unsafe { cb(context, specifier, attributes, referrer) };
+  if unsafe { JS_HasException(ctx) } {
+    return None;
+  }
+  let resolved: *const Module = unsafe { std::mem::transmute(resolved) };
+  (!resolved.is_null()).then_some(resolved)
+}
+
+unsafe fn store_deferred_namespace(
+  ctx: *mut JSContext,
+  id: u64,
+  module: *const Module,
+) -> bool {
+  let namespace =
+    v8__Module__GetModuleNamespace2(module, ModuleImportPhase::kDefer);
+  if namespace.is_null() {
+    return false;
+  }
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let mut map =
+    unsafe { JS_GetPropertyStr(ctx, global, c"__v82jsc_defer_ns".as_ptr()) };
+  if !jsv_is_object(&map) {
+    unsafe { JS_FreeValue(ctx, map) };
+    let source = c"(globalThis.__v82jsc_defer_ns=new Map())";
+    map = unsafe {
+      JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"<deferns>".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      )
+    };
+  }
+  if map.tag == JS_TAG_EXCEPTION {
+    unsafe { JS_FreeValue(ctx, global) };
+    return false;
+  }
+  let set = unsafe { JS_GetPropertyStr(ctx, map, c"set".as_ptr()) };
+  let mut args = [unsafe { JS_NewInt64(ctx, id as i64) }, unsafe {
+    JS_DupValue(ctx, jsval_of(namespace))
+  }];
+  let result = unsafe { JS_Call(ctx, set, map, 2, args.as_mut_ptr()) };
+  let ok = result.tag != JS_TAG_EXCEPTION;
+  unsafe {
+    JS_FreeValue(ctx, result);
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, args[1]);
+    JS_FreeValue(ctx, set);
+    JS_FreeValue(ctx, map);
+    JS_FreeValue(ctx, global);
+  }
+  ok
 }
 
 unsafe fn resolve_source_import(
@@ -3490,7 +3760,8 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
     unsafe { ensure_dynamic_defer_import_global(ctx) };
   }
   let input = dynamic_text.as_deref().unwrap_or(&raw_text);
-  let (text, source_imports) = rewrite_source_phase(input);
+  let (deferred_text, deferred_imports) = rewrite_deferred_imports(input);
+  let (text, source_imports) = rewrite_source_phase(&deferred_text);
   let specifier = unsafe { resource_name_of(ctx, source) };
   let fname = if specifier.is_empty() {
     "<module>".to_string()
@@ -3537,6 +3808,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
       import_offsets,
       import_attributes,
       source_imports,
+      deferred_imports,
       synthetic: false,
       engine_synthetic: false,
       is_async,
@@ -3886,15 +4158,17 @@ pub extern "C" fn v8__Module__GetModuleRequests(
   if ctx.is_null() {
     return ptr::null();
   }
-  let (specs, offsets, attrs, src_imports) = with_module_state(this, |m| {
-    (
-      m.import_specifiers.clone(),
-      m.import_offsets.clone(),
-      m.import_attributes.clone(),
-      m.source_imports.clone(),
-    )
-  })
-  .unwrap_or_default();
+  let (specs, offsets, attrs, src_imports, deferred_imports) =
+    with_module_state(this, |m| {
+      (
+        m.import_specifiers.clone(),
+        m.import_offsets.clone(),
+        m.import_attributes.clone(),
+        m.source_imports.clone(),
+        m.deferred_imports.clone(),
+      )
+    })
+    .unwrap_or_default();
 
   let arr = unsafe { JS_NewArray(ctx) };
   if arr.tag == JS_TAG_EXCEPTION {
@@ -3916,6 +4190,76 @@ pub extern "C" fn v8__Module__GetModuleRequests(
     }
     unsafe {
       JS_SetPropertyStr(ctx, req, c"__src_phase".as_ptr(), JS_NewBool(ctx, 1));
+      JS_SetPropertyStr(
+        ctx,
+        req,
+        c"__v8jsc_module_request".as_ptr(),
+        JS_NewBool(ctx, 1),
+      );
+      JS_SetPropertyUint32(ctx, arr, idx, req);
+    }
+    idx += 1;
+  }
+  for deferred in deferred_imports {
+    let req = unsafe { JS_NewObject(ctx) };
+    if req.tag == JS_TAG_EXCEPTION {
+      unsafe { JS_FreeValue(ctx, req) };
+      continue;
+    }
+    if let Ok(specifier) = CString::new(deferred.specifier) {
+      unsafe {
+        JS_SetPropertyStr(
+          ctx,
+          req,
+          c"specifier".as_ptr(),
+          JS_NewString(ctx, specifier.as_ptr()),
+        );
+      }
+    }
+    unsafe {
+      JS_SetPropertyStr(
+        ctx,
+        req,
+        c"__defer_phase".as_ptr(),
+        JS_NewBool(ctx, 1),
+      );
+      JS_SetPropertyStr(
+        ctx,
+        req,
+        c"__source_offset".as_ptr(),
+        JS_NewInt32(ctx, deferred.source_offset),
+      );
+    }
+    if !deferred.attributes.is_empty() {
+      let attributes = unsafe { JS_NewArray(ctx) };
+      if attributes.tag != JS_TAG_EXCEPTION {
+        for (index, (key, value, _)) in deferred.attributes.iter().enumerate() {
+          let (Ok(key), Ok(value)) =
+            (CString::new(key.as_str()), CString::new(value.as_str()))
+          else {
+            continue;
+          };
+          unsafe {
+            JS_SetPropertyUint32(
+              ctx,
+              attributes,
+              (index * 2) as u32,
+              JS_NewString(ctx, key.as_ptr()),
+            );
+            JS_SetPropertyUint32(
+              ctx,
+              attributes,
+              (index * 2 + 1) as u32,
+              JS_NewString(ctx, value.as_ptr()),
+            );
+          }
+        }
+        unsafe {
+          JS_SetPropertyStr(ctx, req, c"__attr_kv".as_ptr(), attributes)
+        };
+      }
+    }
+    unsafe {
       JS_SetPropertyStr(
         ctx,
         req,
@@ -4405,7 +4749,7 @@ pub extern "C" fn v8__Module__GetModuleNamespace2(
     }
     return ptr::null();
   }
-  let data = unsafe { JS_NewBigInt64(ctx, this as i64) };
+  let data = unsafe { JS_DupValue(ctx, jsval_of(this)) };
   let mut func_data = [data];
   let get = unsafe {
     JS_NewCFunctionData(
@@ -4455,14 +4799,7 @@ unsafe extern "C" fn deferred_namespace_get(
   if ctx.is_null() || argc < 2 || argv.is_null() || func_data.is_null() {
     return jsv_undefined();
   }
-  let mut module_ptr = 0i64;
-  if unsafe { JS_ToBigInt64(ctx, &mut module_ptr, *func_data) } < 0 {
-    return jsv_exception();
-  }
-  let module = module_ptr as *const Module;
-  if module.is_null() {
-    return jsv_undefined();
-  }
+  let module = func_data as *const Module;
   let property = unsafe { *argv.add(1) };
   if jsv_is_string(&property)
     && unsafe { jsval_to_rust(ctx, property) } == "then"
@@ -5350,6 +5687,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
       import_offsets: Vec::new(),
       import_attributes: Vec::new(),
       source_imports: Vec::new(),
+      deferred_imports: Vec::new(),
       synthetic: true,
       engine_synthetic: true,
       is_async: false,
@@ -5637,13 +5975,21 @@ pub extern "C" fn v8__ModuleRequest__GetPhase(
 ) -> ModuleImportPhase {
   let ctx = current_ctx();
   if !ctx.is_null() && !this.is_null() {
-    let v = unsafe {
+    let source = unsafe {
       JS_GetPropertyStr(ctx, jsval_of(this), c"__src_phase".as_ptr())
     };
-    let is_src = unsafe { JS_ToBool(ctx, v) } != 0;
-    unsafe { JS_FreeValue(ctx, v) };
-    if is_src {
+    let is_source = unsafe { JS_ToBool(ctx, source) } != 0;
+    unsafe { JS_FreeValue(ctx, source) };
+    if is_source {
       return ModuleImportPhase::kSource;
+    }
+    let deferred = unsafe {
+      JS_GetPropertyStr(ctx, jsval_of(this), c"__defer_phase".as_ptr())
+    };
+    let is_deferred = unsafe { JS_ToBool(ctx, deferred) } != 0;
+    unsafe { JS_FreeValue(ctx, deferred) };
+    if is_deferred {
+      return ModuleImportPhase::kDefer;
     }
   }
   ModuleImportPhase::kEvaluation
