@@ -400,7 +400,7 @@ pub extern "C" fn v8__Object__New__with_prototype_and_properties(
   unsafe {
     if !prototype_or_null.is_null() {
       let proto = jsval_of(prototype_or_null);
-      if !jsv_is_undefined(&proto) && !jsv_is_null(&proto) {
+      if !jsv_is_undefined(&proto) {
         JS_SetPrototype(ctx, o, proto);
       }
     }
