@@ -98,7 +98,7 @@
 @@ -64824,7 +64843,7 @@
      JS_CFUNC_DEF("getEnclosingLineNumber", 0, js_callsite_ret_undefined),
      JS_CFUNC_DEF("isEval", 0, js_callsite_ret_false),
-     JS_CFUNC_DEF("isToplevel", 0, js_callsite_ret_false),
+     JS_CFUNC_DEF("isToplevel", 0, js_callsite_istoplevel),
 -    JS_CFUNC_DEF("isConstructor", 0, js_callsite_ret_false),
 +    JS_CFUNC_DEF("isConstructor", 0, js_callsite_isconstructor),
      JS_CFUNC_DEF("isAsync", 0, js_callsite_ret_false),
