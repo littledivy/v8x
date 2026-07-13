@@ -145,6 +145,29 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn native_weakref_does_not_keep_target_alive() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let target = JS_NewObject(ctx);
+      let weak = v82jsc_new_weak_ref(ctx, target);
+      assert!(v82jsc_weak_ref_is_live(weak));
+
+      JS_FreeValue(ctx, target);
+      JS_RunGC(rt);
+      assert!(!v82jsc_weak_ref_is_live(weak));
+
+      JS_FreeValue(ctx, weak);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn synthetic_module_namespace_has_module_semantics() {
     unsafe {
       let rt = JS_NewRuntime();

@@ -251,6 +251,7 @@ struct CppGcObject {
   size: usize,
   align: usize,
   wrapper_key: Option<usize>,
+  weak_wrapper: JSValue,
 }
 
 thread_local! {
@@ -336,6 +337,28 @@ fn cppgc_mark_wrapper_key(wrapper_key: usize) -> bool {
     cppgc_mark_object(object as *mut RustObj);
   }
   found
+}
+
+unsafe fn cppgc_new_weak_wrapper(
+  ctx: *mut JSContext,
+  wrapper: JSValue,
+) -> JSValue {
+  let weak = unsafe { v82jsc_new_weak_ref(ctx, wrapper) };
+  if weak.tag == JS_TAG_EXCEPTION {
+    let exception = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exception) };
+    return jsv_undefined();
+  }
+  weak
+}
+
+unsafe fn cppgc_weak_wrapper_is_live(weak: JSValue) -> bool {
+  if jsv_is_undefined(&weak) {
+    // WeakRef is a standard QuickJS intrinsic. Be conservative if creating it
+    // failed so a live native object can never become a dangling wrapper.
+    return true;
+  }
+  unsafe { v82jsc_weak_ref_is_live(weak) }
 }
 
 fn cppgc_value_has_wrapper_marker(ctx: *mut JSContext, value: JSValue) -> bool {
@@ -447,10 +470,19 @@ fn cppgc_collect_garbage() {
   CPPGC_TRACE_MARKS.with(|trace_marks| {
     let previous = trace_marks.replace(&mut marks);
     if !ctx.is_null() {
-      unsafe {
-        let global = JS_GetGlobalObject(ctx);
-        cppgc_mark_global_properties(ctx, global);
-        JS_FreeValue(ctx, global);
+      let roots = CPPGC_OBJECTS.with(|objects| {
+        objects
+          .borrow()
+          .iter()
+          .filter(|object| {
+            object.wrapper_key.is_some()
+              && unsafe { cppgc_weak_wrapper_is_live(object.weak_wrapper) }
+          })
+          .map(|object| object.ptr)
+          .collect::<Vec<_>>()
+      });
+      for root in roots {
+        cppgc_mark_object(root as *mut RustObj);
       }
     }
     trace_marks.set(previous);
@@ -471,6 +503,9 @@ fn cppgc_collect_garbage() {
 
   for object in dropped {
     unsafe {
+      if !ctx.is_null() {
+        JS_FreeValue(ctx, object.weak_wrapper);
+      }
       rusty_v8_RustObj_drop(object.ptr as *mut RustObj);
       if let Ok(layout) =
         std::alloc::Layout::from_size_align(object.size, object.align)
@@ -505,13 +540,24 @@ pub(crate) fn cppgc_register_wrapper(wrapper: JSValue, value: *const RustObj) {
     }
   }
   let wrapper_key = unsafe { wrapper.u.ptr } as usize;
+  let weak_wrapper = if ctx.is_null() {
+    jsv_undefined()
+  } else {
+    unsafe { cppgc_new_weak_wrapper(ctx, wrapper) }
+  };
   CPPGC_OBJECTS.with(|objects| {
     if let Some(object) = objects
       .borrow_mut()
       .iter_mut()
       .find(|object| object.ptr == value as usize)
     {
+      if !ctx.is_null() {
+        unsafe { JS_FreeValue(ctx, object.weak_wrapper) };
+      }
       object.wrapper_key = Some(wrapper_key);
+      object.weak_wrapper = weak_wrapper;
+    } else if !ctx.is_null() {
+      unsafe { JS_FreeValue(ctx, weak_wrapper) };
     }
   });
 }
@@ -687,6 +733,7 @@ pub extern "C" fn cppgc__make_garbage_collectable(
         size,
         align,
         wrapper_key: None,
+        weak_wrapper: jsv_undefined(),
       });
     });
   }

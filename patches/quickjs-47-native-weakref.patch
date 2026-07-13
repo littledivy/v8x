@@ -1,0 +1,81 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -929,6 +929,8 @@ JS_EXTERN bool JS_IsRegExp(JSValueConst val);
+ JS_EXTERN bool JS_IsMap(JSValueConst val);
+ JS_EXTERN bool JS_IsSet(JSValueConst val);
+ JS_EXTERN bool JS_IsWeakRef(JSValueConst val);
++JS_EXTERN JSValue v82jsc_new_weak_ref(JSContext *ctx, JSValueConst target);
++JS_EXTERN bool v82jsc_weak_ref_is_live(JSValueConst weak_ref);
+ JS_EXTERN bool JS_IsWeakSet(JSValueConst val);
+ JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
+ JS_EXTERN bool JS_IsDataView(JSValueConst val);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -64977,16 +64977,17 @@ void JS_ClearKeptObjects(JSRuntime *rt)
+     }
+ }
+ 
+-static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
+-                                      int argc, JSValueConst *argv)
++static JSValue js_weakref_create(JSContext *ctx, JSValueConst new_target,
++                                 JSValueConst target, bool keep_target)
+ {
+-    if (JS_IsUndefined(new_target))
+-        return JS_ThrowTypeError(ctx, "constructor requires 'new'");
+-    JSValueConst arg = argv[0];
+-    if (!is_valid_weakref_target(arg))
++    if (!is_valid_weakref_target(target))
+         return JS_ThrowTypeError(ctx, "invalid target");
+     // TODO(saghul): short-circuit if the refcount is 1?
+-    JSValue obj = js_create_from_ctor(ctx, new_target, JS_CLASS_WEAK_REF);
++    JSValue obj;
++    if (JS_IsUndefined(new_target))
++        obj = JS_NewObjectClass(ctx, JS_CLASS_WEAK_REF);
++    else
++        obj = js_create_from_ctor(ctx, new_target, JS_CLASS_WEAK_REF);
+     if (JS_IsException(obj))
+         return JS_EXCEPTION;
+     JSWeakRefData *wrd = js_malloc(ctx, sizeof(*wrd));
+@@ -65001,20 +65002,39 @@ static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
+         js_free(ctx, wrd);
+         return JS_EXCEPTION;
+     }
+-    wrd->target = arg;
++    wrd->target = target;
+     wrd->obj = obj;
+     wr->kind = JS_WEAK_REF_KIND_WEAK_REF;
+     wr->u.weak_ref_data = wrd;
+-    insert_weakref_record(arg, wr);
++    insert_weakref_record(target, wr);
+ 
+     JS_SetOpaqueInternal(obj, wrd);
+-    if (js_keep_object(ctx, arg)) {
++    if (keep_target && js_keep_object(ctx, target)) {
+         JS_FreeValue(ctx, obj);
+         return JS_EXCEPTION;
+     }
+     return obj;
+ }
+ 
++static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
++                                      int argc, JSValueConst *argv)
++{
++    if (JS_IsUndefined(new_target))
++        return JS_ThrowTypeError(ctx, "constructor requires 'new'");
++    return js_weakref_create(ctx, new_target, argv[0], true);
++}
++
++JSValue v82jsc_new_weak_ref(JSContext *ctx, JSValueConst target)
++{
++    return js_weakref_create(ctx, JS_UNDEFINED, target, false);
++}
++
++bool v82jsc_weak_ref_is_live(JSValueConst weak_ref)
++{
++    JSWeakRefData *wrd = JS_GetOpaque(weak_ref, JS_CLASS_WEAK_REF);
++    return wrd && wrd != &js_weakref_sentinel;
++}
++
+ static JSValue js_weakref_deref(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+ {
+     JSWeakRefData *wrd = JS_GetOpaque2(ctx, this_val, JS_CLASS_WEAK_REF);
