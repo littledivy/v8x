@@ -304,6 +304,8 @@ pub(crate) struct IsoState {
 
   pub atomics_waiter_resolvers: HashMap<u64, (*mut JSContext, JSValue)>,
 
+  pub math_random_states: HashMap<usize, super::init::V8MathRandom>,
+
   pub data_slots: [*mut c_void; 4],
 
   // QuickJS class id for `v8::External` objects. Registered on the runtime
@@ -830,6 +832,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     persistent_handles: Vec::new(),
     private_symbols: Vec::new(),
     atomics_waiter_resolvers: HashMap::new(),
+    math_random_states: HashMap::new(),
     data_slots: [ptr::null_mut(); 4],
     ext_class_id,
     named_handler_class_id,
@@ -1273,6 +1276,10 @@ pub(crate) fn install_default_globals(
   }
   unsafe {
     let global = JS_GetGlobalObject(ctx);
+    if super::init::random_seed().is_some() || super::init::has_entropy_source()
+    {
+      install_entropy_math_random(ctx, global);
+    }
     refresh_snapshot_intrinsics(ctx);
 
     let existing = JS_GetPropertyStr(ctx, global, c"console".as_ptr());
@@ -1312,9 +1319,6 @@ pub(crate) fn install_default_globals(
       JS_SetPropertyStr(ctx, global, c"gc".as_ptr(), gc_fn);
     }
 
-    if super::init::has_entropy_source() {
-      install_entropy_math_random(ctx, global);
-    }
     super::isolate::install_shadow_realm(ctx, global);
     super::module::install_dynamic_source_import_global(ctx, global);
     super::arraybuffer::install_array_buffer_constructor(isolate, ctx, global);
@@ -1786,6 +1790,17 @@ unsafe extern "C" fn qjs_entropy_random(
   _argc: c_int,
   _argv: *mut JSValue,
 ) -> JSValue {
+  if let Some(seed) = super::init::random_seed() {
+    let isolate = current_iso();
+    if !isolate.is_null() {
+      let value = iso_state(isolate)
+        .math_random_states
+        .entry(ctx as usize)
+        .or_insert_with(|| super::init::V8MathRandom::new(seed))
+        .next();
+      return unsafe { JS_NewFloat64(ctx, value) };
+    }
+  }
   let mut bytes = [0u8; 8];
   if !super::init::fill_entropy(&mut bytes) {
     return unsafe { JS_NewFloat64(ctx, 0.0) };

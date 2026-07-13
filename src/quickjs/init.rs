@@ -8,7 +8,7 @@ use crate::Platform;
 use crate::support::{SharedPtrBase, UniquePtr, long};
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
 
 type RawEntropySource = unsafe extern "C" fn(*mut u8, usize) -> bool;
 
@@ -31,8 +31,61 @@ struct QuickJsForegroundTask {
 
 static ENTROPY_SOURCE: AtomicPtr<std::ffi::c_void> =
   AtomicPtr::new(ptr::null_mut());
+static RANDOM_SEED: AtomicI64 = AtomicI64::new(0);
 static CURRENT_PLATFORM: AtomicPtr<std::ffi::c_void> =
   AtomicPtr::new(ptr::null_mut());
+
+pub(crate) struct V8MathRandom {
+  state0: u64,
+  state1: u64,
+  cache: [f64; 64],
+  index: usize,
+}
+
+impl V8MathRandom {
+  pub(crate) fn new(seed: u64) -> Self {
+    Self {
+      state0: murmur_hash3(seed),
+      state1: murmur_hash3(!seed),
+      cache: [0.0; 64],
+      index: 0,
+    }
+  }
+
+  pub(crate) fn next(&mut self) -> f64 {
+    if self.index == 0 {
+      for value in &mut self.cache {
+        let mut state1 = self.state0;
+        let state0 = self.state1;
+        self.state0 = state0;
+        state1 ^= state1 << 23;
+        state1 ^= state1 >> 17;
+        state1 ^= state0;
+        state1 ^= state0 >> 26;
+        self.state1 = state1;
+        *value =
+          ((state0.wrapping_add(state1)) >> 11) as f64 / ((1u64 << 53) as f64);
+      }
+      self.index = self.cache.len();
+    }
+    self.index -= 1;
+    self.cache[self.index]
+  }
+}
+
+fn murmur_hash3(mut value: u64) -> u64 {
+  value ^= value >> 33;
+  value = value.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+  value ^= value >> 33;
+  value = value.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+  value ^= value >> 33;
+  value
+}
+
+pub(crate) fn random_seed() -> Option<u64> {
+  let seed = RANDOM_SEED.load(Ordering::Relaxed);
+  (seed != 0).then_some(seed as u64)
+}
 
 pub(crate) fn has_entropy_source() -> bool {
   !ENTROPY_SOURCE.load(Ordering::SeqCst).is_null()
@@ -172,6 +225,7 @@ pub extern "C" fn v8__V8__SetFlagsFromCommandLine(
 enum V8Flag {
   ForceStrict(bool),
   StackSize(usize),
+  RandomSeed(i32),
   Help,
   Noop,
 }
@@ -193,6 +247,9 @@ fn parse_v8_flag(flag: &str) -> Option<V8Flag> {
     "external_memory_max_reasonable_size" | "max_old_space_size" => value
       .and_then(|value| value.parse::<usize>().ok())
       .map(|_| V8Flag::Noop),
+    "random_seed" => value
+      .and_then(|value| value.parse::<i32>().ok())
+      .map(V8Flag::RandomSeed),
     "inspector_live_edit" | "no_inspector_live_edit" if value.is_none() => {
       Some(V8Flag::Noop)
     }
@@ -220,6 +277,10 @@ fn consume_v8_flag(flag: &str) -> bool {
     Some(V8Flag::StackSize(bytes)) => {
       crate::quickjs::core::MAX_STACK_SIZE
         .store(bytes, std::sync::atomic::Ordering::Relaxed);
+      true
+    }
+    Some(V8Flag::RandomSeed(seed)) => {
+      RANDOM_SEED.store(seed as i64, Ordering::Relaxed);
       true
     }
     Some(V8Flag::Help) => {
@@ -251,7 +312,7 @@ pub extern "C" fn v8__V8__SetFlagsFromString(flags: *const u8, length: usize) {
 
 #[cfg(test)]
 mod tests {
-  use super::{V8Flag, parse_v8_flag};
+  use super::{V8Flag, V8MathRandom, parse_v8_flag};
 
   #[test]
   fn parses_deno_v8_flags() {
@@ -271,6 +332,10 @@ mod tests {
     assert_eq!(parse_v8_flag("--expose-gc"), Some(V8Flag::Noop));
     assert_eq!(parse_v8_flag("--trace-gc"), Some(V8Flag::Noop));
     assert_eq!(parse_v8_flag("--jitless"), Some(V8Flag::Noop));
+    assert_eq!(
+      parse_v8_flag("--random-seed=100"),
+      Some(V8Flag::RandomSeed(100))
+    );
     assert_eq!(parse_v8_flag("--help"), Some(V8Flag::Help));
   }
 
@@ -278,8 +343,29 @@ mod tests {
   fn rejects_unknown_or_malformed_v8_flags() {
     assert_eq!(parse_v8_flag("--stack-size=invalid"), None);
     assert_eq!(parse_v8_flag("--external-memory-max-reasonable-size"), None);
-    assert_eq!(parse_v8_flag("--random-seed=100"), None);
+    assert_eq!(parse_v8_flag("--random-seed=invalid"), None);
     assert_eq!(parse_v8_flag("--definitely-not-a-v8-flag"), None);
+  }
+
+  #[test]
+  fn seeded_math_random_matches_v8() {
+    let mut random = V8MathRandom::new(100);
+    let actual = std::array::from_fn::<_, 10, _>(|_| random.next());
+    assert_eq!(
+      actual,
+      [
+        0.832073805523701,
+        0.7559025334996602,
+        0.050689921012231465,
+        0.5220240009004169,
+        0.7277778086273778,
+        0.06355390914564352,
+        0.45059228063692036,
+        0.12860342649349144,
+        0.9774789444449407,
+        0.8194241558700434,
+      ]
+    );
   }
 }
 
