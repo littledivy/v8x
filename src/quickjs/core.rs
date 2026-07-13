@@ -1304,9 +1304,11 @@ pub(crate) fn install_default_globals(
     let intl = JS_GetPropertyStr(ctx, global, c"Intl".as_ptr());
     let intl_absent = jsv_is_undefined(&intl) || intl.tag == JS_TAG_NULL;
     JS_FreeValue(ctx, intl);
+    super::temporal::install_host_functions(ctx, global);
     if intl_absent {
       install_intl_stub(ctx, global);
     }
+    super::temporal::install(ctx, global);
 
     let gc = JS_GetPropertyStr(ctx, global, c"gc".as_ptr());
     let gc_absent = jsv_is_undefined(&gc) || gc.tag == JS_TAG_NULL;
@@ -1817,10 +1819,49 @@ fn install_intl_stub(ctx: *mut JSContext, _global: JSValue) {
           if(l==='de-DE'&&o&&o.weekday==='long'&&o.year==='numeric'&&o.month==='long'&&o.day==='numeric') return 'Freitag, 26. Juni 2020';\
           return dateToLocaleString.call(this,l,o);\
         };\
-        function DateTimeFormat(l,o){ if(!(this instanceof DateTimeFormat)) return new DateTimeFormat(l,o); this._l=l; this._o=o; }\
-        DateTimeFormat.prototype.format=function(d){ return String(new Date(d)); };\
-        DateTimeFormat.prototype.formatToParts=function(d){ return [{type:'literal',value:String(new Date(d))}]; };\
-        DateTimeFormat.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US'),timeZone:'UTC'}; };\
+        function temporalParts(fmt,d){\
+          var ms=d===undefined?Date.now():Number(d);\
+          return g.__v8xTemporalTimeZone(ms,fmt._tz||'UTC');\
+        }\
+        function pad2(n){ return String(n).padStart(2,'0'); }\
+        function DateTimeFormat(l,o){\
+          if(!(this instanceof DateTimeFormat)) return new DateTimeFormat(l,o);\
+          this._l=l; this._o=o||{};\
+          this._tz=temporalParts({_tz:this._o.timeZone||'UTC'},0).timeZone;\
+        }\
+        DateTimeFormat.prototype.format=function(d){\
+          var p=temporalParts(this,d);\
+          return p.month+'/'+p.day+'/'+Math.abs(p.year)+' '+p.era+', '+\
+            pad2(p.hour)+':'+pad2(p.minute)+':'+pad2(p.second);\
+        };\
+        DateTimeFormat.prototype.formatToParts=function(d){\
+          var p=temporalParts(this,d);\
+          return [\
+            {type:'month',value:String(p.month)},\
+            {type:'literal',value:'/'},\
+            {type:'day',value:String(p.day)},\
+            {type:'literal',value:'/'},\
+            {type:'year',value:String(Math.abs(p.year))},\
+            {type:'literal',value:' '},\
+            {type:'era',value:p.era},\
+            {type:'literal',value:', '},\
+            {type:'hour',value:pad2(p.hour)},\
+            {type:'literal',value:':'},\
+            {type:'minute',value:pad2(p.minute)},\
+            {type:'literal',value:':'},\
+            {type:'second',value:pad2(p.second)}\
+          ];\
+        };\
+        DateTimeFormat.prototype.resolvedOptions=function(){\
+          return {\
+            locale:(this._l||'en-US'),\
+            calendar:(this._o.calendar||'iso8601'),\
+            numberingSystem:'latn',\
+            timeZone:this._tz,\
+            hourCycle:'h23',\
+            hour12:false\
+          };\
+        };\
         DateTimeFormat.supportedLocalesOf=function(l){ return Array.isArray(l)?l:(l?[l]:[]); };\
         function NumberFormat(l,o){ if(!(this instanceof NumberFormat)) return new NumberFormat(l,o); this._l=l; this._o=o; }\
         NumberFormat.prototype.format=function(n){ if(this._l==='ja-JP'&&this._o&&this._o.style==='currency'&&this._o.currency==='JPY') return '\xef\xbf\xa5'+String(Math.trunc(Number(n))).replace(/\\B(?=(\\d{3})+(?!\\d))/g,','); return String(n); };\
@@ -1844,6 +1885,26 @@ fn install_intl_stub(ctx: *mut JSContext, _global: JSValue) {
         function Segmenter(l,o){ if(!(this instanceof Segmenter)) return new Segmenter(l,o); this._l=l; }\
         Segmenter.prototype.segment=function(s){ return String(s); };\
         Segmenter.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US')}; };\
+        function DurationFormat(l,o){ if(!(this instanceof DurationFormat)) return new DurationFormat(l,o); this._l=l; this._o=o||{}; }\
+        DurationFormat.prototype.format=function(d){\
+          var style=this._o.style||'short';\
+          var units=[\
+            ['years','yr','year'],['months','mo','month'],['weeks','wk','week'],\
+            ['days','day','day'],['hours','hr','hour'],['minutes','min','minute'],\
+            ['seconds','sec','second'],['milliseconds','ms','millisecond'],\
+            ['microseconds','us','microsecond'],['nanoseconds','ns','nanosecond']\
+          ];\
+          var out=[];\
+          for(var i=0;i<units.length;i++){\
+            var value=Number(d[units[i][0]]||0);\
+            if(!value) continue;\
+            var label=style==='long'?units[i][2]+(Math.abs(value)===1?'':'s'):units[i][1];\
+            out.push(String(value)+' '+label);\
+          }\
+          return out.length?out.join(', '):'0 sec';\
+        };\
+        DurationFormat.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US'),style:(this._o.style||'short')}; };\
+        DurationFormat.supportedLocalesOf=function(l){ return Array.isArray(l)?l:(l?[l]:[]); };\
         g.Intl={\
             DateTimeFormat:DateTimeFormat,\
             NumberFormat:NumberFormat,\
@@ -1852,6 +1913,7 @@ fn install_intl_stub(ctx: *mut JSContext, _global: JSValue) {
             ListFormat:ListFormat,\
             RelativeTimeFormat:RelativeTimeFormat,\
             Segmenter:Segmenter,\
+            DurationFormat:DurationFormat,\
             getCanonicalLocales:function(l){ return Array.isArray(l)?l.slice():(l?[l]:[]); },\
         };\
     })(globalThis);\0";

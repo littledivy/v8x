@@ -670,6 +670,8 @@ dependencies = [
  "icu_locale",
  "paste",
  "temporal_capi",
+ "temporal_rs",
+ "timezone_provider",
 ]
 
 [[package]]

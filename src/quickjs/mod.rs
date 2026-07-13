@@ -26,6 +26,7 @@ mod shims;
 mod simdutf;
 pub(crate) mod snapshot;
 mod string;
+mod temporal;
 mod value;
 mod wasm;
 
@@ -1029,6 +1030,7 @@ mod api_test {
       assert_eq!(result.to_rust_string_lossy(scope), "2");
     }
 
+    assert_temporal_support();
     assert_continuation_data_survives_await();
     assert_snapshot_context_data_preserves_global_identity();
 
@@ -1036,6 +1038,36 @@ mod api_test {
       v8::V8::dispose();
     }
     v8::V8::dispose_platform();
+  }
+
+  fn assert_temporal_support() {
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let code = v8::String::new(
+      scope,
+      "try {\n\
+       const names = Object.getOwnPropertyNames(Temporal).sort().join(',');\n\
+       const duration = Temporal.Duration.from('P1DT6H30M')\n\
+         .toLocaleString('en-US');\n\
+       const transition = Temporal.ZonedDateTime.from(\n\
+         '2020-01-01T00:00:00-05:00[America/New_York]'\n\
+       ).getTimeZoneTransition('next');\n\
+       `${names}|${duration}|${transition}`;\n\
+       } catch (error) { `ERROR:${error.stack}`; }",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, code, None).unwrap();
+    let result = script.run(scope).unwrap();
+    assert_eq!(
+      result.to_rust_string_lossy(scope),
+      "Duration,Instant,Now,PlainDate,PlainDateTime,PlainMonthDay,PlainTime,\
+       PlainYearMonth,ZonedDateTime|1 day, 6 hr, 30 min|\
+       2020-03-08T03:00:00-04:00[America/New_York]"
+    );
   }
 
   fn assert_continuation_data_survives_await() {
