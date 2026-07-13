@@ -280,6 +280,24 @@ mod cache_key_tests {
   }
 
   #[test]
+  fn missing_export_location_points_to_reexport_name() {
+    let source =
+      "export { AnInterface, isAnInterface } from \"./type_and_code.ts\";";
+    let message = "SyntaxError: The requested module './type_and_code.ts' does not provide an export named 'AnInterface'";
+    assert_eq!(
+      missing_export_location(source, message),
+      Some((
+        1,
+        9,
+        Some(
+          "export { AnInterface, isAnInterface } from \"./type_and_code.ts\";"
+            .to_string()
+        )
+      ))
+    );
+  }
+
+  #[test]
   fn missing_export_location_falls_back_for_non_text_modules() {
     let message = "SyntaxError: The requested module './math.ts' does not provide an export named 'add'";
     assert_eq!(missing_export_location("", message), Some((1, 0, None)));
@@ -4971,7 +4989,16 @@ fn missing_export_location(
     let specifier_offset = source
       .find(&single_quoted)
       .or_else(|| source.find(&double_quoted))?;
-    let name_offset = source[..specifier_offset].rfind(export_name)?;
+    let name_offset = source[..specifier_offset]
+      .match_indices(export_name)
+      .filter(|(offset, _)| {
+        let before = source[..*offset].chars().next_back();
+        let after = source[offset + export_name.len()..].chars().next();
+        !before.is_some_and(js_identifier_continue)
+          && !after.is_some_and(js_identifier_continue)
+      })
+      .map(|(offset, _)| offset)
+      .last()?;
     let line_start = source[..name_offset].rfind('\n').map_or(0, |i| i + 1);
     let line_end = source[name_offset..]
       .find(['\n', '\r'])
@@ -4985,6 +5012,10 @@ fn missing_export_location(
     ))
   })();
   Some(exact.unwrap_or((1, 0, None)))
+}
+
+fn js_identifier_continue(ch: char) -> bool {
+  ch == '$' || ch == '_' || ch.is_alphanumeric()
 }
 
 unsafe fn annotate_module_link_exception(

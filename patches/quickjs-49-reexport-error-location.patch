@@ -1,0 +1,69 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -31322,37 +31322,47 @@
+-static void js_resolve_import_throw_error(JSContext *ctx,
+-                                          JSResolveResultEnum res,
+-                                          JSModuleDef *importer,
+-                                          const JSImportEntry *mi)
++static void js_resolve_requested_module_throw_error(JSContext *ctx,
++                                                     JSResolveResultEnum res,
++                                                     JSModuleDef *importer,
++                                                     int req_module_idx,
++                                                     JSAtom import_name)
+ {
+     const char *specifier;
+     const char *export_name;
+     JSValue exception;
+ 
+     if (res != JS_RESOLVE_RES_NOT_FOUND) {
+         JSModuleDef *target =
+-            importer->req_module_entries[mi->req_module_idx].module;
+-        js_resolve_export_throw_error(ctx, res, target, mi->import_name);
++            importer->req_module_entries[req_module_idx].module;
++        js_resolve_export_throw_error(ctx, res, target, import_name);
+         return;
+     }
+ 
+     specifier = JS_AtomToCString(
+-        ctx, importer->req_module_entries[mi->req_module_idx].module_name);
+-    export_name = JS_AtomToCString(ctx, mi->import_name);
++        ctx, importer->req_module_entries[req_module_idx].module_name);
++    export_name = JS_AtomToCString(ctx, import_name);
+     if (specifier && export_name) {
+         JS_ThrowSyntaxError(
+             ctx,
+             "The requested module '%s' does not provide an export named '%s'",
+             specifier, export_name);
+         exception = JS_GetException(ctx);
+         JS_SetPropertyStr(ctx, exception, "fileName",
+                           JS_AtomToString(ctx, importer->module_name));
+         JS_Throw(ctx, exception);
+     }
+     if (specifier)
+         JS_FreeCString(ctx, specifier);
+     if (export_name)
+         JS_FreeCString(ctx, export_name);
+ }
++
++static void js_resolve_import_throw_error(JSContext *ctx,
++                                          JSResolveResultEnum res,
++                                          JSModuleDef *importer,
++                                          const JSImportEntry *mi)
++{
++    js_resolve_requested_module_throw_error(
++        ctx, res, importer, mi->req_module_idx, mi->import_name);
++}
+ 
+ 
+ typedef enum {
+@@ -31877,7 +31887,8 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
+             m1 = m->req_module_entries[me->u.req_module_idx].module;
+             ret = js_resolve_export(ctx, &res_m, &res_me, m1, me->local_name);
+             if (ret != JS_RESOLVE_RES_FOUND) {
+-                js_resolve_export_throw_error(ctx, ret, m, me->export_name);
++                js_resolve_requested_module_throw_error(
++                    ctx, ret, m, me->u.req_module_idx, me->local_name);
+                 goto fail;
+             }
+         }
