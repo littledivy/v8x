@@ -96,7 +96,7 @@
      csd->native = false;
      csd->line_num = line_num;
      csd->col_num = col_num;
-@@ -64594,15 +64606,228 @@
+@@ -64594,15 +64606,243 @@
          return JS_EXCEPTION;
      int *field = (void *)((char *)csd + magic);
      return js_int32(*field);
@@ -215,6 +215,20 @@
 +    return JS_AtomToString(ctx, ctx->rt->class_array[p->class_id].class_name);
 +}
 +
++static JSValue js_callsite_istoplevel(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
++{
++    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
++    JSValue global_obj;
++    bool is_toplevel;
++
++    if (!csd)
++        return JS_EXCEPTION;
++    global_obj = JS_GetGlobalObject(ctx);
++    is_toplevel = JS_IsStrictEqual(ctx, csd->this_val, global_obj);
++    JS_FreeValue(ctx, global_obj);
++    return js_bool(is_toplevel);
++}
++
 +static JSValue js_callsite_getmethodname(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 +{
 +    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
@@ -317,7 +331,7 @@
 +    JS_CFUNC_DEF("getEnclosingColumnNumber", 0, js_callsite_ret_undefined),
 +    JS_CFUNC_DEF("getEnclosingLineNumber", 0, js_callsite_ret_undefined),
 +    JS_CFUNC_DEF("isEval", 0, js_callsite_ret_false),
-+    JS_CFUNC_DEF("isToplevel", 0, js_callsite_ret_false),
++    JS_CFUNC_DEF("isToplevel", 0, js_callsite_istoplevel),
 +    JS_CFUNC_DEF("isConstructor", 0, js_callsite_ret_false),
 +    JS_CFUNC_DEF("isAsync", 0, js_callsite_ret_false),
 +    JS_CFUNC_DEF("isPromiseAll", 0, js_callsite_ret_false),

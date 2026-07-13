@@ -2177,6 +2177,8 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
       .map(normalize_function_name);
     let type_name = unsafe { call_site_str(ctx, site, c"getTypeName") };
     let method_name = unsafe { call_site_str(ctx, site, c"getMethodName") };
+    let callsite_is_top_level =
+      unsafe { call_site_bool(ctx, site, c"isToplevel") };
     let is_constructor = unsafe { call_site_bool(ctx, site, c"isConstructor") };
     unsafe { JS_FreeValue(ctx, site) };
 
@@ -2207,25 +2209,31 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
 
     // quickjs names top-level script frames `global code` / `<eval>`; V8
     // reports none, so deno prints them as `at file:line:col` (no wrapper).
-    let is_top_level = !is_module_link_frame
+    let is_script_frame = !is_module_link_frame
       && matches!(
         func.as_deref(),
         None | Some("") | Some("global code") | Some("<eval>")
       );
+    let is_top_level = callsite_is_top_level || is_script_frame;
+    let (frame_func, frame_type, frame_method) = if is_script_frame {
+      (None, None, None)
+    } else {
+      (func.clone(), type_name.clone(), method_name.clone())
+    };
 
     frames.push((
       file.clone(),
       line,
       col,
-      func.clone(),
-      type_name.clone(),
-      method_name.clone(),
+      frame_func,
+      frame_type,
+      frame_method,
       is_top_level,
       is_constructor,
     ));
 
     out.push_str("\n    at ");
-    if is_top_level {
+    if is_script_frame {
       append_location(&mut out, &file, line, col);
     } else {
       if is_constructor {
@@ -2233,6 +2241,7 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
       }
       if let Some(func) = func.as_deref() {
         if !is_constructor
+          && !is_top_level
           && let Some(type_name) = type_name.as_deref()
           && !func.starts_with(type_name)
         {
@@ -2240,7 +2249,8 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
           out.push('.');
         }
         out.push_str(func);
-        if let Some(method_name) = method_name.as_deref()
+        if !is_top_level
+          && let Some(method_name) = method_name.as_deref()
           && !func.ends_with(method_name)
         {
           out.push_str(" [as ");
@@ -2290,7 +2300,7 @@ type PreparedFrame = (
 /// into the V8-shaped CallSite objects deno's `from_callsite_object` consumes
 /// (it calls each accessor and applies source maps to file/line/column).
 const CALLSITE_FACTORY_SRC: &str = "(function(d){return d.map(function(f){\
-  var file=f[0],line=f[1],col=f[2],top=f[6],constructor=f[7],fn=top?null:f[3],type=top?null:f[4],method=top?null:f[5];\
+  var file=f[0],line=f[1],col=f[2],top=f[6],constructor=f[7],fn=f[3],type=f[4],method=f[5];\
   return {\
     getFileName:function(){return file||undefined;},\
     getScriptNameOrSourceURL:function(){return file||undefined;},\
