@@ -1,0 +1,20 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -7408,7 +7408,17 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
+         case JS_CLASS_ARGUMENTS:         /* u.array | length */
+             s->array_count++;
+             if (p->fast_array) {
++                uint32_t logical_length;
+                 s->fast_array_count++;
++                if (JS_VALUE_GET_TAG(p->prop[0].u.value) == JS_TAG_INT)
++                    logical_length = JS_VALUE_GET_INT(p->prop[0].u.value);
++                else
++                    logical_length = JS_VALUE_GET_FLOAT64(p->prop[0].u.value);
++                if (logical_length > p->u.array.count) {
++                    /* V8 reserves one tagged slot per logical array hole. */
++                    s->memory_used_size +=
++                        (logical_length - p->u.array.count) * sizeof(uint64_t);
++                }
+                 if (p->u.array.u.values) {
+                     s->memory_used_count++;
+                     s->memory_used_size += p->u.array.count *

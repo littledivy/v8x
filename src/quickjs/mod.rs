@@ -168,6 +168,36 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn heap_usage_counts_fast_array_holes() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let mut before = JSMemoryUsage::default();
+      JS_ComputeMemoryUsage(rt, &mut before);
+      let result = JS_Eval(
+        ctx,
+        c"globalThis.holes = new Array(1_000_000)".as_ptr(),
+        c"globalThis.holes = new Array(1_000_000)".to_bytes().len(),
+        c"array-holes.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert_ne!(result.tag, JS_TAG_EXCEPTION);
+      JS_FreeValue(ctx, result);
+
+      let mut after = JSMemoryUsage::default();
+      JS_ComputeMemoryUsage(rt, &mut after);
+      assert!(after.memory_used_size - before.memory_used_size >= 8_000_000);
+
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn synthetic_module_namespace_has_module_semantics() {
     unsafe {
       let rt = JS_NewRuntime();
