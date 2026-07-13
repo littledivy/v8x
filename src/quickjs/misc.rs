@@ -1275,6 +1275,14 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
   let is_function_template =
     super::function::template_kind(data as *const c_void)
       == Some(super::function::TemplKind::Func);
+  let function_template_proto = if is_function_template {
+    super::function::snapshot_function_template_info(
+      data as *const FunctionTemplate,
+    )
+    .and_then(|info| info.cached_proto)
+  } else {
+    None
+  };
   let val = (!is_function_template).then(|| jsval_of(data));
   let bytes = if is_function_template {
     super::snapshot::serialize_function_template(
@@ -1289,13 +1297,17 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
       &external_refs,
     )
   };
-  let graph_value = val.and_then(|value| {
-    super::snapshot::duplicate_graph_serializable_value(
-      ctx,
-      value,
-      &external_refs,
-    )
-  });
+  let graph_value = if let Some(proto) = function_template_proto {
+    Some(unsafe { JS_DupValue(ctx, proto) })
+  } else {
+    val.and_then(|value| {
+      super::snapshot::duplicate_graph_serializable_value(
+        ctx,
+        value,
+        &external_refs,
+      )
+    })
+  };
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
     let Some(val) = val else {
       eprintln!(
@@ -1306,7 +1318,7 @@ pub extern "C" fn v8__SnapshotCreator__AddData_to_context(
         iso,
         ctx,
         bytes.unwrap_or_default(),
-        None,
+        graph_value,
       );
     };
     let preview = unsafe {

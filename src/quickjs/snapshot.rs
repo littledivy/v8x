@@ -500,6 +500,25 @@ pub(crate) fn deserialize_function_template(
   bytes: &[u8],
   external_refs: &[usize],
 ) -> Option<*const Data> {
+  deserialize_function_template_with_cached_proto(
+    ctx,
+    bytes,
+    external_refs,
+    None,
+  )
+}
+
+pub(crate) fn is_serialized_function_template(bytes: &[u8]) -> bool {
+  bytes.starts_with(DATA_MAGIC)
+    && bytes.get(DATA_MAGIC.len()) == Some(&SNAPSHOT_DATA_FUNCTION_TEMPLATE)
+}
+
+pub(crate) fn deserialize_function_template_with_cached_proto(
+  ctx: *mut JSContext,
+  bytes: &[u8],
+  external_refs: &[usize],
+  rooted_cached_proto: Option<JSValue>,
+) -> Option<*const Data> {
   if !bytes.starts_with(DATA_MAGIC) {
     return None;
   }
@@ -527,9 +546,11 @@ pub(crate) fn deserialize_function_template(
     1 => Some(input.get_string()?),
     _ => return None,
   };
-  let cached_proto = input
-    .get_opt_bytes()?
-    .and_then(|bytes| deserialize_value_with_refs(ctx, &bytes, external_refs));
+  let cached_proto_bytes = input.get_opt_bytes()?;
+  let cached_proto = rooted_cached_proto.or_else(|| {
+    cached_proto_bytes
+      .and_then(|bytes| deserialize_value_with_refs(ctx, &bytes, external_refs))
+  });
   let instance_internal_field_count = input.get_i32()?;
   Some(super::function::restore_function_template_from_snapshot(
     callback,
@@ -1933,12 +1954,41 @@ mod tests {
         0,
       );
 
+    let source_global = unsafe { JS_GetGlobalObject(source.context) };
+    assert_eq!(
+      unsafe {
+        JS_SetPropertyStr(
+          source.context,
+          source_global,
+          c"templatePrototype".as_ptr(),
+          JS_DupValue(source.context, prototype),
+        )
+      },
+      1,
+    );
+    let global_bytes =
+      write_object_bytes(source.context, source_global, &[]).unwrap();
+    unsafe { JS_FreeValue(source.context, source_global) };
     let bytes =
       serialize_function_template(source.context, template, &[]).unwrap();
     let target = TestContext::new();
     unsafe { super::super::core::refresh_snapshot_intrinsics(target.context) };
-    let restored =
-      deserialize_function_template(target.context, &bytes, &[]).unwrap();
+    let restored_global =
+      deserialize_value_with_refs(target.context, &global_bytes, &[]).unwrap();
+    let rooted_proto = unsafe {
+      JS_GetPropertyStr(
+        target.context,
+        restored_global,
+        c"templatePrototype".as_ptr(),
+      )
+    };
+    let restored = deserialize_function_template_with_cached_proto(
+      target.context,
+      &bytes,
+      &[],
+      Some(rooted_proto),
+    )
+    .unwrap();
     let info = super::super::function::snapshot_function_template_info(
       restored as *const FunctionTemplate,
     )
@@ -1946,6 +1996,12 @@ mod tests {
     let prototype = info.cached_proto.unwrap();
 
     unsafe {
+      let global_proto = JS_GetPropertyStr(
+        target.context,
+        restored_global,
+        c"templatePrototype".as_ptr(),
+      );
+      assert_eq!(prototype.u.ptr, global_proto.u.ptr);
       let value =
         JS_GetPropertyStr(target.context, prototype, c"value".as_ptr());
       assert!(!jsv_is_exception(&value));
@@ -1953,6 +2009,8 @@ mod tests {
       assert_eq!(JS_ToInt32(target.context, &mut number, value), 0);
       assert_eq!(number, 42);
       JS_FreeValue(target.context, value);
+      JS_FreeValue(target.context, global_proto);
+      JS_FreeValue(target.context, restored_global);
     }
   }
 
@@ -2058,40 +2116,103 @@ mod tests {
          function setPromise(id) { promiseRing[id] = id; return id; }\
          function resolvePromise(id) { return promiseRing[id]; }\
          function setUpAsyncStub(originalOp) {\
-           return function asyncOp() {\
-             const id = nextPromiseId;\
-             originalOp.call(this, id);\
-             nextPromiseId = id + 1;\
-             return setPromise(id);\
-           };\
+           switch (originalOp.length) {\
+             case 0: return function asyncOp0() {\
+               const id = nextPromiseId;\
+               originalOp.call(this, id);\
+               nextPromiseId = id + 1;\
+               return setPromise(id);\
+             };\
+             case 2: return function asyncOp2(a, b) {\
+               const id = nextPromiseId;\
+               originalOp.call(this, id, a, b);\
+               nextPromiseId = id + 1;\
+               return setPromise(id);\
+             };\
+           }\
          }\
          const ops = { first: setUpAsyncStub(() => undefined),\
-                       second: setUpAsyncStub(() => undefined) };\
-         return { ops: { ...ops }, resolvePromise };\
+                       second: setUpAsyncStub((a, b) => undefined) };\
+         const noop = () => undefined;\
+         return { ops: { ...ops }, setUpAsyncStub, noop, resolvePromise };\
        })()",
     );
-    let bytes = serialize_value(test.context, source_value).unwrap();
-    let restored =
-      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+    let source_global = unsafe { JS_GetGlobalObject(test.context) };
+    assert_eq!(
+      unsafe {
+        JS_SetPropertyStr(
+          test.context,
+          source_global,
+          c"asyncState".as_ptr(),
+          JS_DupValue(test.context, source_value),
+        )
+      },
+      1,
+    );
+    unsafe { super::super::core::refresh_snapshot_intrinsics(test.context) };
+    let bytes = write_object_bytes(test.context, source_global, &[]).unwrap();
+    unsafe { JS_FreeValue(test.context, source_global) };
+    let target = TestContext::new();
+    let restored_global =
+      deserialize_value_with_refs(target.context, &bytes, &[]).unwrap();
 
     unsafe {
-      let ops = JS_GetPropertyStr(test.context, restored, c"ops".as_ptr());
-      let second = JS_GetPropertyStr(test.context, ops, c"second".as_ptr());
-      let id = JS_Call(test.context, second, ops, 0, ptr::null_mut());
-      assert!(!jsv_is_exception(&id));
+      let ctx = target.context;
+      let restored =
+        JS_GetPropertyStr(ctx, restored_global, c"asyncState".as_ptr());
+      let ops = JS_GetPropertyStr(ctx, restored, c"ops".as_ptr());
+      let first = JS_GetPropertyStr(ctx, ops, c"first".as_ptr());
+      let second = JS_GetPropertyStr(ctx, ops, c"second".as_ptr());
+      let factory =
+        JS_GetPropertyStr(ctx, restored, c"setUpAsyncStub".as_ptr());
+      let noop = JS_GetPropertyStr(ctx, restored, c"noop".as_ptr());
+      let first_id = JS_Call(ctx, first, ops, 0, ptr::null_mut());
+      assert!(!jsv_is_exception(&first_id));
+      let mut second_args = [JS_NewInt32(ctx, 1), JS_NewInt32(ctx, 2)];
+      let second_id = JS_Call(ctx, second, ops, 2, second_args.as_mut_ptr());
+      assert!(!jsv_is_exception(&second_id));
+      let mut factory_args = [noop];
+      let new_wrapper =
+        JS_Call(ctx, factory, restored, 1, factory_args.as_mut_ptr());
+      assert!(!jsv_is_exception(&new_wrapper));
+      let third_id = JS_Call(ctx, new_wrapper, restored, 0, ptr::null_mut());
+      assert!(!jsv_is_exception(&third_id));
+      let mut first_number = -1;
+      let mut second_number = -1;
+      let mut third_number = -1;
+      assert_eq!(JS_ToInt32(ctx, &mut first_number, first_id), 0);
+      assert_eq!(JS_ToInt32(ctx, &mut second_number, second_id), 0);
+      assert_eq!(JS_ToInt32(ctx, &mut third_number, third_id), 0);
+      assert_eq!((first_number, second_number), (0, 1));
+      assert_eq!(third_number, 2);
+
       let resolve =
-        JS_GetPropertyStr(test.context, restored, c"resolvePromise".as_ptr());
-      let mut args = [id];
-      let result =
-        JS_Call(test.context, resolve, restored, 1, args.as_mut_ptr());
+        JS_GetPropertyStr(ctx, restored, c"resolvePromise".as_ptr());
+      let mut args = [third_id];
+      let result = JS_Call(ctx, resolve, restored, 1, args.as_mut_ptr());
       assert!(!jsv_is_exception(&result));
       let mut number = -1;
-      assert_eq!(JS_ToInt32(test.context, &mut number, result), 0);
-      assert_eq!(number, 0);
+      assert_eq!(JS_ToInt32(ctx, &mut number, result), 0);
+      assert_eq!(number, 2);
 
-      for value in [result, resolve, id, second, ops, restored, source_value] {
-        JS_FreeValue(test.context, value);
+      for value in [
+        result,
+        resolve,
+        third_id,
+        second_id,
+        first_id,
+        new_wrapper,
+        noop,
+        factory,
+        second,
+        first,
+        ops,
+        restored,
+        restored_global,
+      ] {
+        JS_FreeValue(ctx, value);
       }
+      JS_FreeValue(test.context, source_value);
     }
   }
 

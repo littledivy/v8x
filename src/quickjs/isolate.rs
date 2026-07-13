@@ -352,18 +352,36 @@ pub extern "C" fn v8__Context__GetDataFromSnapshotOnce(
       .get_mut(&(ctx as usize))
       .and_then(|slots| slots.get_mut(index))
       .and_then(Option::take);
-    if value.is_some() {
-      if let Some(bytes) = st
-        .restored_context_data
-        .get_mut(&(ctx as usize))
-        .and_then(|slots| slots.get_mut(index))
-      {
-        *bytes = None;
-      }
-    }
     value
   };
   if let Some(value) = restored_value {
+    let bytes = {
+      let st = super::core::iso_state(iso);
+      st.restored_context_data
+        .get_mut(&(ctx as usize))
+        .and_then(|slots| slots.get_mut(index))
+        .and_then(Option::take)
+    };
+    if let Some(bytes) = bytes
+      && super::snapshot::is_serialized_function_template(&bytes)
+    {
+      let external_refs = {
+        let st = super::core::iso_state(iso);
+        st.external_references.clone()
+      };
+      if let Some(template) =
+        super::snapshot::deserialize_function_template_with_cached_proto(
+          ctx,
+          &bytes,
+          &external_refs,
+          Some(value),
+        )
+      {
+        return template;
+      }
+      unsafe { JS_FreeValue(ctx, value) };
+      return ptr::null();
+    }
     return intern::<Data>(value);
   }
   let bytes = {
