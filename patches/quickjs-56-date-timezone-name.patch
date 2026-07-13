@@ -1,0 +1,76 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -51433,6 +51433,38 @@ static int getTimezoneOffset(int64_t time) {
+ #endif
+ }
+ 
++/* Return the local time zone abbreviation for a timestamp. */
++static size_t getTimezoneName(int64_t time, char *buf, size_t buf_size) {
++    time_t ti;
++    struct tm tm;
++
++    time /= 1000; /* convert to seconds */
++    if (sizeof(time_t) == 4) {
++        if ((time_t)-1 < 0) {
++            if (time < INT32_MIN) {
++                time = INT32_MIN;
++            } else if (time > INT32_MAX) {
++                time = INT32_MAX;
++            }
++        } else {
++            if (time < 0) {
++                time = 0;
++            } else if (time > UINT32_MAX) {
++                time = UINT32_MAX;
++            }
++        }
++    }
++    ti = time;
++#if defined(_WIN32)
++    if (localtime_s(&tm, &ti) != 0)
++        return 0;
++#else
++    if (!localtime_r(&ti, &tm))
++        return 0;
++#endif
++    return strftime(buf, buf_size, "%Z", &tm);
++}
++
+ /* RegExp */
+ 
+ static void js_regexp_finalizer(JSRuntime *rt, JSValueConst val)
+@@ -59877,7 +59909,7 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
+                                int argc, JSValueConst *argv, int magic)
+ {
+     // _string(obj, fmt, part)
+-    char buf[64];
++    char buf[96];
+     double fields[9];
+     int res, fmt, part, pos;
+     int y, mon, d, h, m, s, ms, wd, tz;
+@@ -59964,7 +59996,24 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
+             /* tz is >= 0, can use % */
+             pos += snprintf(buf + pos, sizeof(buf) - pos,
+                             "%02d%02d", tz / 60, tz % 60);
+-            /* XXX: tack the time zone code? */
++            if (pos + 3 < sizeof(buf)) {
++                double dval;
++                int name_pos;
++                size_t name_len;
++                if (!JS_ThisTimeValue(ctx, &dval, this_val)) {
++                    name_pos = pos;
++                    buf[pos++] = ' ';
++                    buf[pos++] = '(';
++                    name_len = getTimezoneName((int64_t)dval, buf + pos,
++                                                sizeof(buf) - pos - 1);
++                    if (name_len) {
++                        pos += name_len;
++                        buf[pos++] = ')';
++                    } else {
++                        pos = name_pos;
++                    }
++                }
++            }
+             break;
+         case 2:
+             pos += snprintf(buf + pos, sizeof(buf) - pos,
