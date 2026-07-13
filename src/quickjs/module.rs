@@ -3697,9 +3697,18 @@ fn clone_status(s: &ModuleStatus) -> ModuleStatus {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__GetException(
-  _this: *const Module,
+  this: *const Module,
 ) -> *const Value {
-  intern::<Value>(jsv_undefined())
+  let ctx = current_ctx();
+  if ctx.is_null() {
+    return ptr::null();
+  }
+  let module_def = with_module_state(this, |module| module.module_def)
+    .unwrap_or(ptr::null_mut());
+  if module_def.is_null() {
+    return intern::<Value>(jsv_undefined());
+  }
+  intern::<Value>(unsafe { v82jsc_module_get_exception(ctx, module_def) })
 }
 
 #[unsafe(no_mangle)]

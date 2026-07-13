@@ -570,6 +570,10 @@ unsafe extern "C" {
 
   pub fn v82jsc_module_is_evaluated(m: *mut JSModuleDef)
   -> std::os::raw::c_int;
+  pub fn v82jsc_module_get_exception(
+    ctx: *mut JSContext,
+    m: *mut JSModuleDef,
+  ) -> JSValue;
   pub fn v82jsc_module_eval_started(m: *mut JSModuleDef)
   -> std::os::raw::c_int;
   pub fn v82jsc_module_is_evaluating_async(

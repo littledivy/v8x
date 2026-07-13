@@ -1,0 +1,15 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1005,6 +1005,12 @@ int v82jsc_module_is_evaluated(JSModuleDef *m) {
+                  m->status == JS_MODULE_STATUS_EVALUATED);
+ }
+ 
++JSValue v82jsc_module_get_exception(JSContext *ctx, JSModuleDef *m) {
++    if (!m || !m->eval_has_exception)
++        return JS_UNDEFINED;
++    return JS_DupValue(ctx, m->eval_exception);
++}
++
+ /* v82jsc: report whether a module's evaluation has STARTED (it is currently
+    evaluating as part of some graph, or already finished). deno evaluates every
+    module as its own root; when it calls Module::Evaluate on a module that is

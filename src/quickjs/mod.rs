@@ -32,6 +32,7 @@ mod wasm;
 #[cfg(test)]
 mod raw_smoke_test {
   use super::quickjs_sys::*;
+  use std::ffi::CStr;
   use std::ffi::CString;
   use std::ptr;
   use std::sync::atomic::AtomicUsize;
@@ -239,6 +240,46 @@ mod raw_smoke_test {
       assert_eq!(HANDLED_REJECTIONS.load(Ordering::SeqCst), 1);
 
       JS_FreeValue(ctx, promise);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
+  fn module_evaluation_exception_remains_available() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = c"throw new Error('boom')";
+      let module = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"throwing-module.js".as_ptr(),
+        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+      );
+      assert_eq!(module.tag, JS_TAG_MODULE);
+      let module_def = module.u.ptr.cast::<JSModuleDef>();
+
+      let result = JS_EvalFunction(ctx, module);
+      assert!(JS_IsPromise(result));
+      assert_eq!(JS_PromiseState(ctx, result), 2);
+
+      let exception = v82jsc_module_get_exception(ctx, module_def);
+      assert_eq!(exception.tag, JS_TAG_OBJECT);
+      let message = JS_GetPropertyStr(ctx, exception, c"message".as_ptr());
+      let message_text = JS_ToCString(ctx, message);
+      assert!(!message_text.is_null());
+      assert_eq!(CStr::from_ptr(message_text).to_bytes(), b"boom");
+
+      JS_FreeCString(ctx, message_text);
+      JS_FreeValue(ctx, message);
+      JS_FreeValue(ctx, exception);
+      JS_FreeValue(ctx, result);
       JS_FreeContext(ctx);
       JS_FreeRuntime(rt);
     }
