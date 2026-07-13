@@ -172,6 +172,7 @@ pub extern "C" fn v8__V8__SetFlagsFromCommandLine(
 enum V8Flag {
   ForceStrict(bool),
   StackSize(usize),
+  Help,
   Noop,
 }
 
@@ -195,7 +196,11 @@ fn parse_v8_flag(flag: &str) -> Option<V8Flag> {
     "inspector_live_edit" | "no_inspector_live_edit" if value.is_none() => {
       Some(V8Flag::Noop)
     }
-    "help" | "log_colour" | "log_color" => Some(V8Flag::Noop),
+    "expose_gc" | "jitless" | "trace_gc" if value.is_none() => {
+      Some(V8Flag::Noop)
+    }
+    "help" if value.is_none() => Some(V8Flag::Help),
+    "log_colour" | "log_color" => Some(V8Flag::Noop),
     _ => None,
   }
 }
@@ -215,6 +220,12 @@ fn consume_v8_flag(flag: &str) -> bool {
     Some(V8Flag::StackSize(bytes)) => {
       crate::quickjs::core::MAX_STACK_SIZE
         .store(bytes, std::sync::atomic::Ordering::Relaxed);
+      true
+    }
+    Some(V8Flag::Help) => {
+      eprintln!(
+        "V8 compatibility options:\nOptions:\n  --expose-gc (expose gc function)\n  --trace-gc (trace garbage collection)"
+      );
       true
     }
     Some(V8Flag::Noop) => true,
@@ -257,12 +268,17 @@ mod tests {
       parse_v8_flag("--max-old-space-size=3072"),
       Some(V8Flag::Noop)
     );
+    assert_eq!(parse_v8_flag("--expose-gc"), Some(V8Flag::Noop));
+    assert_eq!(parse_v8_flag("--trace-gc"), Some(V8Flag::Noop));
+    assert_eq!(parse_v8_flag("--jitless"), Some(V8Flag::Noop));
+    assert_eq!(parse_v8_flag("--help"), Some(V8Flag::Help));
   }
 
   #[test]
   fn rejects_unknown_or_malformed_v8_flags() {
     assert_eq!(parse_v8_flag("--stack-size=invalid"), None);
     assert_eq!(parse_v8_flag("--external-memory-max-reasonable-size"), None);
+    assert_eq!(parse_v8_flag("--random-seed=100"), None);
     assert_eq!(parse_v8_flag("--definitely-not-a-v8-flag"), None);
   }
 }
