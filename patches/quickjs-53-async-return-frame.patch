@@ -1,0 +1,176 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21835,7 +21835,157 @@
+             JS_FreeValue(ctx, JS_GetException(ctx));
+         }
+         JS_FreeAtom(ctx, key_atom);
++    }
++}
++
++static bool js_v82jsc_has_function_frame(JSContext *ctx, JSValueConst error,
++                                          const char *file, const char *func)
++{
++    JSAtom key_atom;
++    JSValue frames, length_value;
++    uint32_t length = 0, i;
++    bool found = false;
++
++    if (!file || !func)
++        return false;
++    key_atom = js_v82jsc_private_atom(ctx,
++        "v82jsc_private:deno_core::call_site_evals");
++    if (key_atom == JS_ATOM_NULL)
++        return false;
++    frames = JS_GetProperty(ctx, error, key_atom);
++    JS_FreeAtom(ctx, key_atom);
++    if (!JS_IsArray(frames)) {
++        JS_FreeValue(ctx, frames);
++        return false;
++    }
++    length_value = JS_GetPropertyStr(ctx, frames, "length");
++    JS_ToUint32(ctx, &length, length_value);
++    JS_FreeValue(ctx, length_value);
++    for (i = 0; i < length && !found; i++) {
++        JSValue site = JS_GetPropertyUint32(ctx, frames, i);
++        JSValue method, file_value, func_value;
++        const char *site_file, *site_func;
++
++        if (!JS_IsObject(site)) {
++            JS_FreeValue(ctx, site);
++            continue;
++        }
++        method = JS_GetPropertyStr(ctx, site, "getFileName");
++        file_value = JS_IsFunction(ctx, method)
++            ? JS_Call(ctx, method, site, 0, NULL) : JS_UNDEFINED;
++        JS_FreeValue(ctx, method);
++        method = JS_GetPropertyStr(ctx, site, "getFunctionName");
++        func_value = JS_IsFunction(ctx, method)
++            ? JS_Call(ctx, method, site, 0, NULL) : JS_UNDEFINED;
++        JS_FreeValue(ctx, method);
++        JS_FreeValue(ctx, site);
++        site_file = JS_IsString(file_value)
++            ? JS_ToCString(ctx, file_value) : NULL;
++        site_func = JS_IsString(func_value)
++            ? JS_ToCString(ctx, func_value) : NULL;
++        found = site_file && site_func &&
++            !strcmp(site_file, file) && !strcmp(site_func, func);
++        if (site_file)
++            JS_FreeCString(ctx, site_file);
++        if (site_func)
++            JS_FreeCString(ctx, site_func);
++        JS_FreeValue(ctx, file_value);
++        JS_FreeValue(ctx, func_value);
++    }
++    JS_FreeValue(ctx, frames);
++    if (JS_HasException(ctx))
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    return found;
++}
++
++static JSValue js_v82jsc_async_return_reject(
++    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
++    int magic, JSValueConst *func_data)
++{
++    JSValueConst error = argc > 0 ? argv[0] : JS_UNDEFINED;
++    const char *file;
++    const char *func;
++    int32_t line = 0, col = 0;
++    JSValue stack;
++
++    (void)this_val;
++    (void)magic;
++    if (JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
++        return JS_Throw(ctx, js_dup(error));
++    file = JS_ToCString(ctx, func_data[0]);
++    func = JS_IsString(func_data[3])
++        ? JS_ToCString(ctx, func_data[3]) : NULL;
++    JS_ToInt32(ctx, &line, func_data[1]);
++    JS_ToInt32(ctx, &col, func_data[2]);
++    stack = JS_GetProperty(ctx, error, JS_ATOM_stack);
++    if (JS_IsException(stack))
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    else
++        JS_FreeValue(ctx, stack);
++    if (!js_v82jsc_has_function_frame(ctx, error, file, func))
++        js_v82jsc_append_async_frame(ctx, error, file, line, col, func);
++    if (file)
++        JS_FreeCString(ctx, file);
++    if (func)
++        JS_FreeCString(ctx, func);
++    return JS_Throw(ctx, js_dup(error));
++}
++
++static JSValue js_v82jsc_wrap_async_return(JSContext *ctx,
++                                            JSAsyncFunctionData *s,
++                                            JSValueConst value)
++{
++    JSValue fobj, reject, wrapped;
++    JSValueConst then_args[2], data[4];
++    JSObject *fp;
++    JSFunctionBytecode *b;
++    const char *file = NULL, *func = NULL;
++    int line = 0, col = 0;
++    uint32_t pc;
++
++    if (!JS_IsPromise(value))
++        return js_dup(value);
++    fobj = s->func_state.frame.cur_func;
++    if (JS_VALUE_GET_TAG(fobj) != JS_TAG_OBJECT)
++        return js_dup(value);
++    fp = JS_VALUE_GET_OBJ(fobj);
++    if (!js_class_has_bytecode(fp->class_id) ||
++        !fp->u.func.function_bytecode || !s->func_state.frame.cur_pc)
++        return js_dup(value);
++    b = fp->u.func.function_bytecode;
++    pc = s->func_state.frame.cur_pc - b->byte_code_buf - 1;
++    line = find_line_num(ctx, b, pc, &col);
++    if (line == 1)
++        col += 1;
++    if (b->filename != JS_ATOM_NULL)
++        file = JS_AtomToCString(ctx, b->filename);
++    if (b->func_name != JS_ATOM_NULL)
++        func = JS_AtomToCString(ctx, b->func_name);
++    if (!file || !func || !strcmp(func, "<eval>") ||
++        !strcmp(func, "global code")) {
++        if (file)
++            JS_FreeCString(ctx, file);
++        if (func)
++            JS_FreeCString(ctx, func);
++        return js_dup(value);
+     }
++    data[0] = JS_NewString(ctx, file);
++    data[1] = js_int32(line);
++    data[2] = js_int32(col);
++    data[3] = JS_NewString(ctx, func);
++    JS_FreeCString(ctx, file);
++    JS_FreeCString(ctx, func);
++    reject = JS_NewCFunctionData(
++        ctx, js_v82jsc_async_return_reject, 1, 0, 4, data);
++    JS_FreeValue(ctx, data[0]);
++    JS_FreeValue(ctx, data[3]);
++    if (JS_IsException(reject))
++        return reject;
++    then_args[0] = JS_UNDEFINED;
++    then_args[1] = reject;
++    wrapped = JS_Invoke(ctx, value, JS_ATOM_then, 2, then_args);
++    JS_FreeValue(ctx, reject);
++    return wrapped;
+ }
+ 
+ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
+@@ -21870,6 +22020,14 @@
+         s->func_state.frame.cur_sp[-1] = JS_UNDEFINED;
+         if (JS_IsUndefined(func_ret)) {
+             /* function returned */
++            if (JS_IsPromise(value)) {
++                JSValue wrapped =
++                    js_v82jsc_wrap_async_return(ctx, s, value);
++                JS_FreeValue(ctx, value);
++                value = wrapped;
++                if (JS_IsException(value))
++                    goto fail;
++            }
+             ret2 = JS_Call(ctx, s->resolving_funcs[0], JS_UNDEFINED,
+                            1, vc(&value));
+             JS_FreeValue(ctx, value);
