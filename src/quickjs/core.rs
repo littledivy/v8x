@@ -2312,12 +2312,8 @@ pub extern "C" fn v8__Script__Run(
   // sloppy-mode bytecode.
   let eval_flags = global_eval_flags();
   let src_str = std::str::from_utf8(source_bytes).ok();
-  let bc_key = src_str.map(|s| {
-    super::module::fast_content_hash(
-      0x5343_5249 ^ eval_flags as u64,
-      s.as_bytes(),
-    )
-  });
+  let bc_key = src_str
+    .map(|s| super::module::script_bc_key(eval_flags as u64, s.as_bytes()));
   let mut result = JSValue {
     u: JSValueUnion { int32: 0 },
     tag: JS_TAG_UNINITIALIZED,

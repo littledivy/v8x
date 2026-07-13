@@ -198,9 +198,22 @@ pub(crate) fn fast_content_hash(seed: u64, bytes: &[u8]) -> u64 {
   h ^ (bytes.len() as u64)
 }
 
+fn versioned_bc_seed(seed: u64) -> u64 {
+  let cache_tag = u64::from_str_radix(env!("V82JSC_QUICKJS_CACHE_TAG"), 16)
+    .expect("invalid QuickJS cache tag");
+  seed ^ cache_tag
+}
+
 pub(crate) fn bc_key(source: &str, module_name: &str) -> u64 {
-  let seed = fast_content_hash(BC_MAGIC as u64, module_name.as_bytes());
+  let seed = fast_content_hash(
+    versioned_bc_seed(BC_MAGIC as u64),
+    module_name.as_bytes(),
+  );
   fast_content_hash(seed, source.as_bytes())
+}
+
+pub(crate) fn script_bc_key(eval_flags: u64, source: &[u8]) -> u64 {
+  fast_content_hash(versioned_bc_seed(0x5343_5249 ^ eval_flags), source)
 }
 
 #[cfg(test)]
@@ -213,6 +226,11 @@ mod cache_key_tests {
       bc_key("export const value = 1;", "file:///a.ts"),
       bc_key("export const value = 1;", "file:///b.ts")
     );
+  }
+
+  #[test]
+  fn bytecode_cache_seed_includes_compiler_tag() {
+    assert_ne!(versioned_bc_seed(0), 0);
   }
 
   #[test]

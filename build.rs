@@ -39,6 +39,38 @@ fn emit_vendor_rerun_inputs(manifest_dir: &Path) {
   }
 }
 
+fn emit_quickjs_cache_tag(manifest_dir: &Path) {
+  const PRIME: u64 = 0x0000_0100_0000_01B3;
+  const SOURCES: &[&str] = &[
+    "quickjs.c",
+    "quickjs.h",
+    "quickjs-atom.h",
+    "quickjs-opcode.h",
+    "libregexp.c",
+    "libregexp.h",
+    "libunicode.c",
+    "libunicode.h",
+    "cutils.c",
+    "cutils.h",
+    "dtoa.c",
+    "dtoa.h",
+  ];
+
+  let quickjs_dir = manifest_dir.join("vendor/quickjs-ng");
+  let mut hash = 0xcbf2_9ce4_8422_2325u64;
+  for relative in SOURCES {
+    let path = quickjs_dir.join(relative);
+    let Ok(bytes) = std::fs::read(&path) else {
+      continue;
+    };
+    for byte in relative.bytes().chain(bytes) {
+      hash = (hash ^ u64::from(byte)).wrapping_mul(PRIME);
+    }
+    println!("cargo:rerun-if-changed={}", path.display());
+  }
+  println!("cargo:rustc-env=V82JSC_QUICKJS_CACHE_TAG={hash:016x}");
+}
+
 fn main() {
   let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
 
@@ -117,6 +149,7 @@ fn main() {
     {
       setup_vendor(&manifest_dir, "quickjs");
     }
+    emit_quickjs_cache_tag(&manifest_dir);
     build_quickjs(&manifest_dir);
     // WebAssembly engine: build the vendored WAMR (interpreter-only) static
     // lib and link it; the WebAssembly.* JS API is implemented over its
