@@ -1,0 +1,112 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -22645,6 +22645,8 @@
+ 
+     DynBuf byte_code;
+     int last_opcode_pos; /* -1 if no last opcode */
++    int constructor_generation;
++    int constructor_argument_depth;
+ 
+     LabelSlot *label_slots;
+     int label_size; /* allocated size for label_slots[] */
+@@ -27392,10 +27394,16 @@
+ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+ {
+     FuncCallType call_type;
+-    int optional_chaining_label;
++    int optional_chaining_label, constructor_line_num, constructor_col_num;
++    int constructor_generation;
++    bool constructor_is_nested;
+     bool accept_lparen = (parse_flags & PF_POSTFIX_CALL) != 0;
+ 
+     call_type = FUNC_CALL_NORMAL;
++    constructor_line_num = 0;
++    constructor_col_num = 0;
++    constructor_generation = 0;
++    constructor_is_nested = false;
+     switch(s->token.val) {
+     case TOK_NUMBER:
+         {
+@@ -27578,6 +27586,12 @@
+         }
+         break;
+     case TOK_NEW:
++        constructor_line_num = s->token.line_num;
++        constructor_col_num = s->token.ptr - s->eol;
++        if (s->eol == s->buf_start)
++            constructor_col_num += 1;
++        constructor_is_nested =
++            s->cur_func->constructor_argument_depth > 0;
+         if (next_token(s))
+             return -1;
+         if (s->token.val == '.') {
+@@ -27593,13 +27607,20 @@
+             emit_atom(s, JS_ATOM_new_target);
+             emit_u16(s, 0);
+         } else {
++            s->cur_func->constructor_generation++;
+             emit_source_loc(s);
+             if (js_parse_postfix_expr(s, 0))
+                 return -1;
++            constructor_generation =
++                s->cur_func->constructor_generation;
+             accept_lparen = true;
+             if (s->token.val != '(') {
+                 /* new operator on an object */
+                 emit_op(s, OP_dup);
++                if (constructor_is_nested ||
++                    s->cur_func->constructor_generation !=
++                    constructor_generation)
++                    emit_source_loc_at(s, constructor_line_num, constructor_col_num);
+                 emit_op(s, OP_call_constructor);
+                 emit_u16(s, 0);
+             } else {
+@@ -27829,6 +27850,8 @@
+             }
+ 
+             /* parse arguments */
++            if (call_type == FUNC_CALL_NEW)
++                fd->constructor_argument_depth++;
+             arg_count = 0;
+             while (s->token.val != ')') {
+                 if (arg_count >= 65535) {
+@@ -27876,6 +27899,8 @@
+                 }
+                 if (next_token(s))
+                     return -1;
++                if (call_type == FUNC_CALL_NEW)
++                    fd->constructor_argument_depth--;
+                 /* drop the index */
+                 emit_op(s, OP_drop);
+ 
+@@ -27909,6 +27934,10 @@
+                     } else if (call_type == FUNC_CALL_NEW) {
+                         /* obj func array -> func obj array */
+                         emit_op(s, OP_perm3);
++                        if (constructor_is_nested ||
++                            fd->constructor_generation !=
++                            constructor_generation)
++                            emit_source_loc_at(s, constructor_line_num, constructor_col_num);
+                         emit_op(s, OP_apply);
+                         emit_u16(s, 1);
+                     } else {
+@@ -27923,6 +27952,8 @@
+             } else {
+                 if (next_token(s))
+                     return -1;
++                if (call_type == FUNC_CALL_NEW)
++                    fd->constructor_argument_depth--;
+             emit_func_call:
+                 switch(opcode) {
+                 case OP_get_field:
+@@ -27951,6 +27982,10 @@
+ 
+                         emit_class_field_init(s);
+                     } else if (call_type == FUNC_CALL_NEW) {
++                        if (constructor_is_nested ||
++                            fd->constructor_generation !=
++                            constructor_generation)
++                            emit_source_loc_at(s, constructor_line_num, constructor_col_num);
+                         emit_op(s, OP_call_constructor);
+                         emit_u16(s, arg_count);
+                     } else {

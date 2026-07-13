@@ -100,7 +100,7 @@ const JS_GPN_ENUM_ONLY: int = 1 << 4;
 const JS_WRITE_OBJ_BYTECODE: int = 1 << 0;
 const JS_READ_OBJ_BYTECODE: int = 1 << 0;
 
-const BC_MAGIC: u32 = 0x5142_4305;
+const BC_MAGIC: u32 = 0x5142_4306;
 
 unsafe extern "C" {
   fn v82jsc_mark_skip_next_async_frame(

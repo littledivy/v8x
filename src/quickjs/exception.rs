@@ -2007,7 +2007,12 @@ fn v8_constructor_location(
     .map_or(current_line.len(), |(index, _)| index);
   let reported_offset =
     line_start.saturating_add(column_offset).min(source.len());
-  let prefix = &source[..reported_offset];
+  let prefix_end = if source[reported_offset..].starts_with("new") {
+    reported_offset.saturating_add(3).min(source.len())
+  } else {
+    reported_offset
+  };
+  let prefix = &source[..prefix_end];
   let bytes = source.as_bytes();
   let is_ident =
     |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$');
@@ -2068,10 +2073,15 @@ fn v8_constructor_location(
   None
 }
 
+fn v8_constructor_column(line: i32, col: i32) -> i32 {
+  if line == 1 && col > 1 { col + 1 } else { col }
+}
+
 #[cfg(test)]
 mod stack_column_tests {
   use super::normalize_function_name;
   use super::not_a_function_callee;
+  use super::v8_constructor_column;
   use super::v8_constructor_location;
   use super::v8_error_column;
   use super::v8_member_call_column;
@@ -2125,6 +2135,23 @@ mod stack_column_tests {
       v8_constructor_location("new Something()", 1, 5, "Something"),
       Some((1, 1))
     );
+  }
+
+  #[test]
+  fn exact_nested_constructor_locations_are_preserved() {
+    let source = r#"  throw new Error("foo", { cause: new Error("bar") });"#;
+    assert_eq!(v8_constructor_location(source, 1, 9, "Error"), Some((1, 9)));
+    assert_eq!(
+      v8_constructor_location(source, 1, 35, "Error"),
+      Some((1, 35))
+    );
+  }
+
+  #[test]
+  fn first_line_constructor_columns_are_one_based() {
+    assert_eq!(v8_constructor_column(1, 10), 11);
+    assert_eq!(v8_constructor_column(1, 1), 1);
+    assert_eq!(v8_constructor_column(2, 10), 10);
   }
 
   #[test]
@@ -2265,13 +2292,23 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
       file
     };
     // Recover V8-compatible expression locations from quickjs's call positions.
-    if let Some(source) = super::core::script_source(&file)
-      && let Some((constructor_line, constructor_col)) =
-        v8_constructor_location(&source, line, col, &location_error_name)
+    let constructor_handled = super::core::script_source(&file)
+      .and_then(|source| {
+        v8_constructor_location(
+          &source,
+          line,
+          v8_constructor_column(line, col),
+          &location_error_name,
+        )
+      })
+      .map(|(constructor_line, constructor_col)| {
+        line = constructor_line;
+        col = constructor_col;
+      })
+      .is_some();
+    if !constructor_handled
+      && let Some(src) = super::core::script_source_line(&file, line)
     {
-      line = constructor_line;
-      col = constructor_col;
-    } else if let Some(src) = super::core::script_source_line(&file, line) {
       col = v8_error_column(&src, col, &name, &message);
     }
 
