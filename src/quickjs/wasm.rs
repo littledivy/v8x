@@ -2057,9 +2057,28 @@ struct JsMemEnv {
   buf: std::cell::Cell<JSValue>,
   pages: std::cell::Cell<u32>,
   max_pages: u32,
+  shared: bool,
 }
 
-unsafe fn js_mem_new_buffer(ctx: *mut JSContext, bytes: usize) -> JSValue {
+unsafe fn js_mem_new_buffer(
+  ctx: *mut JSContext,
+  bytes: usize,
+  shared: bool,
+) -> JSValue {
+  if shared {
+    let global = unsafe { JS_GetGlobalObject(ctx) };
+    let constructor =
+      unsafe { JS_GetPropertyStr(ctx, global, c"SharedArrayBuffer".as_ptr()) };
+    let mut args = [unsafe { JS_NewInt64(ctx, bytes as i64) }];
+    let buf =
+      unsafe { JS_CallConstructor(ctx, constructor, 1, args.as_mut_ptr()) };
+    unsafe {
+      JS_FreeValue(ctx, args[0]);
+      JS_FreeValue(ctx, constructor);
+      JS_FreeValue(ctx, global);
+    }
+    return buf;
+  }
   let zeros = vec![0u8; bytes];
   let buf = unsafe { JS_NewArrayBufferCopy(ctx, zeros.as_ptr(), bytes) };
   crate::quickjs::arraybuffer::mark_buffer_nondetachable(ctx, buf);
@@ -2109,8 +2128,12 @@ unsafe extern "C" fn js_mem_grow(
   if new_pages > env.max_pages {
     return unsafe { throw(ctx, "WebAssembly.Memory.grow: exceeds maximum") };
   }
-  let new_buf =
-    unsafe { js_mem_new_buffer(ctx, new_pages as usize * WASM_PAGE) };
+  let new_buf = unsafe {
+    js_mem_new_buffer(ctx, new_pages as usize * WASM_PAGE, env.shared)
+  };
+  if new_buf.tag == JS_TAG_EXCEPTION {
+    return new_buf;
+  }
   let old = env.buf.get();
   let mut old_len = 0usize;
   let old_ptr = unsafe { JS_GetArrayBuffer(ctx, &mut old_len, old) };
@@ -2137,6 +2160,7 @@ unsafe extern "C" fn wa_memory_ctor(
 ) -> JSValue {
   let mut initial: i64 = 0;
   let mut maximum: i64 = -1;
+  let mut shared = false;
   if argc >= 1 {
     let desc = unsafe { *argv };
     let initv = unsafe { JS_GetPropertyStr(ctx, desc, c"initial".as_ptr()) };
@@ -2147,6 +2171,17 @@ unsafe extern "C" fn wa_memory_ctor(
       unsafe { JS_ToInt64(ctx, &mut maximum, maxv) };
     }
     unsafe { JS_FreeValue(ctx, maxv) };
+    let sharedv = unsafe { JS_GetPropertyStr(ctx, desc, c"shared".as_ptr()) };
+    shared = unsafe { JS_ToBool(ctx, sharedv) } > 0;
+    unsafe { JS_FreeValue(ctx, sharedv) };
+  }
+  if shared && maximum < 0 {
+    return unsafe {
+      throw(
+        ctx,
+        "WebAssembly.Memory(): If shared is true, maximum property should be defined.",
+      )
+    };
   }
   let pages = initial.max(0) as u32;
   // 65536 == the WASM32 max # of 64KiB pages (4GiB address space).
@@ -2155,12 +2190,17 @@ unsafe extern "C" fn wa_memory_ctor(
   } else {
     maximum as u32
   };
-  let buf = unsafe { js_mem_new_buffer(ctx, pages as usize * WASM_PAGE) };
+  let buf =
+    unsafe { js_mem_new_buffer(ctx, pages as usize * WASM_PAGE, shared) };
+  if buf.tag == JS_TAG_EXCEPTION {
+    return buf;
+  }
 
   let env = Box::into_raw(Box::new(JsMemEnv {
     buf: std::cell::Cell::new(buf),
     pages: std::cell::Cell::new(pages),
     max_pages,
+    shared,
   }));
 
   let obj = unsafe { JS_NewObject(ctx) };
