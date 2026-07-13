@@ -1934,13 +1934,32 @@ fn v8_undefined_identifier_column(line: &str, col: i32, message: &str) -> i32 {
   }
 }
 
+fn v8_property_access_column(line: &str, col: i32, message: &str) -> i32 {
+  let property = ["(reading '", "(setting '"]
+    .into_iter()
+    .find_map(|prefix| message.rsplit_once(prefix).map(|(_, rest)| rest))
+    .and_then(|rest| rest.strip_suffix("')"));
+  let Some(property) = property.filter(|property| !property.is_empty()) else {
+    return col;
+  };
+
+  let needle = format!(".{property}");
+  let reported = col.saturating_sub(1) as usize;
+  line
+    .match_indices(&needle)
+    .min_by_key(|(start, _)| start.abs_diff(reported))
+    .map(|(start, _)| (start + 2) as i32)
+    .unwrap_or(col)
+}
+
 fn v8_error_column(line: &str, col: i32, name: &str, message: &str) -> i32 {
   if name == "ReferenceError" {
     let col = v8_undefined_identifier_column(line, col, message);
     v8_new_expr_column(line, col)
   } else {
     let col = v8_new_expr_column(line, col);
-    v8_member_call_column(line, col)
+    let col = v8_member_call_column(line, col);
+    v8_property_access_column(line, col, message)
   }
 }
 
@@ -2104,6 +2123,7 @@ mod stack_column_tests {
   use super::v8_constructor_location;
   use super::v8_error_column;
   use super::v8_member_call_column;
+  use super::v8_property_access_column;
   use super::v8_undefined_identifier_column;
 
   #[test]
@@ -2130,6 +2150,18 @@ mod stack_column_tests {
       27
     );
     assert_eq!(v8_member_call_column("Deno.bench();", 6), 6);
+  }
+
+  #[test]
+  fn property_error_uses_reported_member_column() {
+    assert_eq!(
+      v8_property_access_column(
+        "const value = undefined; value.answer;",
+        26,
+        "Cannot read properties of undefined (reading 'answer')",
+      ),
+      32,
+    );
   }
 
   #[test]
