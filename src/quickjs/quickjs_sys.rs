@@ -629,6 +629,11 @@ unsafe extern "C" {
   // exception. (aarch64 zero-extends the byte, so the bug is invisible on the
   // macOS worker.) Must match the C signature exactly.
   pub fn JS_HasException(ctx: *mut JSContext) -> bool;
+  pub fn JS_SetPrepareStackTraceCallback(
+    ctx: *mut JSContext,
+    callback: JSValue,
+  );
+  pub fn JS_GetPrepareStackTraceCallback(ctx: *mut JSContext) -> JSValue;
   pub fn JS_ResetUncatchableError(ctx: *mut JSContext);
   pub fn JS_ThrowTypeError(
     ctx: *mut JSContext,

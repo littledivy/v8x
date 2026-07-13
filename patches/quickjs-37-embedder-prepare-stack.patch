@@ -1,0 +1,239 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -516,6 +516,8 @@
+     JSValue error_ctor;
+     JSValue error_back_trace;
+     JSValue error_prepare_stack;
++    JSValue error_prepare_stack_callback;
++    JSValue error_stack_pending_marker;
+     JSValue error_stack_trace_limit;
+     JSValue iterator_ctor;
+     JSValue iterator_ctor_getset;
+@@ -2630,6 +2632,8 @@
+     ctx->error_ctor = JS_NULL;
+     ctx->error_back_trace = JS_UNDEFINED;
+     ctx->error_prepare_stack = JS_UNDEFINED;
++    ctx->error_prepare_stack_callback = JS_UNDEFINED;
++    ctx->error_stack_pending_marker = JS_UNDEFINED;
+     ctx->error_stack_trace_limit = js_int32(10);
+     init_list_head(&ctx->loaded_modules);
+ 
+@@ -2754,6 +2758,8 @@
+     JS_MarkValue(rt, ctx->error_ctor, mark_func);
+     JS_MarkValue(rt, ctx->error_back_trace, mark_func);
+     JS_MarkValue(rt, ctx->error_prepare_stack, mark_func);
++    JS_MarkValue(rt, ctx->error_prepare_stack_callback, mark_func);
++    JS_MarkValue(rt, ctx->error_stack_pending_marker, mark_func);
+     JS_MarkValue(rt, ctx->error_stack_trace_limit, mark_func);
+     for(i = 0; i < rt->class_count; i++) {
+         JS_MarkValue(rt, ctx->class_proto[i], mark_func);
+@@ -2836,6 +2842,8 @@
+     JS_FreeValue(ctx, ctx->error_ctor);
+     JS_FreeValue(ctx, ctx->error_back_trace);
+     JS_FreeValue(ctx, ctx->error_prepare_stack);
++    JS_FreeValue(ctx, ctx->error_prepare_stack_callback);
++    JS_FreeValue(ctx, ctx->error_stack_pending_marker);
+     JS_FreeValue(ctx, ctx->error_stack_trace_limit);
+     for(i = 0; i < rt->class_count; i++) {
+         JS_FreeValue(ctx, ctx->class_proto[i]);
+@@ -8091,8 +8099,64 @@
+     if (find_own_property1(p, JS_ATOM_stack))
+         return false;
+     return true;
++}
++
++static JSAtom js_error_stack_pending_atom(JSContext *ctx)
++{
++    JSAtom descr, atom;
++
++    if (JS_IsUndefined(ctx->error_stack_pending_marker)) {
++        descr = JS_NewAtom(ctx, "v82jsc.errorStackPending");
++        if (descr == JS_ATOM_NULL)
++            return JS_ATOM_NULL;
++        ctx->error_stack_pending_marker =
++            JS_NewSymbolFromAtom(ctx, descr, JS_ATOM_TYPE_PRIVATE);
++        JS_FreeAtom(ctx, descr);
++        if (JS_IsException(ctx->error_stack_pending_marker)) {
++            ctx->error_stack_pending_marker = JS_UNDEFINED;
++            return JS_ATOM_NULL;
++        }
++    }
++    atom = JS_ValueToAtom(ctx, ctx->error_stack_pending_marker);
++    return atom;
++}
++
++static bool js_mark_error_stack_pending(JSContext *ctx, JSValueConst stack)
++{
++    JSAtom atom = js_error_stack_pending_atom(ctx);
++    int ret;
++
++    if (atom == JS_ATOM_NULL)
++        return false;
++    ret = JS_DefinePropertyValue(ctx, stack, atom, JS_TRUE, 0);
++    JS_FreeAtom(ctx, atom);
++    return ret >= 0;
+ }
+ 
++static bool js_error_stack_is_pending(JSContext *ctx, JSValueConst stack)
++{
++    JSAtom atom = js_error_stack_pending_atom(ctx);
++    int ret;
++
++    if (!JS_IsObject(stack))
++        return false;
++    if (atom == JS_ATOM_NULL)
++        return false;
++    ret = JS_HasProperty(ctx, stack, atom);
++    JS_FreeAtom(ctx, atom);
++    return ret > 0;
++}
++
++static void js_clear_error_stack_pending(JSContext *ctx, JSValueConst stack)
++{
++    JSAtom atom = js_error_stack_pending_atom(ctx);
++
++    if (atom == JS_ATOM_NULL)
++        return;
++    JS_DeleteProperty(ctx, stack, atom, 0);
++    JS_FreeAtom(ctx, atom);
++}
++
+ #define JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL (1 << 0)
+ /* only taken into account if filename is provided */
+ #define JS_BACKTRACE_FLAG_SINGLE_LEVEL     (1 << 1)
+@@ -8119,7 +8181,8 @@
+     const char *str1;
+     JSObject *p;
+     JSFunctionBytecode *b;
+-    bool backtrace_barrier, has_prepare, has_filter_func, has_frame_filter;
++    bool backtrace_barrier, has_prepare, has_embedder_prepare;
++    bool defer_prepare, has_filter_func, has_frame_filter;
+     JSRuntime *rt;
+     JSCallSiteData csd[64];
+     uint32_t i;
+@@ -8165,6 +8228,8 @@
+     stack_trace_limit = min_int(stack_trace_limit, countof(csd));
+     stack_trace_limit = max_int(stack_trace_limit, 0);
+     has_prepare = false;
++    has_embedder_prepare = false;
++    defer_prepare = false;
+     has_filter_func = backtrace_flags & JS_BACKTRACE_FLAG_FILTER_FUNC;
+     has_frame_filter = backtrace_flags &
+         (JS_BACKTRACE_FLAG_FILTER_FUNC |
+@@ -8172,7 +8237,11 @@
+     i = 0;
+ 
+     if (!JS_IsNull(ctx->error_ctor)) {
+-        prepare = js_dup(ctx->error_prepare_stack);
++        has_embedder_prepare = JS_IsFunction(ctx, ctx->error_prepare_stack_callback);
++        if (has_embedder_prepare)
++            prepare = js_dup(ctx->error_prepare_stack_callback);
++        else
++            prepare = js_dup(ctx->error_prepare_stack);
+         has_prepare = JS_IsFunction(ctx, prepare);
+     }
+ 
+@@ -8291,18 +8360,26 @@
+             JS_FreeValue(ctx, csd[k].func_name);
+             JS_FreeValue(ctx, csd[k].this_val);
+         }
+-        JSValueConst args[] = {
+-            error_obj,
+-            stack,
+-        };
+-        JSValue stack2 = JS_Call(ctx, prepare, ctx->error_ctor, countof(args), args);
+-        JS_FreeValue(ctx, stack);
+-        if (JS_IsException(stack2))
+-            stack = JS_NULL;
+-        else
+-            stack = stack2;
+-        JS_FreeValue(ctx, prepare);
+-        JS_Throw(ctx, saved_exception);
++        defer_prepare = has_embedder_prepare &&
++                        can_store_error_stack(error_obj) &&
++                        js_mark_error_stack_pending(ctx, stack);
++        if (defer_prepare) {
++            JS_FreeValue(ctx, prepare);
++            JS_Throw(ctx, saved_exception);
++        } else {
++            JSValueConst args[] = {
++                error_obj,
++                stack,
++            };
++            JSValue stack2 = JS_Call(ctx, prepare, ctx->error_ctor, countof(args), args);
++            JS_FreeValue(ctx, stack);
++            if (JS_IsException(stack2))
++                stack = JS_NULL;
++            else
++                stack = stack2;
++            JS_FreeValue(ctx, prepare);
++            JS_Throw(ctx, saved_exception);
++        }
+     } else {
+         if (dbuf_error(&dbuf))
+             stack = JS_NULL;
+@@ -44796,12 +44873,33 @@
+ static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
+ {
+     JSObject *p;
++    JSValue prepare, stack;
+ 
+     if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
+         return JS_ThrowTypeErrorNotAnObject(ctx);
+     p = JS_VALUE_GET_OBJ(this_val);
+     if (p->class_id != JS_CLASS_ERROR)
+         return JS_UNDEFINED;
++    if (js_error_stack_is_pending(ctx, p->u.object_data)) {
++        if (JS_IsFunction(ctx, ctx->error_prepare_stack_callback))
++            prepare = js_dup(ctx->error_prepare_stack_callback);
++        else
++            prepare = js_dup(ctx->error_prepare_stack);
++        if (JS_IsFunction(ctx, prepare)) {
++            JSValueConst args[] = { this_val, p->u.object_data };
++            stack = JS_Call(ctx, prepare, ctx->error_ctor, countof(args), args);
++            JS_FreeValue(ctx, prepare);
++            if (JS_IsException(stack))
++                return stack;
++        } else {
++            JS_FreeValue(ctx, prepare);
++            stack = js_dup(p->u.object_data);
++        }
++        js_clear_error_stack_pending(ctx, p->u.object_data);
++        JS_FreeValue(ctx, p->u.object_data);
++        p->u.object_data = js_dup(stack);
++        return js_error_prepend_stack_header(ctx, this_val, stack);
++    }
+     return js_error_prepend_stack_header(ctx, this_val,
+                                          js_dup(p->u.object_data));
+ }
+@@ -44885,8 +44983,19 @@
+     JS_FreeValue(ctx, ctx->error_prepare_stack);
+     ctx->error_prepare_stack = js_dup(value);
+     return JS_UNDEFINED;
++}
++
++void JS_SetPrepareStackTraceCallback(JSContext *ctx, JSValueConst callback)
++{
++    JS_FreeValue(ctx, ctx->error_prepare_stack_callback);
++    ctx->error_prepare_stack_callback = js_dup(callback);
+ }
+ 
++JSValue JS_GetPrepareStackTraceCallback(JSContext *ctx)
++{
++    return js_dup(ctx->error_prepare_stack_callback);
++}
++
+ static JSValue js_error_capture_stack_trace(JSContext *ctx, JSValueConst this_val,
+                                             int argc, JSValueConst *argv)
+ {
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -519,6 +519,8 @@
+ JS_EXTERN void *JS_GetContextOpaque(JSContext *ctx);
+ JS_EXTERN void JS_SetContextOpaque(JSContext *ctx, void *opaque);
+ JS_EXTERN JSRuntime *JS_GetRuntime(JSContext *ctx);
++JS_EXTERN void JS_SetPrepareStackTraceCallback(JSContext *ctx, JSValueConst callback);
++JS_EXTERN JSValue JS_GetPrepareStackTraceCallback(JSContext *ctx);
+ JS_EXTERN void JS_SetClassProto(JSContext *ctx, JSClassID class_id, JSValue obj);
+ JS_EXTERN JSValue JS_GetClassProto(JSContext *ctx, JSClassID class_id);
+ JS_EXTERN JSValue JS_GetFunctionProto(JSContext *ctx);

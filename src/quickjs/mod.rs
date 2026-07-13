@@ -34,6 +34,20 @@ mod raw_smoke_test {
   use super::quickjs_sys::*;
   use std::ffi::CString;
   use std::ptr;
+  use std::sync::atomic::AtomicUsize;
+  use std::sync::atomic::Ordering;
+
+  static PREPARE_STACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+  unsafe extern "C" fn test_prepare_stack_trace(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    _argc: std::ffi::c_int,
+    _argv: *mut JSValue,
+  ) -> JSValue {
+    PREPARE_STACK_CALLS.fetch_add(1, Ordering::SeqCst);
+    unsafe { JS_NewString(ctx, c"embedder stack".as_ptr()) }
+  }
 
   #[test]
   #[cfg(feature = "link_quickjs")]
@@ -58,6 +72,61 @@ mod raw_smoke_test {
       JS_FreeContext(ctx);
       JS_FreeRuntime(rt);
       let _ = ptr::null::<u8>();
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
+  fn embedder_prepare_stack_is_lazy_and_separate_from_user_hook() {
+    unsafe {
+      PREPARE_STACK_CALLS.store(0, Ordering::SeqCst);
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let callback = JS_NewCFunction(
+        ctx,
+        test_prepare_stack_trace,
+        c"prepareStackTrace".as_ptr(),
+        2,
+      );
+      JS_SetPrepareStackTraceCallback(ctx, callback);
+      JS_FreeValue(ctx, callback);
+
+      let setup = c"Error.prepareStackTrace = () => 'user stack'; globalThis.error = new Error('boom'); typeof Error.prepareStackTrace";
+      let result = JS_Eval(
+        ctx,
+        setup.as_ptr(),
+        setup.to_bytes().len(),
+        c"prepare-stack-test.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "setup threw");
+      assert_eq!(PREPARE_STACK_CALLS.load(Ordering::SeqCst), 0);
+      JS_FreeValue(ctx, result);
+
+      let result = JS_Eval(
+        ctx,
+        c"error.stack".as_ptr(),
+        c"error.stack".to_bytes().len(),
+        c"prepare-stack-test.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "stack access threw");
+      let mut len = 0;
+      let text = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!text.is_null());
+      let actual =
+        std::str::from_utf8(std::slice::from_raw_parts(text as *const u8, len))
+          .unwrap();
+      assert_eq!(actual, "embedder stack");
+      assert_eq!(PREPARE_STACK_CALLS.load(Ordering::SeqCst), 1);
+
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
     }
   }
 

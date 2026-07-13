@@ -688,9 +688,9 @@ pub extern "C" fn v8__StackTrace__CurrentStackTrace(
   if ctx.is_null() {
     return ptr::null();
   }
-  let (error_ctor, saved_prepare) = unsafe { take_prepare_stack_trace(ctx) };
+  let saved_prepare = unsafe { take_prepare_stack_trace(ctx) };
   let raw = unsafe { current_backtrace_string(ctx) };
-  unsafe { restore_prepare_stack_trace(ctx, error_ctor, saved_prepare) };
+  unsafe { restore_prepare_stack_trace(ctx, saved_prepare) };
   let mut frames = parse_qjs_backtrace(&raw);
   for frame in &mut frames {
     let Some(file) = frame.url.as_deref() else {
@@ -1458,11 +1458,12 @@ pub extern "C" fn v8__TryCatch__StackTrace(
 // deno_core registers a native V8 PrepareStackTraceCallback
 // (`v8__Isolate__SetPrepareStackTraceCallback`). On V8 that callback runs in
 // place of `Error.prepareStackTrace`, reading structured CallSite frames and
-// formatting them. QuickJS-ng has no equivalent native hook — it only consults
-// `Error.prepareStackTrace`. The vendored fork exposes the full V8 CallSite API
-// on its native CallSites, but with placeholder values (isToplevel always
-// false, getColumnNumber = the construct CALL column, synthetic Promise/Error
-// native frames left in). Left as-is, deno's
+// formatting them. Our QuickJS-ng patch adds a separate embedder callback slot
+// so assigning the user-visible `Error.prepareStackTrace` cannot replace this
+// bridge. The vendored fork exposes the full V8 CallSite API on its native
+// CallSites, but with placeholder values (isToplevel always false,
+// getColumnNumber = the construct CALL column, synthetic Promise/Error native
+// frames left in). Left as-is, deno's
 // `Display for JsError` prints the raw multi-frame quickjs stack, e.g.
 //   Error: fail
 //       at construct ([native code])
@@ -1471,9 +1472,9 @@ pub extern "C" fn v8__TryCatch__StackTrace(
 //       at global code (a.js:1:25)
 // where V8 prints just `Error: fail\n    at a.js:1:16`.
 //
-// We close the gap with our own `Error.prepareStackTrace`, installed ONLY on
-// runtimes that called SetPrepareStackTraceCallback (deno_core — never the bare
-// rusty_v8 cell, which keeps quickjs's native stack untouched). It reads the
+// We close the gap with our own engine callback, installed ONLY on runtimes that
+// called SetPrepareStackTraceCallback (deno_core — never the bare rusty_v8 cell,
+// which keeps quickjs's native stack untouched). It reads the
 // fork's CallSites and re-formats them V8-style: synthetic native frames are
 // dropped while native constructor frames are retained, top-level frames print
 // without a function name, and `new X()` construct columns are moved from the
@@ -1486,12 +1487,13 @@ thread_local! {
     const { std::cell::Cell::new(false) };
   static PREPARE_STACK_SUPPRESS_DEPTH: std::cell::Cell<u32> =
     const { std::cell::Cell::new(0) };
+  static PREPARE_STACK_DISPATCHING: std::cell::Cell<bool> =
+    const { std::cell::Cell::new(false) };
 
   // deno's native PrepareStackTraceCallback (registered via
-  // v8__Isolate__SetPrepareStackTraceCallback). QuickJS has no engine hook for
-  // it, so our JS `Error.prepareStackTrace` forwards the (corrected) frames into
-  // this callback when it's set — deno's formatter then applies native source
-  // maps (the `//# sourceMappingURL=` payloads surfaced by
+  // v8__Isolate__SetPrepareStackTraceCallback). Our QuickJS engine callback
+  // forwards corrected frames into it, and deno's formatter then applies native
+  // source maps (the `//# sourceMappingURL=` payloads surfaced by
   // UnboundModuleScript::GetSourceMappingURL) before producing the stack string.
   static PREPARE_STACK_TRACE_CB: std::cell::Cell<
     Option<crate::isolate::PrepareStackTraceCallback<'static>>,
@@ -1520,9 +1522,9 @@ pub(crate) fn with_prepare_stack_suppressed<T>(f: impl FnOnce() -> T) -> T {
   f()
 }
 
-/// Store deno's native PrepareStackTraceCallback so our `Error.prepareStackTrace`
-/// can forward into it (enabling source-map resolution). Also flips the active
-/// flag so new contexts install the shim.
+/// Store deno's native PrepareStackTraceCallback so the engine bridge can
+/// forward into it (enabling source-map resolution). Also flips the active flag
+/// so new contexts install the bridge.
 pub(crate) fn set_prepare_stack_trace_cb(
   cb: crate::isolate::PrepareStackTraceCallback<'static>,
 ) {
@@ -1531,33 +1533,26 @@ pub(crate) fn set_prepare_stack_trace_cb(
 }
 
 /// Record that this thread's runtime registered a PrepareStackTraceCallback, so
-/// new contexts get our `Error.prepareStackTrace` from `install_default_globals`.
+/// new contexts get the engine bridge from `install_default_globals`.
 pub(crate) fn activate_prepare_stack() {
   PREPARE_STACK_ACTIVE.with(|c| c.set(true));
 }
 
-/// Install our `Error.prepareStackTrace` on `ctx`. No-op unless a
+/// Install our engine prepare-stack callback on `ctx`. No-op unless a
 /// PrepareStackTraceCallback was registered for this isolate (see above).
 pub(crate) fn install_prepare_stack_trace(ctx: *mut JSContext) {
   if ctx.is_null() || !is_prepare_stack_active() {
     return;
   }
   unsafe {
-    let global = JS_GetGlobalObject(ctx);
-    let error = JS_GetPropertyStr(ctx, global, c"Error".as_ptr());
-    JS_FreeValue(ctx, global);
-    if error.tag == JS_TAG_EXCEPTION || !JS_IsFunction(ctx, error) {
-      JS_FreeValue(ctx, error);
-      return;
-    }
     let f = JS_NewCFunction(
       ctx,
       qjs_prepare_stack_trace,
       c"prepareStackTrace".as_ptr(),
       2,
     );
-    JS_SetPropertyStr(ctx, error, c"prepareStackTrace".as_ptr(), f);
-    JS_FreeValue(ctx, error);
+    JS_SetPrepareStackTraceCallback(ctx, f);
+    JS_FreeValue(ctx, f);
   }
 }
 
@@ -2275,7 +2270,20 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
   // hand it the SAME corrected frames computed above as synthetic CallSite
   // objects, so the column/function-name fixes survive and unmapped frames
   // (e.g. no source map) format identically to the string built here.
-  if let Some(mapped) = unsafe { source_mapped_stack(ctx, error, &frames) } {
+  let mapped = PREPARE_STACK_DISPATCHING.with(|dispatching| {
+    if dispatching.replace(true) {
+      return None;
+    }
+    struct Guard<'a>(&'a std::cell::Cell<bool>);
+    impl Drop for Guard<'_> {
+      fn drop(&mut self) {
+        self.0.set(false);
+      }
+    }
+    let _guard = Guard(dispatching);
+    unsafe { source_mapped_stack(ctx, error, &frames) }
+  });
+  if let Some(mapped) = mapped {
     return mapped;
   }
 
@@ -2293,6 +2301,21 @@ type PreparedFrame = (
   bool,
   bool,
 );
+
+unsafe fn take_prepare_stack_trace(ctx: *mut JSContext) -> JSValue {
+  unsafe {
+    let saved = JS_GetPrepareStackTraceCallback(ctx);
+    JS_SetPrepareStackTraceCallback(ctx, jsv_undefined());
+    saved
+  }
+}
+
+unsafe fn restore_prepare_stack_trace(ctx: *mut JSContext, saved: JSValue) {
+  unsafe {
+    JS_SetPrepareStackTraceCallback(ctx, saved);
+    JS_FreeValue(ctx, saved);
+  }
+}
 
 /// JS factory that turns rows of
 /// `[file, line, col, funcOrNull, typeOrNull, methodOrNull, isTopLevel,
@@ -2396,49 +2419,6 @@ unsafe fn build_callsites(
   }
 }
 
-/// Temporarily clear `globalThis.Error.prepareStackTrace` (returns the Error
-/// object handle and the saved callback to restore afterwards). deno's native
-/// callback re-dispatches to a user `Error.prepareStackTrace` if present — which
-/// is *this* shim — so it must be cleared while we invoke the callback.
-unsafe fn take_prepare_stack_trace(ctx: *mut JSContext) -> (JSValue, JSValue) {
-  unsafe {
-    let global = JS_GetGlobalObject(ctx);
-    let error = JS_GetPropertyStr(ctx, global, c"Error".as_ptr());
-    JS_FreeValue(ctx, global);
-    if error.tag == JS_TAG_EXCEPTION || !JS_IsFunction(ctx, error) {
-      clear_pending(ctx);
-      JS_FreeValue(ctx, error);
-      return (jsv_undefined(), jsv_undefined());
-    }
-    let saved = JS_GetPropertyStr(ctx, error, c"prepareStackTrace".as_ptr());
-    JS_SetPropertyStr(
-      ctx,
-      error,
-      c"prepareStackTrace".as_ptr(),
-      jsv_undefined(),
-    );
-    (error, saved)
-  }
-}
-
-/// Restore the previously-saved `Error.prepareStackTrace`.
-unsafe fn restore_prepare_stack_trace(
-  ctx: *mut JSContext,
-  error: JSValue,
-  saved: JSValue,
-) {
-  unsafe {
-    if error.tag == JS_TAG_EXCEPTION || !JS_IsFunction(ctx, error) {
-      JS_FreeValue(ctx, error);
-      JS_FreeValue(ctx, saved);
-      return;
-    }
-    // JS_SetPropertyStr consumes `saved`.
-    JS_SetPropertyStr(ctx, error, c"prepareStackTrace".as_ptr(), saved);
-    JS_FreeValue(ctx, error);
-  }
-}
-
 /// Forward the corrected `frames` into deno's native PrepareStackTraceCallback,
 /// returning the source-mapped, V8-formatted stack string. `None` when no
 /// callback is registered (the bare rusty_v8 cell) or anything fails, so the
@@ -2454,8 +2434,6 @@ unsafe fn source_mapped_stack(
   }
   let sites = unsafe { build_callsites(ctx, frames) }?;
 
-  let (error_obj, saved) = unsafe { take_prepare_stack_trace(ctx) };
-
   let out = unsafe {
     let ctx_h = super::core::intern_ctx(ctx);
     let err_h = intern_dup::<Value>(ctx, error);
@@ -2467,11 +2445,23 @@ unsafe fn source_mapped_stack(
     ) {
       (Some(c_l), Some(e_l), Some(s_l)) => {
         let ret = cb(c_l, e_l, s_l);
+        if JS_HasException(ctx) {
+          let exception = JS_GetException(ctx);
+          if jsv_is_object(&exception) {
+            let stack = JS_GetPropertyStr(ctx, exception, c"stack".as_ptr());
+            if stack.tag == JS_TAG_EXCEPTION {
+              clear_pending(ctx);
+            } else {
+              JS_FreeValue(ctx, stack);
+            }
+          }
+          JS_Throw(ctx, exception);
+          return Some(jsv_exception());
+        }
         // PrepareStackTraceCallbackRet wraps a private `*const Value`.
         let v: *const Value = std::mem::transmute(ret);
-        if v.is_null() || jsv_is_undefined(&jsval_of(v)) {
-          // Null/undefined = the embedder declined (e.g. deno_core during
-          // runtime init, before its state exists) — keep our own string.
+        if v.is_null() {
+          // A null handle means the embedder declined. Keep our own string.
           None
         } else {
           Some(JS_DupValue(ctx, jsval_of(v)))
@@ -2480,7 +2470,5 @@ unsafe fn source_mapped_stack(
       _ => None,
     }
   };
-
-  unsafe { restore_prepare_stack_trace(ctx, error_obj, saved) };
   out
 }
