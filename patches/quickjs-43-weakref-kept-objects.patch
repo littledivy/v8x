@@ -1,0 +1,78 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -540,6 +540,7 @@
+ JS_EXTERN int JS_AddIntrinsicPromise(JSContext *ctx);
+ JS_EXTERN int JS_AddIntrinsicBigInt(JSContext *ctx);
+ JS_EXTERN int JS_AddIntrinsicWeakRef(JSContext *ctx);
++JS_EXTERN void JS_ClearKeptObjects(JSRuntime *rt);
+ JS_EXTERN int JS_AddPerformance(JSContext *ctx);
+ JS_EXTERN int JS_AddIntrinsicDOMException(JSContext *ctx);
+ JS_EXTERN int JS_AddIntrinsicAToB(JSContext *ctx);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -323,6 +323,7 @@
+     // for smuggling the parent promise from js_promise_then
+     // to js_promise_constructor
+     JSValueLink *parent_promise;
++    JSValueLink *kept_objects;
+ 
+     JSJobContextCapture *job_context_capture;
+     JSJobContextSet *job_context_set;
+@@ -2414,6 +2415,7 @@
+ 
+     rt->in_free = true;
+     JS_FreeValueRT(rt, rt->current_exception);
++    JS_ClearKeptObjects(rt);
+ 
+     list_for_each_safe(el, el1, &rt->job_list) {
+         JSJobEntry *e = list_entry(el, JSJobEntry, link);
+@@ -64861,6 +64863,29 @@
+     js_free_rt(rt, wr);
+ }
+ 
++static int js_keep_object(JSContext *ctx, JSValueConst value)
++{
++    JSValueLink *link = js_malloc(ctx, sizeof(*link));
++    if (!link)
++        return -1;
++    link->value = js_dup(value);
++    link->next = ctx->rt->kept_objects;
++    ctx->rt->kept_objects = link;
++    return 0;
++}
++
++void JS_ClearKeptObjects(JSRuntime *rt)
++{
++    JSValueLink *link = rt->kept_objects;
++    rt->kept_objects = NULL;
++    while (link) {
++        JSValueLink *next = link->next;
++        JS_FreeValueRT(rt, link->value);
++        js_free_rt(rt, link);
++        link = next;
++    }
++}
++
+ static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
+                                       int argc, JSValueConst *argv)
+ {
+@@ -64889,6 +64914,10 @@
+     insert_weakref_record(arg, wr);
+ 
+     JS_SetOpaqueInternal(obj, wrd);
++    if (js_keep_object(ctx, arg)) {
++        JS_FreeValue(ctx, obj);
++        return JS_EXCEPTION;
++    }
+     return obj;
+ }
+ 
+@@ -64900,6 +64929,8 @@
+         return JS_EXCEPTION;
+     if (wrd == &js_weakref_sentinel)
+         return JS_UNDEFINED;
++    if (js_keep_object(ctx, wrd->target))
++        return JS_EXCEPTION;
+     return js_dup(wrd->target);
+ }
+

@@ -309,6 +309,7 @@ unsafe extern "C" {
   );
   pub fn JS_SetGCThreshold(rt: *mut JSRuntime, gc_threshold: usize);
   pub fn JS_RunGC(rt: *mut JSRuntime);
+  pub fn JS_ClearKeptObjects(rt: *mut JSRuntime);
   pub fn JS_IsJobPending(rt: *mut JSRuntime) -> bool;
   pub fn JS_ExecutePendingJob(
     rt: *mut JSRuntime,

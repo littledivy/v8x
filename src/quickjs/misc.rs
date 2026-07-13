@@ -619,7 +619,7 @@ pub extern "C" fn v8__Isolate__RequestGarbageCollectionForTesting(
   let st = iso_state(isolate);
   let prologue_callbacks = st.gc_prologue_callbacks.clone();
   run_gc_callbacks(isolate, &prologue_callbacks);
-  if st.kept_objects_cleared && !st.rt.is_null() {
+  if !st.rt.is_null() {
     unsafe { JS_RunGC(st.rt) };
   }
   cppgc_collect_garbage();

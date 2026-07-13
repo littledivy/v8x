@@ -94,6 +94,57 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn weakref_targets_are_kept_until_cleared() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let create = c"globalThis.ref = new WeakRef({});
+        ref.deref() !== undefined";
+      let result = JS_Eval(
+        ctx,
+        create.as_ptr(),
+        create.to_bytes().len(),
+        c"weakref-create.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert_eq!(JS_ToBool(ctx, result), 1);
+      JS_FreeValue(ctx, result);
+
+      JS_RunGC(rt);
+      let retained = c"ref.deref() !== undefined";
+      let result = JS_Eval(
+        ctx,
+        retained.as_ptr(),
+        retained.to_bytes().len(),
+        c"weakref-retained.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert_eq!(JS_ToBool(ctx, result), 1);
+      JS_FreeValue(ctx, result);
+
+      JS_ClearKeptObjects(rt);
+      JS_RunGC(rt);
+      let cleared = c"ref.deref() === undefined";
+      let result = JS_Eval(
+        ctx,
+        cleared.as_ptr(),
+        cleared.to_bytes().len(),
+        c"weakref-cleared.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert_eq!(JS_ToBool(ctx, result), 1);
+      JS_FreeValue(ctx, result);
+
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn synthetic_module_namespace_has_module_semantics() {
     unsafe {
       let rt = JS_NewRuntime();

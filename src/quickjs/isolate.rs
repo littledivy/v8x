@@ -1820,10 +1820,8 @@ pub extern "C" fn v8__Isolate__ClearKeptObjects(
 ) {
   if !isolate.is_null() {
     let st = iso_state(isolate as *mut RealIsolate);
-    st.kept_objects_cleared = true;
-    crate::quickjs::core::clear_kept_objects_for_context(st.ctx);
-    for ctx in &st.extra_contexts {
-      crate::quickjs::core::clear_kept_objects_for_context(*ctx);
+    if !st.rt.is_null() {
+      unsafe { JS_ClearKeptObjects(st.rt) };
     }
   }
 }

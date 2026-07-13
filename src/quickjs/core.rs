@@ -362,8 +362,6 @@ pub(crate) struct IsoState {
 
   pub weak_handles: Vec<WeakHandle>,
 
-  pub kept_objects_cleared: bool,
-
   pub gc_prologue_callbacks: Vec<GcCallbackEntry>,
 
   pub gc_epilogue_callbacks: Vec<GcCallbackEntry>,
@@ -859,7 +857,6 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     bytecode_and_metadata_size: AtomicUsize::new(0),
     global_handles: AtomicI64::new(0),
     weak_handles: Vec::new(),
-    kept_objects_cleared: false,
     gc_prologue_callbacks: Vec::new(),
     gc_epilogue_callbacks: Vec::new(),
     message_listeners: Vec::new(),
@@ -1327,7 +1324,6 @@ pub(crate) fn install_default_globals(
     super::isolate::install_snapshot_intrinsics(ctx, global);
     JS_FreeValue(ctx, global);
   }
-  install_weakref_kept_object_shim(ctx);
   // Install our V8-accurate `Error.prepareStackTrace` (no-op unless deno
   // registered a PrepareStackTraceCallback — see exception.rs).
   super::exception::install_prepare_stack_trace(ctx);
@@ -1812,53 +1808,6 @@ unsafe extern "C" fn qjs_entropy_random(
   unsafe { JS_NewFloat64(ctx, value) }
 }
 
-fn install_weakref_kept_object_shim(ctx: *mut JSContext) {
-  const SRC: &[u8] = br#"
-    Object.defineProperty(globalThis, "__v8xKeptObjectsCleared", {
-      value: false,
-      writable: true,
-      configurable: true,
-    });
-    Object.defineProperty(globalThis, "WeakRef", { value: class WeakRef {
-      constructor(target) { this.__v8xTarget = target; }
-      deref() {
-        return globalThis.__v8xKeptObjectsCleared ? undefined : this.__v8xTarget;
-      }
-    }, writable: true, configurable: true });
-  "#;
-  // QuickJS's parser needs a NUL sentinel at buf[len]; a raw string can't
-  // embed one (`\0` inside r#""# is a literal backslash + zero — that typo
-  // broke every Context::New on CI), so copy into a NUL-terminated CString.
-  let csrc = std::ffi::CString::new(SRC).unwrap();
-  unsafe {
-    let r = JS_Eval(
-      ctx,
-      csrc.as_ptr(),
-      SRC.len(),
-      c"<weakref-kept-objects>".as_ptr(),
-      JS_EVAL_TYPE_GLOBAL,
-    );
-    if r.tag == JS_TAG_EXCEPTION {
-      let exc = JS_GetException(ctx);
-      JS_FreeValue(ctx, exc);
-    } else {
-      JS_FreeValue(ctx, r);
-    }
-  }
-}
-
-pub(crate) fn clear_kept_objects_for_context(ctx: *mut JSContext) {
-  if ctx.is_null() {
-    return;
-  }
-  unsafe {
-    let global = JS_GetGlobalObject(ctx);
-    let value = JS_NewBool(ctx, 1);
-    JS_SetPropertyStr(ctx, global, c"__v8xKeptObjectsCleared".as_ptr(), value);
-    JS_FreeValue(ctx, global);
-  }
-}
-
 fn install_intl_stub(ctx: *mut JSContext, _global: JSValue) {
   const SRC: &[u8] = b"(function(g){\
         if (g.Intl) return;\
@@ -2330,16 +2279,6 @@ pub extern "C" fn v8__Script__Run(
   }
   let source_bytes =
     unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
-  if source_bytes
-    .windows(b"weakrefs.some(w => !w.deref())".len())
-    .any(|w| w == b"weakrefs.some(w => !w.deref())")
-    || source_bytes
-      .windows(b"weakrefs.every(w => w.deref())".len())
-      .any(|w| w == b"weakrefs.every(w => w.deref())")
-  {
-    unsafe { JS_FreeCString(ctx, cstr) };
-    return intern::<Value>(jsv_undefined());
-  }
   // Use the compile-time resource name (script URL) as the eval filename so
   // `import()` inside this script resolves relative to it; fall back to
   // `<eval>` for scripts compiled without a ScriptOrigin.
