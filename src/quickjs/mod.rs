@@ -514,10 +514,55 @@ mod raw_smoke_test {
       assert!(!message_text.is_null());
       assert_eq!(CStr::from_ptr(message_text).to_bytes(), b"boom");
 
+      let global = JS_GetGlobalObject(ctx);
+      assert_eq!(
+        JS_SetPropertyStr(ctx, global, c"modulePromise".as_ptr(), result),
+        1
+      );
+      JS_FreeValue(ctx, global);
+
+      let consumer = c"globalThis.moduleStack = 'pending';
+        (async function consumer() {
+          try {
+            await modulePromise;
+          } catch (error) {
+            globalThis.moduleStack = error.stack;
+          }
+        })();";
+      let consumer_result = JS_Eval(
+        ctx,
+        consumer.as_ptr(),
+        consumer.to_bytes().len(),
+        c"module-consumer.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(consumer_result.tag != JS_TAG_EXCEPTION, "consumer threw");
+      JS_FreeValue(ctx, consumer_result);
+
+      let mut job_ctx = ptr::null_mut();
+      while JS_IsJobPending(rt) {
+        assert!(JS_ExecutePendingJob(rt, &mut job_ctx) >= 0);
+      }
+
+      let stack = JS_Eval(
+        ctx,
+        c"moduleStack".as_ptr(),
+        c"moduleStack".to_bytes().len(),
+        c"module-consumer.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(stack.tag != JS_TAG_EXCEPTION, "stack access threw");
+      let stack_cstr = JS_ToCString(ctx, stack);
+      assert!(!stack_cstr.is_null());
+      let stack_text = CStr::from_ptr(stack_cstr).to_string_lossy();
+      assert!(stack_text.contains("throwing-module.js:1"));
+      assert!(!stack_text.contains("module-consumer.js"));
+      JS_FreeCString(ctx, stack_cstr);
+      JS_FreeValue(ctx, stack);
+
       JS_FreeCString(ctx, message_text);
       JS_FreeValue(ctx, message);
       JS_FreeValue(ctx, exception);
-      JS_FreeValue(ctx, result);
       JS_FreeContext(ctx);
       JS_FreeRuntime(rt);
     }

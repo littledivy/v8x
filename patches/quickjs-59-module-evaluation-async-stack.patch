@@ -1,0 +1,126 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21599,12 +21599,22 @@ void v82jsc_mark_skip_next_async_frame(JSContext *ctx, JSValueConst error,
+ {
+     JSAtom atom;
++    JSValue marker;
+ 
+     if (JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
+         return;
+     atom = js_v82jsc_private_atom(ctx,
+         "v82jsc_private:skip_next_async_frame");
+     if (atom == JS_ATOM_NULL)
+         return;
++    marker = JS_GetProperty(ctx, error, atom);
++    if (JS_IsNull(marker)) {
++        JS_FreeValue(ctx, marker);
++        JS_FreeAtom(ctx, atom);
++        return;
++    }
++    if (JS_IsException(marker))
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    JS_FreeValue(ctx, marker);
+     if (JS_DefinePropertyValue(ctx, error, atom, js_dup(filename),
+                                JS_PROP_CONFIGURABLE) < 0)
+         JS_FreeValue(ctx, JS_GetException(ctx));
+@@ -21611,27 +21611,49 @@ void v82jsc_mark_skip_next_async_frame(JSContext *ctx, JSValueConst error,
+     JS_FreeAtom(ctx, atom);
+ }
+ 
+-static bool js_v82jsc_take_skip_next_async_frame(JSContext *ctx,
+-                                                  JSValueConst error,
+-                                                  const char *file)
++/* Module evaluation failures retain the stack from the module body. V8 does
++   not stitch the dynamic importer's await site onto those errors, so mark the
++   next async boundary for unconditional suppression. */
++static void js_v82jsc_mark_skip_next_async_frame_any(JSContext *ctx,
++                                                      JSValueConst error)
++{
++    JSAtom atom;
++
++    if (JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
++        return;
++    atom = js_v82jsc_private_atom(ctx,
++        "v82jsc_private:skip_next_async_frame");
++    if (atom == JS_ATOM_NULL)
++        return;
++    if (JS_DefinePropertyValue(ctx, error, atom, JS_NULL,
++                               JS_PROP_CONFIGURABLE) < 0)
++        JS_FreeValue(ctx, JS_GetException(ctx));
++    JS_FreeAtom(ctx, atom);
++}
++
++/* 0 = no marker, 1 = matching filename, 2 = unconditional. */
++static int js_v82jsc_take_skip_next_async_frame(JSContext *ctx,
++                                                 JSValueConst error,
++                                                 const char *file)
+ {
+     JSAtom atom;
+     JSValue marker;
+     const char *marked_file;
+-    bool skip;
++    int skip;
+ 
+     atom = js_v82jsc_private_atom(ctx,
+         "v82jsc_private:skip_next_async_frame");
+     if (atom == JS_ATOM_NULL)
+-        return false;
++        return 0;
+     marker = JS_GetProperty(ctx, error, atom);
+     if (JS_IsException(marker)) {
+         JS_FreeValue(ctx, JS_GetException(ctx));
+         JS_FreeAtom(ctx, atom);
+-        return false;
++        return 0;
+     }
+     marked_file = JS_IsString(marker) ? JS_ToCString(ctx, marker) : NULL;
+-    skip = marked_file && file && !strcmp(marked_file, file);
++    skip = JS_IsNull(marker) ? 2 :
++        (marked_file && file && !strcmp(marked_file, file) ? 1 : 0);
+     if (marked_file)
+         JS_FreeCString(ctx, marked_file);
+     JS_FreeValue(ctx, marker);
+@@ -21707,13 +21729,14 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
+     DynBuf dbuf;
+     const char *cs;
+     size_t len;
+-    bool skip_marked;
++    int skip_marked;
+ 
+     if (!file || JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
+         return;
+     skip_marked = js_v82jsc_take_skip_next_async_frame(ctx, error, file);
+-    if (skip_marked &&
++    if (skip_marked == 2 ||
++        (skip_marked == 1 &&
+-        js_v82jsc_has_same_async_site(ctx, error, file, -1))
++         js_v82jsc_has_same_async_site(ctx, error, file, -1)))
+         return;
+     error_obj = JS_VALUE_GET_OBJ(error);
+     stack_prop = find_own_property1(error_obj, JS_ATOM_stack);
+@@ -21734,8 +21752,7 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
+         cs = JS_ToCStringLen(ctx, &len, stack);
+         if (cs) {
+             dbuf_put(&dbuf, (const uint8_t *)cs, len);
+-            if (len == 0 || cs[len - 1] != '\n')
+-                dbuf_putc(&dbuf, '\n');
++            dbuf_putc(&dbuf, '\n');
+             JS_FreeCString(ctx, cs);
+         }
+     }
+@@ -32827,6 +32844,7 @@ static JSValue js_async_module_execution_rejected(JSContext *ctx, JSValueConst t
+     module->async_func_state = NULL;
+     module->eval_has_exception = true;
+     module->eval_exception = js_dup(error);
++    js_v82jsc_mark_skip_next_async_frame_any(ctx, error);
+     module->status = JS_MODULE_STATUS_EVALUATED;
+ 
+     for(i = 0; i < module->async_parent_modules_count; i++) {
+@@ -33104,6 +33122,7 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
+             m1->status = JS_MODULE_STATUS_EVALUATED;
+             m1->eval_has_exception = true;
+             m1->eval_exception = js_dup(result);
++            js_v82jsc_mark_skip_next_async_frame_any(ctx, result);
+             m1->cycle_root = m; /* spec bug: should be present */
+             stack_top = m1->stack_prev;
+         }
