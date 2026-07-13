@@ -224,6 +224,7 @@ unsafe extern "C" {
   pub fn wasm_memory_grow(m: *mut wasm_memory_t, delta: u32) -> bool;
 
   pub fn wasm_trap_delete(t: *mut wasm_trap_t);
+  pub fn wasm_trap_message(t: *const wasm_trap_t, out: *mut wasm_vec_t);
   pub fn wasm_trap_new(
     store: *mut wasm_store_t,
     message: *const wasm_vec_t,
@@ -370,6 +371,57 @@ mod tests {
       assert!(jsv_is_null(&value));
 
       JS_FreeValue(ctx, value);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  fn wasm_traps_are_runtime_errors() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+      install_webassembly(ctx);
+
+      let source = CString::new(
+        r#"
+        const bytes = new Uint8Array([
+          0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00,
+          0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02,
+          0x01, 0x00, 0x07, 0x0f, 0x01, 0x0b, 0x75, 0x6e,
+          0x72, 0x65, 0x61, 0x63, 0x68, 0x61, 0x62, 0x6c,
+          0x65, 0x00, 0x00, 0x0a, 0x05, 0x01, 0x03, 0x00,
+          0x00, 0x0b,
+        ]);
+        const instance = new WebAssembly.Instance(new WebAssembly.Module(bytes));
+        try {
+          instance.exports.unreachable();
+        } catch (error) {
+          `${error instanceof WebAssembly.RuntimeError}:${error.name}:${error.message}`;
+        }
+        "#,
+      )
+      .unwrap();
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.as_bytes().len(),
+        c"wasm-runtime-error.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "eval threw");
+      let mut len = 0usize;
+      let actual = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!actual.is_null());
+      assert_eq!(
+        std::slice::from_raw_parts(actual as *const u8, len),
+        b"true:RuntimeError:unreachable"
+      );
+
+      JS_FreeCString(ctx, actual);
+      JS_FreeValue(ctx, result);
       JS_FreeContext(ctx);
       JS_FreeRuntime(rt);
     }
@@ -627,6 +679,48 @@ unsafe fn throw(ctx: *mut JSContext, msg: &str) -> JSValue {
   } else {
     jsv_exception()
   }
+}
+
+unsafe fn throw_wasm_error(
+  ctx: *mut JSContext,
+  class_name: &std::ffi::CStr,
+  message: &str,
+) -> JSValue {
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let webassembly =
+    unsafe { JS_GetPropertyStr(ctx, global, c"WebAssembly".as_ptr()) };
+  let constructor =
+    unsafe { JS_GetPropertyStr(ctx, webassembly, class_name.as_ptr()) };
+  let Ok(message) = CString::new(message) else {
+    unsafe {
+      JS_FreeValue(ctx, constructor);
+      JS_FreeValue(ctx, webassembly);
+      JS_FreeValue(ctx, global);
+    }
+    return jsv_exception();
+  };
+  let mut args = [unsafe { JS_NewString(ctx, message.as_ptr()) }];
+  let error =
+    unsafe { JS_CallConstructor(ctx, constructor, 1, args.as_mut_ptr()) };
+  unsafe {
+    JS_FreeValue(ctx, args[0]);
+    JS_FreeValue(ctx, constructor);
+    JS_FreeValue(ctx, webassembly);
+    JS_FreeValue(ctx, global);
+  }
+  if error.tag == JS_TAG_EXCEPTION {
+    error
+  } else {
+    unsafe { JS_Throw(ctx, error) }
+  }
+}
+
+unsafe fn trap_message(trap: *const wasm_trap_t) -> std::string::String {
+  let mut bytes = wasm_vec_t::empty();
+  unsafe { wasm_trap_message(trap, &mut bytes) };
+  let message = vec_name_to_string(&bytes);
+  unsafe { wasm_byte_vec_delete(&mut bytes) };
+  message
 }
 
 unsafe fn read_wasm_bytes(ctx: *mut JSContext, v: JSValue) -> Option<Vec<u8>> {
@@ -986,12 +1080,14 @@ unsafe extern "C" fn call_export(
     eprintln!("[wasm] call_export returned, trap={}", !trap.is_null());
   }
 
-  if let Some(exc) = PENDING_IMPORT_EXC.with(|p| p.borrow_mut().take()) {
-    unsafe { JS_FreeValue(ctx, exc) };
-  }
+  let pending_import_exception =
+    PENDING_IMPORT_EXC.with(|pending| pending.borrow_mut().take());
   if !trap.is_null() {
-    unsafe { wasm_trap_delete(trap) };
     if !iso.is_null() && iso_state(iso).is_terminating() {
+      if let Some(exception) = pending_import_exception {
+        unsafe { JS_FreeValue(ctx, exception) };
+      }
+      unsafe { wasm_trap_delete(trap) };
       unsafe {
         JS_ThrowInternalError(ctx, c"interrupted".as_ptr());
         let exc = JS_GetException(ctx);
@@ -999,11 +1095,21 @@ unsafe extern "C" fn call_export(
         return JS_Throw(ctx, exc);
       }
     }
+    if let Some(exception) = pending_import_exception {
+      unsafe { wasm_trap_delete(trap) };
+      return unsafe { JS_Throw(ctx, exception) };
+    }
     if std::env::var("V82_WASM_TRACE").is_ok() {
       let d = WASM_CALL_DEPTH.with(|d| d.get());
       eprintln!("[wasm] TRAP in export {:?} depth={d}", env.name);
     }
-    return unsafe { throw(ctx, "WebAssembly: trap during function call") };
+    let message = unsafe { trap_message(trap) };
+    unsafe { wasm_trap_delete(trap) };
+    let message = message.strip_prefix("Exception: ").unwrap_or(&message);
+    return unsafe { throw_wasm_error(ctx, c"RuntimeError", message) };
+  }
+  if let Some(exception) = pending_import_exception {
+    return unsafe { JS_Throw(ctx, exception) };
   }
   if results.is_empty() {
     jsv_undefined()
@@ -2442,7 +2548,7 @@ pub(crate) fn install_webassembly(ctx: *mut JSContext) {
     JS_SetPropertyStr(ctx, global, c"WebAssembly".as_ptr(), wa);
     JS_FreeValue(ctx, global);
 
-    let brands = c"(()=>{const W=WebAssembly;for(const n of ['Module','Instance','Memory','Global','Table'])Object.defineProperty(W[n].prototype,Symbol.toStringTag,{value:`WebAssembly.${n}`,configurable:true});})()";
+    let brands = c"(()=>{const W=WebAssembly;for(const n of ['Module','Instance','Memory','Global','Table'])Object.defineProperty(W[n].prototype,Symbol.toStringTag,{value:`WebAssembly.${n}`,configurable:true});for(const n of ['CompileError','LinkError','RuntimeError']){const C=class extends Error{};Object.defineProperty(C,'name',{value:n});Object.defineProperty(C.prototype,'name',{value:n,configurable:true});Object.defineProperty(W,n,{value:C,writable:true,configurable:true});}})()";
     let brands_result = JS_Eval(
       ctx,
       brands.as_ptr(),
