@@ -643,6 +643,13 @@ fn parse_loc(loc: &str) -> (&str, i32, i32) {
   (file, line, col)
 }
 
+fn normalize_function_name(name: std::string::String) -> std::string::String {
+  name
+    .strip_prefix("[#")
+    .and_then(|name| name.strip_suffix(']'))
+    .map_or(name.clone(), |name| format!("#{name}"))
+}
+
 /// Return the `(line, col)` of the first `    at <…>:line:col` frame in a stack
 /// string, or `(0, 0)` if none. Used by `Script::Compile` to recover a
 /// SyntaxError's parse location for deno's `from_v8_message` fallback.
@@ -2006,6 +2013,7 @@ fn v8_constructor_location(
 
 #[cfg(test)]
 mod stack_column_tests {
+  use super::normalize_function_name;
   use super::v8_constructor_location;
   use super::v8_error_column;
   use super::v8_member_call_column;
@@ -2078,6 +2086,16 @@ mod stack_column_tests {
       ),
       3,
     );
+  }
+
+  #[test]
+  fn private_method_function_names_match_v8() {
+    assert_eq!(
+      normalize_function_name("[#pollControl]".into()),
+      "#pollControl"
+    );
+    assert_eq!(normalize_function_name("ordinary".into()), "ordinary");
+    assert_eq!(normalize_function_name("[computed]".into()), "[computed]");
   }
 }
 
@@ -2155,7 +2173,8 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     let file = unsafe { call_site_str(ctx, site, c"getFileName") };
     let mut line = unsafe { call_site_int(ctx, site, c"getLineNumber") };
     let mut col = unsafe { call_site_int(ctx, site, c"getColumnNumber") };
-    let func = unsafe { call_site_str(ctx, site, c"getFunctionName") };
+    let func = unsafe { call_site_str(ctx, site, c"getFunctionName") }
+      .map(normalize_function_name);
     let type_name = unsafe { call_site_str(ctx, site, c"getTypeName") };
     let method_name = unsafe { call_site_str(ctx, site, c"getMethodName") };
     let is_constructor = unsafe { call_site_bool(ctx, site, c"isConstructor") };
