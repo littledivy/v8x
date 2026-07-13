@@ -1,29 +1,30 @@
-diff --git a/quickjs.c b/quickjs.c
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21019,7 +21019,234 @@
+@@ -21025,8 +21025,239 @@
+         p->u.async_function_data = s;
+     }
      return 0;
- }
- 
--static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
++}
++
 +/* v82jsc: build a CallSite-shaped JS object for an injected async frame.
 +   Used to satisfy embedders (e.g. deno's `has_call_site`) that gate stack
 +   preservation on a populated `#callSiteEvals` private. Returns a fresh,
 +   self-contained object; the embedder reads file/line/col via methods. */
 +static JSValue js_v82jsc_make_async_callsite(JSContext *ctx, const char *file,
-+                                             int line, int col)
++                                             int line, int col,
++                                             const char *func)
 +{
 +    static const char src[] =
-+        "(function(file, line, col) { return {\n"
++        "(function(file, line, col, func) { return {\n"
 +        "  getFileName: function () { return file; },\n"
 +        "  getLineNumber: function () { return line; },\n"
 +        "  getColumnNumber: function () { return col; },\n"
-+        "  getFunctionName: function () { return null; },\n"
++        "  getFunctionName: function () { return func; },\n"
 +        "  getMethodName: function () { return null; },\n"
 +        "  getTypeName: function () { return null; },\n"
 +        "  getEvalOrigin: function () { return null; },\n"
 +        "  getPromiseIndex: function () { return null; },\n"
-+        "  isToplevel: function () { return true; },\n"
++        "  isToplevel: function () { return !func; },\n"
 +        "  isEval: function () { return false; },\n"
 +        "  isNative: function () { return false; },\n"
 +        "  isConstructor: function () { return false; },\n"
@@ -34,13 +35,15 @@ diff --git a/quickjs.c b/quickjs.c
 +                              "<v82jsc-async-callsite>", JS_EVAL_TYPE_GLOBAL);
 +    if (JS_IsException(factory))
 +        return JS_NULL;
-+    JSValue argv[3];
++    JSValue argv[4];
 +    argv[0] = JS_NewString(ctx, file ? file : "");
 +    argv[1] = js_int32(line);
 +    argv[2] = js_int32(col);
-+    JSValue cs = JS_Call(ctx, factory, JS_UNDEFINED, 3, vc(argv));
++    argv[3] = func ? JS_NewString(ctx, func) : JS_NULL;
++    JSValue cs = JS_Call(ctx, factory, JS_UNDEFINED, 4, vc(argv));
 +    JS_FreeValue(ctx, factory);
 +    JS_FreeValue(ctx, argv[0]);
++    JS_FreeValue(ctx, argv[3]);
 +    if (JS_IsException(cs)) {
 +        JS_FreeValue(ctx, JS_GetException(ctx));
 +        return JS_NULL;
@@ -79,8 +82,8 @@ diff --git a/quickjs.c b/quickjs.c
 +    JSAtom atom = JS_ValueToAtom(ctx, sym);
 +    JS_FreeValue(ctx, sym);
 +    return atom;
-+}
-+
+ }
+ 
 +static bool js_v82jsc_has_same_async_site(JSContext *ctx,
 +                                           JSValueConst error,
 +                                           const char *file, int line)
@@ -137,7 +140,8 @@ diff --git a/quickjs.c b/quickjs.c
 +   populated structured-frames array and preserve the augmented stack.
 +   No-op for non-object errors and when stack/file are absent. */
 +static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
-+                                         const char *file, int line, int col)
++                                         const char *file, int line, int col,
++                                         const char *func)
 +{
 +    JSValue stack, new_stack;
 +    DynBuf dbuf;
@@ -164,12 +168,17 @@ diff --git a/quickjs.c b/quickjs.c
 +        }
 +    }
 +    JS_FreeValue(ctx, stack);
-+    dbuf_printf(&dbuf, "    at async %s", file);
++    if (func)
++        dbuf_printf(&dbuf, "    at async %s (%s", func, file);
++    else
++        dbuf_printf(&dbuf, "    at async %s", file);
 +    if (line >= 1) {
 +        dbuf_printf(&dbuf, ":%d", line);
 +        if (col >= 1)
 +            dbuf_printf(&dbuf, ":%d", col);
 +    }
++    if (func)
++        dbuf_putc(&dbuf, ')');
 +    if (dbuf_error(&dbuf)) {
 +        dbuf_free(&dbuf);
 +        return;
@@ -213,7 +222,8 @@ diff --git a/quickjs.c b/quickjs.c
 +                return;
 +            }
 +        }
-+        JSValue cs_obj = js_v82jsc_make_async_callsite(ctx, file, line, col);
++        JSValue cs_obj = js_v82jsc_make_async_callsite(ctx, file, line, col,
++                                                       func);
 +        if (!JS_IsNull(cs_obj)) {
 +            JS_DefinePropertyValueUint32(ctx, arr, next_idx, cs_obj,
 +                                         JS_PROP_C_W_E);
@@ -227,45 +237,28 @@ diff --git a/quickjs.c b/quickjs.c
 +    }
 +}
 +
-+/* v82jsc: `async_file`/`line`/`col` describe the call's await site; if non-NULL,
-+   the helper above is invoked on an unhandled rejection so the resumed frame
-+   shows up on the error's stack. Initial-call resumes pass NULL — V8 only
-+   stitches async frames for the resume-after-rejection path. */
-+static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s,
-+                                     const char *async_file,
-+                                     int async_line, int async_col)
+ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
  {
      bool is_success = true;
-     JSValue func_ret, ret2;
-@@ -21031,6 +21258,9 @@
-             is_success = false;
-         } else {
-             JSValue error = JS_GetException(ctx);
-+            if (async_file)
-+                js_v82jsc_append_async_frame(ctx, error, async_file,
-+                                             async_line, async_col);
-             ret2 = JS_Call(ctx, s->resolving_funcs[1], JS_UNDEFINED,
-                            1, vc(&error));
-             JS_FreeValue(ctx, error);
-@@ -21097,6 +21327,9 @@
+@@ -21105,6 +21336,10 @@
      JSObject *p = JS_VALUE_GET_OBJ(func_obj);
      JSAsyncFunctionData *s = p->u.async_function_data;
      bool is_reject = p->class_id - JS_CLASS_ASYNC_FUNCTION_RESOLVE;
 +    const char *async_file = NULL;
++    const char *async_func = NULL;
 +    int async_line = 0, async_col = 0;
 +    bool ok;
      JSValueConst arg;
  
      if (argc > 0)
-@@ -21110,7 +21343,34 @@
-         /* return value of await */
-         s->func_state.frame.cur_sp[-1] = js_dup(arg);
-     }
--    if (!js_async_function_resume(ctx, s))
-+    /* v82jsc: on the rejection path, capture the await site from the suspended
-+       frame so js_async_function_resume can attach it to the propagated error
-+       (matches v8 zero-cost async stack traces). */
-+    if (is_reject) {
+@@ -21112,13 +21347,51 @@
+     else
+         arg = JS_UNDEFINED;
+     s->func_state.throw_flag = is_reject;
++    /* v82jsc: stitch the suspended await site onto a rejected Error before
++       injecting it into the async function. The function may catch the
++       rejection, but V8 still exposes its async parent on the Error's stack. */
+     if (is_reject) {
 +        JSValue fobj = s->func_state.frame.cur_func;
 +        if (JS_VALUE_GET_TAG(fobj) == JS_TAG_OBJECT) {
 +            JSObject *fp = JS_VALUE_GET_OBJ(fobj);
@@ -283,26 +276,35 @@ diff --git a/quickjs.c b/quickjs.c
 +                    async_col += 1;
 +                if (b->filename != JS_ATOM_NULL)
 +                    async_file = JS_AtomToCString(ctx, b->filename);
++                if (b->func_name != JS_ATOM_NULL)
++                    async_func = JS_AtomToCString(ctx, b->func_name);
++                if (async_func &&
++                    (!strcmp(async_func, "<eval>") ||
++                     !strcmp(async_func, "global code"))) {
++                    JS_FreeCString(ctx, async_func);
++                    async_func = NULL;
++                }
 +            }
 +        }
-+    }
-+    ok = js_async_function_resume(ctx, s, async_file, async_line, async_col);
++        if (async_file)
++            js_v82jsc_append_async_frame(ctx, arg, async_file,
++                                         async_line, async_col, async_func);
+         JS_Throw(ctx, js_dup(arg));
+     } else {
+         /* return value of await */
+         s->func_state.frame.cur_sp[-1] = js_dup(arg);
+     }
+-    if (!js_async_function_resume(ctx, s))
++    ok = js_async_function_resume(ctx, s);
 +    if (async_file)
 +        JS_FreeCString(ctx, async_file);
++    if (async_func)
++        JS_FreeCString(ctx, async_func);
 +    if (!ok)
          return JS_EXCEPTION;
      return JS_UNDEFINED;
  }
-@@ -21143,7 +21403,7 @@
-     }
-     s->is_active = true;
- 
--    if (!js_async_function_resume(ctx, s))
-+    if (!js_async_function_resume(ctx, s, NULL, 0, 0))
-         goto fail;
- 
-     js_async_function_free(ctx->rt, s);
-@@ -27389,19 +27649,27 @@
+@@ -27412,19 +27685,27 @@
              return -1;
          parse_flags = 0;
          break;
@@ -331,3 +333,4 @@ diff --git a/quickjs.c b/quickjs.c
      default:
          if (js_parse_postfix_expr(s, PF_POSTFIX_CALL))
              return -1;
+
