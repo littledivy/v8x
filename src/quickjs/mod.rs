@@ -94,6 +94,71 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn synthetic_module_namespace_has_module_semantics() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let namespace = v82jsc_new_module_namespace(ctx);
+      assert!(namespace.tag != JS_TAG_EXCEPTION);
+      assert_eq!(
+        v82jsc_module_namespace_set(
+          ctx,
+          namespace,
+          c"default".as_ptr(),
+          jsv_int32(1),
+        ),
+        0
+      );
+
+      let global = JS_GetGlobalObject(ctx);
+      assert_eq!(
+        JS_SetPropertyStr(
+          ctx,
+          global,
+          c"namespace".as_ptr(),
+          JS_DupValue(ctx, namespace),
+        ),
+        1
+      );
+      JS_FreeValue(ctx, global);
+
+      let source = c"Object.preventExtensions(namespace);
+        [Object.prototype.toString.call(namespace),
+         Object.getPrototypeOf(namespace) === null,
+         Object.isExtensible(namespace),
+         Reflect.set(namespace, 'default', 2),
+         namespace.default,
+         Object.getOwnPropertyDescriptor(namespace, 'default').writable
+        ].join(':')";
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"synthetic-module-namespace.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "namespace inspection threw");
+      let mut len = 0;
+      let text = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!text.is_null());
+      let actual =
+        std::str::from_utf8(std::slice::from_raw_parts(text as *const u8, len))
+          .unwrap();
+      assert_eq!(actual, "[object Module]:true:false:false:1:true");
+
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, result);
+      JS_FreeValue(ctx, namespace);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn embedder_prepare_stack_is_lazy_and_separate_from_user_hook() {
     unsafe {
       PREPARE_STACK_CALLS.store(0, Ordering::SeqCst);

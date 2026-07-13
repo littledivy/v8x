@@ -60,13 +60,6 @@ use crate::script_compiler::{
 use crate::support::{MaybeBool, int};
 
 unsafe extern "C" {
-  fn JS_DefinePropertyValueStr(
-    ctx: *mut JSContext,
-    this_obj: JSValue,
-    prop: *const std::os::raw::c_char,
-    val: JSValue,
-    flags: int,
-  ) -> int;
   fn JS_GetProperty(
     ctx: *mut JSContext,
     this_obj: JSValue,
@@ -79,6 +72,7 @@ unsafe extern "C" {
     obj: JSValue,
     flags: int,
   ) -> int;
+  fn JS_PreventExtensions(ctx: *mut JSContext, obj: JSValue) -> int;
   fn v82jsc_link_module(ctx: *mut JSContext, module: *mut JSModuleDef) -> int;
   fn v82jsc_set_module_error_backtrace(
     ctx: *mut JSContext,
@@ -100,9 +94,6 @@ struct ModulePropertyEnum {
   atom: JSAtom,
 }
 
-const JS_PROP_CONFIGURABLE: int = 1 << 0;
-const JS_PROP_WRITABLE: int = 1 << 1;
-const JS_PROP_ENUMERABLE: int = 1 << 2;
 const JS_GPN_STRING_MASK: int = 1 << 0;
 const JS_GPN_ENUM_ONLY: int = 1 << 4;
 
@@ -110,6 +101,37 @@ const JS_WRITE_OBJ_BYTECODE: int = 1 << 0;
 const JS_READ_OBJ_BYTECODE: int = 1 << 0;
 
 const BC_MAGIC: u32 = 0x5142_4303;
+
+unsafe fn new_synthetic_namespace(ctx: *mut JSContext) -> JSValue {
+  unsafe { v82jsc_new_module_namespace(ctx) }
+}
+
+unsafe fn add_synthetic_namespace_export(
+  ctx: *mut JSContext,
+  namespace: JSValue,
+  name: &CString,
+  value: JSValue,
+) -> bool {
+  unsafe {
+    v82jsc_module_namespace_set(ctx, namespace, name.as_ptr(), value) == 0
+  }
+}
+
+unsafe fn finish_synthetic_namespace(
+  ctx: *mut JSContext,
+  namespace: JSValue,
+) -> Option<JSValue> {
+  if unsafe { JS_PreventExtensions(ctx, namespace) } < 0 {
+    let exception = unsafe { JS_GetException(ctx) };
+    unsafe {
+      JS_FreeValue(ctx, exception);
+      JS_FreeValue(ctx, namespace);
+    }
+    None
+  } else {
+    Some(namespace)
+  }
+}
 
 fn bc_cache_dir() -> Option<std::path::PathBuf> {
   use std::sync::OnceLock;
@@ -1568,7 +1590,7 @@ pub(crate) fn snapshot_module_namespace(
   }
 
   let info = module_snapshot_info_for_value(value)?;
-  let namespace = unsafe { JS_NewObject(ctx) };
+  let namespace = unsafe { new_synthetic_namespace(ctx) };
   if namespace.tag == JS_TAG_EXCEPTION {
     let exc = unsafe { JS_GetException(ctx) };
     unsafe { JS_FreeValue(ctx, exc) };
@@ -1579,16 +1601,14 @@ pub(crate) fn snapshot_module_namespace(
       unsafe { JS_FreeValue(ctx, namespace) };
       return None;
     };
-    if unsafe {
-      JS_DefinePropertyValueStr(
+    if !unsafe {
+      add_synthetic_namespace_export(
         ctx,
         namespace,
-        name.as_ptr(),
+        &name,
         JS_DupValue(ctx, value),
-        JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE | JS_PROP_ENUMERABLE,
       )
-    } < 0
-    {
+    } {
       let exc = unsafe { JS_GetException(ctx) };
       unsafe {
         JS_FreeValue(ctx, exc);
@@ -1597,7 +1617,7 @@ pub(crate) fn snapshot_module_namespace(
       return None;
     }
   }
-  Some(namespace)
+  unsafe { finish_synthetic_namespace(ctx, namespace) }
 }
 
 #[inline]
@@ -4020,7 +4040,7 @@ pub extern "C" fn v8__Module__GetModuleNamespace(
   // dereferences `func_obj` and segfaults. Build the namespace object directly
   // from the recorded synthetic exports instead.
   if with_module_state(this, |m| m.engine_synthetic).unwrap_or(false) {
-    let ns = unsafe { JS_NewObject(ctx) };
+    let ns = unsafe { new_synthetic_namespace(ctx) };
     if let Some(def) =
       SYNTHETIC_DEFS.with(|t| t.borrow().get(&handle_key(this)).copied())
     {
@@ -4042,11 +4062,21 @@ pub extern "C" fn v8__Module__GetModuleNamespace(
         for (name, val) in exports {
           if let Ok(c) = CString::new(name) {
             let dup = unsafe { JS_DupValue(ctx, val) };
-            unsafe { JS_SetPropertyStr(ctx, ns, c.as_ptr(), dup) };
+            if !unsafe { add_synthetic_namespace_export(ctx, ns, &c, dup) } {
+              let exception = unsafe { JS_GetException(ctx) };
+              unsafe {
+                JS_FreeValue(ctx, exception);
+                JS_FreeValue(ctx, ns);
+              }
+              return ptr::null();
+            }
           }
         }
       }
     }
+    let Some(ns) = (unsafe { finish_synthetic_namespace(ctx, ns) }) else {
+      return ptr::null();
+    };
     return intern::<Value>(ns);
   }
   let mut def =

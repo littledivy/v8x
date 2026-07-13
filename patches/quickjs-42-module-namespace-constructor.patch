@@ -1,0 +1,84 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1199,6 +1199,9 @@
+ JS_EXTERN JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);
+ JS_EXTERN JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m);
+ JS_EXTERN JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m);
++JS_EXTERN JSValue v82jsc_new_module_namespace(JSContext *ctx);
++JS_EXTERN int v82jsc_module_namespace_set(JSContext *ctx, JSValueConst obj,
++                                          const char *name, JSValue value);
+ 
+ /* associate a JSValue to a C module */
+ JS_EXTERN int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1458,5 +1458,6 @@
+                              bool is_arg);
+ static JSVarRef *js_create_var_ref(JSContext *ctx, bool is_gc_object);
++static JSVarRef *js_create_module_var(JSContext *ctx, bool is_lexical);
+ static JSValue js_call_generator_function(JSContext *ctx, JSValueConst func_obj,
+                                           JSValueConst this_obj,
+                                           int argc, JSValueConst *argv,
+@@ -31463,6 +31463,62 @@
+     return JS_EXCEPTION;
+ }
+ 
++JSValue v82jsc_new_module_namespace(JSContext *ctx)
++{
++    JSValue obj = JS_NewObjectClass(ctx, JS_CLASS_MODULE_NS);
++    if (JS_IsException(obj))
++        return obj;
++    if (JS_DefinePropertyValue(ctx, obj, JS_ATOM_Symbol_toStringTag,
++                               JS_AtomToString(ctx, JS_ATOM_Module), 0) < 0) {
++        JS_FreeValue(ctx, obj);
++        return JS_EXCEPTION;
++    }
++    return obj;
++}
++
++int v82jsc_module_namespace_set(JSContext *ctx, JSValueConst obj,
++                                const char *name, JSValue value)
++{
++    JSAtom atom;
++    JSObject *p;
++    JSProperty *prop;
++    JSVarRef *var_ref;
++
++    if (!JS_IsObject(obj) ||
++        JS_VALUE_GET_OBJ(obj)->class_id != JS_CLASS_MODULE_NS) {
++        JS_FreeValue(ctx, value);
++        JS_ThrowTypeError(ctx, "not a module namespace");
++        return -1;
++    }
++    atom = JS_NewAtom(ctx, name);
++    if (atom == JS_ATOM_NULL) {
++        JS_FreeValue(ctx, value);
++        return -1;
++    }
++    p = JS_VALUE_GET_OBJ(obj);
++    var_ref = js_create_module_var(ctx, false);
++    if (!var_ref)
++        goto fail;
++    JS_FreeValue(ctx, var_ref->value);
++    var_ref->value = value;
++    prop = add_property(ctx, p, atom,
++                        JS_PROP_ENUMERABLE | JS_PROP_WRITABLE |
++                        JS_PROP_VARREF);
++    if (!prop) {
++        free_var_ref(ctx->rt, var_ref);
++        goto fail_no_value;
++    }
++    prop->u.var_ref = var_ref;
++    JS_FreeAtom(ctx, atom);
++    return 0;
++
++ fail:
++    JS_FreeValue(ctx, value);
++ fail_no_value:
++    JS_FreeAtom(ctx, atom);
++    return -1;
++}
++
+ JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m)
+ {
+     if (JS_IsUndefined(m->module_ns)) {

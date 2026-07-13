@@ -593,6 +593,13 @@ unsafe extern "C" {
     ctx: *mut JSContext,
     m: *mut JSModuleDef,
   ) -> JSValue;
+  pub fn v82jsc_new_module_namespace(ctx: *mut JSContext) -> JSValue;
+  pub fn v82jsc_module_namespace_set(
+    ctx: *mut JSContext,
+    namespace: JSValue,
+    name: *const c_char,
+    value: JSValue,
+  ) -> c_int;
   pub fn v82jsc_global_var_obj(ctx: *mut JSContext) -> JSValue;
   pub fn JS_NewCModule(
     ctx: *mut JSContext,
