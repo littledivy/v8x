@@ -872,6 +872,52 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn error_stack_is_an_own_lazy_accessor() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = c"class DerivedError extends Error {}
+        const error = new Error('plain');
+        const derived = new DerivedError('derived');
+        const descriptor = Object.getOwnPropertyDescriptor(error, 'stack');
+        [
+          Object.hasOwn(error, 'stack'),
+          Object.hasOwn(derived, 'stack'),
+          typeof descriptor.get,
+          typeof descriptor.set,
+          descriptor.enumerable,
+          descriptor.configurable,
+          derived.stack.startsWith('Error: derived'),
+        ].join(':')";
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"error-own-stack-test.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "eval threw");
+
+      let mut len = 0;
+      let text = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!text.is_null());
+      let actual =
+        std::str::from_utf8(std::slice::from_raw_parts(text as *const u8, len))
+          .unwrap();
+      assert_eq!(actual, "true:true:function:function:false:true:true");
+
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn function_constructor_preserves_caller_resource_name() {
     unsafe {
       let rt = JS_NewRuntime();
