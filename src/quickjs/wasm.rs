@@ -769,7 +769,7 @@ unsafe fn trap_frames(
         function_index,
         function_offset: unsafe { wasm_frame_func_offset(frame) },
         module_offset: if module_offset == 0 {
-          wasm_function_body_end(
+          wasm_function_trap_fallback(
             module_bytes,
             function_index - imported_function_count,
           )
@@ -2542,7 +2542,10 @@ fn wasm_function_names(
   names
 }
 
-fn wasm_function_body_end(bytes: &[u8], defined_index: u32) -> Option<usize> {
+fn wasm_function_trap_fallback(
+  bytes: &[u8],
+  defined_index: u32,
+) -> Option<usize> {
   if bytes.len() < 8 || &bytes[..4] != b"\0asm" {
     return None;
   }
@@ -2573,7 +2576,9 @@ fn wasm_function_body_end(bytes: &[u8], defined_index: u32) -> Option<usize> {
         return None;
       }
       if index == defined_index {
-        return body_end.checked_sub(1);
+        // WAMR's fast interpreter does not retain a raw module PC. A terminal
+        // trap is immediately before the function's final `end` opcode.
+        return body_end.checked_sub(2);
       }
       off = body_end;
     }
