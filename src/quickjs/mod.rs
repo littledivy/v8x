@@ -1031,6 +1031,7 @@ mod api_test {
     }
 
     assert_temporal_support();
+    assert_finalization_registry_token_is_weak();
     assert_continuation_data_survives_await();
     assert_snapshot_context_data_preserves_global_identity();
 
@@ -1038,6 +1039,49 @@ mod api_test {
       v8::V8::dispose();
     }
     v8::V8::dispose_platform();
+  }
+
+  fn assert_finalization_registry_token_is_weak() {
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let code = v8::String::new(
+      scope,
+      "globalThis.finalized = [];\n\
+       globalThis.registry = new FinalizationRegistry(\n\
+         value => finalized.push(value)\n\
+       );\n\
+       (() => {\n\
+         const targetAndToken = {};\n\
+         registry.register(targetAndToken, 'closed', targetAndToken);\n\
+       })();\n\
+       globalThis.keptTarget = {};\n\
+       (() => {\n\
+         const token = {};\n\
+         registry.register(keptTarget, 'token-collected', token);\n\
+       })();\n\
+       (() => {\n\
+         const target = {};\n\
+         const token = {};\n\
+         registry.register(target, 'unregistered', token);\n\
+         registry.unregister(token);\n\
+       })();\n\
+       gc();\n\
+       keptTarget = undefined;\n\
+       gc();",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, code, None).unwrap();
+    script.run(scope).unwrap();
+    scope.perform_microtask_checkpoint();
+
+    let check = v8::String::new(scope, "finalized.sort().join(',')").unwrap();
+    let script = v8::Script::compile(scope, check, None).unwrap();
+    let result = script.run(scope).unwrap();
+    assert_eq!(result.to_rust_string_lossy(scope), "closed,token-collected");
   }
 
   fn assert_temporal_support() {
