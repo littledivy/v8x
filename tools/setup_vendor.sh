@@ -42,7 +42,10 @@ apply_series() {
     [ -e "$p" ] || continue
     if ! git -C "$sub" apply --reverse --check "../../$p" 2>/dev/null; then
       if ! git -C "$sub" apply "../../$p"; then
-        if patch_already_applied "$sub" "$p"; then
+        if patch --batch --dry-run --forward -p1 -d "$sub" < "$p" \
+             >/dev/null 2>&1; then
+          patch --batch --forward -p1 -d "$sub" < "$p"
+        elif patch_already_applied "$sub" "$p"; then
           echo "warn: $p may already be applied"
         else
           return 1
