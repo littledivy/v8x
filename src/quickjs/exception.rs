@@ -1881,8 +1881,19 @@ fn v8_undefined_identifier_column(line: &str, col: i32, message: &str) -> i32 {
   }
 }
 
+fn v8_error_column(line: &str, col: i32, name: &str, message: &str) -> i32 {
+  if name == "ReferenceError" {
+    let col = v8_undefined_identifier_column(line, col, message);
+    v8_new_expr_column(line, col)
+  } else {
+    let col = v8_new_expr_column(line, col);
+    v8_member_call_column(line, col)
+  }
+}
+
 #[cfg(test)]
 mod stack_column_tests {
+  use super::v8_error_column;
   use super::v8_member_call_column;
   use super::v8_undefined_identifier_column;
 
@@ -1920,6 +1931,15 @@ mod stack_column_tests {
         "require is not defined",
       ),
       9,
+    );
+    assert_eq!(
+      v8_error_column(
+        "  document.querySelector(\"div\");",
+        12,
+        "ReferenceError",
+        "document is not defined",
+      ),
+      3,
     );
   }
 }
@@ -2012,13 +2032,9 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     } else {
       file
     };
-    // Recover V8's `new`-keyword column for `new X()` frames.
+    // Recover V8-compatible expression columns from quickjs's call positions.
     if let Some(src) = super::core::script_source_line(&file, line) {
-      if name == "ReferenceError" {
-        col = v8_undefined_identifier_column(&src, col, &message);
-      }
-      col = v8_new_expr_column(&src, col);
-      col = v8_member_call_column(&src, col);
+      col = v8_error_column(&src, col, &name, &message);
     }
 
     // quickjs names top-level script frames `global code` / `<eval>`; V8
