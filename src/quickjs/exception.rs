@@ -1760,6 +1760,12 @@ fn v8_member_call_column(line: &str, col: i32) -> i32 {
   let is_ident = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
   let mut i = (col - 1) as usize;
   for open in (0..=i).rev().filter(|index| chars[*index] == '(') {
+    if chars[open..=i]
+      .windows(2)
+      .any(|window| window == ['=', '>'])
+    {
+      continue;
+    }
     let balance =
       chars[open..=i]
         .iter()
@@ -2023,6 +2029,10 @@ mod stack_column_tests {
     assert_eq!(
       v8_member_call_column("    assertEquals(div(1, 2), 3)", 18),
       5
+    );
+    assert_eq!(
+      v8_member_call_column("Deno.test(\"test 1\", () => test());", 27),
+      27
     );
     assert_eq!(v8_member_call_column("Deno.bench();", 6), 6);
   }
