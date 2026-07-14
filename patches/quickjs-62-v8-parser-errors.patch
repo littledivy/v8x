@@ -1,0 +1,31 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -23339,7 +23339,7 @@ static int js_parse_expect_semi(JSParseState *s)
+         if (s->token.val == TOK_EOF || s->token.val == '}' || s->got_lf) {
+             return 0;
+         }
+-        return js_parse_error(s, "expecting '%c'", ';');
++        return js_parse_expect(s, ';');
+     }
+     return next_token(s);
+ }
+@@ -30200,7 +30200,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s, int decl_mask
+         break;
+     case TOK_RETURN:
+         if (s->cur_func->is_eval) {
+-            js_parse_error(s, "return not in a function");
++            js_parse_error(s, "Illegal return statement");
+             goto fail;
+         }
+         if (s->cur_func->func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT) {
+@@ -33293,8 +33293,7 @@ static __exception int js_parse_from_clause(JSParseState *s, JSModuleDef *m)
+     int idx;
+ 
+     if (!token_is_pseudo_keyword(s, JS_ATOM_from)) {
+-        js_parse_error(s, "from clause expected");
+-        return -1;
++        return js_parse_expect(s, TOK_IDENT);
+     }
+     if (next_token(s))
+         return -1;

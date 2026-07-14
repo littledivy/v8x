@@ -5024,6 +5024,7 @@ unsafe fn compile_module_for_instantiation(
       )
     };
     if compiled.tag == JS_TAG_EXCEPTION {
+      unsafe { super::exception::mark_pending_parse_error(ctx) };
       return ptr::null_mut();
     }
     if compiled.tag != JS_TAG_MODULE {

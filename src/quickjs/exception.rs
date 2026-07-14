@@ -49,6 +49,7 @@ const MESSAGE_SOURCE_LINE_PROP: &std::ffi::CStr = c"__v8qjs_source_line";
 const MESSAGE_STACK_PTR_PROP: &std::ffi::CStr = c"__v8qjs_stack_ptr";
 const HOST_STACK_BOUNDARY_PROP: &std::ffi::CStr =
   c"__v8qjs_host_stack_boundary";
+const PARSE_ERROR_PROP: &std::ffi::CStr = c"__v8qjs_parse_error";
 
 pub(crate) unsafe fn mark_host_stack_boundary(
   ctx: *mut JSContext,
@@ -65,6 +66,29 @@ pub(crate) unsafe fn mark_host_stack_boundary(
       JS_NewBool(ctx, 1),
     );
   }
+}
+
+pub(crate) unsafe fn mark_parse_error(ctx: *mut JSContext, error: JSValue) {
+  if ctx.is_null() || !jsv_is_object(&error) {
+    return;
+  }
+  unsafe {
+    JS_SetPropertyStr(
+      ctx,
+      error,
+      PARSE_ERROR_PROP.as_ptr(),
+      JS_NewBool(ctx, 1),
+    );
+  }
+}
+
+pub(crate) unsafe fn mark_pending_parse_error(ctx: *mut JSContext) {
+  if ctx.is_null() || !unsafe { JS_HasException(ctx) } {
+    return;
+  }
+  let error = unsafe { JS_GetException(ctx) };
+  unsafe { mark_parse_error(ctx, error) };
+  unsafe { JS_Throw(ctx, error) };
 }
 const MODULE_LINK_FRAME_PROP: &std::ffi::CStr = c"__v8qjs_module_link_frame";
 const JS_CLASS_PROMISE: JSClassID = 52;
@@ -2347,6 +2371,7 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     unsafe { read_bool_prop(ctx, error, MODULE_LINK_FRAME_PROP) };
   let stop_at_host_boundary =
     unsafe { read_bool_prop(ctx, error, HOST_STACK_BOUNDARY_PROP) };
+  let is_parse_error = unsafe { read_bool_prop(ctx, error, PARSE_ERROR_PROP) };
   let mut out = if message.is_empty() {
     name.clone()
   } else if name.is_empty() {
@@ -2439,7 +2464,8 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
         Some("global code") | Some("<eval>") => true,
         _ => false,
       };
-    let is_top_level = callsite_is_top_level || is_script_frame;
+    let is_top_level =
+      (callsite_is_top_level || is_script_frame) && !is_parse_error;
     let (frame_func, frame_type, frame_method) = if is_script_frame {
       (None, None, None)
     } else {
@@ -2460,7 +2486,13 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
 
     out.push_str("\n    at ");
     if is_script_frame {
-      append_location(&mut out, &file, line, col);
+      if is_parse_error {
+        out.push_str("<anonymous> (");
+        append_location(&mut out, &file, line, col);
+        out.push(')');
+      } else {
+        append_location(&mut out, &file, line, col);
+      }
     } else {
       if is_constructor {
         out.push_str("new ");

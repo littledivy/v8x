@@ -2488,6 +2488,7 @@ unsafe fn stamp_syntax_error_location(
   }
   // Takes ownership and clears the pending slot; we re-throw it below.
   let exc = unsafe { JS_GetException(ctx) };
+  unsafe { super::exception::mark_parse_error(ctx, exc) };
 
   let (line, col) = unsafe { error_backtrace_location(ctx, exc) };
 
