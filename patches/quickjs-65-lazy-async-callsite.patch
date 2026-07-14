@@ -1,0 +1,52 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21586,6 +21586,38 @@
+         return JS_NULL;
+     }
+     return cs;
++}
++
++/* Keep async frames structured while an embedder prepare-stack callback is
++   pending. This lets the embedder process the complete frame list (including
++   source mapping) when Error.stack is eventually read. */
++static bool js_v82jsc_append_pending_async_callsite(JSContext *ctx,
++                                                    JSValueConst stack,
++                                                    const char *file,
++                                                    int line, int col,
++                                                    const char *func)
++{
++    JSValue len_v, site;
++    uint32_t next_idx = 0;
++
++    if (!js_error_stack_is_pending(ctx, stack))
++        return false;
++    len_v = JS_GetPropertyStr(ctx, stack, "length");
++    if (JS_ToUint32(ctx, &next_idx, len_v) < 0) {
++        JS_FreeValue(ctx, len_v);
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        return false;
++    }
++    JS_FreeValue(ctx, len_v);
++    site = js_v82jsc_make_async_callsite(ctx, file, line, col, func, -1);
++    if (JS_IsNull(site))
++        return false;
++    if (JS_DefinePropertyValueUint32(ctx, stack, next_idx, site,
++                                     JS_PROP_C_W_E) < 0) {
++        JS_FreeValue(ctx, JS_GetException(ctx));
++        return false;
++    }
++    return true;
+ }
+ 
+ /* v82jsc: look up (or create) the embedder's private-symbol key for the
+@@ -21863,6 +21895,10 @@
+         !js_error_has_native_stack_accessor(ctx, error_obj))
+         return;
+     if (js_v82jsc_has_same_async_site(ctx, error, file, line, func))
++        return;
++    if (error_obj->class_id == JS_CLASS_ERROR &&
++        js_v82jsc_append_pending_async_callsite(
++            ctx, error_obj->u.object_data, file, line, col, func))
+         return;
+     stack = JS_GetProperty(ctx, error, JS_ATOM_stack);
+     if (JS_IsException(stack)) {

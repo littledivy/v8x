@@ -58,6 +58,22 @@ mod raw_smoke_test {
     unsafe { JS_NewString(ctx, c"embedder stack".as_ptr()) }
   }
 
+  unsafe extern "C" fn test_forward_prepare_stack_trace(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    argc: std::ffi::c_int,
+    argv: *mut JSValue,
+  ) -> JSValue {
+    unsafe {
+      let global = JS_GetGlobalObject(ctx);
+      let formatter = JS_GetPropertyStr(ctx, global, c"formatStack".as_ptr());
+      let result = JS_Call(ctx, formatter, global, argc, argv);
+      JS_FreeValue(ctx, formatter);
+      JS_FreeValue(ctx, global);
+      result
+    }
+  }
+
   unsafe extern "C" fn test_promise_rejection_tracker(
     _ctx: *mut JSContext,
     _promise: JSValue,
@@ -378,6 +394,76 @@ mod raw_smoke_test {
           .unwrap();
       assert_eq!(actual, "embedder stack");
       assert_eq!(PREPARE_STACK_CALLS.load(Ordering::SeqCst), 1);
+
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
+  fn embedder_prepare_stack_receives_async_frame_lazily() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let callback = JS_NewCFunction(
+        ctx,
+        test_forward_prepare_stack_trace,
+        c"prepareStackTrace".as_ptr(),
+        2,
+      );
+      JS_SetPrepareStackTraceCallback(ctx, callback);
+      JS_FreeValue(ctx, callback);
+
+      let source = c"globalThis.formatStack = (_, sites) => sites.map((site) =>
+          `${site.isAsync()}:${site.getFileName()}:${site.getLineNumber()}`).join('|');
+        globalThis.result = 'pending';
+        (async function parent() {
+          const error = new Error('boom');
+          try {
+            await Promise.reject(error);
+          } catch (error) {
+            globalThis.result = error.stack;
+          }
+        })();";
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"lazy-async-stack.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "eval threw");
+      JS_FreeValue(ctx, result);
+
+      let mut job_ctx = ptr::null_mut();
+      while JS_IsJobPending(rt) {
+        assert!(JS_ExecutePendingJob(rt, &mut job_ctx) >= 0);
+      }
+
+      let result = JS_Eval(
+        ctx,
+        c"result".as_ptr(),
+        c"result".to_bytes().len(),
+        c"lazy-async-stack.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "result access threw");
+      let mut len = 0;
+      let text = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!text.is_null());
+      let actual =
+        std::str::from_utf8(std::slice::from_raw_parts(text as *const u8, len))
+          .unwrap();
+      assert!(
+        actual.contains("true:lazy-async-stack.js:"),
+        "embedder callback missed async frame: {actual}"
+      );
 
       JS_FreeCString(ctx, text);
       JS_FreeValue(ctx, result);

@@ -2419,6 +2419,7 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     let callsite_is_top_level =
       unsafe { call_site_bool(ctx, site, c"isToplevel") };
     let is_constructor = unsafe { call_site_bool(ctx, site, c"isConstructor") };
+    let is_async = unsafe { call_site_bool(ctx, site, c"isAsync") };
     unsafe { JS_FreeValue(ctx, site) };
 
     // V8 retains native constructor calls such as `new Promise (<anonymous>)`,
@@ -2481,6 +2482,7 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
       frame_method,
       is_top_level,
       is_constructor,
+      is_async,
       false,
     ));
 
@@ -2496,6 +2498,9 @@ unsafe extern "C" fn qjs_prepare_stack_trace(
     } else {
       if is_constructor {
         out.push_str("new ");
+      }
+      if is_async {
+        out.push_str("async ");
       }
       if let Some(func) = func.as_deref() {
         if !is_constructor
@@ -2580,6 +2585,7 @@ type PreparedFrame = (
   bool,
   bool,
   bool,
+  bool,
 );
 
 unsafe fn attached_wasm_frames(
@@ -2645,6 +2651,7 @@ unsafe fn attached_wasm_frames(
         None,
         false,
         false,
+        false,
         true,
       )
     } else {
@@ -2658,6 +2665,7 @@ unsafe fn attached_wasm_frames(
         false,
         false,
         false,
+        false,
       )
     });
   }
@@ -2668,10 +2676,14 @@ unsafe fn attached_wasm_frames(
 }
 
 fn append_prepared_frame(out: &mut std::string::String, frame: &PreparedFrame) {
-  let (file, line, col, function, _, _, top, constructor, is_wasm) = frame;
+  let (file, line, col, function, _, _, top, constructor, is_async, is_wasm) =
+    frame;
   out.push_str("\n    at ");
   if *constructor {
     out.push_str("new ");
+  }
+  if *is_async {
+    out.push_str("async ");
   }
   if let Some(function) = function {
     out.push_str(function);
@@ -2712,11 +2724,11 @@ unsafe fn restore_prepare_stack_trace(ctx: *mut JSContext, saved: JSValue) {
 
 /// JS factory that turns rows of
 /// `[file, line, col, funcOrNull, typeOrNull, methodOrNull, isTopLevel,
-/// isConstructor, isWasm]`
+/// isConstructor, isAsync, isWasm]`
 /// into the V8-shaped CallSite objects deno's `from_callsite_object` consumes
 /// (it calls each accessor and applies source maps to file/line/column).
 const CALLSITE_FACTORY_SRC: &str = "(function(d){return d.map(function(f){\
-  var file=f[0],line=f[1],col=f[2],top=f[6],constructor=f[7],wasm=f[8],fn=f[3],type=f[4],method=f[5];\
+  var file=f[0],line=f[1],col=f[2],top=f[6],constructor=f[7],async=f[8],wasm=f[9],fn=f[3],type=f[4],method=f[5];\
   return {\
     getFileName:function(){return file||undefined;},\
     getScriptNameOrSourceURL:function(){return file||undefined;},\
@@ -2732,7 +2744,7 @@ const CALLSITE_FACTORY_SRC: &str = "(function(d){return d.map(function(f){\
     isEval:function(){return false;},\
     isNative:function(){return false;},\
     isConstructor:function(){return constructor;},\
-    isAsync:function(){return false;},\
+    isAsync:function(){return async;},\
     isPromiseAll:function(){return false;},\
     getPromiseIndex:function(){return null;},\
     toString:function(){var loc=wasm?(file+':wasm-function['+(line-1)+']:0x'+(col-1).toString(16)):(file+':'+line+':'+col);return fn?(fn+' ('+loc+')'):(top?loc:('<anonymous> ('+loc+')'));}\
@@ -2777,6 +2789,7 @@ unsafe fn build_callsites(
         method_name,
         top,
         constructor,
+        is_async,
         is_wasm,
       ),
     ) in frames.iter().enumerate()
@@ -2807,7 +2820,8 @@ unsafe fn build_callsites(
       JS_SetPropertyUint32(ctx, row, 5, methodv);
       JS_SetPropertyUint32(ctx, row, 6, JS_NewBool(ctx, *top as c_int));
       JS_SetPropertyUint32(ctx, row, 7, JS_NewBool(ctx, *constructor as c_int));
-      JS_SetPropertyUint32(ctx, row, 8, JS_NewBool(ctx, *is_wasm as c_int));
+      JS_SetPropertyUint32(ctx, row, 8, JS_NewBool(ctx, *is_async as c_int));
+      JS_SetPropertyUint32(ctx, row, 9, JS_NewBool(ctx, *is_wasm as c_int));
       JS_SetPropertyUint32(ctx, rows, i as u32, row);
     }
 
