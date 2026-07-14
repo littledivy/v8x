@@ -1,0 +1,262 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -375,6 +375,7 @@
+ 
+ typedef struct JSStackFrame {
+     struct JSStackFrame *prev_frame; /* NULL if first stack frame */
++    JSValue gc_owner; /* borrowed owner of a heap-allocated suspended frame */
+     JSValue cur_func; /* current function, JS_UNDEFINED if the frame is detached */
+     JSValue this_val; /* borrowed while the frame is active */
+     JSValue *arg_buf; /* arguments */
+@@ -424,6 +425,7 @@
+             uint8_t is_const; /* only used with global variables */
+         };
+     };
++    JSValue gc_owner; /* owner while referencing a suspended stack frame */
+     JSValue *pvalue; /* pointer to the value, either on the stack or
+                         to 'value' */
+     union {
+@@ -6653,12 +6655,19 @@
+         assert(var_ref->header.ref_count > 0);
+         if (--var_ref->header.ref_count == 0) {
+             if (var_ref->is_detached) {
++                assert(JS_IsUndefined(var_ref->gc_owner));
+                 JS_FreeValueRT(rt, var_ref->value);
+                 remove_gc_object(&var_ref->header);
+             } else {
+                 JSStackFrame *sf = var_ref->stack_frame;
++                JSValue gc_owner = var_ref->gc_owner;
+                 assert(sf->var_refs[var_ref->var_ref_idx] == var_ref);
+                 sf->var_refs[var_ref->var_ref_idx] = NULL;
++                if (!JS_IsUndefined(gc_owner)) {
++                    var_ref->gc_owner = JS_UNDEFINED;
++                    remove_gc_object(&var_ref->header);
++                    JS_FreeValueRT(rt, gc_owner);
++                }
+             }
+             js_free_rt(rt, var_ref);
+         }
+@@ -6757,9 +6766,10 @@
+         if (var_refs) {
+             for(i = 0; i < b->closure_var_count; i++) {
+                 JSVarRef *var_ref = var_refs[i];
+-                if (var_ref && var_ref->is_detached) {
++                if (var_ref &&
++                    (var_ref->is_detached ||
++                     !JS_IsUndefined(var_ref->gc_owner)))
+                     mark_func(rt, &var_ref->header);
+-                }
+             }
+         }
+         /* must mark the function bytecode because template objects may be
+@@ -7082,9 +7092,12 @@
+     case JS_GC_OBJ_TYPE_VAR_REF:
+         {
+             JSVarRef *var_ref = (JSVarRef *)gp;
+-            /* only detached variable referenced are taken into account */
+-            assert(var_ref->is_detached);
+-            JS_MarkValue(rt, *var_ref->pvalue, mark_func);
++            if (var_ref->is_detached) {
++                JS_MarkValue(rt, var_ref->value, mark_func);
++            } else {
++                assert(!JS_IsUndefined(var_ref->gc_owner));
++                JS_MarkValue(rt, var_ref->gc_owner, mark_func);
++            }
+         }
+         break;
+     case JS_GC_OBJ_TYPE_ASYNC_FUNCTION:
+@@ -7237,6 +7250,11 @@
+ 
+ void JS_RunGC(JSRuntime *rt)
+ {
++    JSStackFrame *sf;
++
++    for (sf = rt->current_stack_frame; sf; sf = sf->prev_frame)
++        JS_DupValueRT(rt, sf->cur_func);
++
+     /* decrement the reference of the children of each object. mark =
+        1 after this pass. */
+     gc_decref(rt);
+@@ -7246,6 +7264,9 @@
+ 
+     /* free the GC objects in a cycle */
+     gc_free_cycles(rt);
++
++    for (sf = rt->current_stack_frame; sf; sf = sf->prev_frame)
++        JS_FreeValueRT(rt, sf->cur_func);
+ }
+ 
+ /* Return false if not an object or if the object has already been
+@@ -17645,6 +17666,7 @@
+         return NULL;
+     var_ref->header.ref_count = 1;
+     var_ref->is_detached = true;
++    var_ref->gc_owner = JS_UNDEFINED;
+     var_ref->value = JS_UNDEFINED;
+     var_ref->pvalue = &var_ref->value;
+     if (is_gc_object)
+@@ -17691,10 +17713,14 @@
+         var_ref->is_detached = false;
+         var_ref->is_lexical = false;
+         var_ref->is_const = false;
++        var_ref->gc_owner = js_dup(sf->gc_owner);
+         var_ref->var_ref_idx = var_ref_idx;
+         var_ref->stack_frame = sf;
+         sf->var_refs[var_ref_idx] = var_ref;
+         var_ref->pvalue = pvalue;
++        if (!JS_IsUndefined(var_ref->gc_owner))
++            add_gc_object(ctx->rt, &var_ref->header,
++                          JS_GC_OBJ_TYPE_VAR_REF);
+         return var_ref;
+     } else {
+         /* Variable is not captured (e.g., from eval closures on uncaptured vars).
+@@ -17704,6 +17730,7 @@
+             return NULL;
+         var_ref->header.ref_count = 1;
+         var_ref->is_detached = true;
++        var_ref->gc_owner = JS_UNDEFINED;
+         var_ref->value = js_dup(*pvalue);
+         var_ref->pvalue = &var_ref->value;
+         add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
+@@ -17711,6 +17738,23 @@
+     }
+ }
+ 
++static void set_stack_frame_gc_owner(JSRuntime *rt, JSStackFrame *sf,
++                                     JSValueConst gc_owner)
++{
++    int i;
++
++    assert(!JS_IsUndefined(gc_owner));
++    sf->gc_owner = unsafe_unconst(gc_owner);
++    for (i = 0; i < sf->var_ref_count; i++) {
++        JSVarRef *var_ref = sf->var_refs[i];
++        if (var_ref && JS_IsUndefined(var_ref->gc_owner)) {
++            assert(!var_ref->is_detached);
++            var_ref->gc_owner = js_dup(gc_owner);
++            add_gc_object(rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
++        }
++    }
++}
++
+ static JSValue js_closure2(JSContext *ctx, JSValue func_obj,
+                            JSFunctionBytecode *b,
+                            JSVarRef **cur_var_refs,
+@@ -17939,11 +17983,18 @@
+ 
+ static void close_var_ref(JSRuntime *rt, JSVarRef *var_ref)
+ {
++    JSValue gc_owner = var_ref->gc_owner;
++
+     var_ref->value = js_dup(*var_ref->pvalue);
+     var_ref->pvalue = &var_ref->value;
+     /* the reference is no longer to a local variable */
+     var_ref->is_detached = true;
+-    add_gc_object(rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
++    var_ref->gc_owner = JS_UNDEFINED;
++    if (JS_IsUndefined(gc_owner)) {
++        add_gc_object(rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
++    } else {
++        JS_FreeValueRT(rt, gc_owner);
++    }
+ }
+ 
+ static void close_var_refs(JSRuntime *rt, JSStackFrame *sf)
+@@ -18273,6 +18324,7 @@
+ 
+     sf->is_strict_mode = b->is_strict_mode;
+     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
++    sf->gc_owner = JS_UNDEFINED;
+     arg_buf = (JSValue *)argv;
+     sf->arg_count = argc;
+     sf->cur_func = unsafe_unconst(func_obj);
+@@ -21200,7 +21252,8 @@
+ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
+                                        JSValueConst func_obj,
+                                        JSValueConst this_obj,
+-                                       int argc, JSValueConst *argv)
++                                       int argc, JSValueConst *argv,
++                                       JSValueConst gc_owner)
+ {
+     JSObject *p;
+     JSFunctionBytecode *b;
+@@ -21209,6 +21262,7 @@
+     size_t alloc_size;
+ 
+     sf = &s->frame;
++    sf->gc_owner = gc_owner;
+     p = JS_VALUE_GET_OBJ(func_obj);
+     b = p->u.func.function_bytecode;
+     sf->is_strict_mode = b->is_strict_mode;
+@@ -21449,7 +21503,8 @@
+     if (!s)
+         return JS_EXCEPTION;
+     s->state = JS_GENERATOR_STATE_SUSPENDED_START;
+-    if (async_func_init(ctx, &s->func_state, func_obj, this_obj, argc, argv)) {
++    if (async_func_init(ctx, &s->func_state, func_obj, this_obj, argc, argv,
++                        JS_UNDEFINED)) {
+         s->state = JS_GENERATOR_STATE_COMPLETED;
+         goto fail;
+     }
+@@ -21463,6 +21518,7 @@
+     obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_GENERATOR);
+     if (JS_IsException(obj))
+         goto fail;
++    s->func_state.frame.gc_owner = obj;
+     JS_SetOpaqueInternal(obj, s);
+     return obj;
+  fail:
+@@ -22284,6 +22340,8 @@
+                 JS_FreeValue(ctx, promise);
+                 goto fail;
+             }
++            set_stack_frame_gc_owner(ctx->rt, &s->func_state.frame,
++                                     resolving_funcs[0]);
+ 
+             /* Note: no need to create 'thrownawayCapability' as in
+                the spec */
+@@ -22389,7 +22447,8 @@
+     if (JS_IsException(promise))
+         goto fail;
+ 
+-    if (async_func_init(ctx, &s->func_state, func_obj, this_obj, argc, argv)) {
++    if (async_func_init(ctx, &s->func_state, func_obj, this_obj, argc, argv,
++                        JS_UNDEFINED)) {
+     fail:
+         JS_FreeValue(ctx, promise);
+         js_async_function_free(ctx->rt, s);
+@@ -22865,7 +22924,8 @@
+         return JS_EXCEPTION;
+     s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_START;
+     init_list_head(&s->queue);
+-    if (async_func_init(ctx, &s->func_state, func_obj, this_obj, argc, argv)) {
++    if (async_func_init(ctx, &s->func_state, func_obj, this_obj, argc, argv,
++                        JS_UNDEFINED)) {
+         s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
+         goto fail;
+     }
+@@ -22880,6 +22940,7 @@
+     obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_ASYNC_GENERATOR);
+     if (JS_IsException(obj))
+         goto fail;
++    s->func_state.frame.gc_owner = obj;
+     s->generator = JS_VALUE_GET_OBJ(obj);
+     JS_SetOpaqueInternal(obj, s);
+     return obj;
+@@ -32230,6 +32291,7 @@
+     if (!var_ref)
+         return NULL;
+     var_ref->header.ref_count = 1;
++    var_ref->gc_owner = JS_UNDEFINED;
+     if (is_lexical)
+         var_ref->value = JS_UNINITIALIZED;
+     else
+@@ -41922,6 +41984,7 @@
+     var_ref->is_detached = true;
+     var_ref->is_lexical = flags & 1;
+     var_ref->is_const = (flags >> 1) & 1;
++    var_ref->gc_owner = JS_UNDEFINED;
+     var_ref->value = JS_UNDEFINED;
+     var_ref->pvalue = &var_ref->value;
+     add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
