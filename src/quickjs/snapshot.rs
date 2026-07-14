@@ -18,9 +18,11 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 
 use super::quickjs_sys::*;
-use crate::{Data, FunctionCallback, FunctionTemplate, RealIsolate};
+use crate::{
+  Data, FunctionCallback, FunctionTemplate, ObjectTemplate, RealIsolate,
+};
 
-const MAGIC: &[u8; 8] = b"V8XSNP3\0";
+const MAGIC: &[u8; 8] = b"V8XSNP4\0";
 const DATA_MAGIC: &[u8; 8] = b"V8XSDAT\0";
 const CONTEXT_DATA_REGISTRY: &std::ffi::CStr = c"__v8x_snapshot_context_data";
 const NO_REF_INDEX: u32 = u32::MAX;
@@ -98,11 +100,26 @@ pub(crate) struct SnapshotBlob {
 #[derive(Clone)]
 pub(crate) struct ContextSnapshot {
   pub global_object: Option<Vec<u8>>,
+  pub global_template: Option<SnapshotObjectTemplate>,
   pub globals: Vec<GlobalEntry>,
   pub lexical_globals: Vec<GlobalEntry>,
   pub embedder_data: Vec<Option<Vec<u8>>>,
   pub context_data: Vec<Vec<u8>>,
   pub context_data_refs: Vec<bool>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SnapshotObjectTemplate {
+  internal_field_count: i32,
+  named_handler: Option<SnapshotPropertyHandler>,
+  indexed_handler: Option<SnapshotPropertyHandler>,
+}
+
+#[derive(Clone)]
+struct SnapshotPropertyHandler {
+  callbacks: [Option<ExternalRefSlot>; 7],
+  data: Option<Vec<u8>>,
+  flags: u8,
 }
 
 #[derive(Clone)]
@@ -152,6 +169,141 @@ impl ExternalRefSlot {
     }
     self.raw
   }
+}
+
+fn callback_slot<T>(
+  callback: Option<T>,
+  external_refs: &[usize],
+) -> Option<ExternalRefSlot>
+where
+  T: Copy,
+{
+  callback.map(|callback| {
+    let raw = unsafe { std::mem::transmute_copy::<T, usize>(&callback) };
+    ExternalRefSlot::new(raw, external_refs)
+  })
+}
+
+fn resolve_callback<T>(
+  slot: Option<ExternalRefSlot>,
+  external_refs: &[usize],
+) -> Option<T>
+where
+  T: Copy,
+{
+  let raw = slot?.resolve(external_refs);
+  if raw == 0 {
+    return None;
+  }
+  Some(unsafe { std::mem::transmute_copy::<usize, T>(&raw) })
+}
+
+pub(crate) fn capture_object_template(
+  templ: *const ObjectTemplate,
+  external_refs: &[usize],
+) -> Option<SnapshotObjectTemplate> {
+  let info = super::function::snapshot_object_template_info(templ)?;
+  let named_handler =
+    info.named_handler.map(|handler| SnapshotPropertyHandler {
+      callbacks: [
+        callback_slot(handler.getter, external_refs),
+        callback_slot(handler.setter, external_refs),
+        callback_slot(handler.query, external_refs),
+        callback_slot(handler.deleter, external_refs),
+        callback_slot(handler.enumerator, external_refs),
+        callback_slot(handler.definer, external_refs),
+        callback_slot(handler.descriptor, external_refs),
+      ],
+      data: if jsv_is_undefined(&handler.data) {
+        None
+      } else {
+        write_object_bytes(handler.owner_ctx, handler.data, external_refs)
+      },
+      flags: u8::from(handler.non_masking)
+        | (u8::from(handler.only_intercept_strings) << 1),
+    });
+  let indexed_handler =
+    info.indexed_handler.map(|handler| SnapshotPropertyHandler {
+      callbacks: [
+        callback_slot(handler.getter, external_refs),
+        callback_slot(handler.setter, external_refs),
+        callback_slot(handler.query, external_refs),
+        callback_slot(handler.deleter, external_refs),
+        callback_slot(handler.enumerator, external_refs),
+        callback_slot(handler.definer, external_refs),
+        callback_slot(handler.descriptor, external_refs),
+      ],
+      data: if jsv_is_undefined(&handler.data) {
+        None
+      } else {
+        write_object_bytes(handler.owner_ctx, handler.data, external_refs)
+      },
+      flags: u8::from(handler.non_masking),
+    });
+  Some(SnapshotObjectTemplate {
+    internal_field_count: info.internal_field_count,
+    named_handler,
+    indexed_handler,
+  })
+}
+
+fn replay_object_template(
+  ctx: *mut JSContext,
+  info: &SnapshotObjectTemplate,
+  external_refs: &[usize],
+) {
+  let named_handler = info.named_handler.as_ref().map(|handler| {
+    super::function::SnapshotNamedHandlerInfo {
+      getter: resolve_callback(handler.callbacks[0], external_refs),
+      setter: resolve_callback(handler.callbacks[1], external_refs),
+      query: resolve_callback(handler.callbacks[2], external_refs),
+      deleter: resolve_callback(handler.callbacks[3], external_refs),
+      enumerator: resolve_callback(handler.callbacks[4], external_refs),
+      definer: resolve_callback(handler.callbacks[5], external_refs),
+      descriptor: resolve_callback(handler.callbacks[6], external_refs),
+      data: handler
+        .data
+        .as_deref()
+        .and_then(|bytes| {
+          deserialize_value_with_refs(ctx, bytes, external_refs)
+        })
+        .unwrap_or_else(jsv_undefined),
+      owner_ctx: ctx,
+      non_masking: handler.flags & 1 != 0,
+      only_intercept_strings: handler.flags & 2 != 0,
+    }
+  });
+  let indexed_handler = info.indexed_handler.as_ref().map(|handler| {
+    super::function::SnapshotIndexedHandlerInfo {
+      getter: resolve_callback(handler.callbacks[0], external_refs),
+      setter: resolve_callback(handler.callbacks[1], external_refs),
+      query: resolve_callback(handler.callbacks[2], external_refs),
+      deleter: resolve_callback(handler.callbacks[3], external_refs),
+      enumerator: resolve_callback(handler.callbacks[4], external_refs),
+      definer: resolve_callback(handler.callbacks[5], external_refs),
+      descriptor: resolve_callback(handler.callbacks[6], external_refs),
+      data: handler
+        .data
+        .as_deref()
+        .and_then(|bytes| {
+          deserialize_value_with_refs(ctx, bytes, external_refs)
+        })
+        .unwrap_or_else(jsv_undefined),
+      owner_ctx: ctx,
+      non_masking: handler.flags & 1 != 0,
+    }
+  });
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  super::function::restore_snapshot_object_template(
+    ctx,
+    global,
+    super::function::SnapshotObjectTemplateInfo {
+      internal_field_count: info.internal_field_count,
+      named_handler,
+      indexed_handler,
+    },
+  );
+  unsafe { JS_FreeValue(ctx, global) };
 }
 
 thread_local! {
@@ -1117,8 +1269,20 @@ pub(crate) fn capture_context(
       "QuickJS snapshot must serialize the context global as one object graph",
     )
   });
+  let global_template = {
+    let isolate = super::core::current_iso();
+    if isolate.is_null() {
+      None
+    } else {
+      super::core::iso_state(isolate)
+        .context_global_templates
+        .get(&(ctx as usize))
+        .cloned()
+    }
+  };
   let snapshot = ContextSnapshot {
     global_object,
+    global_template,
     globals: Vec::new(),
     lexical_globals: capture_global_lexicals(ctx, external_refs),
     embedder_data: capture_embedder_data(ctx, external_refs),
@@ -1266,6 +1430,9 @@ pub(crate) fn replay_context(
   let global = deserialize_value_with_refs(ctx, bytes, external_refs)
     .expect("QuickJS snapshot context-global graph failed to deserialize");
   unsafe { JS_FreeValue(ctx, global) };
+  if let Some(template) = snapshot.global_template.as_ref() {
+    replay_object_template(ctx, template, external_refs);
+  }
   restore_snapshot_module_exports(ctx);
   let context_values =
     take_context_data_registry(ctx, &snapshot.context_data_refs);
@@ -1413,6 +1580,7 @@ fn decode_blob(bytes: &[u8]) -> Option<SnapshotBlob> {
 
 fn put_context(out: &mut Vec<u8>, context: &ContextSnapshot) {
   put_opt_bytes(out, &context.global_object);
+  put_opt_object_template(out, context.global_template.as_ref());
   put_vec(out, &context.globals, put_global);
   put_vec(out, &context.lexical_globals, put_global);
   put_vec(out, &context.embedder_data, put_opt_bytes);
@@ -1422,6 +1590,36 @@ fn put_context(out: &mut Vec<u8>, context: &ContextSnapshot) {
   put_vec(out, &context.context_data_refs, |out, value| {
     out.push(u8::from(*value))
   });
+}
+
+fn put_opt_object_template(
+  out: &mut Vec<u8>,
+  template: Option<&SnapshotObjectTemplate>,
+) {
+  let Some(template) = template else {
+    out.push(0);
+    return;
+  };
+  out.push(1);
+  put_i32(out, template.internal_field_count);
+  put_opt_property_handler(out, template.named_handler.as_ref());
+  put_opt_property_handler(out, template.indexed_handler.as_ref());
+}
+
+fn put_opt_property_handler(
+  out: &mut Vec<u8>,
+  handler: Option<&SnapshotPropertyHandler>,
+) {
+  let Some(handler) = handler else {
+    out.push(0);
+    return;
+  };
+  out.push(1);
+  for callback in handler.callbacks {
+    put_opt_ref_slot(out, callback);
+  }
+  put_opt_bytes(out, &handler.data);
+  out.push(handler.flags);
 }
 
 fn put_global(out: &mut Vec<u8>, entry: &GlobalEntry) {
@@ -1593,12 +1791,47 @@ impl<'a> Reader<'a> {
   fn get_context(&mut self) -> Option<ContextSnapshot> {
     Some(ContextSnapshot {
       global_object: self.get_opt_bytes()?,
+      global_template: self.get_opt_object_template()?,
       globals: self.get_vec(Reader::get_global)?,
       lexical_globals: self.get_vec(Reader::get_global)?,
       embedder_data: self.get_vec(Reader::get_opt_bytes)?,
       context_data: self.get_vec(Reader::get_bytes)?,
       context_data_refs: self.get_vec(|reader| Some(reader.get_u8()? != 0))?,
     })
+  }
+
+  fn get_opt_object_template(
+    &mut self,
+  ) -> Option<Option<SnapshotObjectTemplate>> {
+    match self.get_u8()? {
+      0 => Some(None),
+      1 => Some(Some(SnapshotObjectTemplate {
+        internal_field_count: self.get_i32()?,
+        named_handler: self.get_opt_property_handler()?,
+        indexed_handler: self.get_opt_property_handler()?,
+      })),
+      _ => None,
+    }
+  }
+
+  fn get_opt_property_handler(
+    &mut self,
+  ) -> Option<Option<SnapshotPropertyHandler>> {
+    match self.get_u8()? {
+      0 => Some(None),
+      1 => {
+        let mut callbacks = [None; 7];
+        for callback in &mut callbacks {
+          *callback = self.get_opt_ref_slot()?;
+        }
+        Some(Some(SnapshotPropertyHandler {
+          callbacks,
+          data: self.get_opt_bytes()?,
+          flags: self.get_u8()?,
+        }))
+      }
+      _ => None,
+    }
   }
 
   fn get_opt_context(&mut self) -> Option<Option<ContextSnapshot>> {

@@ -35,6 +35,13 @@ unsafe extern "C" {
     this_obj: JSValue,
     prop: JSAtom,
   ) -> JSValue;
+  fn JS_GetOwnProperty(
+    ctx: *mut JSContext,
+    desc: *mut JSPropertyDescriptorQjs,
+    obj: JSValue,
+    prop: JSAtom,
+  ) -> c_int;
+  fn JS_GetPrototype(ctx: *mut JSContext, obj: JSValue) -> JSValue;
   fn JS_SetProperty(
     ctx: *mut JSContext,
     this_obj: JSValue,
@@ -77,9 +84,70 @@ struct JSPropertyEnum {
   atom: JSAtom,
 }
 
+#[repr(C)]
+struct JSPropertyDescriptorQjs {
+  flags: c_int,
+  value: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+}
+
 const JS_GPN_STRING_MASK: c_int = 1 << 0;
 const JS_GPN_SYMBOL_MASK: c_int = 1 << 1;
 const JS_GPN_ENUM_ONLY: c_int = 1 << 4;
+const JS_PROP_GETSET_QJS: c_int = 1 << 4;
+
+unsafe fn real_named_property_descriptor(
+  ctx: *mut JSContext,
+  object: JSValue,
+  atom: JSAtom,
+) -> Result<Option<JSPropertyDescriptorQjs>, ()> {
+  let mut current = unsafe { JS_DupValue(ctx, object) };
+  loop {
+    if !jsv_is_object(&current) {
+      unsafe { JS_FreeValue(ctx, current) };
+      return Ok(None);
+    }
+    if !super::function::is_named_handler_object(current) {
+      let mut desc = JSPropertyDescriptorQjs {
+        flags: 0,
+        value: jsv_undefined(),
+        getter: jsv_undefined(),
+        setter: jsv_undefined(),
+      };
+      let result = unsafe { JS_GetOwnProperty(ctx, &mut desc, current, atom) };
+      if result < 0 {
+        unsafe { JS_FreeValue(ctx, current) };
+        return Err(());
+      }
+      if result > 0 {
+        unsafe { JS_FreeValue(ctx, current) };
+        return Ok(Some(desc));
+      }
+    }
+    let prototype = unsafe { JS_GetPrototype(ctx, current) };
+    unsafe { JS_FreeValue(ctx, current) };
+    if jsv_is_exception(&prototype) {
+      return Err(());
+    }
+    if jsv_is_null(&prototype) {
+      unsafe { JS_FreeValue(ctx, prototype) };
+      return Ok(None);
+    }
+    current = prototype;
+  }
+}
+
+unsafe fn free_property_descriptor(
+  ctx: *mut JSContext,
+  desc: JSPropertyDescriptorQjs,
+) {
+  unsafe {
+    JS_FreeValue(ctx, desc.value);
+    JS_FreeValue(ctx, desc.getter);
+    JS_FreeValue(ctx, desc.setter);
+  }
+}
 
 fn is_private_atom(ctx: *mut JSContext, atom: JSAtom) -> bool {
   let iso = current_iso();
@@ -154,6 +222,26 @@ fn attr_to_jsprop(attr: u32) -> c_int {
     flags |= JS_PROP_CONFIGURABLE;
   }
   flags
+}
+
+#[inline]
+fn jsprop_to_attr(desc: &JSPropertyDescriptorQjs) -> u32 {
+  let mut attr = 0;
+  let read_only = if desc.flags & JS_PROP_GETSET_QJS != 0 {
+    !jsv_is_object(&desc.setter)
+  } else {
+    desc.flags & JS_PROP_WRITABLE == 0
+  };
+  if read_only {
+    attr |= 1;
+  }
+  if desc.flags & JS_PROP_ENUMERABLE == 0 {
+    attr |= 2;
+  }
+  if desc.flags & JS_PROP_CONFIGURABLE == 0 {
+    attr |= 4;
+  }
+  attr
 }
 
 #[inline]
@@ -491,6 +579,30 @@ pub extern "C" fn v8__Object__Set(
   let atom = key_atom(ctx, key);
   if atom == 0 {
     return MaybeBool::Nothing;
+  }
+
+  match unsafe { real_named_property_descriptor(ctx, jsval_of(this), atom) } {
+    Ok(Some(desc)) if jsv_is_object(&desc.setter) => {
+      let mut args = [jsval_of(value)];
+      let result = unsafe {
+        JS_Call(ctx, desc.setter, jsval_of(this), 1, args.as_mut_ptr())
+      };
+      unsafe {
+        free_property_descriptor(ctx, desc);
+        JS_FreeAtom(ctx, atom);
+      }
+      if jsv_is_exception(&result) {
+        return MaybeBool::Nothing;
+      }
+      unsafe { JS_FreeValue(ctx, result) };
+      return MaybeBool::JustTrue;
+    }
+    Ok(Some(desc)) => unsafe { free_property_descriptor(ctx, desc) },
+    Ok(None) => {}
+    Err(()) => {
+      unsafe { JS_FreeAtom(ctx, atom) };
+      return MaybeBool::Nothing;
+    }
   }
 
   let v = unsafe { JS_DupValue(ctx, jsval_of(value)) };
@@ -1383,19 +1495,22 @@ pub extern "C" fn v8__Object__GetRealNamedProperty(
   if atom == 0 {
     return ptr::null();
   }
-  let v = unsafe { JS_GetProperty(ctx, jsval_of(this), atom) };
+  let desc =
+    unsafe { real_named_property_descriptor(ctx, jsval_of(this), atom) };
   unsafe { JS_FreeAtom(ctx, atom) };
-  if v.tag == JS_TAG_EXCEPTION {
-    let exc = unsafe { JS_GetException(ctx) };
-    unsafe { JS_FreeValue(ctx, exc) };
+  let Ok(Some(desc)) = desc else {
+    return ptr::null();
+  };
+  let value = if jsv_is_object(&desc.getter) {
+    unsafe { JS_Call(ctx, desc.getter, jsval_of(this), 0, ptr::null_mut()) }
+  } else {
+    unsafe { JS_DupValue(ctx, desc.value) }
+  };
+  unsafe { free_property_descriptor(ctx, desc) };
+  if jsv_is_exception(&value) {
     return ptr::null();
   }
-
-  if jsv_is_undefined(&v) {
-    unsafe { JS_FreeValue(ctx, v) };
-    return ptr::null();
-  }
-  intern::<Value>(v)
+  intern::<Value>(value)
 }
 
 #[unsafe(no_mangle)]
@@ -1412,12 +1527,17 @@ pub extern "C" fn v8__Object__HasRealNamedProperty(
   if atom == 0 {
     return MaybeBool::Nothing;
   }
-  let r = unsafe { JS_HasProperty(ctx, jsval_of(this), atom) };
+  let desc =
+    unsafe { real_named_property_descriptor(ctx, jsval_of(this), atom) };
   unsafe { JS_FreeAtom(ctx, atom) };
-  if r < 0 {
-    return MaybeBool::Nothing;
+  match desc {
+    Ok(Some(desc)) => {
+      unsafe { free_property_descriptor(ctx, desc) };
+      just_bool(true)
+    }
+    Ok(None) => just_bool(false),
+    Err(()) => MaybeBool::Nothing,
   }
-  just_bool(r != 0)
 }
 
 #[unsafe(no_mangle)]
@@ -1437,12 +1557,15 @@ pub extern "C" fn v8__Object__GetRealNamedPropertyAttributes(
     unsafe { maybe_attr_none(out) };
     return;
   }
-  let r = unsafe { JS_HasProperty(ctx, jsval_of(this), atom) };
+  let desc =
+    unsafe { real_named_property_descriptor(ctx, jsval_of(this), atom) };
   unsafe { JS_FreeAtom(ctx, atom) };
-  if r == 1 {
-    unsafe { maybe_attr_set(out, 0) };
-  } else {
-    unsafe { maybe_attr_none(out) };
+  match desc {
+    Ok(Some(desc)) => unsafe {
+      maybe_attr_set(out, jsprop_to_attr(&desc));
+      free_property_descriptor(ctx, desc);
+    },
+    Ok(None) | Err(()) => unsafe { maybe_attr_none(out) },
   }
 }
 

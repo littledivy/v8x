@@ -37,10 +37,12 @@ use std::ptr;
 
 use crate::quickjs::core::{
   ctx_of, current_ctx, current_host_defined_options, current_iso,
-  current_script_name_or_source_url, intern, intern_ctx, intern_dup, iso_state,
-  jsval_of, new_script_value, note_compilation_cache_miss,
-  note_compiled_bytecode, record_script_host_defined_options,
-  record_script_resource_name, script_source_value,
+  current_script_name_or_source_url, host_defined_options_for_name,
+  host_defined_options_for_script_value, intern, intern_ctx, intern_dup,
+  iso_state, jsval_of, new_script_value, note_compilation_cache_miss,
+  note_compiled_bytecode, record_host_defined_options_for_name,
+  record_script_host_defined_options, record_script_resource_name,
+  script_source_value,
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::{
@@ -1206,6 +1208,7 @@ unsafe fn module_import_attribute_key(
 
 unsafe extern "C" fn dynamic_import_hook(
   ctx: *mut JSContext,
+  function: JSValue,
   basename: JSValue,
   specifier: JSValue,
   attributes: JSValue,
@@ -1215,8 +1218,8 @@ unsafe extern "C" fn dynamic_import_hook(
   let reject = unsafe { *resolving_funcs.add(1) };
 
   if std::env::var_os("QJS_DBG_DYNIMPORT").is_some() {
-    let s = unsafe { jsval_to_rust(ctx, specifier) };
-    eprintln!("[dynimport] specifier={s:?}");
+    let specifier = unsafe { jsval_to_rust(ctx, specifier) };
+    eprintln!("[dynimport] specifier={specifier:?}");
   }
 
   let reject_with = |msg: &str| unsafe {
@@ -1234,11 +1237,22 @@ unsafe extern "C" fn dynamic_import_hook(
   };
 
   let context = intern_ctx(ctx);
-  let host_opts = intern::<Data>(jsv_undefined());
+  let base_str = unsafe { jsval_to_rust(ctx, basename) };
+  let mut host_opts = current_host_defined_options();
+  if host_opts.is_null() {
+    host_opts = host_defined_options_for_script_value(function);
+  }
+  if host_opts.is_null() {
+    host_opts = host_defined_options_for_name(&base_str);
+  }
+  let host_opts = if host_opts.is_null() {
+    intern::<Data>(jsv_undefined())
+  } else {
+    host_opts
+  };
   // Scripts compiled without a resource name run under our synthetic
   // "<eval>"/"<anonymous>" filenames; V8 reports an EMPTY referrer for
   // those (deno prints "(no referrer)").
-  let base_str = unsafe { jsval_to_rust(ctx, basename) };
   let referrer = if base_str == "<eval>" || base_str == "<anonymous>" {
     let empty = unsafe { JS_NewString(ctx, c"".as_ptr()) };
     intern::<Value>(empty)
@@ -3881,6 +3895,12 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   // Map name -> this wrapper so deno's import.meta callback can be handed the
   // exact handle it registered (it looks modules up by Global identity).
   record_module_wrapper(&module_name, this);
+  unsafe {
+    record_host_defined_options_for_name(
+      &module_name,
+      host_defined_options_of(source),
+    );
+  }
   this
 }
 
@@ -3973,7 +3993,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
   let name_c = CString::new(if name.is_empty() {
     "<function>".to_string()
   } else {
-    name
+    name.clone()
   })
   .unwrap_or_else(|_| CString::new("<function>").unwrap());
   let compiled = unsafe {
@@ -4031,7 +4051,14 @@ pub extern "C" fn v8__ScriptCompiler__CompileFunction(
       resource_line_offset.saturating_sub(wrapper_line_count),
     );
   }
-  intern::<Function>(result)
+  let function = intern::<Function>(result);
+  unsafe {
+    record_script_host_defined_options(
+      function,
+      host_defined_options_of(source),
+    );
+  }
+  function
 }
 
 #[unsafe(no_mangle)]

@@ -28,6 +28,7 @@
 
 use crate::quickjs::core::{
   ctx_of, current_ctx, current_iso, intern, intern_dup, iso_state, jsval_of,
+  push_callback_context,
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::{
@@ -59,6 +60,7 @@ unsafe extern "C" {
     obj: JSValue,
     proto: JSValue,
   ) -> c_int;
+  fn JS_GetPrototype(ctx: *mut JSContext, obj: JSValue) -> JSValue;
   fn JS_PreventExtensions(ctx: *mut JSContext, obj: JSValue) -> c_int;
   fn JS_IsStrictEqual(ctx: *mut JSContext, op1: JSValue, op2: JSValue) -> bool;
 
@@ -414,6 +416,42 @@ pub(crate) struct SnapshotFunctionTemplateInfo {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) struct SnapshotNamedHandlerInfo {
+  pub getter: Option<crate::NamedPropertyGetterCallback>,
+  pub setter: Option<crate::NamedPropertySetterCallback>,
+  pub query: Option<crate::NamedPropertyQueryCallback>,
+  pub deleter: Option<crate::NamedPropertyDeleterCallback>,
+  pub enumerator: Option<crate::NamedPropertyEnumeratorCallback>,
+  pub definer: Option<crate::NamedPropertyDefinerCallback>,
+  pub descriptor: Option<crate::NamedPropertyDescriptorCallback>,
+  pub data: JSValue,
+  pub owner_ctx: *mut JSContext,
+  pub non_masking: bool,
+  pub only_intercept_strings: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotIndexedHandlerInfo {
+  pub getter: Option<crate::IndexedPropertyGetterCallback>,
+  pub setter: Option<crate::IndexedPropertySetterCallback>,
+  pub query: Option<crate::IndexedPropertyQueryCallback>,
+  pub deleter: Option<crate::IndexedPropertyDeleterCallback>,
+  pub enumerator: Option<crate::IndexedPropertyEnumeratorCallback>,
+  pub definer: Option<crate::IndexedPropertyDefinerCallback>,
+  pub descriptor: Option<crate::IndexedPropertyDescriptorCallback>,
+  pub data: JSValue,
+  pub owner_ctx: *mut JSContext,
+  pub non_masking: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SnapshotObjectTemplateInfo {
+  pub internal_field_count: i32,
+  pub named_handler: Option<SnapshotNamedHandlerInfo>,
+  pub indexed_handler: Option<SnapshotIndexedHandlerInfo>,
+}
+
+#[derive(Clone, Copy)]
 struct NamedGetterEntry {
   getter: crate::NamedPropertyGetterCallback,
   data: JSValue,
@@ -731,6 +769,11 @@ unsafe fn named_handler_from_obj<'a>(
   }
 }
 
+pub(crate) fn is_named_handler_object(obj: JSValue) -> bool {
+  let class_id = named_handler_class_id_current();
+  class_id != 0 && !unsafe { JS_GetOpaque(obj, class_id) }.is_null()
+}
+
 unsafe fn atom_to_u32_index(ctx: *mut JSContext, atom: JSAtom) -> Option<u32> {
   let mut len = 0_usize;
   let ptr = unsafe { JS_AtomToCStringLen(ctx, &mut len, atom) };
@@ -900,6 +943,7 @@ unsafe fn call_named_setter(
   handler: &NamedHandler,
   setter: crate::NamedPropertySetterCallback,
 ) -> c_int {
+  let _context_guard = push_callback_context(ctx);
   let iso = current_iso();
   let saved_depth = if iso.is_null() {
     0
@@ -4813,11 +4857,164 @@ pub(crate) fn apply_object_template_to_global(
   );
   apply_props(ctx, global, &t.props);
   apply_accessors(ctx, global, &t.accessors);
-  if let Some(handler) = &t.named_handler {
-    install_named_global_handler(ctx, global, handler);
+  let isolate = current_iso();
+  let is_snapshot_creator =
+    !isolate.is_null() && iso_state(isolate).is_snapshot_creator;
+  if !is_snapshot_creator
+    && (t.named_handler.is_some() || t.indexed_handler.is_some())
+  {
+    install_global_handler_proxy(
+      ctx,
+      global,
+      NamedHandlerInstance {
+        named_handler: t
+          .named_handler
+          .as_ref()
+          .map(|handler| clone_named_handler(ctx, handler)),
+        indexed_handler: t
+          .indexed_handler
+          .as_ref()
+          .map(|handler| clone_indexed_handler(ctx, handler)),
+      },
+    );
   }
   if t.immutable_proto {
     unsafe { JS_PreventExtensions(ctx, global) };
+  }
+}
+
+fn install_global_handler_proxy(
+  ctx: *mut JSContext,
+  global: JSValue,
+  instance: NamedHandlerInstance,
+) {
+  let class_id = named_handler_class_id_current();
+  if class_id == 0 {
+    free_named_handler_instance(ctx, instance);
+    return;
+  }
+  let proxy = unsafe { JS_NewObjectClass(ctx, class_id as c_int) };
+  if jsv_is_exception(&proxy) {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exc) };
+    free_named_handler_instance(ctx, instance);
+    return;
+  }
+  unsafe { JS_SetOpaque(proxy, Box::into_raw(Box::new(instance)).cast()) };
+  let old_proto = unsafe { JS_GetPrototype(ctx, global) };
+  if jsv_is_exception(&old_proto) {
+    let exc = unsafe { JS_GetException(ctx) };
+    unsafe {
+      JS_FreeValue(ctx, exc);
+      JS_FreeValue(ctx, proxy);
+    }
+    return;
+  }
+  unsafe {
+    JS_SetPrototype(ctx, proxy, old_proto);
+    JS_SetPrototype(ctx, global, proxy);
+    JS_FreeValue(ctx, old_proto);
+    JS_FreeValue(ctx, proxy);
+  }
+}
+
+fn free_named_handler_instance(
+  ctx: *mut JSContext,
+  instance: NamedHandlerInstance,
+) {
+  if let Some(handler) = instance.named_handler
+    && !jsv_is_undefined(&handler.data)
+  {
+    unsafe { JS_FreeValue(ctx, handler.data) };
+  }
+  if let Some(handler) = instance.indexed_handler
+    && !jsv_is_undefined(&handler.data)
+  {
+    unsafe { JS_FreeValue(ctx, handler.data) };
+  }
+}
+
+pub(crate) fn snapshot_object_template_info(
+  templ: *const ObjectTemplate,
+) -> Option<SnapshotObjectTemplateInfo> {
+  let templ = unsafe { (templ as *const ObjTemplate).as_ref() }?;
+  Some(SnapshotObjectTemplateInfo {
+    internal_field_count: templ.internal_field_count,
+    named_handler: templ.named_handler.as_ref().map(|handler| {
+      SnapshotNamedHandlerInfo {
+        getter: handler.getter,
+        setter: handler.setter,
+        query: handler.query,
+        deleter: handler.deleter,
+        enumerator: handler.enumerator,
+        definer: handler.definer,
+        descriptor: handler.descriptor,
+        data: handler.data,
+        owner_ctx: handler.owner_ctx,
+        non_masking: handler.non_masking,
+        only_intercept_strings: handler.only_intercept_strings,
+      }
+    }),
+    indexed_handler: templ.indexed_handler.as_ref().map(|handler| {
+      SnapshotIndexedHandlerInfo {
+        getter: handler.getter,
+        setter: handler.setter,
+        query: handler.query,
+        deleter: handler.deleter,
+        enumerator: handler.enumerator,
+        definer: handler.definer,
+        descriptor: handler.descriptor,
+        data: handler.data,
+        owner_ctx: handler.owner_ctx,
+        non_masking: handler.non_masking,
+      }
+    }),
+  })
+}
+
+pub(crate) fn restore_snapshot_object_template(
+  ctx: *mut JSContext,
+  global: JSValue,
+  info: SnapshotObjectTemplateInfo,
+) {
+  super::object::set_internal_field_count_for_value(
+    global,
+    info.internal_field_count,
+  );
+  let named_handler = info.named_handler.map(|handler| NamedHandler {
+    getter: handler.getter,
+    setter: handler.setter,
+    query: handler.query,
+    deleter: handler.deleter,
+    enumerator: handler.enumerator,
+    definer: handler.definer,
+    descriptor: handler.descriptor,
+    data: handler.data,
+    owner_ctx: ctx,
+    non_masking: handler.non_masking,
+    only_intercept_strings: handler.only_intercept_strings,
+  });
+  let indexed_handler = info.indexed_handler.map(|handler| IndexedHandler {
+    getter: handler.getter,
+    setter: handler.setter,
+    query: handler.query,
+    deleter: handler.deleter,
+    enumerator: handler.enumerator,
+    definer: handler.definer,
+    descriptor: handler.descriptor,
+    data: handler.data,
+    owner_ctx: ctx,
+    non_masking: handler.non_masking,
+  });
+  if named_handler.is_some() || indexed_handler.is_some() {
+    install_global_handler_proxy(
+      ctx,
+      global,
+      NamedHandlerInstance {
+        named_handler,
+        indexed_handler,
+      },
+    );
   }
 }
 

@@ -307,6 +307,10 @@ pub(crate) struct IsoState {
 
   pub persistent_handles: Vec<PersistentHandle>,
 
+  pub script_host_defined_options: HashMap<usize, JSValue>,
+
+  pub host_defined_options_by_name: HashMap<String, JSValue>,
+
   pub private_symbols: Vec<(JSValue, JSValue)>,
 
   pub atomics_waiter_resolvers: HashMap<u64, (*mut JSContext, JSValue)>,
@@ -350,6 +354,8 @@ pub(crate) struct IsoState {
   // Capture while the rusty_v8 annex and embedder callbacks are still alive.
   pub snap_default_context_capture: Option<super::snapshot::ContextSnapshot>,
   pub snap_context_captures: Vec<super::snapshot::ContextSnapshot>,
+  pub context_global_templates:
+    HashMap<usize, super::snapshot::SnapshotObjectTemplate>,
   pub snap_isolate_data: Vec<Vec<u8>>,
   pub snap_context_data: HashMap<usize, Vec<Vec<u8>>>,
   pub snap_context_data_values: HashMap<usize, Vec<Option<JSValue>>>,
@@ -523,6 +529,36 @@ pub(crate) fn current_iso() -> *mut RealIsolate {
 #[inline(always)]
 pub(crate) fn current_ctx() -> *mut JSContext {
   CURRENT_CTX.with(|c| *c.borrow())
+}
+
+pub(crate) struct CallbackContextGuard {
+  isolate: *mut RealIsolate,
+  depth: usize,
+}
+
+impl Drop for CallbackContextGuard {
+  fn drop(&mut self) {
+    if self.isolate.is_null() {
+      return;
+    }
+    let st = iso_state(self.isolate);
+    st.contexts.truncate(self.depth);
+    refresh_current_ctx(st);
+  }
+}
+
+pub(crate) fn push_callback_context(
+  ctx: *mut JSContext,
+) -> Option<CallbackContextGuard> {
+  let isolate = current_iso();
+  if isolate.is_null() || ctx.is_null() {
+    return None;
+  }
+  let st = iso_state(isolate);
+  let depth = st.contexts.len();
+  st.contexts.push(ctx);
+  refresh_current_ctx(st);
+  Some(CallbackContextGuard { isolate, depth })
 }
 
 fn set_current(iso: *mut RealIsolate) {
@@ -835,6 +871,8 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     contexts: Vec::new(),
     handles: Vec::new(),
     persistent_handles: Vec::new(),
+    script_host_defined_options: HashMap::new(),
+    host_defined_options_by_name: HashMap::new(),
     private_symbols: Vec::new(),
     atomics_waiter_resolvers: HashMap::new(),
     math_random_states: HashMap::new(),
@@ -851,6 +889,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     snap_contexts: Vec::new(),
     snap_default_context_capture: None,
     snap_context_captures: Vec::new(),
+    context_global_templates: HashMap::new(),
     snap_isolate_data: Vec::new(),
     snap_context_data: HashMap::new(),
     snap_context_data_values: HashMap::new(),
@@ -956,6 +995,12 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
       let v = *slot.slot;
       JS_FreeValue(st.ctx, v);
       drop(Box::from_raw(slot.slot));
+    }
+    for (_, value) in st.script_host_defined_options.drain() {
+      JS_FreeValue(st.ctx, value);
+    }
+    for (_, value) in st.host_defined_options_by_name.drain() {
+      JS_FreeValue(st.ctx, value);
     }
     while let Some((symbol, name)) = st.private_symbols.pop() {
       JS_FreeValue(st.ctx, symbol);
@@ -1187,6 +1232,15 @@ pub extern "C" fn v8__Context__New(
   }
   install_default_globals(isolate, ctx);
   if !templ.is_null() {
+    if st.is_snapshot_creator {
+      let external_references = st.external_references.clone();
+      if let Some(template) = super::snapshot::capture_object_template(
+        templ as *const ObjectTemplate,
+        &external_references,
+      ) {
+        st.context_global_templates.insert(ctx as usize, template);
+      }
+    }
     unsafe {
       let global = JS_GetGlobalObject(ctx);
       super::function::apply_object_template_to_global(
@@ -1987,9 +2041,6 @@ thread_local! {
     std::collections::HashMap<usize, std::ffi::CString>,
   > = RefCell::new(std::collections::HashMap::new());
 
-  static SCRIPT_HOST_DEFINED_OPTIONS: RefCell<HashMap<usize, usize>> =
-    RefCell::new(HashMap::new());
-
   // Source text per script filename, captured at eval time. Used by the
   // error-stack `Error.prepareStackTrace` shim (see `exception.rs`) to recover
   // V8's `new`-keyword column for `new X()` frames: quickjs records the
@@ -2060,17 +2111,76 @@ pub(crate) fn record_script_host_defined_options(
   let Some(key) = script_metadata_key(script) else {
     return;
   };
-  SCRIPT_HOST_DEFINED_OPTIONS.with(|m| {
-    let mut options_by_script = m.borrow_mut();
-    if options_by_script.len() > 256 && !options_by_script.contains_key(&key) {
-      options_by_script.clear();
-    }
-    if options.is_null() {
-      options_by_script.remove(&key);
-    } else {
-      options_by_script.insert(key, options as usize);
-    }
-  });
+  let isolate = current_iso();
+  if isolate.is_null() {
+    return;
+  }
+  let state = iso_state(isolate);
+  if let Some(old) = state.script_host_defined_options.remove(&key) {
+    unsafe { JS_FreeValue(state.ctx, old) };
+  }
+  if !options.is_null() {
+    let value = unsafe { JS_DupValue(state.ctx, jsval_of(options)) };
+    state.script_host_defined_options.insert(key, value);
+  }
+}
+
+pub(crate) fn record_host_defined_options_for_name(
+  name: &str,
+  options: *const Data,
+) {
+  if name.is_empty() {
+    return;
+  }
+  let isolate = current_iso();
+  if isolate.is_null() {
+    return;
+  }
+  let state = iso_state(isolate);
+  if let Some(old) = state.host_defined_options_by_name.remove(name) {
+    unsafe { JS_FreeValue(state.ctx, old) };
+  }
+  if options.is_null() {
+    return;
+  }
+  let value = unsafe { JS_DupValue(state.ctx, jsval_of(options)) };
+  state
+    .host_defined_options_by_name
+    .insert(name.to_string(), value);
+}
+
+pub(crate) fn host_defined_options_for_name(name: &str) -> *const Data {
+  let isolate = current_iso();
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let state = iso_state(isolate);
+  let Some(value) = state.host_defined_options_by_name.get(name).copied()
+  else {
+    return ptr::null();
+  };
+  intern_dup::<Data>(state.ctx, value)
+}
+
+pub(crate) fn host_defined_options_for_script_value(
+  value: JSValue,
+) -> *const Data {
+  if !jsv_is_object(&value) {
+    return ptr::null();
+  }
+  let isolate = current_iso();
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let state = iso_state(isolate);
+  let Some(value) = state
+    .script_host_defined_options
+    .get(&(unsafe { value.u.ptr } as usize))
+    .copied()
+  else {
+    return ptr::null();
+  };
+  intern_dup::<Data>(state.ctx, value)
 }
 
 pub(crate) fn record_script_resource_name(
@@ -2091,6 +2201,16 @@ pub(crate) fn record_script_resource_name(
       names.insert(key, name);
     }
   });
+  let isolate = current_iso();
+  if !isolate.is_null()
+    && let Some(value) = iso_state(isolate)
+      .script_host_defined_options
+      .get(&key)
+      .copied()
+  {
+    let options = intern_dup::<Data>(iso_state(isolate).ctx, value);
+    record_host_defined_options_for_name(name, options);
+  }
 }
 
 fn script_metadata_key(script: *const impl Sized) -> Option<usize> {
@@ -2460,7 +2580,16 @@ pub extern "C" fn v8__Script__Run(
     SCRIPT_RESOURCE_NAMES.with(|m| m.borrow().get(&key).cloned())
   });
   let host_defined_options = script_key.and_then(|key| {
-    SCRIPT_HOST_DEFINED_OPTIONS.with(|m| m.borrow().get(&key).copied())
+    let isolate = current_iso();
+    if isolate.is_null() {
+      return None;
+    }
+    let state = iso_state(isolate);
+    state
+      .script_host_defined_options
+      .get(&key)
+      .copied()
+      .map(|value| intern_dup::<Data>(ctx, value) as usize)
   });
   let fname_ptr = match fname_owned.as_ref() {
     Some(name) => name.as_ptr(),

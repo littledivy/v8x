@@ -2,14 +2,35 @@ diff --git a/quickjs.c b/quickjs.c
 index 11caae0..a5d29c7 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -31057,6 +31197,18 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -1476,8 +1476,8 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+ static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
+                                JS_MarkFunc *mark_func);
+ static JSValue js_import_meta(JSContext *ctx);
+-static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
+-                                 JSValueConst options);
++static JSValue js_dynamic_import(JSContext *ctx, JSValueConst function,
++                                 JSValueConst specifier, JSValueConst options);
+ static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
+ static JSValue js_new_promise_capability(JSContext *ctx,
+                                          JSValue *resolving_funcs,
+@@ -18793,7 +18793,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             {
+                 JSValue val;
+                 sf->cur_pc = pc;
+-                val = js_dynamic_import(ctx, sp[-2], sp[-1]);
++                val = js_dynamic_import(ctx, sf->cur_func, sp[-2], sp[-1]);
+                 if (JS_IsException(val))
+                     goto exception;
+                 JS_FreeValue(ctx, sp[-2]);
+@@ -31057,6 +31197,19 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
 +/* v82jsc: embedder hook for dynamic import(). When set, js_dynamic_import calls
 +   it instead of the built-in sync loader job; the hook settles resolving_funcs
 +   (resolve=[0], reject=[1]) — e.g. by chaining deno's async import promise. */
-+typedef void (*JSV82jscDynImportHook)(JSContext *ctx, JSValueConst basename,
++typedef void (*JSV82jscDynImportHook)(JSContext *ctx, JSValueConst function,
++                                      JSValueConst basename,
 +                                      JSValueConst specifier,
 +                                      JSValueConst attributes,
 +                                      JSValueConst *resolving_funcs);
@@ -21,7 +42,17 @@ index 11caae0..a5d29c7 100644
  static JSValue js_dynamic_import_job(JSContext *ctx,
                                       int argc, JSValueConst *argv)
  {
-@@ -31177,9 +31329,18 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
+@@ -31101,7 +31242,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+ }
+ 
+-static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
+-                                 JSValueConst options)
++static JSValue js_dynamic_import(JSContext *ctx, JSValueConst function,
++                                 JSValueConst specifier, JSValueConst options)
+ {
+     JSAtom basename;
+     JSValue promise, resolving_funcs[2], basename_val, err, ret;
+@@ -31177,9 +31329,18 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst function,
      args[3] = specifier_str;
      args[4] = attributes;
  
@@ -33,8 +64,8 @@ index 11caae0..a5d29c7 100644
 +       the host can fetch+compile new specifiers asynchronously and settle the
 +       resolving_funcs. Falls back to QuickJS's built-in sync loader job. */
 +    if (v82jsc_dyn_import_hook) {
-+        v82jsc_dyn_import_hook(ctx, basename_val, specifier_str, attributes,
-+                               resolving_funcs);
++        v82jsc_dyn_import_hook(ctx, function, basename_val, specifier_str,
++                               attributes, resolving_funcs);
 +    } else {
 +        /* cannot run JS_LoadModuleInternal synchronously because it would
 +           cause an unexpected recursion in js_evaluate_module() */

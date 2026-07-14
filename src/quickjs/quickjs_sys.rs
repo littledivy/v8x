@@ -267,6 +267,7 @@ pub type JSModuleCheckSupportedImportAttributes = unsafe extern "C" fn(
 
 pub type JSV82jscDynImportHook = unsafe extern "C" fn(
   ctx: *mut JSContext,
+  function: JSValue,
   basename: JSValue,
   specifier: JSValue,
   attributes: JSValue,
