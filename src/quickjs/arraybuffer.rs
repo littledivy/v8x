@@ -1004,7 +1004,13 @@ pub extern "C" fn v8__ArrayBuffer__NewBackingStore__with_data(
 pub extern "C" fn v8__BackingStore__Data(
   this: *const BackingStore,
 ) -> *mut c_void {
-  bs_inner(this).map_or(ptr::null_mut(), |b| b.data)
+  bs_inner(this).map_or(ptr::null_mut(), |b| {
+    if b.byte_length == 0 {
+      ptr::null_mut()
+    } else {
+      b.data
+    }
+  })
 }
 
 #[unsafe(no_mangle)]

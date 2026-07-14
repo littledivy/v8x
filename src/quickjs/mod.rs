@@ -1194,6 +1194,7 @@ mod api_test {
     assert_continuation_data_survives_await();
     assert_snapshot_context_data_preserves_global_identity();
     assert_detached_array_buffer_view_contents();
+    assert_empty_shared_backing_store_has_null_data();
     assert_backing_store_survives_isolate();
     assert_global_drop_uses_owning_isolate();
     assert_internal_globals_are_not_enumerable();
@@ -1232,6 +1233,24 @@ mod api_test {
     let code = v8::String::new(scope, "40 + 2").unwrap();
     let script = v8::Script::compile(scope, code, None).unwrap();
     assert_eq!(script.run(scope).unwrap().integer_value(scope), Some(42));
+  }
+
+  fn assert_empty_shared_backing_store_has_null_data() {
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let source =
+      v8::String::new(scope, "new Uint8Array(new SharedArrayBuffer(0))")
+        .unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    let view = script.run(scope).unwrap();
+    let view = v8::Local::<v8::ArrayBufferView>::try_from(view).unwrap();
+    let backing_store = view.get_backing_store().unwrap();
+
+    assert_eq!(backing_store.byte_length(), 0);
+    assert!(backing_store.data().is_none());
   }
 
   fn assert_backing_store_survives_isolate() {
