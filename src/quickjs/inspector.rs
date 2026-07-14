@@ -597,19 +597,44 @@ fn cancel_pause_on_next_statement(
   });
 }
 
-pub(crate) fn maybe_pause_on_next_statement() {
-  let Some(state) = SCHEDULED_PAUSE.with(|slot| {
-    let mut slot = slot.borrow_mut();
-    let state = slot.as_mut()?;
-    if !state.scheduled {
-      return None;
-    }
-    state.scheduled = false;
-    Some(*state)
-  }) else {
+fn activate_debugger_session(
+  client: *mut RawV8InspectorClient,
+  context_group_id: int,
+  channel: *mut RawChannel,
+) {
+  if client.is_null() || channel.is_null() {
     return;
-  };
+  }
+  SCHEDULED_PAUSE.with(|slot| {
+    *slot.borrow_mut() = Some(ScheduledPause {
+      client,
+      context_group_id,
+      channel,
+      scheduled: false,
+    });
+  });
+}
 
+fn deactivate_debugger_session(
+  client: *mut RawV8InspectorClient,
+  channel: *mut RawChannel,
+) {
+  SCHEDULED_PAUSE.with(|slot| {
+    let mut slot = slot.borrow_mut();
+    if matches!(
+      *slot,
+      Some(ScheduledPause {
+        client: active_client,
+        channel: active_channel,
+        ..
+      }) if active_client == client && active_channel == channel
+    ) {
+      *slot = None;
+    }
+  });
+}
+
+fn pause_inspector(state: ScheduledPause, emit_script_parsed: bool) {
   if state.client.is_null() || state.channel.is_null() {
     return;
   }
@@ -618,10 +643,12 @@ pub(crate) fn maybe_pause_on_next_statement() {
     let _ =
       v8_inspector__V8InspectorClient__BASE__generateUniqueId(state.client);
   }
-  send_channel_notification(
-    state.channel,
-    r#"{"method":"Debugger.scriptParsed","params":{"scriptId":"1","url":"","startLine":0,"startColumn":0,"endLine":0,"endColumn":0,"executionContextId":1,"hash":""}}"#.to_string(),
-  );
+  if emit_script_parsed {
+    send_channel_notification(
+      state.channel,
+      r#"{"method":"Debugger.scriptParsed","params":{"scriptId":"1","url":"","startLine":0,"startColumn":0,"endLine":0,"endColumn":0,"executionContextId":1,"hash":""}}"#.to_string(),
+    );
+  }
   send_channel_notification(
     state.channel,
     r#"{"method":"Debugger.paused","params":{"callFrames":[],"reason":"other","hitBreakpoints":[]}}"#.to_string(),
@@ -635,6 +662,30 @@ pub(crate) fn maybe_pause_on_next_statement() {
       state.context_group_id,
     );
   }
+}
+
+pub(crate) fn maybe_pause_on_next_statement() {
+  let Some(state) = SCHEDULED_PAUSE.with(|slot| {
+    let mut slot = slot.borrow_mut();
+    let state = slot.as_mut()?;
+    if !state.scheduled {
+      return None;
+    }
+    state.scheduled = false;
+    Some(*state)
+  }) else {
+    return;
+  };
+
+  pause_inspector(state, true);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v82jsc_debugger_statement() {
+  let Some(state) = SCHEDULED_PAUSE.with(|slot| *slot.borrow()) else {
+    return;
+  };
+  pause_inspector(state, false);
 }
 
 #[unsafe(no_mangle)]
@@ -1076,6 +1127,16 @@ mod cdp {
         );
       }
     }
+    fn enable_debugger(&self) {
+      super::activate_debugger_session(
+        self.client,
+        self.context_group_id,
+        self.channel,
+      );
+    }
+    fn disable_debugger(&self) {
+      super::deactivate_debugger_session(self.client, self.channel);
+    }
     fn retain(&mut self, ctx: *mut JSContext, v: JSValue) -> u64 {
       let id = self.next_obj_id;
       self.next_obj_id += 1;
@@ -1086,6 +1147,7 @@ mod cdp {
 
   impl Drop for CdpSession {
     fn drop(&mut self) {
+      super::deactivate_debugger_session(self.client, self.channel);
       let ctx = current_ctx();
       if !ctx.is_null() {
         for (_, v) in self.objects.drain() {
@@ -2211,9 +2273,14 @@ mod cdp {
 
     match method.as_str() {
       "Debugger.enable" => unsafe {
+        sess.enable_debugger();
         let response = JS_NewObject(ctx);
         set_str(ctx, response, c"debuggerId", "1");
         send_obj(sess, ctx, response, Some(id));
+      },
+      "Debugger.disable" => unsafe {
+        sess.disable_debugger();
+        ack(sess, ctx, id);
       },
       "Debugger.resume" => unsafe {
         ack(sess, ctx, id);

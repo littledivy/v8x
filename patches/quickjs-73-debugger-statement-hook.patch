@@ -1,0 +1,42 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -7972,5 +7972,6 @@ extern void v82jsc_coverage_range_hit(const void *key,
+                                       uint32_t end);
+ extern void v82jsc_coverage_function_hit(const void *key);
++extern void v82jsc_debugger_statement(void);
+ 
+ void JS_SetPreciseCoverageEnabled(bool enabled)
+ {
+@@ -20970,5 +20971,8 @@ restart:
+             goto done_generator;
+ 
++        CASE(OP_debugger):
++            v82jsc_debugger_statement();
++            BREAK;
+         CASE(OP_nop):
+             BREAK;
+         CASE(OP_is_undefined_or_null):
+@@ -31259,11 +31263,12 @@ static __exception int js_parse_statement_or_decl(JSParseState *s, int decl_mas
+         break;
+ 
+     case TOK_DEBUGGER:
+-        /* currently no debugger, so just skip the keyword */
++        emit_source_loc(s);
+         if (next_token(s))
+             goto fail;
+         if (js_parse_expect_semi(s))
+             goto fail;
++        emit_op(s, OP_debugger);
+         break;
+ 
+     case TOK_ENUM:
+--- a/quickjs-opcode.h
++++ b/quickjs-opcode.h
+@@ -372,6 +372,7 @@ DEF(   is_undefined, 1, 1, 1, none)
+ DEF(        is_null, 1, 1, 1, none)
+ DEF(typeof_is_undefined, 1, 1, 1, none)
+ DEF( typeof_is_function, 1, 1, 1, none)
++DEF(            debugger, 1, 0, 0, none)
+ 
+ #undef DEF
+ #undef def
