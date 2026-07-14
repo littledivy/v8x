@@ -2307,14 +2307,17 @@ mod tests {
     let setup = source.eval(
       "(() => {\
          const brand = Symbol('brand');\
+         const metadata = Symbol('metadata');\
          class Root {}\
          Object.setPrototypeOf(globalThis, Root.prototype);\
+         Object.defineProperty(Symbol, 'metadata', { value: metadata });\
          globalThis[brand] = brand;\
          globalThis.alias = globalThis;\
          globalThis.verifySnapshot = () =>\
            (Object.getPrototypeOf(globalThis) === Root.prototype ? 1 : 0) +\
            (globalThis[brand] === brand ? 2 : 0) +\
-           (globalThis.alias === globalThis ? 4 : 0);\
+           (globalThis.alias === globalThis ? 4 : 0) +\
+           (globalThis.Symbol.metadata === metadata ? 8 : 0);\
        })()",
     );
     unsafe { JS_FreeValue(source.context, setup) };
@@ -2340,7 +2343,7 @@ mod tests {
       assert!(!jsv_is_exception(&result));
       let mut checks = 0;
       assert_eq!(JS_ToInt32(target.context, &mut checks, result), 0);
-      assert_eq!(checks, 7);
+      assert_eq!(checks, 15);
 
       JS_FreeValue(target.context, result);
       JS_FreeValue(target.context, verify);

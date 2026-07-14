@@ -1,0 +1,22 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -40448,7 +40448,7 @@
+     bc_put_u8(s, path.found_exact);
+     JS_FreeIntrinsicFunctionPath(&path);
+     if (path.found_exact)
+-        return 0;
++        return JS_WriteSnapshotObjectState(s, obj, false, false, true);
+ 
+     bc_put_u8(s, p->u.cfunc.length);
+     bc_put_u8(s, p->u.cfunc.cproto);
+@@ -42173,7 +42173,8 @@
+     if (bc_get_u8(s, &is_exact) || is_exact > 1)
+         goto fail;
+     if (is_exact) {
+-        if (BC_add_object_ref(s, anchor))
++        if (BC_add_object_ref(s, anchor) ||
++            JS_ReadSnapshotObjectState(s, anchor, true))
+             goto fail;
+         return anchor;
+     }
