@@ -510,6 +510,7 @@ unsafe extern "C" {
     val: JSValue,
     flags: std::ffi::c_int,
   ) -> std::ffi::c_int;
+  fn JS_SetInspectorStatementScheduled(scheduled: bool);
 }
 
 #[inline]
@@ -860,6 +861,7 @@ fn schedule_pause_on_next_statement(
       scheduled: true,
     });
   });
+  unsafe { JS_SetInspectorStatementScheduled(true) };
 }
 
 fn cancel_pause_on_next_statement(
@@ -881,6 +883,7 @@ fn cancel_pause_on_next_statement(
       }
     }
   });
+  unsafe { JS_SetInspectorStatementScheduled(false) };
 }
 
 fn activate_debugger_session(
@@ -899,6 +902,7 @@ fn activate_debugger_session(
       scheduled: false,
     });
   });
+  unsafe { JS_SetInspectorStatementScheduled(false) };
 }
 
 fn deactivate_debugger_session(
@@ -958,6 +962,7 @@ pub(crate) fn maybe_pause_on_next_statement() {
       return None;
     }
     state.scheduled = false;
+    unsafe { JS_SetInspectorStatementScheduled(false) };
     Some(*state)
   }) else {
     return;
@@ -972,6 +977,11 @@ pub extern "C" fn v82jsc_debugger_statement() {
     return;
   };
   pause_inspector(state, false);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v82jsc_inspector_statement() {
+  maybe_pause_on_next_statement();
 }
 
 #[unsafe(no_mangle)]
@@ -1434,6 +1444,10 @@ mod cdp {
           self.client,
         );
       }
+    }
+    fn step_over(&self) {
+      self.schedule_pause_on_next_statement();
+      self.resume();
     }
     fn enable_debugger(&self) {
       super::activate_debugger_session(
@@ -2644,6 +2658,10 @@ mod cdp {
       "Debugger.resume" => unsafe {
         ack(sess, ctx, id);
         sess.resume();
+      },
+      "Debugger.stepOver" => unsafe {
+        ack(sess, ctx, id);
+        sess.step_over();
       },
       "Profiler.enable" => unsafe { ack(sess, ctx, id) },
       "Profiler.disable" | "Profiler.stopPreciseCoverage" => unsafe {
