@@ -1,0 +1,121 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -43857,25 +43857,23 @@
+         if (class_id >= 0)
+             ctx->class_proto[class_id] = js_dup(proto);
+     }
+-    if (JS_SetPropertyFunctionList(ctx, proto, proto_fields, n_proto_fields))
+-        goto fail;
+-
+     /* additional fields: name, length, prototype */
+     ctor = JS_NewCFunction3(ctx, func, name, length, cproto, magic, parent_ctor,
+                             n_ctor_fields + 3);
+     if (JS_IsException(ctor))
++        goto fail;
++    if (JS_SetConstructor2(ctx, ctor, proto, proto_flags, ctor_flags))
+         goto fail;
+     if (JS_SetPropertyFunctionList(ctx, ctor, ctor_fields, n_ctor_fields))
+         goto fail;
++    if (JS_SetPropertyFunctionList(ctx, proto, proto_fields, n_proto_fields))
++        goto fail;
+     if (!(flags & JS_NEW_CTOR_NO_GLOBAL)) {
+         if (JS_DefinePropertyValueStr(ctx, ctx->global_obj, name,
+                                       js_dup(ctor),
+                                       JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE) < 0)
+             goto fail;
+     }
+-    if (JS_SetConstructor2(ctx, ctor, proto, proto_flags, ctor_flags))
+-        goto fail;
+-
+     JS_FreeValue(ctx, proto);
+     JS_FreeValue(ctx, parent_proto);
+     return ctor;
+@@ -46293,6 +46291,9 @@
+ static const JSCFunctionListEntry js_array_funcs[] = {
+     JS_CFUNC_DEF("isArray", 1, js_array_isArray ),
+     JS_CFUNC_DEF("from", 1, js_array_from ),
++};
++
++static const JSCFunctionListEntry js_array_funcs_after_from_async[] = {
+     JS_CFUNC_DEF("of", 0, js_array_of ),
+     JS_CGETSET_DEF("[Symbol.species]", js_get_this, NULL ),
+ };
+@@ -49133,44 +49134,44 @@
+ 
+ static const JSCFunctionListEntry js_array_proto_funcs[] = {
+     JS_CFUNC_DEF("at", 1, js_array_at ),
+-    JS_CFUNC_DEF("with", 2, js_array_with ),
+     JS_CFUNC_DEF("concat", 1, js_array_concat ),
+-    JS_CFUNC_MAGIC_DEF("every", 1, js_array_every, special_every ),
+-    JS_CFUNC_MAGIC_DEF("some", 1, js_array_every, special_some ),
+-    JS_CFUNC_MAGIC_DEF("forEach", 1, js_array_every, special_forEach ),
+-    JS_CFUNC_MAGIC_DEF("map", 1, js_array_every, special_map ),
+-    JS_CFUNC_MAGIC_DEF("filter", 1, js_array_every, special_filter ),
+-    JS_CFUNC_MAGIC_DEF("reduce", 1, js_array_reduce, special_reduce ),
+-    JS_CFUNC_MAGIC_DEF("reduceRight", 1, js_array_reduce, special_reduceRight ),
++    JS_CFUNC_DEF("copyWithin", 2, js_array_copyWithin ),
+     JS_CFUNC_DEF("fill", 1, js_array_fill ),
+     JS_CFUNC_MAGIC_DEF("find", 1, js_array_find, ArrayFind ),
+     JS_CFUNC_MAGIC_DEF("findIndex", 1, js_array_find, ArrayFindIndex ),
+     JS_CFUNC_MAGIC_DEF("findLast", 1, js_array_find, ArrayFindLast ),
+     JS_CFUNC_MAGIC_DEF("findLastIndex", 1, js_array_find, ArrayFindLastIndex ),
+-    JS_CFUNC_DEF("indexOf", 1, js_array_indexOf ),
+     JS_CFUNC_DEF("lastIndexOf", 1, js_array_lastIndexOf ),
+-    JS_CFUNC_DEF("includes", 1, js_array_includes ),
+-    JS_CFUNC_MAGIC_DEF("join", 1, js_array_join, 0 ),
+-    JS_CFUNC_DEF("toString", 0, js_array_toString ),
+-    JS_CFUNC_MAGIC_DEF("toLocaleString", 0, js_array_join, 1 ),
+     JS_CFUNC_MAGIC_DEF("pop", 0, js_array_pop, 0 ),
+     JS_CFUNC_MAGIC_DEF("push", 1, js_array_push, 0 ),
++    JS_CFUNC_DEF("reverse", 0, js_array_reverse ),
+     JS_CFUNC_MAGIC_DEF("shift", 0, js_array_pop, 1 ),
+     JS_CFUNC_MAGIC_DEF("unshift", 1, js_array_push, 1 ),
+-    JS_CFUNC_DEF("reverse", 0, js_array_reverse ),
+-    JS_CFUNC_DEF("toReversed", 0, js_array_toReversed ),
+-    JS_CFUNC_DEF("sort", 1, js_array_sort ),
+-    JS_CFUNC_DEF("toSorted", 1, js_array_toSorted ),
+     JS_CFUNC_MAGIC_DEF("slice", 2, js_array_slice, 0 ),
++    JS_CFUNC_DEF("sort", 1, js_array_sort ),
+     JS_CFUNC_MAGIC_DEF("splice", 2, js_array_slice, 1 ),
+-    JS_CFUNC_DEF("toSpliced", 2, js_array_toSpliced ),
+-    JS_CFUNC_DEF("copyWithin", 2, js_array_copyWithin ),
+-    JS_CFUNC_MAGIC_DEF("flatMap", 1, js_array_flatten, 1 ),
+-    JS_CFUNC_MAGIC_DEF("flat", 0, js_array_flatten, 0 ),
+-    JS_CFUNC_MAGIC_DEF("values", 0, js_create_array_iterator, JS_ITERATOR_KIND_VALUE ),
+-    JS_ALIAS_DEF("[Symbol.iterator]", "values" ),
++    JS_CFUNC_DEF("includes", 1, js_array_includes ),
++    JS_CFUNC_DEF("indexOf", 1, js_array_indexOf ),
++    JS_CFUNC_MAGIC_DEF("join", 1, js_array_join, 0 ),
+     JS_CFUNC_MAGIC_DEF("keys", 0, js_create_array_iterator, JS_ITERATOR_KIND_KEY ),
+     JS_CFUNC_MAGIC_DEF("entries", 0, js_create_array_iterator, JS_ITERATOR_KIND_KEY_AND_VALUE ),
++    JS_CFUNC_MAGIC_DEF("values", 0, js_create_array_iterator, JS_ITERATOR_KIND_VALUE ),
++    JS_CFUNC_MAGIC_DEF("forEach", 1, js_array_every, special_forEach ),
++    JS_CFUNC_MAGIC_DEF("filter", 1, js_array_every, special_filter ),
++    JS_CFUNC_MAGIC_DEF("flat", 0, js_array_flatten, 0 ),
++    JS_CFUNC_MAGIC_DEF("flatMap", 1, js_array_flatten, 1 ),
++    JS_CFUNC_MAGIC_DEF("map", 1, js_array_every, special_map ),
++    JS_CFUNC_MAGIC_DEF("every", 1, js_array_every, special_every ),
++    JS_CFUNC_MAGIC_DEF("some", 1, js_array_every, special_some ),
++    JS_CFUNC_MAGIC_DEF("reduce", 1, js_array_reduce, special_reduce ),
++    JS_CFUNC_MAGIC_DEF("reduceRight", 1, js_array_reduce, special_reduceRight ),
++    JS_CFUNC_DEF("toReversed", 0, js_array_toReversed ),
++    JS_CFUNC_DEF("toSorted", 1, js_array_toSorted ),
++    JS_CFUNC_DEF("toSpliced", 2, js_array_toSpliced ),
++    JS_CFUNC_DEF("with", 2, js_array_with ),
++    JS_CFUNC_MAGIC_DEF("toLocaleString", 0, js_array_join, 1 ),
++    JS_CFUNC_DEF("toString", 0, js_array_toString ),
++    JS_ALIAS_DEF("[Symbol.iterator]", "values" ),
+     JS_OBJECT_DEF("[Symbol.unscopables]", js_array_unscopables_funcs, countof(js_array_unscopables_funcs), JS_PROP_CONFIGURABLE ),
+ };
+ 
+@@ -61785,6 +61786,10 @@
+                               JS_AUTOINIT_ID_BYTECODE,
+                               (void *)(uintptr_t)JS_BUILTIN_ARRAY_FROMASYNC,
+                               JS_PROP_WRITABLE|JS_PROP_CONFIGURABLE);
++    if (JS_SetPropertyFunctionList(ctx, obj1,
++                                   js_array_funcs_after_from_async,
++                                   countof(js_array_funcs_after_from_async)))
++        return -1;
+ 
+     /* needed to initialize arguments[Symbol.iterator] */
+     ctx->array_proto_values =

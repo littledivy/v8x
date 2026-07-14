@@ -2397,6 +2397,27 @@ mod tests {
   }
 
   #[test]
+  fn array_intrinsic_property_order_matches_v8() {
+    let test = TestContext::new();
+    let keys = test.eval(
+      "Reflect.ownKeys(Array).map(String).join(',') + ';' +\
+       Reflect.ownKeys(Array.prototype).map(String).join(',')",
+    );
+    let key_text = value_to_string(test.context, keys).unwrap();
+    unsafe { JS_FreeValue(test.context, keys) };
+    assert_eq!(
+      key_text,
+      "length,name,prototype,isArray,from,fromAsync,of,Symbol(Symbol.species);\
+       length,constructor,at,concat,copyWithin,fill,find,findIndex,findLast,\
+       findLastIndex,lastIndexOf,pop,push,reverse,shift,unshift,slice,sort,\
+       splice,includes,indexOf,join,keys,entries,values,forEach,filter,flat,\
+       flatMap,map,every,some,reduce,reduceRight,toReversed,toSorted,toSpliced,\
+       with,toLocaleString,toString,Symbol(Symbol.iterator),\
+       Symbol(Symbol.unscopables)",
+    );
+  }
+
+  #[test]
   fn bytecode_functions_roundtrip_shared_closure_state() {
     let test = TestContext::new();
     let source_value = test.eval(
