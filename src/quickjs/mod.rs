@@ -1195,6 +1195,7 @@ mod api_test {
     assert_detached_array_buffer_view_contents();
     assert_backing_store_survives_isolate();
     assert_global_drop_uses_owning_isolate();
+    assert_internal_globals_are_not_enumerable();
     assert_suspended_async_capture_survives_gc();
     assert_wasm_streaming_respects_explicit_microtasks();
     assert_duplicate_module_requests_resolve_once();
@@ -1264,6 +1265,30 @@ mod api_test {
       let _scope = &mut scope.init();
       drop(global);
     }
+  }
+
+  fn assert_internal_globals_are_not_enumerable() {
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let source = v8::String::new(
+      scope,
+      "[\
+         '__v8x_snapshot_intrinsics',\
+         '__v8xTemporalTimeZone',\
+         '__v8x_import_source',\
+         '__v8xPostForegroundTask',\
+         '__v8xAtomicsRegisterWaiter',\
+         '__v8xAtomicsNotifyWaiters',\
+         '__v8xAtomicsCancelWaiter'\
+       ].filter(name => Object.prototype.propertyIsEnumerable.call(\
+         globalThis, name)).length",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    assert_eq!(script.run(scope).unwrap().integer_value(scope), Some(0));
   }
 
   fn assert_suspended_async_capture_survives_gc() {

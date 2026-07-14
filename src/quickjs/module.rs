@@ -902,10 +902,10 @@ pub(crate) unsafe fn install_dynamic_source_import_global(
     )
   };
   unsafe {
-    JS_SetPropertyStr(
+    super::core::define_internal_global(
       ctx,
       global,
-      c"__v8x_import_source".as_ptr(),
+      c"__v8x_import_source",
       import_source,
     );
   }
@@ -927,10 +927,10 @@ pub(crate) unsafe fn ensure_dynamic_defer_import_global(ctx: *mut JSContext) {
       )
     };
     unsafe {
-      JS_SetPropertyStr(
+      super::core::define_internal_global(
         ctx,
         global,
-        c"__v8x_import_defer".as_ptr(),
+        c"__v8x_import_defer",
         import_defer,
       );
     }

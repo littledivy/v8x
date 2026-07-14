@@ -161,7 +161,12 @@ pub(crate) unsafe fn install_host_functions(
     JS_NewCFunction(ctx, format_time_zone, c"__v8xTemporalTimeZone".as_ptr(), 2)
   };
   unsafe {
-    JS_SetPropertyStr(ctx, global, c"__v8xTemporalTimeZone".as_ptr(), function);
+    super::core::define_internal_global(
+      ctx,
+      global,
+      c"__v8xTemporalTimeZone",
+      function,
+    );
   }
 }
 

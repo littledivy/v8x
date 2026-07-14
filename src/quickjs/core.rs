@@ -44,6 +44,7 @@ use crate::{
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
 use std::sync::atomic::{
@@ -1428,10 +1429,10 @@ pub(crate) unsafe fn refresh_snapshot_intrinsics(ctx: *mut JSContext) {
     unsafe { JS_FreeValue(ctx, existing) };
     let registry = unsafe { JS_NewArray(ctx) };
     unsafe {
-      JS_SetPropertyStr(
+      define_internal_global(
         ctx,
         global,
-        c"__v8x_snapshot_intrinsics".as_ptr(),
+        c"__v8x_snapshot_intrinsics",
         JS_DupValue(ctx, registry),
       );
     }
@@ -1444,6 +1445,27 @@ pub(crate) unsafe fn refresh_snapshot_intrinsics(ctx: *mut JSContext) {
     JS_FreeValue(ctx, registry);
     JS_FreeValue(ctx, global);
   };
+}
+
+pub(crate) unsafe fn define_internal_global(
+  ctx: *mut JSContext,
+  global: JSValue,
+  name: &CStr,
+  value: JSValue,
+) {
+  if unsafe {
+    JS_DefinePropertyValueStr(
+      ctx,
+      global,
+      name.as_ptr(),
+      value,
+      JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE,
+    )
+  } < 0
+  {
+    let exception = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exception) };
+  }
 }
 
 unsafe extern "C" fn qjs_gc(
@@ -1795,17 +1817,17 @@ fn install_atomics_wait_async_shim(ctx: *mut JSContext, global: JSValue) {
       c"__v8xPostForegroundTask".as_ptr(),
       0,
     );
-    JS_SetPropertyStr(ctx, global, c"__v8xPostForegroundTask".as_ptr(), post);
+    define_internal_global(ctx, global, c"__v8xPostForegroundTask", post);
     let register = JS_NewCFunction(
       ctx,
       qjs_atomics_register_waiter,
       c"__v8xAtomicsRegisterWaiter".as_ptr(),
       3,
     );
-    JS_SetPropertyStr(
+    define_internal_global(
       ctx,
       global,
-      c"__v8xAtomicsRegisterWaiter".as_ptr(),
+      c"__v8xAtomicsRegisterWaiter",
       register,
     );
     let notify = JS_NewCFunction(
@@ -1814,24 +1836,14 @@ fn install_atomics_wait_async_shim(ctx: *mut JSContext, global: JSValue) {
       c"__v8xAtomicsNotifyWaiters".as_ptr(),
       3,
     );
-    JS_SetPropertyStr(
-      ctx,
-      global,
-      c"__v8xAtomicsNotifyWaiters".as_ptr(),
-      notify,
-    );
+    define_internal_global(ctx, global, c"__v8xAtomicsNotifyWaiters", notify);
     let cancel = JS_NewCFunction(
       ctx,
       qjs_atomics_cancel_waiter,
       c"__v8xAtomicsCancelWaiter".as_ptr(),
       1,
     );
-    JS_SetPropertyStr(
-      ctx,
-      global,
-      c"__v8xAtomicsCancelWaiter".as_ptr(),
-      cancel,
-    );
+    define_internal_global(ctx, global, c"__v8xAtomicsCancelWaiter", cancel);
 
     let csrc = std::ffi::CString::new(SRC).unwrap();
     let r = JS_Eval(

@@ -1,8 +1,8 @@
 #![allow(non_snake_case, unused)]
 
 use crate::quickjs::core::{
-  ctx_of, current_ctx, current_host_defined_options, current_iso, intern,
-  intern_ctx, intern_dup, iso_state, jsval_of,
+  ctx_of, current_ctx, current_host_defined_options, current_iso,
+  define_internal_global, intern, intern_ctx, intern_dup, iso_state, jsval_of,
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::support::int;
@@ -559,10 +559,10 @@ pub(crate) unsafe fn install_snapshot_intrinsics(
       setf,
     );
     if install_registry {
-      JS_SetPropertyStr(
+      define_internal_global(
         ctx,
         global,
-        c"__v8x_snapshot_intrinsics".as_ptr(),
+        c"__v8x_snapshot_intrinsics",
         registry,
       );
     } else {
