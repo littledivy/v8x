@@ -1356,8 +1356,18 @@ mod api_test {
          } catch (error) {\
            primitiveRejected = error instanceof TypeError;\
          }\
+         let normalReturnCalled = false;\
+         for await (const _ of {\
+           [Symbol.asyncIterator]() {\
+             return {\
+               next() { return Promise.resolve({ done: true }); },\
+               return() { normalReturnCalled = true; return Promise.resolve({}); },\
+             };\
+           },\
+         }) {}\
          asyncIteratorCloseResult =\
-           `${breakClosed}:${returnClosed}:${returnValue}:${primitiveRejected}`;\
+           `${breakClosed}:${returnClosed}:${returnValue}:` +\
+           `${primitiveRejected}:${normalReturnCalled}`;\
        })();",
     )
     .unwrap();
@@ -1369,7 +1379,7 @@ mod api_test {
     let script = v8::Script::compile(scope, source, None).unwrap();
     assert_eq!(
       script.run(scope).unwrap().to_rust_string_lossy(scope),
-      "true:true:42:true",
+      "true:true:42:true:false",
     );
   }
 
