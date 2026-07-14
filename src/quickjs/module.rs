@@ -4647,7 +4647,10 @@ pub extern "C" fn v8__Module__GetModuleNamespace(
         exports = SYNTHETIC_EXPORTS.with(|t| t.borrow().get(&def).cloned());
       }
       if exports.is_none() {
-        unsafe { run_synthetic_eval_steps(ctx, def as *mut JSModuleDef) };
+        if !unsafe { run_synthetic_eval_steps(ctx, def as *mut JSModuleDef) } {
+          unsafe { JS_FreeValue(ctx, ns) };
+          return ptr::null();
+        }
         exports = SYNTHETIC_EXPORTS.with(|t| t.borrow().get(&def).cloned());
       }
       if let Some(exports) = exports {
@@ -5324,6 +5327,15 @@ pub extern "C" fn v8__Module__Evaluate(
           with_module_state(this, |m| m.status = ModuleStatus::Errored);
           return make_rejected_promise(ctx, exc);
         }
+        if result.tag == JS_TAG_OBJECT && unsafe { JS_IsPromise(result) } {
+          let status = if unsafe { JS_PromiseState(ctx, result) } == 2 {
+            ModuleStatus::Errored
+          } else {
+            ModuleStatus::Evaluated
+          };
+          with_module_state(this, |m| m.status = status);
+          return intern::<Value>(result);
+        }
         unsafe { JS_FreeValue(ctx, result) };
       }
       with_module_state(this, |m| m.status = ModuleStatus::Evaluated);
@@ -5815,32 +5827,51 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
 // Run deno's `SyntheticModuleEvaluationSteps` for module `m`, which call
 // `SetSyntheticModuleExport` to populate SYNTHETIC_EXPORTS. Does NOT touch the
 // QuickJS module export slots (caller decides).
-unsafe fn run_synthetic_eval_steps(ctx: *mut JSContext, m: *mut JSModuleDef) {
+unsafe fn run_synthetic_eval_steps(
+  ctx: *mut JSContext,
+  m: *mut JSModuleDef,
+) -> bool {
   let steps =
     SYNTHETIC_EVAL_STEPS.with(|t| t.borrow().get(&(m as usize)).copied());
   if let Some((eval_steps, handle_jsval)) = steps {
-    let cur_ctx = current_ctx();
-    let ctx_for_call = if cur_ctx.is_null() { ctx } else { cur_ctx };
-
-    let ctx_handle = super::core::intern_ctx(ctx_for_call);
-    let mod_handle =
-      super::core::intern_dup::<Module>(ctx_for_call, handle_jsval);
+    let ctx_handle = super::core::intern_ctx(ctx);
+    let mod_handle = super::core::intern_dup::<Module>(ctx, handle_jsval);
     unsafe {
       if let (Some(ctx_l), Some(mod_l)) = (
         crate::Local::from_raw(ctx_handle),
         crate::Local::from_raw(mod_handle),
       ) {
-        let _ = eval_steps(ctx_l, mod_l);
+        #[cfg(not(target_os = "windows"))]
+        let result =
+          std::mem::transmute::<_, *const Value>(eval_steps(ctx_l, mod_l));
+        #[cfg(target_os = "windows")]
+        let result = {
+          let mut result = ptr::null();
+          eval_steps(&mut result, ctx_l, mod_l);
+          result
+        };
+        if result.is_null() {
+          if !JS_HasException(ctx) {
+            JS_ThrowInternalError(
+              ctx,
+              c"synthetic module evaluation failed".as_ptr(),
+            );
+          }
+          return false;
+        }
       }
     }
   }
+  true
 }
 
 unsafe extern "C" fn synthetic_module_init_callback(
   ctx: *mut JSContext,
   m: *mut JSModuleDef,
 ) -> std::os::raw::c_int {
-  unsafe { run_synthetic_eval_steps(ctx, m) };
+  if !unsafe { run_synthetic_eval_steps(ctx, m) } {
+    return -1;
+  }
 
   let exports = SYNTHETIC_EXPORTS
     .with(|t| t.borrow_mut().remove(&(m as usize)).unwrap_or_default());
