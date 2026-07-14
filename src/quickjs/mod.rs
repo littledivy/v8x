@@ -1193,6 +1193,7 @@ mod api_test {
     assert_continuation_data_survives_await();
     assert_snapshot_context_data_preserves_global_identity();
     assert_detached_array_buffer_view_contents();
+    assert_backing_store_survives_isolate();
     assert_wasm_streaming_respects_explicit_microtasks();
     assert_duplicate_module_requests_resolve_once();
 
@@ -1225,6 +1226,23 @@ mod api_test {
     let code = v8::String::new(scope, "40 + 2").unwrap();
     let script = v8::Script::compile(scope, code, None).unwrap();
     assert_eq!(script.run(scope).unwrap().integer_value(scope), Some(42));
+  }
+
+  fn assert_backing_store_survives_isolate() {
+    let backing_store = {
+      let isolate = &mut v8::Isolate::new(Default::default());
+      let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+      let scope = &mut scope.init();
+      let context = v8::Context::new(scope, Default::default());
+      let scope = &mut v8::ContextScope::new(scope, context);
+      let buffer = v8::ArrayBuffer::new(scope, 4);
+      let backing_store = buffer.get_backing_store();
+      backing_store[0].set(42);
+      backing_store
+    };
+
+    assert_eq!(backing_store.byte_length(), 4);
+    assert_eq!(backing_store[0].get(), 42);
   }
 
   fn assert_wasm_streaming_respects_explicit_microtasks() {

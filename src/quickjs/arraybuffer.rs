@@ -355,6 +355,58 @@ fn backing_store_for_buffer(
   make_shared_ref(inner)
 }
 
+/// Move alias backing stores off QuickJS-owned memory before their runtime is
+/// destroyed. V8 backing stores may outlive their isolate, so retaining a
+/// JSValue and freeing it later through a dead JSContext is not valid.
+pub(crate) unsafe fn release_backing_stores_for_runtime(rt: *mut JSRuntime) {
+  if rt.is_null() {
+    return;
+  }
+
+  let inners = {
+    let mut registry = alias_registry().lock().unwrap();
+    let mut inners = Vec::new();
+    registry.retain(|_, entries| {
+      entries.retain(|entry| {
+        let inner = *entry as *mut BsInner;
+        let matches = !inner.is_null()
+          && unsafe {
+            !(*inner).retained_ctx.is_null()
+              && JS_GetRuntime((*inner).retained_ctx) == rt
+          };
+        if matches {
+          inners.push(inner);
+        }
+        !matches
+      });
+      !entries.is_empty()
+    });
+    inners
+  };
+
+  for inner in inners {
+    let b = unsafe { &mut *inner };
+    let copy = if b.byte_length == 0 {
+      ptr::null_mut()
+    } else {
+      let copy = unsafe { malloc(b.byte_length) };
+      if copy.is_null() {
+        std::process::abort();
+      }
+      unsafe { ptr::copy_nonoverlapping(b.data, copy, b.byte_length) };
+      copy
+    };
+
+    b.data = copy;
+    b.owns_malloc = true;
+    b.deleter = noop_deleter;
+    b.deleter_data = ptr::null_mut();
+    unsafe { JS_FreeValue(b.retained_ctx, b.retained_val) };
+    b.retained_ctx = ptr::null_mut();
+    b.retained_val = jsv_undefined();
+  }
+}
+
 unsafe fn is_resizable_by_user_javascript(
   ctx: *mut JSContext,
   buf: JSValue,

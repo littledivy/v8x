@@ -1037,6 +1037,7 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
         JS_FreeValue(ctx as *mut JSContext, value);
       }
     }
+    super::arraybuffer::release_backing_stores_for_runtime(st.rt);
     super::isolate::release_continuation_state(&mut st);
     // Release any saved eval/Function bindings a context held while code
     // generation from strings was disabled, before its JSContext is freed.
