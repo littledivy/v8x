@@ -1107,6 +1107,7 @@ mod api_test {
     assert_continuation_data_survives_await();
     assert_snapshot_context_data_preserves_global_identity();
     assert_detached_array_buffer_view_contents();
+    assert_wasm_streaming_respects_explicit_microtasks();
 
     unsafe {
       v8::V8::dispose();
@@ -1137,6 +1138,58 @@ mod api_test {
     let code = v8::String::new(scope, "40 + 2").unwrap();
     let script = v8::Script::compile(scope, code, None).unwrap();
     assert_eq!(script.run(scope).unwrap().integer_value(scope), Some(42));
+  }
+
+  fn assert_wasm_streaming_respects_explicit_microtasks() {
+    thread_local! {
+      static STREAM: std::cell::RefCell<Option<v8::WasmStreaming<false>>> =
+        const { std::cell::RefCell::new(None) };
+    }
+
+    let isolate = &mut v8::Isolate::new(Default::default());
+    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+    isolate.set_wasm_streaming_callback(
+      |_scope: &mut v8::PinScope,
+       _url: v8::Local<v8::Value>,
+       stream: v8::WasmStreaming<false>| {
+        STREAM
+          .with(|slot| assert!(slot.borrow_mut().replace(stream).is_none()));
+      },
+    );
+
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let global = context.global(scope);
+    let result_name = v8::String::new(scope, "streamingResult").unwrap();
+
+    let code = v8::String::new(
+      scope,
+      "globalThis.streamingResult = null;\n\
+       WebAssembly.compileStreaming('https://example.com')\n\
+         .then(module => globalThis.streamingResult = module);",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, code, None).unwrap();
+    script.run(scope).unwrap();
+
+    assert!(STREAM.with(|slot| slot.borrow().is_none()));
+    scope.perform_microtask_checkpoint();
+    let mut stream = STREAM.with(|slot| slot.borrow_mut().take().unwrap());
+    assert!(global.get(scope, result_name.into()).unwrap().is_null());
+
+    stream.on_bytes_received(&[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00]);
+    stream.finish();
+    assert!(global.get(scope, result_name.into()).unwrap().is_null());
+
+    scope.perform_microtask_checkpoint();
+    assert!(
+      global
+        .get(scope, result_name.into())
+        .unwrap()
+        .is_wasm_module_object()
+    );
   }
 
   fn assert_finalization_registry_token_is_weak() {

@@ -3448,7 +3448,7 @@ pub(crate) fn streaming_finish(
     let r = JS_Call(st.ctx, st.resolve, jsv_undefined(), 1, args.as_mut_ptr());
     JS_FreeValue(st.ctx, r);
   }
-  drain_jobs(st.ctx);
+  super::isolate::run_microtasks_if_auto();
   STREAMING_PENDING.with(|p| p.set(p.get().saturating_sub(1)));
 }
 
@@ -3470,27 +3470,9 @@ pub(crate) fn streaming_abort(this: *mut c_void, exception: *const Value) {
       JS_FreeValue(st.ctx, args[0]);
       JS_FreeValue(st.ctx, r);
     }
-    drain_jobs(st.ctx);
+    super::isolate::run_microtasks_if_auto();
   }
   STREAMING_PENDING.with(|p| p.set(p.get().saturating_sub(1)));
-}
-
-fn drain_jobs(ctx: *mut JSContext) {
-  if ctx.is_null() {
-    return;
-  }
-  let iso = current_iso();
-  if iso.is_null() {
-    return;
-  }
-  let rt = iso_state(iso).rt;
-  if rt.is_null() {
-    return;
-  }
-  unsafe {
-    let mut pctx = ctx;
-    while JS_ExecutePendingJob(rt, &mut pctx) > 0 {}
-  }
 }
 
 fn streaming_state(this: *mut c_void) -> Option<&'static mut StreamingState> {
