@@ -564,15 +564,20 @@ pub(crate) fn cppgc_register_wrapper(wrapper: JSValue, value: *const RustObj) {
   });
 }
 
-pub(crate) fn cppgc_is_live_object(value: *mut RustObj) -> bool {
-  if value.is_null() {
+pub(crate) fn cppgc_wrapper_matches(
+  value: *mut RustObj,
+  wrapper: JSValue,
+) -> bool {
+  if value.is_null() || !jsv_is_object(&wrapper) {
     return false;
   }
+  let wrapper_key = unsafe { wrapper.u.ptr } as usize;
   CPPGC_OBJECTS.with(|objects| {
-    objects
-      .borrow()
-      .iter()
-      .any(|object| object.ptr == value as usize)
+    objects.borrow().iter().any(|object| {
+      object.ptr == value as usize
+        && object.wrapper_key == Some(wrapper_key)
+        && unsafe { cppgc_weak_wrapper_is_live(object.weak_wrapper) }
+    })
   })
 }
 
@@ -826,6 +831,45 @@ mod cppgc_persistent_tests {
     cppgc__WeakPersistent__Assign(weak, second);
     assert_eq!(cppgc__WeakPersistent__Get(weak), second);
     cppgc__WeakPersistent__DESTRUCT(weak);
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
+  fn collected_wrapper_does_not_match_stale_native_record() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let wrapper = JS_NewObject(ctx);
+      let weak_wrapper = cppgc_new_weak_wrapper(ctx, wrapper);
+      assert!(!jsv_is_undefined(&weak_wrapper));
+      let native = 8usize as *mut RustObj;
+      CPPGC_OBJECTS.with(|objects| {
+        objects.borrow_mut().push(CppGcObject {
+          ptr: native as usize,
+          size: 0,
+          align: 8,
+          wrapper_key: Some(wrapper.u.ptr as usize),
+          weak_wrapper,
+        });
+      });
+
+      assert!(cppgc_wrapper_matches(native, wrapper));
+      JS_FreeValue(ctx, wrapper);
+      JS_RunGC(rt);
+      assert!(!cppgc_wrapper_matches(native, wrapper));
+
+      CPPGC_OBJECTS.with(|objects| {
+        objects
+          .borrow_mut()
+          .retain(|object| object.ptr != native as usize);
+      });
+      JS_FreeValue(ctx, weak_wrapper);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
   }
 }
 

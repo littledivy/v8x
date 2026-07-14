@@ -1904,12 +1904,19 @@ pub extern "C" fn v8__Object__Unwrap(
     return ptr::null_mut();
   }
   let key = wrap_key(wrapper);
+  let wrapper_value = jsval_of(wrapper);
   WRAP_TABLE.with(|t| {
-    t.borrow()
-      .get(&(key, tag))
-      .map(|&p| p as *mut crate::binding::RustObj)
-      .filter(|&p| super::misc::cppgc_is_live_object(p))
-      .unwrap_or(ptr::null_mut())
+    let entry = t.borrow().get(&(key, tag)).copied();
+    let Some(entry) = entry else {
+      return ptr::null_mut();
+    };
+    let value = entry as *mut crate::binding::RustObj;
+    if super::misc::cppgc_wrapper_matches(value, wrapper_value) {
+      value
+    } else {
+      t.borrow_mut().remove(&(key, tag));
+      ptr::null_mut()
+    }
   })
 }
 
