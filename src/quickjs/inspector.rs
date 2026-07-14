@@ -1876,8 +1876,18 @@ mod cdp {
           .then_some(((start, end), count))
       })
       .collect::<BTreeMap<_, _>>();
+    let call_count = if is_script_root {
+      function.call_count.min(1)
+    } else {
+      function.call_count
+    };
     let mut location_counts = BTreeMap::<usize, u64>::new();
     if !is_script_root && range_counts.is_empty() {
+      // Function entry has no executable QuickJS bytecode, so it never gets a
+      // location hit of its own. Seed it from the invocation count to avoid
+      // reporting the prologue of an executed straight-line function as an
+      // uncovered block.
+      location_counts.insert(start_offset, call_count);
       for (line, column) in function.locations {
         let offset = utf16_offset(&script, line, column);
         if offset >= start_offset && offset < end_offset {
@@ -1894,11 +1904,6 @@ mod cdp {
         }
       }
     }
-    let call_count = if is_script_root {
-      function.call_count.min(1)
-    } else {
-      function.call_count
-    };
     let mut ranges = vec![CoverageRangeData {
       start_offset,
       end_offset,
