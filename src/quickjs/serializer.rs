@@ -41,6 +41,11 @@ const TAG_OBJECT: u8 = b'O';
 const TAG_SAB: u8 = b'S';
 
 const SAB_CLONE_ERROR: &[u8] = b"#<SharedArrayBuffer> could not be cloned.";
+const SYMBOL_CLONE_ERROR: &[u8] = b"Symbol could not be cloned.";
+const WEAK_MAP_CLONE_ERROR: &[u8] = b"#<WeakMap> could not be cloned.";
+const WEAK_SET_CLONE_ERROR: &[u8] = b"#<WeakSet> could not be cloned.";
+const WASM_MODULE_CLONE_ERROR: &[u8] =
+  b"#<WebAssembly.Module> could not be cloned.";
 
 #[repr(C)]
 struct JSPropertyEnum {
@@ -51,6 +56,8 @@ const JS_GPN_OWN_ENUM: c_int = (1 << 0) | (1 << 1) | (1 << 4); // string|symbol|
 
 unsafe extern "C" {
   fn JS_IsInstanceOf(ctx: *mut JSContext, val: JSValue, obj: JSValue) -> c_int;
+  fn JS_IsWeakMap(val: JSValue) -> bool;
+  fn JS_IsWeakSet(val: JSValue) -> bool;
   fn JS_ValueToAtom(ctx: *mut JSContext, val: JSValue) -> JSAtom;
   fn JS_GetOwnPropertyNames(
     ctx: *mut JSContext,
@@ -468,6 +475,11 @@ pub extern "C" fn v8__ValueSerializer__WriteValue(
   let v = jsval_of::<Value>(value.as_non_null().as_ptr() as *const Value);
   st.data_clone_error = false;
 
+  if let Some(message) = uncloneable_message(ctx, v) {
+    throw_clone_error(st, ctx, message);
+    return MaybeBool::Nothing;
+  }
+
   // Default path: a single opaque `JS_WriteObject` blob under `TAG_VALUE`. Only
   // switch to the recursive graph walk when the value carries a transferred
   // ArrayBuffer (JS_WriteObject throws on the detached buffer) or a host object
@@ -493,7 +505,28 @@ pub extern "C" fn v8__ValueSerializer__WriteValue(
   }
 }
 
-fn throw_sab_clone_error(st: &mut SerState, ctx: *mut JSContext) {
+fn uncloneable_message(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> Option<&'static [u8]> {
+  if jsv_is_symbol(&value) {
+    Some(SYMBOL_CLONE_ERROR)
+  } else if unsafe { JS_IsWeakMap(value) } {
+    Some(WEAK_MAP_CLONE_ERROR)
+  } else if unsafe { JS_IsWeakSet(value) } {
+    Some(WEAK_SET_CLONE_ERROR)
+  } else if crate::quickjs::wasm::is_module_value(ctx, value) {
+    Some(WASM_MODULE_CLONE_ERROR)
+  } else {
+    None
+  }
+}
+
+fn throw_clone_error(
+  st: &mut SerState,
+  ctx: *mut JSContext,
+  clone_error: &[u8],
+) {
   st.data_clone_error = true;
   if ctx.is_null() || st.delegate.is_null() {
     return;
@@ -501,8 +534,8 @@ fn throw_sab_clone_error(st: &mut SerState, ctx: *mut JSContext) {
   let message = unsafe {
     JS_NewStringLen(
       ctx,
-      SAB_CLONE_ERROR.as_ptr() as *const c_char,
-      SAB_CLONE_ERROR.len(),
+      clone_error.as_ptr() as *const c_char,
+      clone_error.len(),
     )
   };
   if message.tag == JS_TAG_EXCEPTION {
@@ -617,7 +650,7 @@ fn ser_rec(
         st.buf.extend_from_slice(&id.to_le_bytes());
         return true;
       }
-      throw_sab_clone_error(st, ctx);
+      throw_clone_error(st, ctx, SAB_CLONE_ERROR);
       return false;
     }
     let ptr = unsafe { v.u.ptr } as usize;
