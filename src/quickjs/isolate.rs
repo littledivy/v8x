@@ -936,6 +936,14 @@ pub(crate) fn set_near_heap_limit_callback(
     st.near_heap_limit_initial
       .store(DEFAULT_LIMIT, Ordering::Relaxed);
   }
+  let limit = st.near_heap_limit_current.load(Ordering::Relaxed);
+  let hard_limit = limit.saturating_add(near_heap_limit_headroom(limit));
+  unsafe { JS_SetMemoryLimit(st.rt, hard_limit) };
+}
+
+fn near_heap_limit_headroom(limit: usize) -> usize {
+  const MIN_HEADROOM: usize = 2 * 1024 * 1024;
+  (limit / 8).max(MIN_HEADROOM)
 }
 
 pub(crate) fn maybe_drive_near_heap_limit_callback(isolate: *mut RealIsolate) {
@@ -968,13 +976,22 @@ pub(crate) fn maybe_drive_near_heap_limit_callback(isolate: *mut RealIsolate) {
     unsafe { JS_ComputeMemoryUsage(rt, &mut usage) };
   }
   let used = (usage.malloc_size.max(usage.memory_used_size)).max(0) as usize;
-  if used < limit {
+  // QuickJS rejects an allocation as soon as it crosses its hard limit. Run
+  // the V8-compatible callback shortly before that point so it can raise the
+  // limit first.
+  let callback_headroom = near_heap_limit_headroom(limit);
+  if used.saturating_add(callback_headroom) < limit {
     iso_state(iso)
       .near_heap_limit_in_callback
       .store(false, Ordering::Release);
     return;
   }
 
+  // Snapshot callbacks allocate while inspecting the heap. Lift the QuickJS
+  // cap for the duration, then install the callback's returned limit.
+  if !rt.is_null() {
+    unsafe { JS_SetMemoryLimit(rt, 0) };
+  }
   let cb: crate::isolate::NearHeapLimitCallback =
     unsafe { std::mem::transmute(cb_addr) };
   let new_limit =
@@ -987,6 +1004,16 @@ pub(crate) fn maybe_drive_near_heap_limit_callback(isolate: *mut RealIsolate) {
   if new_limit > limit {
     st.near_heap_limit_current
       .store(new_limit, Ordering::Relaxed);
+  }
+  let current_limit = st.near_heap_limit_current.load(Ordering::Relaxed);
+  if !rt.is_null() {
+    let hard_limit = if st.near_heap_limit_callback.load(Ordering::Acquire) == 0
+    {
+      current_limit
+    } else {
+      current_limit.saturating_add(near_heap_limit_headroom(current_limit))
+    };
+    unsafe { JS_SetMemoryLimit(rt, hard_limit) };
   }
   st.near_heap_limit_in_callback
     .store(false, Ordering::Release);
@@ -1009,6 +1036,31 @@ pub(crate) unsafe extern "C" fn terminate_interrupt_handler(
   run_pending_interrupts(iso);
   maybe_drive_near_heap_limit_callback(iso);
   iso_state(iso).is_terminating() as c_int
+}
+
+pub(crate) unsafe extern "C" fn memory_limit_handler(
+  rt: *mut JSRuntime,
+  opaque: *mut c_void,
+) {
+  let iso = opaque as *mut RealIsolate;
+  if iso.is_null() {
+    return;
+  }
+  maybe_drive_near_heap_limit_callback(iso);
+
+  let st = iso_state(iso);
+  if st.near_heap_limit_callback.load(Ordering::Acquire) == 0 {
+    // V8 treats an exhausted heap as fatal. QuickJS reports an ordinary OOM,
+    // which leaves embedders unable to allocate while unwinding that error.
+    // Terminate execution instead and reserve enough allocator headroom for
+    // the embedder to tear down the failed evaluation.
+    const TERMINATION_HEADROOM: usize = 16 * 1024 * 1024;
+    st.terminating.store(true, Ordering::Release);
+    let limit = st.near_heap_limit_current.load(Ordering::Relaxed);
+    unsafe {
+      JS_SetMemoryLimit(rt, limit.saturating_add(TERMINATION_HEADROOM))
+    };
+  }
 }
 
 pub(crate) fn run_pending_interrupts(iso: *mut RealIsolate) {
@@ -1195,6 +1247,10 @@ pub extern "C" fn v8__Isolate__RemoveNearHeapLimitCallback(
       .store(heap_limit, Ordering::Relaxed);
     st.near_heap_limit_initial
       .store(heap_limit, Ordering::Relaxed);
+  }
+  let limit = st.near_heap_limit_current.load(Ordering::Relaxed);
+  if !st.rt.is_null() {
+    unsafe { JS_SetMemoryLimit(st.rt, limit) };
   }
 }
 

@@ -286,6 +286,8 @@ pub type JSHostPromiseRejectionTracker = unsafe extern "C" fn(
 // Return != 0 to interrupt the running JS.
 pub type JSInterruptHandler =
   unsafe extern "C" fn(rt: *mut JSRuntime, opaque: *mut c_void) -> c_int;
+pub type JSMemoryLimitHandler =
+  unsafe extern "C" fn(rt: *mut JSRuntime, opaque: *mut c_void);
 pub type JSStackFrameVisitor = unsafe extern "C" fn(
   opaque: *mut c_void,
   function_name: *const c_char,
@@ -301,6 +303,11 @@ unsafe extern "C" {
   pub fn JS_SetRuntimeOpaque(rt: *mut JSRuntime, opaque: *mut c_void);
   pub fn JS_GetRuntimeOpaque(rt: *mut JSRuntime) -> *mut c_void;
   pub fn JS_SetMemoryLimit(rt: *mut JSRuntime, limit: usize);
+  pub fn JS_SetMemoryLimitHandler(
+    rt: *mut JSRuntime,
+    handler: Option<JSMemoryLimitHandler>,
+    opaque: *mut c_void,
+  );
   pub fn JS_SetMaxStackSize(rt: *mut JSRuntime, stack_size: usize);
   pub fn JS_SetCanBlock(rt: *mut JSRuntime, can_block: bool);
   pub fn JS_ComputeMemoryUsage(rt: *mut JSRuntime, usage: *mut JSMemoryUsage);

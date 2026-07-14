@@ -100,6 +100,11 @@ pub(crate) static FORCE_STRICT: AtomicBool = AtomicBool::new(false);
 /// `JS_SetMaxStackSize`.
 pub(crate) static MAX_STACK_SIZE: AtomicUsize = AtomicUsize::new(1024 * 1024);
 
+/// Process-wide heap limit for subsequently created QuickJS runtimes. V8's
+/// `--max-old-space-size` is expressed in MiB; this stores bytes for
+/// `JS_SetMemoryLimit`. A value of zero leaves the runtime unlimited.
+pub(crate) static MAX_HEAP_SIZE: AtomicUsize = AtomicUsize::new(0);
+
 /// The `JS_EVAL_TYPE_GLOBAL` flags to use when running a top-level script,
 /// folding in strict mode if `--use_strict` was set.
 #[inline]
@@ -799,10 +804,19 @@ fn runtime_lifecycle_lock() -> MutexGuard<'static, ()> {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   let _lifecycle_guard = runtime_lifecycle_lock();
+  let raw_params = if params.is_null() {
+    ptr::null()
+  } else {
+    params as *const crate::isolate_create_params::raw::CreateParams
+  };
+  let heap_limit = heap_limit_from_params(raw_params);
   let rt = unsafe { JS_NewRuntime() };
   assert!(!rt.is_null(), "JS_NewRuntime failed");
 
   unsafe { JS_SetMaxStackSize(rt, MAX_STACK_SIZE.load(Ordering::Relaxed)) };
+  if heap_limit != 0 {
+    unsafe { JS_SetMemoryLimit(rt, heap_limit) };
+  }
   // deno's V8 lets `Atomics.wait` block the main isolate (deno isn't a browser);
   // QuickJS gates it behind can_block (default false → "cannot block in this
   // thread"). Enable to match.
@@ -840,11 +854,6 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   if std::env::var_os("QJS_NO_WASM").is_none() {
     super::wasm::install_webassembly(ctx);
   }
-  let raw_params = if params.is_null() {
-    ptr::null()
-  } else {
-    params as *const crate::isolate_create_params::raw::CreateParams
-  };
   let counter_lookup_callback = if raw_params.is_null() {
     None
   } else {
@@ -860,7 +869,6 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   let external_references =
     super::snapshot::external_references_from_params(raw_params);
   let restored_snapshot = super::snapshot::blob_from_params(raw_params);
-  let heap_limit = heap_limit_from_params(raw_params);
   let restored_isolate_data = restored_snapshot
     .as_ref()
     .map(|blob| blob.isolate_data.iter().cloned().map(Some).collect())
@@ -940,6 +948,11 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
       Some(super::isolate::terminate_interrupt_handler),
       iso as *mut c_void,
     );
+    JS_SetMemoryLimitHandler(
+      rt,
+      Some(super::isolate::memory_limit_handler),
+      iso as *mut c_void,
+    );
   }
   iso
 }
@@ -947,6 +960,10 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
 fn heap_limit_from_params(
   params: *const crate::isolate_create_params::raw::CreateParams,
 ) -> usize {
+  let flag_limit = MAX_HEAP_SIZE.load(Ordering::Relaxed);
+  if flag_limit != 0 {
+    return flag_limit;
+  }
   if params.is_null() {
     return 0;
   }

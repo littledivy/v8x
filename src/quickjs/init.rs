@@ -225,6 +225,7 @@ pub extern "C" fn v8__V8__SetFlagsFromCommandLine(
 enum V8Flag {
   ForceStrict(bool),
   StackSize(usize),
+  MaxOldSpaceSize(usize),
   RandomSeed(i32),
   Help,
   Noop,
@@ -244,9 +245,13 @@ fn parse_v8_flag(flag: &str) -> Option<V8Flag> {
       .and_then(|value| value.parse::<usize>().ok())
       .and_then(|kib| kib.checked_mul(1024))
       .map(V8Flag::StackSize),
-    "external_memory_max_reasonable_size" | "max_old_space_size" => value
+    "external_memory_max_reasonable_size" => value
       .and_then(|value| value.parse::<usize>().ok())
       .map(|_| V8Flag::Noop),
+    "max_old_space_size" => value
+      .and_then(|value| value.parse::<usize>().ok())
+      .and_then(|mib| mib.checked_mul(1024 * 1024))
+      .map(V8Flag::MaxOldSpaceSize),
     "random_seed" => value
       .and_then(|value| value.parse::<i32>().ok())
       .map(V8Flag::RandomSeed),
@@ -276,6 +281,11 @@ fn consume_v8_flag(flag: &str) -> bool {
     }
     Some(V8Flag::StackSize(bytes)) => {
       crate::quickjs::core::MAX_STACK_SIZE
+        .store(bytes, std::sync::atomic::Ordering::Relaxed);
+      true
+    }
+    Some(V8Flag::MaxOldSpaceSize(bytes)) => {
+      crate::quickjs::core::MAX_HEAP_SIZE
         .store(bytes, std::sync::atomic::Ordering::Relaxed);
       true
     }
@@ -327,7 +337,7 @@ mod tests {
     );
     assert_eq!(
       parse_v8_flag("--max-old-space-size=3072"),
-      Some(V8Flag::Noop)
+      Some(V8Flag::MaxOldSpaceSize(3072 * 1024 * 1024))
     );
     assert_eq!(parse_v8_flag("--expose-gc"), Some(V8Flag::Noop));
     assert_eq!(parse_v8_flag("--trace-gc"), Some(V8Flag::Noop));
