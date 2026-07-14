@@ -1,0 +1,43 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -9198,6 +9198,14 @@ static JSValue js_bytecode_eval(JSContext *ctx, const uint8_t *bytecode,
+     return result;
+ }
+ 
++static JSValue js_array_from_async_call(JSContext *ctx,
++                                        JSValueConst this_val,
++                                        int argc, JSValueConst *argv,
++                                        int magic, JSValue *func_data)
++{
++    return JS_Call(ctx, func_data[0], this_val, argc, argv);
++}
++
+ static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
+                                     void *opaque)
+ {
+@@ -9208,5 +9216,6 @@ static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
+     case JS_BUILTIN_ARRAY_FROMASYNC:
+         {
++            JSValue impl, result;
+             JSValue argv[] = {
+                 JS_NewCFunction(ctx, js_array_constructor, "Array", 0),
+                 JS_NewCFunctionMagic(ctx, js_error_constructor, "TypeError",
+@@ -9220,9 +9229,15 @@ static JSValue js_bytecode_autoinit(JSContext *ctx, JSObject *p, JSAtom atom,
+                                      JS_CFUNC_generic_magic, 0),
+                 JS_AtomToValue(ctx, JS_ATOM_Symbol_iterator),
+             };
+-            return js_bytecode_eval(ctx, qjsc_builtin_array_fromasync,
+-                                    sizeof(qjsc_builtin_array_fromasync),
+-                                    countof(argv), argv);
++            impl = js_bytecode_eval(ctx, qjsc_builtin_array_fromasync,
++                                    sizeof(qjsc_builtin_array_fromasync),
++                                    countof(argv), argv);
++            if (JS_IsException(impl))
++                return impl;
++            result = JS_NewCFunctionData2(ctx, js_array_from_async_call,
++                                          "fromAsync", 1, 0, 1, &impl);
++            JS_FreeValue(ctx, impl);
++            return result;
+         }
+     case JS_BUILTIN_ITERATOR_ZIP:
+         {

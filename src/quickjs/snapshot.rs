@@ -2918,6 +2918,22 @@ mod tests {
   }
 
   #[test]
+  fn array_from_async_roundtrips_as_plain_function() {
+    let test = TestContext::new();
+    let source_value = test.eval("Array.fromAsync");
+    assert_eq!(unsafe { js_v82jsc_function_kind(source_value) }, 0);
+    let bytes = serialize_value(test.context, source_value).unwrap();
+    let restored =
+      deserialize_value_with_refs(test.context, &bytes, &[]).unwrap();
+    assert_eq!(unsafe { js_v82jsc_function_kind(restored) }, 0);
+
+    unsafe {
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, source_value);
+    }
+  }
+
+  #[test]
   fn bytecode_class_roundtrips_intrinsic_prototype_identity() {
     let source = TestContext::new();
     let source_class = source.eval("(class CustomError extends Error {})");
