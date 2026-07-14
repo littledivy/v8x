@@ -18,8 +18,9 @@
 
 use crate::binding::RustObj;
 use crate::quickjs::core::{
-  PersistentHandle, adjust_external_memory, ctx_of, current_ctx, current_iso,
-  intern, intern_dup, iso_state, jsval_of, release_external_string_memory,
+  PersistentCell, PersistentHandle, adjust_external_memory, ctx_of,
+  current_ctx, current_iso, intern, intern_dup, iso_state, jsval_of,
+  release_external_string_memory,
 };
 use crate::quickjs::quickjs_sys::*;
 use crate::{
@@ -867,17 +868,21 @@ pub extern "C" fn v8__Global__New(
   }
 
   let v = jsval_of(data);
-  let dup = unsafe { JS_DupValue(ctx, v) };
-  let cell = Box::into_raw(Box::new(dup));
+  let cell = Box::into_raw(Box::new(PersistentCell {
+    value: unsafe { JS_DupValue(ctx, v) },
+    context: ctx,
+    isolate: _isolate,
+  }));
+  let slot = unsafe { &mut (*cell).value } as *mut JSValue;
   if !_isolate.is_null() {
     let st = iso_state(_isolate);
     st.persistent_handles.push(PersistentHandle {
-      slot: cell,
+      slot,
       is_weak: false,
     });
     st.global_handles.fetch_add(1, Ordering::SeqCst);
   }
-  cell as *const Data
+  slot as *const Data
 }
 
 #[unsafe(no_mangle)]
@@ -916,7 +921,8 @@ pub extern "C" fn v8__Global__Reset(data: *const Data) {
     return;
   }
 
-  let iso = current_iso();
+  let cell = data as *mut PersistentCell;
+  let iso = unsafe { (*cell).isolate };
   if !iso.is_null() {
     let st = iso_state(iso);
     st.weak_handles.retain(|weak| weak.handle != data);
@@ -927,10 +933,9 @@ pub extern "C" fn v8__Global__Reset(data: *const Data) {
     }
   }
 
-  let ctx = stable_ctx();
   unsafe {
-    let cell = data as *mut JSValue;
-    let v = *cell;
+    let ctx = (*cell).context;
+    let v = (*cell).value;
     if !ctx.is_null() {
       JS_FreeValue(ctx, v);
     }

@@ -75,6 +75,13 @@ pub(crate) struct PersistentHandle {
   pub is_weak: bool,
 }
 
+#[repr(C)]
+pub(crate) struct PersistentCell {
+  pub value: JSValue,
+  pub context: *mut JSContext,
+  pub isolate: *mut RealIsolate,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) struct GcCallbackEntry {
   pub callback: crate::isolate::GcCallbackWithData,
@@ -1009,9 +1016,9 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
       drop(Box::from_raw(slot));
     }
     while let Some(slot) = st.persistent_handles.pop() {
-      let v = *slot.slot;
-      JS_FreeValue(st.ctx, v);
-      drop(Box::from_raw(slot.slot));
+      let cell = slot.slot as *mut PersistentCell;
+      JS_FreeValue((*cell).context, (*cell).value);
+      drop(Box::from_raw(cell));
     }
     for (_, value) in st.script_host_defined_options.drain() {
       JS_FreeValue(st.ctx, value);

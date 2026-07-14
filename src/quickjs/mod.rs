@@ -1194,6 +1194,7 @@ mod api_test {
     assert_snapshot_context_data_preserves_global_identity();
     assert_detached_array_buffer_view_contents();
     assert_backing_store_survives_isolate();
+    assert_global_drop_uses_owning_isolate();
     assert_wasm_streaming_respects_explicit_microtasks();
     assert_duplicate_module_requests_resolve_once();
 
@@ -1243,6 +1244,25 @@ mod api_test {
 
     assert_eq!(backing_store.byte_length(), 4);
     assert_eq!(backing_store[0].get(), 42);
+  }
+
+  fn assert_global_drop_uses_owning_isolate() {
+    let mut first = v8::Isolate::new(Default::default());
+    let global = {
+      let scope = std::pin::pin!(v8::HandleScope::new(&mut first));
+      let scope = &mut scope.init();
+      let context = v8::Context::new(scope, Default::default());
+      let scope = &mut v8::ContextScope::new(scope, context);
+      let value = v8::Object::new(scope);
+      v8::Global::new(scope, value)
+    };
+
+    {
+      let mut second = v8::Isolate::new(Default::default());
+      let scope = std::pin::pin!(v8::HandleScope::new(&mut second));
+      let _scope = &mut scope.init();
+      drop(global);
+    }
   }
 
   fn assert_wasm_streaming_respects_explicit_microtasks() {
