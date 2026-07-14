@@ -231,6 +231,54 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn weak_collection_targets_are_kept_until_cleared() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      for source in [c"new WeakSet([{}])", c"new WeakMap([[{}, 1]])"] {
+        let collection = JS_Eval(
+          ctx,
+          source.as_ptr(),
+          source.to_bytes().len(),
+          c"weak-collection.js".as_ptr(),
+          JS_EVAL_TYPE_GLOBAL,
+        );
+        assert_ne!(collection.tag, JS_TAG_EXCEPTION);
+
+        let preview =
+          js_v82jsc_iterator_preview(ctx, collection, std::ptr::null_mut());
+        assert_ne!(preview.tag, JS_TAG_EXCEPTION);
+        let length = JS_GetPropertyStr(ctx, preview, c"length".as_ptr());
+        let mut length_value = 0;
+        assert_eq!(JS_ToInt32(ctx, &mut length_value, length), 0);
+        assert!(length_value > 0);
+        JS_FreeValue(ctx, length);
+        JS_FreeValue(ctx, preview);
+
+        JS_ClearKeptObjects(rt);
+        JS_RunGC(rt);
+        let preview =
+          js_v82jsc_iterator_preview(ctx, collection, std::ptr::null_mut());
+        assert_ne!(preview.tag, JS_TAG_EXCEPTION);
+        let length = JS_GetPropertyStr(ctx, preview, c"length".as_ptr());
+        let mut length_value = -1;
+        assert_eq!(JS_ToInt32(ctx, &mut length_value, length), 0);
+        assert_eq!(length_value, 0);
+        JS_FreeValue(ctx, length);
+        JS_FreeValue(ctx, preview);
+        JS_FreeValue(ctx, collection);
+      }
+
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn native_weakref_does_not_keep_target_alive() {
     unsafe {
       let rt = JS_NewRuntime();

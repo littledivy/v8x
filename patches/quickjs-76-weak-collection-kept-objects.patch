@@ -1,0 +1,21 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -55796,6 +55796,8 @@ static const JSCFunctionListEntry js_symbol_funcs[] = {
+ #define MAGIC_SET (1 << 0)
+ #define MAGIC_WEAK (1 << 1)
+ 
++static int js_keep_object(JSContext *ctx, JSValueConst value);
++
+ static JSValue js_map_constructor(JSContext *ctx, JSValueConst new_target,
+                                   int argc, JSValueConst *argv, int magic)
+ {
+@@ -56222,6 +56224,8 @@ static JSValue js_map_set(JSContext *ctx, JSValueConst this_val,
+     key = map_normalize_key_const(ctx, argv[0]);
+     if (s->is_weak && !is_valid_weakref_target(key))
+         return JS_ThrowTypeError(ctx, "invalid value used as %s key", is_set ? "WeakSet" : "WeakMap");
++    if (s->is_weak && js_keep_object(ctx, key))
++        return JS_EXCEPTION;
+     if (is_set)
+         value = JS_UNDEFINED;
+     else
