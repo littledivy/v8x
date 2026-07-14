@@ -453,6 +453,8 @@ struct InspectorState {
   client: *mut RawV8InspectorClient,
   context_group_id: int,
   channel: *mut RawChannel,
+  context_name: String,
+  context_aux_data: String,
 }
 
 #[derive(Clone, Copy)]
@@ -1180,6 +1182,8 @@ pub extern "C" fn v8_inspector__V8Inspector__create(
     client,
     context_group_id: 1,
     channel: std::ptr::null_mut(),
+    context_name: "main realm".to_string(),
+    context_aux_data: r#"{"isDefault":true,"type":"default"}"#.to_string(),
   }))
   .cast::<RawV8Inspector>()
 }
@@ -1193,12 +1197,22 @@ pub extern "C" fn v8_inspector__V8Inspector__connect(
   _client_trust_level: V8InspectorClientTrustLevel,
 ) -> *mut RawV8InspectorSession {
   let mut client = std::ptr::null_mut();
+  let mut context_name = String::new();
+  let mut context_aux_data = String::new();
   if !inspector.is_null() {
     let state = unsafe { &mut *inspector.cast::<InspectorState>() };
     state.channel = channel;
     client = state.client;
+    context_name.clone_from(&state.context_name);
+    context_aux_data.clone_from(&state.context_aux_data);
   }
-  let sess = Box::new(cdp::CdpSession::new(channel, client, _context_group_id));
+  let sess = Box::new(cdp::CdpSession::new(
+    channel,
+    client,
+    _context_group_id,
+    context_name,
+    context_aux_data,
+  ));
   Box::into_raw(sess).cast::<RawV8InspectorSession>()
 }
 
@@ -1207,14 +1221,18 @@ pub extern "C" fn v8_inspector__V8Inspector__contextCreated(
   this: *mut RawV8Inspector,
   _context: *const Context,
   contextGroupId: int,
-  _humanReadableName: StringView,
-  _auxData: StringView,
+  humanReadableName: StringView,
+  auxData: StringView,
 ) {
   if this.is_null() {
     return;
   }
   let state = unsafe { &mut *this.cast::<InspectorState>() };
   state.context_group_id = contextGroupId;
+  state.context_name =
+    String::from_utf16_lossy(&string_view_to_utf16(&humanReadableName));
+  state.context_aux_data =
+    String::from_utf16_lossy(&string_view_to_utf16(&auxData));
   ACTIVE_INSPECTOR_CLIENT.with(|slot| {
     *slot.borrow_mut() = Some((state.client, contextGroupId));
   });
@@ -1368,6 +1386,8 @@ mod cdp {
     channel: *mut RawChannel,
     client: *mut RawV8InspectorClient,
     context_group_id: int,
+    context_name: String,
+    context_aux_data: String,
     next_obj_id: u64,
 
     objects: HashMap<u64, JSValue>,
@@ -1378,11 +1398,15 @@ mod cdp {
       channel: *mut RawChannel,
       client: *mut RawV8InspectorClient,
       context_group_id: int,
+      context_name: String,
+      context_aux_data: String,
     ) -> Self {
       CdpSession {
         channel,
         client,
         context_group_id,
+        context_name,
+        context_aux_data,
         next_obj_id: 1,
         objects: HashMap::new(),
       }
@@ -1803,10 +1827,25 @@ mod cdp {
     let context = unsafe { JS_NewObject(ctx) };
     unsafe { set_val(ctx, context, c"id", JS_NewInt32(ctx, 1)) };
     unsafe { set_str(ctx, context, c"origin", "") };
-    unsafe { set_str(ctx, context, c"name", "repl") };
+    unsafe { set_str(ctx, context, c"name", &sess.context_name) };
     unsafe { set_str(ctx, context, c"uniqueId", "1") };
-    let aux = unsafe { JS_NewObject(ctx) };
-    unsafe { set_bool(ctx, aux, c"isDefault", true) };
+    let aux = CString::new(sess.context_aux_data.as_str())
+      .ok()
+      .map(|json| unsafe {
+        JS_ParseJSON(
+          ctx,
+          json.as_ptr(),
+          sess.context_aux_data.len(),
+          c"<context-aux-data>".as_ptr(),
+        )
+      })
+      .filter(|value| !jsv_is_exception(value))
+      .unwrap_or_else(|| {
+        unsafe { drain_exc(ctx) };
+        let aux = unsafe { JS_NewObject(ctx) };
+        unsafe { set_bool(ctx, aux, c"isDefault", true) };
+        aux
+      });
     unsafe { set_val(ctx, context, c"auxData", aux) };
     unsafe { set_val(ctx, params, c"context", context) };
     unsafe { set_val(ctx, notif, c"params", params) };
