@@ -1,0 +1,73 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -998,6 +998,7 @@ struct JSModuleDef {
+     bool eval_has_exception;
+     JSValue eval_exception;
+     JSValue meta_obj; /* for import.meta */
++    bool meta_initialized;
+     JSValue private_value; /* private value for C modules */
+ };
+ 
+@@ -32490,6 +32491,18 @@ JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m)
+     return JS_DupAtom(ctx, m->module_name);
+ }
+ 
++static JSV82jscImportMetaHook *v82jsc_import_meta_hook;
++
++void JS_SetImportMetaHook(JSV82jscImportMetaHook *fn)
++{
++    v82jsc_import_meta_hook = fn;
++}
++
++void v82jsc_mark_import_meta_initialized(JSModuleDef *m)
++{
++    m->meta_initialized = true;
++}
++
+ JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m)
+ {
+     JSValue obj;
+@@ -32506,6 +32518,7 @@ JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m)
+ static JSValue js_import_meta(JSContext *ctx)
+ {
+     JSAtom filename;
++    JSValue meta;
+     JSModuleDef *m;
+ 
+     filename = JS_GetScriptOrModuleName(ctx, 0);
+@@ -32521,7 +32534,18 @@ static JSValue js_import_meta(JSContext *ctx)
+         JS_ThrowTypeError(ctx, "import.meta not supported in this context");
+         return JS_EXCEPTION;
+     }
+-    return JS_GetImportMeta(ctx, m);
++    meta = JS_GetImportMeta(ctx, m);
++    if (JS_IsException(meta))
++        return meta;
++    if (!m->meta_initialized) {
++        m->meta_initialized = true;
++        if (v82jsc_import_meta_hook &&
++            v82jsc_import_meta_hook(ctx, m, meta) < 0) {
++            JS_FreeValue(ctx, meta);
++            return JS_EXCEPTION;
++        }
++    }
++    return meta;
+ }
+ 
+ static JSValue JS_NewModuleValue(JSContext *ctx, JSModuleDef *m)
+diff --git a/quickjs.h b/quickjs.h
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1197,6 +1197,11 @@ JS_EXTERN JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+ JS_EXTERN JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);
+ JS_EXTERN JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m);
+ JS_EXTERN JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m);
++typedef int JSV82jscImportMetaHook(JSContext *ctx, JSModuleDef *m,
++                                   JSValueConst meta);
++JS_EXTERN void JS_SetImportMetaHook(JSV82jscImportMetaHook *fn);
++JS_EXTERN void v82jsc_mark_import_meta_initialized(JSModuleDef *m);
++
+ JS_EXTERN JSValue v82jsc_new_module_namespace(JSContext *ctx);
+ JS_EXTERN int v82jsc_module_namespace_set(JSContext *ctx, JSValueConst obj,
+                                           const char *name, JSValue value);

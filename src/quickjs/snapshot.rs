@@ -1984,9 +1984,63 @@ mod tests {
   ) {
   }
 
+  static IMPORT_META_HOOK_CALLS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+  unsafe extern "C" fn snapshot_import_meta_hook(
+    ctx: *mut JSContext,
+    _module: *mut JSModuleDef,
+    meta: JSValue,
+  ) -> c_int {
+    IMPORT_META_HOOK_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    unsafe {
+      JS_SetPropertyStr(ctx, meta, c"marker".as_ptr(), JS_NewInt32(ctx, 21))
+    }
+  }
+
   unsafe extern "C" fn snapshot_callback_b(
     _info: *const crate::FunctionCallbackInfo,
   ) {
+  }
+
+  #[test]
+  fn import_meta_runs_host_hook_once() {
+    let test = TestContext::new();
+    IMPORT_META_HOOK_CALLS.store(0, std::sync::atomic::Ordering::Relaxed);
+    unsafe { JS_SetImportMetaHook(Some(snapshot_import_meta_hook)) };
+    let source = CString::new(
+      "globalThis.importMetaResult = import.meta.marker + import.meta.marker;",
+    )
+    .unwrap();
+    let module = unsafe {
+      JS_Eval(
+        test.context,
+        source.as_ptr(),
+        source.as_bytes().len(),
+        c"snapshot-import-meta.js".as_ptr(),
+        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+      )
+    };
+    assert_eq!(module.tag, JS_TAG_MODULE);
+    let result = unsafe { JS_EvalFunction(test.context, module) };
+    unsafe { JS_SetImportMetaHook(None) };
+    assert!(!jsv_is_exception(&result));
+    let global = unsafe { JS_GetGlobalObject(test.context) };
+    let value = unsafe {
+      JS_GetPropertyStr(test.context, global, c"importMetaResult".as_ptr())
+    };
+    let mut marker = 0;
+    assert_eq!(unsafe { JS_ToInt32(test.context, &mut marker, value) }, 0);
+    assert_eq!(marker, 42);
+    assert_eq!(
+      IMPORT_META_HOOK_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+      1
+    );
+    unsafe {
+      JS_FreeValue(test.context, value);
+      JS_FreeValue(test.context, global);
+      JS_FreeValue(test.context, result);
+    }
   }
 
   #[test]

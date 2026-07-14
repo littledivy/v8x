@@ -274,6 +274,12 @@ pub type JSV82jscDynImportHook = unsafe extern "C" fn(
   resolving_funcs: *const JSValue,
 );
 
+pub type JSV82jscImportMetaHook = unsafe extern "C" fn(
+  ctx: *mut JSContext,
+  module: *mut JSModuleDef,
+  meta: JSValue,
+) -> c_int;
+
 pub type JSHostPromiseRejectionTracker = unsafe extern "C" fn(
   ctx: *mut JSContext,
   promise: JSValue,
@@ -600,6 +606,8 @@ unsafe extern "C" {
   ) -> *mut JSModuleDef;
 
   pub fn JS_SetDynamicImportHook(fn_: JSV82jscDynImportHook);
+  pub fn JS_SetImportMetaHook(fn_: Option<JSV82jscImportMetaHook>);
+  pub fn v82jsc_mark_import_meta_initialized(module: *mut JSModuleDef);
   pub fn JS_GetModuleNamespace(
     ctx: *mut JSContext,
     m: *mut JSModuleDef,

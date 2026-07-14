@@ -646,6 +646,49 @@ pub(crate) fn set_import_meta_callback(
 ) {
   IMPORT_META_ENABLED.with(|c| c.set(true));
   IMPORT_META_CB.with(|c| c.set(Some(cb)));
+  unsafe { JS_SetImportMetaHook(Some(import_meta_hook)) };
+}
+
+unsafe extern "C" fn import_meta_hook(
+  ctx: *mut JSContext,
+  def: *mut JSModuleDef,
+  meta: JSValue,
+) -> int {
+  if !IMPORT_META_ENABLED.with(|enabled| enabled.get()) {
+    return 0;
+  }
+  let name = MODULE_STATE.with(|modules| {
+    modules
+      .borrow()
+      .values()
+      .find(|module| module.context == ctx && module.module_def == def)
+      .map(|module| module.module_name.clone())
+  });
+  let Some(name) = name else {
+    return 0;
+  };
+  let Some(callback) = IMPORT_META_CB.with(|callback| callback.get()) else {
+    return 0;
+  };
+  let Some(wrapper_value) = lookup_module_wrapper(&name) else {
+    return 0;
+  };
+  let wrapper = intern_dup::<Module>(ctx, wrapper_value);
+  let meta = intern_dup::<Object>(ctx, meta);
+  let context = intern_ctx(ctx);
+  let (Some(context), Some(module), Some(meta)) = (
+    unsafe { crate::Local::from_raw(context) },
+    unsafe { crate::Local::from_raw(wrapper) },
+    unsafe { crate::Local::from_raw(meta) },
+  ) else {
+    return 0;
+  };
+  unsafe { callback(context, module, meta) };
+  if unsafe { JS_HasException(ctx) } {
+    -1
+  } else {
+    0
+  }
 }
 
 thread_local! {
@@ -1390,6 +1433,7 @@ unsafe fn populate_import_meta(
         unsafe { JS_FreeValue(ctx, exc) };
         return;
       }
+      unsafe { v82jsc_mark_import_meta_initialized(def) };
       let context = intern_ctx(ctx);
       let meta_handle = intern::<Object>(meta);
       let (Some(ctx_l), Some(mod_l), Some(meta_l)) = (
@@ -1422,6 +1466,7 @@ unsafe fn populate_import_meta(
     unsafe { JS_FreeValue(ctx, exc) };
     return;
   }
+  unsafe { v82jsc_mark_import_meta_initialized(def) };
   if let Ok(curl) = CString::new(source_name) {
     let url_val = unsafe { JS_NewString(ctx, curl.as_ptr()) };
     unsafe { JS_SetPropertyStr(ctx, meta, c"url".as_ptr(), url_val) };
