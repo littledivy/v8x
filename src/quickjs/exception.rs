@@ -869,27 +869,18 @@ pub extern "C" fn v8__Promise__Result(this: *const Promise) -> *const Value {
   intern::<Value>(v)
 }
 
-unsafe fn call_promise_method(
+unsafe fn perform_promise_then(
   promise: *const Promise,
   context: *const Context,
-  method: &[u8],
-  handlers: &[JSValue],
+  on_fulfilled: JSValue,
+  on_rejected: JSValue,
 ) -> *const Promise {
   let ctx = ctx_of(context);
   let ctx = if ctx.is_null() { current_ctx() } else { ctx };
   if ctx.is_null() || promise.is_null() {
     return ptr::null();
   }
-  let pv = jsval_of(promise);
-  let f = JS_GetPropertyStr(ctx, pv, method.as_ptr() as *const c_char);
-  if f.tag == JS_TAG_EXCEPTION || !JS_IsFunction(ctx, f) {
-    JS_FreeValue(ctx, f);
-    clear_pending(ctx);
-    return ptr::null();
-  }
-  let mut args: Vec<JSValue> = handlers.to_vec();
-  let ret = JS_Call(ctx, f, pv, args.len() as i32, args.as_mut_ptr());
-  JS_FreeValue(ctx, f);
+  let ret = JS_PromiseThen(ctx, jsval_of(promise), on_fulfilled, on_rejected);
   if ret.tag == JS_TAG_EXCEPTION {
     clear_pending(ctx);
     return ptr::null();
@@ -904,7 +895,7 @@ pub extern "C" fn v8__Promise__Catch(
   handler: *const Function,
 ) -> *const Promise {
   unsafe {
-    call_promise_method(this, context, b"catch\0", &[jsval_of(handler)])
+    perform_promise_then(this, context, jsv_undefined(), jsval_of(handler))
   }
 }
 
@@ -916,11 +907,11 @@ pub extern "C" fn v8__Promise__Then2(
   on_rejected: *const Function,
 ) -> *const Promise {
   unsafe {
-    call_promise_method(
+    perform_promise_then(
       this,
       context,
-      b"then\0",
-      &[jsval_of(on_fulfilled), jsval_of(on_rejected)],
+      jsval_of(on_fulfilled),
+      jsval_of(on_rejected),
     )
   }
 }

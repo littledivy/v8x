@@ -558,6 +558,12 @@ unsafe extern "C" {
     ctx: *mut JSContext,
     resolving_funcs: *mut JSValue,
   ) -> JSValue;
+  pub fn JS_PromiseThen(
+    ctx: *mut JSContext,
+    promise: JSValue,
+    on_fulfilled: JSValue,
+    on_rejected: JSValue,
+  ) -> JSValue;
   pub fn JS_PromiseState(ctx: *mut JSContext, promise: JSValue) -> c_int;
   pub fn JS_PromiseResult(ctx: *mut JSContext, promise: JSValue) -> JSValue;
   pub fn JS_IsPromise(v: JSValue) -> bool;

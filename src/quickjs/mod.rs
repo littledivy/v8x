@@ -1199,6 +1199,7 @@ mod api_test {
     assert_internal_globals_are_not_enumerable();
     assert_suspended_async_capture_survives_gc();
     assert_async_iterator_close_is_awaited();
+    assert_native_promise_then_ignores_monkeypatch();
     assert_wasm_streaming_respects_explicit_microtasks();
     assert_duplicate_module_requests_resolve_once();
 
@@ -1381,6 +1382,59 @@ mod api_test {
       script.run(scope).unwrap().to_rust_string_lossy(scope),
       "true:true:42:true:false",
     );
+  }
+
+  fn assert_native_promise_then_ignores_monkeypatch() {
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let source = v8::String::new(
+      scope,
+      "globalThis.promiseThenResult = 0;\
+       globalThis.onFulfilled = value => promiseThenResult = value + 1;\
+       globalThis.onRejected = () => promiseThenResult = -1;\
+       globalThis.onCaught = value => value + 2;\
+       globalThis.nativePromise = Promise.resolve(41);\
+       globalThis.nativeRejectedPromise = Promise.reject(40);\
+       Promise.prototype.then = () => { throw new Error('poisoned'); };\
+       Promise.prototype.catch = () => { throw new Error('poisoned'); };\
+       nativePromise;",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    let promise = script.run(scope).unwrap();
+    let promise = v8::Local::<v8::Promise>::try_from(promise).unwrap();
+
+    let global = context.global(scope);
+    let on_fulfilled_key = v8::String::new(scope, "onFulfilled").unwrap();
+    let on_fulfilled = global.get(scope, on_fulfilled_key.into()).unwrap();
+    let on_fulfilled =
+      v8::Local::<v8::Function>::try_from(on_fulfilled).unwrap();
+    let on_rejected_key = v8::String::new(scope, "onRejected").unwrap();
+    let on_rejected = global.get(scope, on_rejected_key.into()).unwrap();
+    let on_rejected = v8::Local::<v8::Function>::try_from(on_rejected).unwrap();
+
+    let chained = promise.then2(scope, on_fulfilled, on_rejected).unwrap();
+    scope.perform_microtask_checkpoint();
+    assert_eq!(chained.state(), v8::PromiseState::Fulfilled);
+    assert_eq!(chained.result(scope).integer_value(scope), Some(42));
+
+    let rejected_key = v8::String::new(scope, "nativeRejectedPromise").unwrap();
+    let rejected = global.get(scope, rejected_key.into()).unwrap();
+    let rejected = v8::Local::<v8::Promise>::try_from(rejected).unwrap();
+    let on_caught_key = v8::String::new(scope, "onCaught").unwrap();
+    let on_caught = global.get(scope, on_caught_key.into()).unwrap();
+    let on_caught = v8::Local::<v8::Function>::try_from(on_caught).unwrap();
+    let caught = rejected.catch(scope, on_caught).unwrap();
+    scope.perform_microtask_checkpoint();
+    assert_eq!(caught.state(), v8::PromiseState::Fulfilled);
+    assert_eq!(caught.result(scope).integer_value(scope), Some(42));
+
+    let result = v8::String::new(scope, "promiseThenResult").unwrap();
+    let script = v8::Script::compile(scope, result, None).unwrap();
+    assert_eq!(script.run(scope).unwrap().integer_value(scope), Some(42));
   }
 
   fn assert_wasm_streaming_respects_explicit_microtasks() {
