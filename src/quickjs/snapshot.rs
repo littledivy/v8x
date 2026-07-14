@@ -2317,7 +2317,8 @@ mod tests {
            (Object.getPrototypeOf(globalThis) === Root.prototype ? 1 : 0) +\
            (globalThis[brand] === brand ? 2 : 0) +\
            (globalThis.alias === globalThis ? 4 : 0) +\
-           (globalThis.Symbol.metadata === metadata ? 8 : 0);\
+           (globalThis.Symbol.metadata === metadata ? 8 : 0) +\
+           (typeof globalThis.Array.fromAsync === 'function' ? 16 : 0);\
        })()",
     );
     unsafe { JS_FreeValue(source.context, setup) };
@@ -2343,7 +2344,7 @@ mod tests {
       assert!(!jsv_is_exception(&result));
       let mut checks = 0;
       assert_eq!(JS_ToInt32(target.context, &mut checks, result), 0);
-      assert_eq!(checks, 15);
+      assert_eq!(checks, 31);
 
       JS_FreeValue(target.context, result);
       JS_FreeValue(target.context, verify);
