@@ -4960,10 +4960,6 @@ unsafe fn compile_module_for_instantiation(
     with_module_state(this, |m| m.module_def = bytecode_def);
     return bytecode_def;
   }
-  if source_text.is_empty() {
-    return ptr::null_mut();
-  }
-
   let cache_name = if module_name.is_empty() {
     "<module>"
   } else {
