@@ -5,6 +5,7 @@ use crate::quickjs::core::{
   adjust_external_memory, ctx_of, current_ctx, current_iso, intern, iso_state,
   jsval_of,
 };
+use crate::quickjs::exception::clear_pending;
 use crate::quickjs::quickjs_sys::*;
 use crate::support::{MaybeBool, SharedPtrBase, SharedRef, UniquePtr, long};
 use crate::{
@@ -381,10 +382,16 @@ unsafe fn read_len_prop(
   name: *const std::os::raw::c_char,
 ) -> usize {
   let v = unsafe { JS_GetPropertyStr(ctx, view, name) };
+  if v.tag == JS_TAG_EXCEPTION {
+    unsafe { clear_pending(ctx) };
+    return 0;
+  }
   let mut out: i64 = 0;
-  unsafe {
-    JS_ToInt64(ctx, &mut out, v);
-    JS_FreeValue(ctx, v);
+  let result = unsafe { JS_ToInt64(ctx, &mut out, v) };
+  unsafe { JS_FreeValue(ctx, v) };
+  if result < 0 {
+    unsafe { clear_pending(ctx) };
+    return 0;
   }
   out.max(0) as usize
 }
@@ -767,7 +774,10 @@ pub extern "C" fn v8__ArrayBuffer__ByteLength(
     return 0;
   }
   let mut len: usize = 0;
-  unsafe { JS_GetArrayBuffer(ctx, &mut len, jsval_of(this)) };
+  let data = unsafe { JS_GetArrayBuffer(ctx, &mut len, jsval_of(this)) };
+  if data.is_null() {
+    unsafe { clear_pending(ctx) };
+  }
   len
 }
 
@@ -780,7 +790,11 @@ pub extern "C" fn v8__ArrayBuffer__Data(
     return ptr::null_mut();
   }
   let mut len: usize = 0;
-  unsafe { JS_GetArrayBuffer(ctx, &mut len, jsval_of(this)) as *mut c_void }
+  let data = unsafe { JS_GetArrayBuffer(ctx, &mut len, jsval_of(this)) };
+  if data.is_null() {
+    unsafe { clear_pending(ctx) };
+  }
+  data as *mut c_void
 }
 
 // Some ArrayBuffers must report `IsDetachable() == false` — notably the backing
@@ -1059,6 +1073,9 @@ pub extern "C" fn v8__ArrayBufferView__Buffer__Data(
   let data = unsafe { JS_GetArrayBuffer(ctx, &mut len, buf) as *mut c_void };
 
   unsafe { JS_FreeValue(ctx, buf) };
+  if data.is_null() {
+    unsafe { clear_pending(ctx) };
+  }
   data
 }
 
@@ -1150,12 +1167,20 @@ pub extern "C" fn v8__ArrayBufferView__GetContents(
   let mut buf_len: usize = 0;
   let base = unsafe { JS_GetArrayBuffer(ctx, &mut buf_len, buf) };
   unsafe { JS_FreeValue(ctx, buf) };
-  let data = if base.is_null() {
-    ptr::null_mut()
-  } else {
-    unsafe { base.add(off) }
-  };
-  memory_span_t { data, size: len }
+  if base.is_null() {
+    // QuickJS reports detached backing stores as an exception. V8's
+    // ArrayBufferView::GetContents contract instead returns an empty span and
+    // does not leave an exception pending in the isolate.
+    unsafe { clear_pending(ctx) };
+    return memory_span_t {
+      data: ptr::null_mut(),
+      size: 0,
+    };
+  }
+  memory_span_t {
+    data: unsafe { base.add(off) },
+    size: len,
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1379,8 +1404,7 @@ pub extern "C" fn v8__ArrayBufferView__CopyContents(
   let base = unsafe { JS_GetArrayBuffer(ctx, &mut buf_len, buf) };
   unsafe { JS_FreeValue(ctx, buf) };
   if base.is_null() {
-    let exc = unsafe { JS_GetException(ctx) };
-    unsafe { JS_FreeValue(ctx, exc) };
+    unsafe { clear_pending(ctx) };
     return 0;
   }
   let n = std::cmp::min(len, byte_length as usize);

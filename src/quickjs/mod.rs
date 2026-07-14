@@ -1106,11 +1106,37 @@ mod api_test {
     assert_unbound_script_preserves_origin();
     assert_continuation_data_survives_await();
     assert_snapshot_context_data_preserves_global_identity();
+    assert_detached_array_buffer_view_contents();
 
     unsafe {
       v8::V8::dispose();
     }
     v8::V8::dispose_platform();
+  }
+
+  fn assert_detached_array_buffer_view_contents() {
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let buffer = v8::ArrayBuffer::new(scope, 16);
+    let view = v8::Uint8Array::new(scope, buffer, 0, 16).unwrap();
+    assert!(buffer.detach(None).unwrap());
+
+    assert_eq!(view.byte_length(), 0);
+    assert_eq!(view.byte_offset(), 0);
+    let detached_buffer = view.buffer(scope).unwrap();
+    assert_eq!(detached_buffer.byte_length(), 0);
+    assert!(detached_buffer.data().is_none());
+
+    let mut storage = [0; v8::TYPED_ARRAY_MAX_SIZE_IN_HEAP];
+    assert!(view.get_contents(&mut storage).is_empty());
+
+    let code = v8::String::new(scope, "40 + 2").unwrap();
+    let script = v8::Script::compile(scope, code, None).unwrap();
+    assert_eq!(script.run(scope).unwrap().integer_value(scope), Some(42));
   }
 
   fn assert_finalization_registry_token_is_weak() {
