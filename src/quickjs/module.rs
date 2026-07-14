@@ -3159,8 +3159,14 @@ unsafe fn build_resolution_map(
       }
       deferred_targets.push((deferred.id, resolved));
     }
+    let mut resolved_requests = HashSet::new();
     for (si, (spec, _ty)) in specs.into_iter().enumerate() {
       let attr_pairs = attrs.get(si).map(Vec::as_slice).unwrap_or(&[]);
+      if !resolved_requests
+        .insert((spec.clone(), static_import_attribute_key(attr_pairs)))
+      {
+        continue;
+      }
       let Some(resolved) = (unsafe {
         resolve_module_import(ctx, context, cb, m, &spec, attr_pairs)
       }) else {

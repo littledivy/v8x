@@ -1108,6 +1108,7 @@ mod api_test {
     assert_snapshot_context_data_preserves_global_identity();
     assert_detached_array_buffer_view_contents();
     assert_wasm_streaming_respects_explicit_microtasks();
+    assert_duplicate_module_requests_resolve_once();
 
     unsafe {
       v8::V8::dispose();
@@ -1190,6 +1191,95 @@ mod api_test {
         .unwrap()
         .is_wasm_module_object()
     );
+  }
+
+  fn assert_duplicate_module_requests_resolve_once() {
+    thread_local! {
+      static DEPENDENCY: std::cell::RefCell<Option<v8::Global<v8::Module>>> =
+        const { std::cell::RefCell::new(None) };
+      static RESOLVE_COUNT: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+      };
+    }
+
+    #[allow(clippy::unnecessary_wraps)]
+    fn resolve_callback<'scope>(
+      context: v8::Local<'scope, v8::Context>,
+      specifier: v8::Local<'scope, v8::String>,
+      _attributes: v8::Local<'scope, v8::FixedArray>,
+      _referrer: v8::Local<'scope, v8::Module>,
+    ) -> Option<v8::Local<'scope, v8::Module>> {
+      v8::callback_scope!(unsafe scope, context);
+      assert_eq!(specifier.to_rust_string_lossy(scope), "original");
+      RESOLVE_COUNT.with(|count| count.set(count.get() + 1));
+      DEPENDENCY.with(|dependency| {
+        Some(v8::Local::new(scope, dependency.borrow().as_ref().unwrap()))
+      })
+    }
+
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let dependency_source =
+      v8::String::new(scope, "export default 1; export const value = 2;")
+        .unwrap();
+    let dependency_origin_name =
+      v8::String::new(scope, "dependency.js").unwrap();
+    let dependency_origin = v8::ScriptOrigin::new(
+      scope,
+      dependency_origin_name.into(),
+      0,
+      0,
+      false,
+      -1,
+      None,
+      false,
+      false,
+      true,
+      None,
+    );
+    let mut dependency_source = v8::script_compiler::Source::new(
+      dependency_source,
+      Some(&dependency_origin),
+    );
+    let dependency =
+      v8::script_compiler::compile_module(scope, &mut dependency_source)
+        .unwrap();
+    DEPENDENCY.with(|slot| {
+      *slot.borrow_mut() = Some(v8::Global::new(scope, dependency));
+    });
+
+    let root_source = v8::String::new(
+      scope,
+      "export * from 'original'; export { default } from 'original';",
+    )
+    .unwrap();
+    let root_origin_name = v8::String::new(scope, "root.js").unwrap();
+    let root_origin = v8::ScriptOrigin::new(
+      scope,
+      root_origin_name.into(),
+      0,
+      0,
+      false,
+      -1,
+      None,
+      false,
+      false,
+      true,
+      None,
+    );
+    let mut root_source =
+      v8::script_compiler::Source::new(root_source, Some(&root_origin));
+    let root =
+      v8::script_compiler::compile_module(scope, &mut root_source).unwrap();
+
+    RESOLVE_COUNT.with(|count| count.set(0));
+    assert_eq!(root.instantiate_module(scope, resolve_callback), Some(true));
+    assert_eq!(RESOLVE_COUNT.with(|count| count.get()), 1);
+    DEPENDENCY.with(|slot| slot.borrow_mut().take());
   }
 
   fn assert_finalization_registry_token_is_weak() {
