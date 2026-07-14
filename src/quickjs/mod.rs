@@ -1656,7 +1656,9 @@ mod api_test {
         let scope = &mut v8::ContextScope::new(scope, context);
         let code = v8::String::new(
           scope,
-          "globalThis.sharedSnapshotValue = { marker: 1 }; sharedSnapshotValue",
+          "globalThis.sharedSnapshotValue = {\
+             marker: 1, typeErrorPrototype: TypeError.prototype\
+           }; sharedSnapshotValue",
         )
         .unwrap();
         let script = v8::Script::compile(scope, code, None).unwrap();
@@ -1682,6 +1684,14 @@ mod api_test {
       let script = v8::Script::compile(scope, code, None).unwrap();
       let global_value = script.run(scope).unwrap();
       assert!(restored.strict_equals(global_value));
+      let code = v8::String::new(
+        scope,
+        "globalThis.sharedSnapshotValue.typeErrorPrototype ===\
+         TypeError.prototype",
+      )
+      .unwrap();
+      let script = v8::Script::compile(scope, code, None).unwrap();
+      assert!(script.run(scope).unwrap().is_true());
     }
   }
 }
