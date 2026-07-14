@@ -1,0 +1,382 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -873,8 +873,8 @@
+ } JSProxyData;
+ 
+ typedef struct JSArrayBuffer {
+-    int byte_length; /* 0 if detached */
+-    int max_byte_length; /* -1 if not resizable; >= byte_length otherwise */
++    size_t byte_length; /* 0 if detached */
++    int64_t max_byte_length; /* -1 if not resizable; >= byte_length otherwise */
+     uint8_t detached;
+     uint8_t immutable;
+     uint8_t shared; /* if shared, the array buffer cannot be detached */
+@@ -888,8 +888,8 @@
+     struct list_head link; /* link to arraybuffer */
+     JSObject *obj; /* back pointer to the TypedArray/DataView object */
+     JSObject *buffer; /* based array buffer */
+-    uint32_t offset; /* byte offset in the array buffer */
+-    uint32_t length; /* byte length in the array buffer */
++    size_t offset; /* byte offset in the array buffer */
++    size_t length; /* byte length in the array buffer */
+     bool track_rab; /* auto-track length of backing array buffer */
+ } JSTypedArray;
+ 
+@@ -41043,6 +41043,10 @@
+     JSObject *p = JS_VALUE_GET_OBJ(obj);
+     JSTypedArray *ta = p->u.typed_array;
+ 
++    if (ta->offset > UINT32_MAX) {
++        JS_ThrowRangeError(s->ctx, "typed array offset is too large to serialize");
++        return -1;
++    }
+     bc_put_u8(s, BC_TAG_TYPED_ARRAY);
+     bc_put_u8(s, p->class_id - JS_CLASS_UINT8C_ARRAY);
+     bc_put_leb128(s, p->u.array.count);
+@@ -41060,6 +41064,11 @@
+         JS_ThrowTypeErrorDetachedArrayBuffer(s->ctx);
+         return -1;
+     }
++    if (abuf->byte_length > UINT32_MAX ||
++        abuf->max_byte_length > UINT32_MAX) {
++        JS_ThrowRangeError(s->ctx, "array buffer is too large to serialize");
++        return -1;
++    }
+     bc_put_u8(s, BC_TAG_ARRAY_BUFFER);
+     bc_put_leb128(s, abuf->byte_length);
+     bc_put_leb128(s, abuf->max_byte_length);
+@@ -41072,6 +41081,12 @@
+     JSObject *p = JS_VALUE_GET_OBJ(obj);
+     JSArrayBuffer *abuf = p->u.array_buffer;
+     assert(!abuf->detached); /* SharedArrayBuffer are never detached */
++    if (abuf->byte_length > UINT32_MAX ||
++        abuf->max_byte_length > UINT32_MAX) {
++        JS_ThrowRangeError(s->ctx,
++                           "shared array buffer is too large to serialize");
++        return -1;
++    }
+     bc_put_u8(s, BC_TAG_SHARED_ARRAY_BUFFER);
+     bc_put_leb128(s, abuf->byte_length);
+     bc_put_leb128(s, abuf->max_byte_length);
+@@ -61961,7 +61976,7 @@
+     JSRuntime *rt = ctx->rt;
+     JSValue obj;
+     JSArrayBuffer *abuf = NULL;
+-    uint64_t sab_alloc_len;
++    size_t sab_alloc_len;
+ 
+     if (!alloc_flag && buf && max_len && free_func != js_array_buffer_free) {
+         // not observable from JS land, only through C API misuse;
+@@ -61973,12 +61988,11 @@
+     obj = js_create_from_ctor(ctx, new_target, class_id);
+     if (JS_IsException(obj))
+         return obj;
+-    /* XXX: we are currently limited to 2 GB */
+-    if (len > INT32_MAX) {
++    if (len > SIZE_MAX || len > INT64_MAX) {
+         JS_ThrowRangeError(ctx, "invalid array buffer length");
+         goto fail;
+     }
+-    if (max_len && *max_len > INT32_MAX) {
++    if (max_len && (*max_len > SIZE_MAX || *max_len > INT64_MAX)) {
+         JS_ThrowRangeError(ctx, "invalid max array buffer length");
+         goto fail;
+     }
+@@ -61992,22 +62006,23 @@
+     abuf = js_malloc(ctx, sizeof(*abuf));
+     if (!abuf)
+         goto fail;
+-    abuf->byte_length = len;
+-    abuf->max_byte_length = max_len ? *max_len : -1;
++    abuf->byte_length = (size_t)len;
++    abuf->max_byte_length = max_len ? (int64_t)*max_len : -1;
+     if (alloc_flag) {
+         if (class_id == JS_CLASS_SHARED_ARRAY_BUFFER &&
+             rt->sab_funcs.sab_alloc) {
+             // TOOD(bnoordhuis) resizing backing memory for SABs atomically
+             // is hard so we cheat and allocate |maxByteLength| bytes upfront
+-            sab_alloc_len = max_len ? *max_len : len;
++            sab_alloc_len = (size_t)(max_len ? *max_len : len);
+             abuf->data = rt->sab_funcs.sab_alloc(rt->sab_funcs.sab_opaque,
+-                                                 max_int(sab_alloc_len, 1));
++                                                 sab_alloc_len ? sab_alloc_len : 1);
+             if (!abuf->data)
+                 goto fail;
+-            memset(abuf->data, 0, sab_alloc_len);
++            if (!rt->sab_funcs.sab_alloc_zeroed)
++                memset(abuf->data, 0, sab_alloc_len);
+         } else {
+             /* the allocation must be done after the object creation */
+-            abuf->data = js_mallocz(ctx, max_int(len, 1));
++            abuf->data = js_mallocz(ctx, len ? (size_t)len : 1);
+             if (!abuf->data)
+                 goto fail;
+         }
+@@ -62032,7 +62047,7 @@
+     abuf->opaque = opaque;
+     abuf->free_func = free_func;
+     if (alloc_flag && buf)
+-        memcpy(abuf->data, buf, len);
++        memcpy(abuf->data, buf, (size_t)len);
+     JS_SetOpaqueInternal(obj, abuf);
+     return obj;
+  fail:
+@@ -62236,7 +62251,7 @@
+     if (!abuf)
+         return JS_EXCEPTION;
+     /* return 0 if detached */
+-    return js_uint32(abuf->byte_length);
++    return js_int64((int64_t)abuf->byte_length);
+ }
+ 
+ static JSValue js_array_buffer_get_maxByteLength(JSContext *ctx,
+@@ -62247,8 +62262,8 @@
+     if (!abuf)
+         return JS_EXCEPTION;
+     if (array_buffer_is_resizable(abuf))
+-        return js_uint32(abuf->max_byte_length);
+-    return js_uint32(abuf->byte_length);
++        return js_int64(abuf->max_byte_length);
++    return js_int64((int64_t)abuf->byte_length);
+ }
+ 
+ static JSValue js_array_buffer_get_resizable(JSContext *ctx,
+@@ -62351,7 +62366,7 @@
+     JSTypedArray *ta;
+     JSObject *p;
+     uint8_t *data;
+-    int64_t len;
++    size_t len;
+ 
+     len = abuf->byte_length;
+     data = abuf->data;
+@@ -62368,12 +62383,13 @@
+         size_log2 = typed_array_size_log2(p->class_id);
+         size_elem = 1 << size_log2;
+         if (ta->track_rab) {
+-            if (len >= (int64_t)ta->offset + size_elem) {
+-                p->u.array.count = (len - ta->offset) >> size_log2;
++            if (len >= ta->offset + size_elem) {
++                size_t count = (len - ta->offset) >> size_log2;
++                p->u.array.count = count > UINT32_MAX ? UINT32_MAX : count;
+                 p->u.array.u.ptr = &data[ta->offset];
+             }
+         } else {
+-            if (len >= (int64_t)ta->offset + ta->length) {
++            if (len >= ta->offset + ta->length) {
+                 p->u.array.count = ta->length >> size_log2;
+                 p->u.array.u.ptr = &data[ta->offset];
+             }
+@@ -62468,6 +62484,7 @@
+     JSArrayBuffer *abuf;
+     uint8_t *data;
+     int64_t len;
++    size_t new_len;
+ 
+     abuf = JS_GetOpaque2(ctx, this_val, class_id);
+     if (!abuf)
+@@ -62487,11 +62504,12 @@
+     bad_length:
+         return JS_ThrowRangeError(ctx, "invalid array buffer length");
+     }
++    new_len = (size_t)len;
+     // SABs can only grow and we don't need to realloc because
+     // js_array_buffer_constructor3 commits all memory upfront;
+     // regular RABs are resizable both ways and realloc
+     if (abuf->shared) {
+-        if (len < abuf->byte_length)
++        if (new_len < abuf->byte_length)
+             goto bad_length;
+         // Note this is off-spec; there's supposed to be a single atomic
+         // |byteLength| property that's shared across SABs but we store
+@@ -62500,14 +62518,15 @@
+         // throw a TypeError in thread B as the spec says we should,
+         // instead both threads get their own view of the backing memory,
+         // 2 bytes big in A, and 1 byte big in B
+-        abuf->byte_length = len;
++        abuf->byte_length = new_len;
+     } else {
+-        data = js_realloc(ctx, abuf->data, max_int(len, 1));
++        data = js_realloc(ctx, abuf->data, new_len ? new_len : 1);
+         if (!data)
+             return JS_EXCEPTION;
+-        if (len > abuf->byte_length)
+-            memset(&data[abuf->byte_length], 0, len - abuf->byte_length);
+-        abuf->byte_length = len;
++        if (new_len > abuf->byte_length)
++            memset(&data[abuf->byte_length], 0,
++                   new_len - abuf->byte_length);
++        abuf->byte_length = new_len;
+         abuf->data = data;
+     }
+     js_array_buffer_update_typed_arrays(abuf);
+@@ -62657,8 +62676,7 @@
+ {
+     JSArrayBuffer *abuf;
+     JSTypedArray *ta;
+-    int len, size_elem;
+-    int64_t end;
++    size_t len, size_elem;
+ 
+     assert(is_typed_array(p->class_id));
+ 
+@@ -62671,11 +62689,10 @@
+         return true;
+     if (ta->track_rab)
+         return false;
+-    if (len < (int64_t)ta->offset + ta->length)
++    if (ta->length > len - ta->offset)
+         return true;
+     size_elem = 1 << typed_array_size_log2(p->class_id);
+-    end = (int64_t)ta->offset + (int64_t)p->u.array.count * size_elem;
+-    return end > len;
++    return p->u.array.count > (len - ta->offset) / size_elem;
+ }
+ 
+ /* WARNING: 'p' must be a typed array. Works even if the array buffer
+@@ -62684,7 +62701,7 @@
+ {
+     JSTypedArray *ta = p->u.typed_array;
+     int size_log2 = typed_array_size_log2(p->class_id);
+-    return ta->length >> size_log2;
++    return (uint32_t)(ta->length >> size_log2);
+ }
+ 
+ static int validate_typed_array(JSContext *ctx, JSValueConst this_val)
+@@ -62733,7 +62750,7 @@
+         return js_int32(0);
+     ta = p->u.typed_array;
+     if (!ta->track_rab)
+-        return js_uint32(ta->length);
++        return js_int64((int64_t)ta->length);
+     size_log2 = typed_array_size_log2(p->class_id);
+     return js_int64((int64_t)p->u.array.count << size_log2);
+ }
+@@ -62748,7 +62765,7 @@
+     if (typed_array_is_oob(p))
+         return js_int32(0);
+     ta = p->u.typed_array;
+-    return js_uint32(ta->offset);
++    return js_int64((int64_t)ta->offset);
+ }
+ 
+ JSValue JS_NewTypedArray(JSContext *ctx, int argc, JSValueConst *argv,
+@@ -64445,6 +64462,12 @@
+ 
+     p = JS_VALUE_GET_OBJ(obj);
+     size_log2 = typed_array_size_log2(p->class_id);
++    if (len > UINT32_MAX || offset > SIZE_MAX ||
++        len > (SIZE_MAX >> size_log2)) {
++        JS_FreeValue(ctx, buffer);
++        JS_ThrowRangeError(ctx, "invalid typed array length");
++        return -1;
++    }
+     ta = js_malloc(ctx, sizeof(*ta));
+     if (!ta) {
+         JS_FreeValue(ctx, buffer);
+@@ -64454,13 +64477,13 @@
+     abuf = pbuffer->u.array_buffer;
+     ta->obj = p;
+     ta->buffer = pbuffer;
+-    ta->offset = offset;
+-    ta->length = len << size_log2;
++    ta->offset = (size_t)offset;
++    ta->length = (size_t)len << size_log2;
+     ta->track_rab = track_rab;
+     list_add_tail(&ta->link, &abuf->array_list);
+     p->u.typed_array = ta;
+-    p->u.array.count = len;
+-    p->u.array.u.ptr = abuf->data + offset;
++    p->u.array.count = (uint32_t)len;
++    p->u.array.u.ptr = abuf->data + ta->offset;
+     return 0;
+ }
+ 
+@@ -64745,7 +64768,7 @@
+     bool track_rab = false;
+     JSArrayBuffer *abuf;
+     uint64_t offset;
+-    uint32_t len;
++    size_t len;
+     JSValueConst buffer;
+     JSValue obj;
+     JSTypedArray *ta;
+@@ -64771,7 +64794,7 @@
+             return JS_EXCEPTION;
+         if (l > len)
+             return JS_ThrowRangeError(ctx, "invalid byteLength");
+-        len = l;
++        len = (size_t)l;
+     } else {
+         recompute_len = true;
+         track_rab = array_buffer_is_resizable(abuf);
+@@ -64804,7 +64827,7 @@
+     p = JS_VALUE_GET_OBJ(obj);
+     ta->obj = p;
+     ta->buffer = JS_VALUE_GET_OBJ(js_dup(buffer));
+-    ta->offset = offset;
++    ta->offset = (size_t)offset;
+     ta->length = len;
+     ta->track_rab = track_rab;
+     list_add_tail(&ta->link, &abuf->array_list);
+@@ -64827,7 +64850,7 @@
+         return true;
+     if (ta->track_rab)
+         return false;
+-    return (int64_t)ta->offset + ta->length > abuf->byte_length;
++    return ta->length > abuf->byte_length - ta->offset;
+ }
+ 
+ static JSObject *get_dataview(JSContext *ctx, JSValueConst this_val)
+@@ -64869,9 +64892,9 @@
+     ta = p->u.typed_array;
+     if (ta->track_rab) {
+         abuf = ta->buffer->u.array_buffer;
+-        return js_uint32(abuf->byte_length - ta->offset);
++        return js_int64((int64_t)(abuf->byte_length - ta->offset));
+     }
+-    return js_uint32(ta->length);
++    return js_int64((int64_t)ta->length);
+ }
+ 
+ static JSValue js_dataview_get_byteOffset(JSContext *ctx, JSValueConst this_val)
+@@ -64885,7 +64908,7 @@
+     if (dataview_is_oob(p))
+         return JS_ThrowTypeErrorArrayBufferOOB(ctx);
+     ta = p->u.typed_array;
+-    return js_uint32(ta->offset);
++    return js_int64((int64_t)ta->offset);
+ }
+ 
+ static JSValue js_dataview_getValue(JSContext *ctx,
+@@ -64917,7 +64940,8 @@
+     // test262 expects a TypeError for this and V8, in its infinite wisdom,
+     // throws a "detached array buffer" exception, but IMO that doesn't make
+     // sense because the buffer is not in fact detached, it's still there
+-    if ((int64_t)ta->offset + ta->length > abuf->byte_length)
++    if (ta->offset > abuf->byte_length ||
++        ta->length > abuf->byte_length - ta->offset)
+         return JS_ThrowTypeError(ctx, "out of bound");
+     ptr = abuf->data + ta->offset + pos;
+ 
+@@ -65062,7 +65086,8 @@
+     // test262 expects a TypeError for this and V8, in its infinite wisdom,
+     // throws a "detached array buffer" exception, but IMO that doesn't make
+     // sense because the buffer is not in fact detached, it's still there
+-    if ((int64_t)ta->offset + ta->length > abuf->byte_length)
++    if (ta->offset > abuf->byte_length ||
++        ta->length > abuf->byte_length - ta->offset)
+         return JS_ThrowTypeError(ctx, "out of bound");
+     ptr = abuf->data + ta->offset + pos;
+ 
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1103,6 +1103,7 @@
+     void (*sab_free)(void *opaque, void *ptr);
+     void (*sab_dup)(void *opaque, void *ptr);
+     void *sab_opaque;
++    bool sab_alloc_zeroed;
+ } JSSharedArrayBufferFunctions;
+ JS_EXTERN void JS_SetSharedArrayBufferFunctions(JSRuntime *rt, const JSSharedArrayBufferFunctions *sf);
+ 
+

@@ -22,6 +22,7 @@ pub struct JSSharedArrayBufferFunctions {
   pub sab_dup:
     Option<unsafe extern "C" fn(opaque: *mut c_void, ptr: *mut c_void)>,
   pub sab_opaque: *mut c_void,
+  pub sab_alloc_zeroed: bool,
 }
 
 #[repr(C)]

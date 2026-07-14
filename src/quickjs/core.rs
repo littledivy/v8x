@@ -757,7 +757,7 @@ static NEXT_ATOMICS_WAITER_ID: std::sync::atomic::AtomicU64 =
   std::sync::atomic::AtomicU64::new(1);
 
 unsafe extern "C" {
-  fn malloc(size: usize) -> *mut c_void;
+  fn calloc(count: usize, size: usize) -> *mut c_void;
   fn free(ptr: *mut c_void);
 }
 
@@ -765,7 +765,7 @@ unsafe extern "C" fn sab_alloc_fn(
   _opaque: *mut c_void,
   size: usize,
 ) -> *mut c_void {
-  let p = unsafe { malloc(size.max(1)) };
+  let p = unsafe { calloc(size.max(1), 1) };
   if !p.is_null() {
     sab_refcounts().lock().unwrap().insert(p as usize, 1);
   }
@@ -800,6 +800,7 @@ fn sab_funcs_table() -> *const JSSharedArrayBufferFunctions {
     sab_free: Some(sab_free_fn),
     sab_dup: Some(sab_dup_fn),
     sab_opaque: ptr::null_mut(),
+    sab_alloc_zeroed: true,
   });
   &FUNCS.0
 }
