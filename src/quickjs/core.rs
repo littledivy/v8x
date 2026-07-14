@@ -1974,9 +1974,51 @@ fn install_intl_stub(ctx: *mut JSContext, _global: JSValue) {
         PluralRules.prototype.select=function(){ return 'other'; };\
         PluralRules.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US')}; };\
         PluralRules.supportedLocalesOf=function(l){ return Array.isArray(l)?l:(l?[l]:[]); };\
-        function ListFormat(l,o){ if(!(this instanceof ListFormat)) return new ListFormat(l,o); this._l=l; }\
-        ListFormat.prototype.format=function(a){ return Array.isArray(a)?a.join(', '):String(a); };\
-        ListFormat.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US')}; };\
+        function ListFormat(l,o){ if(!(this instanceof ListFormat)) return new ListFormat(l,o); this._l=l; this._o=o||{}; }\
+        function listFormatParts(f,a){\
+          var values=Array.from(a,function(v){return String(v);});\
+          var out=[],type=f._o.type||'conjunction';\
+          for(var i=0;i<values.length;i++){\
+            if(i){\
+              var literal=', ';\
+              if(values.length===2) literal=type==='disjunction'?' or ':' and ';\
+              else if(i===values.length-1) literal=type==='disjunction'?', or ':', and ';\
+              out.push({type:'literal',value:literal});\
+            }\
+            out.push({type:'element',value:values[i]});\
+          }\
+          return out;\
+        }\
+        ListFormat.prototype.formatToParts=function(a){ return listFormatParts(this,a); };\
+        ListFormat.prototype.format=function(a){ return listFormatParts(this,a).map(function(p){return p.value;}).join(''); };\
+        ListFormat.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US'),type:(this._o.type||'conjunction'),style:(this._o.style||'long')}; };\
+        ListFormat.supportedLocalesOf=function(l){ return Array.isArray(l)?l:(l?[l]:[]); };\
+        function Locale(tag,o){\
+          if(!(this instanceof Locale)) throw new TypeError('Constructor Intl.Locale requires new');\
+          var parts=String(tag).split('-'),i=0;\
+          this._language=(parts[i++]||'und').toLowerCase();\
+          this._script=undefined; this._region=undefined;\
+          if(parts[i]&&/^[A-Za-z]{4}$/.test(parts[i])){ var s=parts[i++].toLowerCase(); this._script=s[0].toUpperCase()+s.slice(1); }\
+          if(parts[i]&&(/^[A-Za-z]{2}$/.test(parts[i])||/^\\d{3}$/.test(parts[i]))) this._region=parts[i++].toUpperCase();\
+          var variants=[];\
+          while(parts[i]&&parts[i].length!==1) variants.push(parts[i++].toLowerCase());\
+          this._variants=variants.length?variants.join('-'):undefined;\
+          this._baseName=[this._language,this._script,this._region,this._variants].filter(Boolean).join('-');\
+          o=o||{};\
+          this._calendar=o.calendar; this._caseFirst=o.caseFirst; this._collation=o.collation;\
+          this._hourCycle=o.hourCycle; this._numberingSystem=o.numberingSystem; this._numeric=!!o.numeric;\
+          var self=this; Object.keys(this).forEach(function(k){Object.defineProperty(self,k,{enumerable:false});});\
+        }\
+        Object.defineProperties(Locale.prototype,{\
+          baseName:{get:function(){return this._baseName;}},calendar:{get:function(){return this._calendar;}},\
+          caseFirst:{get:function(){return this._caseFirst;}},collation:{get:function(){return this._collation;}},\
+          hourCycle:{get:function(){return this._hourCycle;}},language:{get:function(){return this._language;}},\
+          numberingSystem:{get:function(){return this._numberingSystem;}},numeric:{get:function(){return this._numeric;}},\
+          region:{get:function(){return this._region;}},script:{get:function(){return this._script;}},\
+          variants:{get:function(){return this._variants;}},\
+          toString:{value:function(){return this._baseName;},configurable:true,writable:true},\
+          [Symbol.toStringTag]:{value:'Intl.Locale',configurable:true}\
+        });\
         function RelativeTimeFormat(l,o){ if(!(this instanceof RelativeTimeFormat)) return new RelativeTimeFormat(l,o); this._l=l; }\
         RelativeTimeFormat.prototype.format=function(v,u){ return String(v)+' '+String(u); };\
         RelativeTimeFormat.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US')}; };\
@@ -2009,6 +2051,7 @@ fn install_intl_stub(ctx: *mut JSContext, _global: JSValue) {
             Collator:Collator,\
             PluralRules:PluralRules,\
             ListFormat:ListFormat,\
+            Locale:Locale,\
             RelativeTimeFormat:RelativeTimeFormat,\
             Segmenter:Segmenter,\
             DurationFormat:DurationFormat,\

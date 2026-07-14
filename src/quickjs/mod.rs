@@ -1188,6 +1188,7 @@ mod api_test {
     }
 
     assert_temporal_support();
+    assert_intl_basics();
     assert_finalization_registry_token_is_weak();
     assert_unbound_script_preserves_origin();
     assert_continuation_data_survives_await();
@@ -1650,6 +1651,40 @@ mod api_test {
       "Duration,Instant,Now,PlainDate,PlainDateTime,PlainMonthDay,PlainTime,\
        PlainYearMonth,ZonedDateTime|1 day, 6 hr, 30 min|\
        2020-03-08T03:00:00-04:00[America/New_York]"
+    );
+  }
+
+  fn assert_intl_basics() {
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let source = v8::String::new(
+      scope,
+      "const conjunction = new Intl.ListFormat('en', {\
+         style: 'long', type: 'conjunction'\
+       });\
+       const disjunction = new Intl.ListFormat('en', {\
+         style: 'short', type: 'disjunction'\
+       });\
+       const locale = new Intl.Locale('zh-Hant-TW', { hourCycle: 'h12' });\
+       [\
+         conjunction.format(new Set(['red', 'green', 'blue'])),\
+         disjunction.format(['Rust', 'Go']),\
+         locale.baseName, locale.language, locale.script, locale.region,\
+         locale.hourCycle, locale.numeric,\
+         new Intl.Locale('de-DE-1996-fonipa').variants,\
+         Object.prototype.toString.call(locale),\
+         Object.keys(locale).length,\
+       ].join('|')",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    assert_eq!(
+      script.run(scope).unwrap().to_rust_string_lossy(scope),
+      "red, green, and blue|Rust or Go|zh-Hant-TW|zh|Hant|TW|h12|false|\
+       1996-fonipa|[object Intl.Locale]|0",
     );
   }
 
