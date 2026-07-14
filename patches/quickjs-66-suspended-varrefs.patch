@@ -216,6 +216,15 @@ diff --git a/quickjs.c b/quickjs.c
  
              /* Note: no need to create 'thrownawayCapability' as in
                 the spec */
+@@ -22335,6 +22393,8 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
+     bool ok;
+     JSValueConst arg;
+ 
++    set_stack_frame_gc_owner(ctx->rt, &s->func_state.frame, func_obj);
++
+     if (argc > 0)
+         arg = argv[0];
+     else
 @@ -22389,7 +22447,8 @@
      if (JS_IsException(promise))
          goto fail;

@@ -1199,6 +1199,7 @@ mod api_test {
     assert_global_drop_uses_owning_isolate();
     assert_internal_globals_are_not_enumerable();
     assert_suspended_async_capture_survives_gc();
+    assert_rejected_await_capture_survives_gc();
     assert_async_iterator_close_is_awaited();
     assert_native_promise_then_ignores_monkeypatch();
     assert_promise_hooks_follow_continuations();
@@ -1340,6 +1341,32 @@ mod api_test {
     script.run(scope).unwrap();
     scope.perform_microtask_checkpoint();
     let source = v8::String::new(scope, "observed").unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    assert_eq!(script.run(scope).unwrap().integer_value(scope), Some(42));
+  }
+
+  fn assert_rejected_await_capture_survives_gc() {
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let source = v8::String::new(
+      scope,
+      "globalThis.rejectedCapture = 0;\
+       (async () => {\
+         let captured = 41;\
+         try { await Promise.reject(new Error('expected')); } catch {}\
+         const read = () => captured + 1;\
+         gc();\
+         rejectedCapture = read();\
+       })();",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    script.run(scope).unwrap();
+    scope.perform_microtask_checkpoint();
+    let source = v8::String::new(scope, "rejectedCapture").unwrap();
     let script = v8::Script::compile(scope, source, None).unwrap();
     assert_eq!(script.run(scope).unwrap().integer_value(scope), Some(42));
   }
