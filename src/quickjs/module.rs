@@ -5395,6 +5395,8 @@ pub extern "C" fn v8__Module__Evaluate(
     return make_resolved_promise(ctx);
   }
 
+  super::inspector::maybe_pause_on_next_statement();
+
   let (bytecode, source_text, source_name, module_name) =
     with_module_state(this, |m| {
       m.status = ModuleStatus::Evaluated;

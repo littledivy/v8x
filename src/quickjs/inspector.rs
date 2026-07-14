@@ -417,6 +417,9 @@ unsafe extern "C" {
     this: *mut RawV8InspectorClient,
     context_group_id: int,
   );
+  fn v8_inspector__V8InspectorClient__BASE__quitMessageLoopOnPause(
+    this: *mut RawV8InspectorClient,
+  );
   fn v8_inspector__V8InspectorClient__BASE__consoleAPIMessage(
     this: *mut RawV8InspectorClient,
     context_group_id: int,
@@ -622,10 +625,6 @@ pub(crate) fn maybe_pause_on_next_statement() {
   send_channel_notification(
     state.channel,
     r#"{"method":"Debugger.paused","params":{"callFrames":[],"reason":"other","hitBreakpoints":[]}}"#.to_string(),
-  );
-  send_channel_notification(
-    state.channel,
-    r#"{"method":"Debugger.resumed","params":{}}"#.to_string(),
   );
   unsafe {
     v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
@@ -1062,6 +1061,20 @@ mod cdp {
     }
     pub fn cancel_pause_on_next_statement(&self) {
       super::cancel_pause_on_next_statement(self.client, self.channel);
+    }
+    fn resume(&self) {
+      super::send_channel_notification(
+        self.channel,
+        r#"{"method":"Debugger.resumed","params":{}}"#.to_string(),
+      );
+      unsafe {
+        super::v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
+          self.channel,
+        );
+        super::v8_inspector__V8InspectorClient__BASE__quitMessageLoopOnPause(
+          self.client,
+        );
+      }
     }
     fn retain(&mut self, ctx: *mut JSContext, v: JSValue) -> u64 {
       let id = self.next_obj_id;
@@ -2201,6 +2214,10 @@ mod cdp {
         let response = JS_NewObject(ctx);
         set_str(ctx, response, c"debuggerId", "1");
         send_obj(sess, ctx, response, Some(id));
+      },
+      "Debugger.resume" => unsafe {
+        ack(sess, ctx, id);
+        sess.resume();
       },
       "Profiler.enable" => unsafe { ack(sess, ctx, id) },
       "Profiler.disable" | "Profiler.stopPreciseCoverage" => unsafe {
