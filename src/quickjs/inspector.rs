@@ -405,6 +405,8 @@ thread_local! {
   static ACTIVE_INSPECTOR_CLIENT:
     std::cell::RefCell<Option<(*mut RawV8InspectorClient, int)>> =
       const { std::cell::RefCell::new(None) };
+  static ACTIVE_RUNTIME_CHANNEL: std::cell::RefCell<Option<*mut RawChannel>> =
+    const { std::cell::RefCell::new(None) };
   static SCHEDULED_PAUSE: std::cell::RefCell<Option<ScheduledPause>> =
     const { std::cell::RefCell::new(None) };
 }
@@ -437,6 +439,13 @@ unsafe extern "C" {
   fn v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
     this: *mut RawChannel,
   );
+  fn JS_DefinePropertyValueStr(
+    ctx: *mut JSContext,
+    this_obj: JSValue,
+    prop: *const std::ffi::c_char,
+    val: JSValue,
+    flags: std::ffi::c_int,
+  ) -> std::ffi::c_int;
 }
 
 #[inline]
@@ -556,6 +565,219 @@ fn send_channel_notification(channel: *mut RawChannel, json: String) {
   unsafe {
     v8_inspector__V8Inspector__Channel__BASE__sendNotification(channel, unique)
   };
+}
+
+fn activate_runtime_session(channel: *mut RawChannel) {
+  if !channel.is_null() {
+    ACTIVE_RUNTIME_CHANNEL.with(|slot| *slot.borrow_mut() = Some(channel));
+  }
+}
+
+fn deactivate_runtime_session(channel: *mut RawChannel) {
+  ACTIVE_RUNTIME_CHANNEL.with(|slot| {
+    let mut slot = slot.borrow_mut();
+    if *slot == Some(channel) {
+      *slot = None;
+    }
+  });
+}
+
+unsafe fn console_remote_object_json(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> String {
+  if jsv_is_undefined(&value) {
+    return r#"{"type":"undefined"}"#.to_string();
+  }
+  if jsv_is_null(&value) {
+    return r#"{"type":"object","subtype":"null","value":null}"#.to_string();
+  }
+  if jsv_is_bool(&value) {
+    return format!(
+      r#"{{"type":"boolean","value":{}}}"#,
+      unsafe { JS_ToBool(ctx, value) } != 0
+    );
+  }
+  if jsv_is_number(&value) {
+    let mut number = 0.0;
+    if unsafe { JS_ToFloat64(ctx, &mut number, value) } == 0 {
+      if number.is_finite() {
+        return format!(r#"{{"type":"number","value":{number}}}"#);
+      }
+      let value = if number.is_nan() {
+        "NaN"
+      } else if number.is_sign_negative() {
+        "-Infinity"
+      } else {
+        "Infinity"
+      };
+      return format!(
+        r#"{{"type":"number","unserializableValue":{}}}"#,
+        json_string(value)
+      );
+    }
+  }
+  if jsv_is_string(&value) {
+    let value = unsafe { js_value_to_string(ctx, value) }.unwrap_or_default();
+    return format!(r#"{{"type":"string","value":{}}}"#, json_string(&value));
+  }
+  if jsv_is_bigint(&value) {
+    let value = unsafe { js_value_to_string(ctx, value) }.unwrap_or_default();
+    return format!(
+      r#"{{"type":"bigint","unserializableValue":{},"description":{}}}"#,
+      json_string(&format!("{value}n")),
+      json_string(&format!("{value}n"))
+    );
+  }
+  if jsv_is_symbol(&value) {
+    return r#"{"type":"symbol","description":"Symbol()"}"#.to_string();
+  }
+  if unsafe { JS_IsFunction(ctx, value) } {
+    return r#"{"type":"function","className":"Function","description":"Function"}"#.to_string();
+  }
+  r#"{"type":"object","className":"Object","description":"Object"}"#.to_string()
+}
+
+fn console_event_type(magic: std::ffi::c_int) -> &'static str {
+  match magic {
+    1 => "debug",
+    2 => "info",
+    3 => "warning",
+    4 => "error",
+    5 => "dir",
+    6 => "dirxml",
+    7 => "table",
+    8 => "trace",
+    9 => "startGroup",
+    10 => "startGroupCollapsed",
+    11 => "endGroup",
+    12 => "clear",
+    13 => "assert",
+    _ => "log",
+  }
+}
+
+unsafe fn emit_console_api_called(
+  ctx: *mut JSContext,
+  magic: std::ffi::c_int,
+  argc: std::ffi::c_int,
+  argv: *mut JSValue,
+) {
+  let Some(channel) = ACTIVE_RUNTIME_CHANNEL.with(|slot| *slot.borrow()) else {
+    return;
+  };
+  if channel.is_null() {
+    return;
+  }
+
+  let mut args = Vec::with_capacity(argc.max(1) as usize);
+  if !argv.is_null() {
+    for index in 0..argc.max(0) as usize {
+      args.push(unsafe { console_remote_object_json(ctx, *argv.add(index)) });
+    }
+  }
+  if magic == 11 && args.is_empty() {
+    args.push(r#"{"type":"string","value":"console.groupEnd"}"#.to_string());
+  }
+  let timestamp = SystemTime::now()
+    .duration_since(SystemTime::UNIX_EPOCH)
+    .unwrap_or_default()
+    .as_secs_f64()
+    * 1_000.0;
+  send_channel_notification(
+    channel,
+    format!(
+      r#"{{"method":"Runtime.consoleAPICalled","params":{{"type":{},"args":[{}],"executionContextId":1,"timestamp":{timestamp}}}}}"#,
+      json_string(console_event_type(magic)),
+      args.join(",")
+    ),
+  );
+  unsafe {
+    v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
+      channel,
+    );
+  }
+}
+
+unsafe extern "C" fn inspector_console_wrapper(
+  ctx: *mut JSContext,
+  this_val: JSValue,
+  argc: std::ffi::c_int,
+  argv: *mut JSValue,
+  magic: std::ffi::c_int,
+  func_data: *mut JSValue,
+) -> JSValue {
+  unsafe { emit_console_api_called(ctx, magic, argc, argv) };
+  if func_data.is_null() {
+    return jsv_undefined();
+  }
+  unsafe { JS_Call(ctx, *func_data, this_val, argc, argv) }
+}
+
+unsafe fn install_console_api_wrappers(ctx: *mut JSContext) {
+  let global = unsafe { JS_GetGlobalObject(ctx) };
+  let console = unsafe { JS_GetPropertyStr(ctx, global, c"console".as_ptr()) };
+  unsafe { JS_FreeValue(ctx, global) };
+  if !jsv_is_object(&console) {
+    unsafe { JS_FreeValue(ctx, console) };
+    return;
+  }
+
+  let marker = unsafe {
+    JS_GetPropertyStr(ctx, console, c"__v8x_inspector_wrapped__".as_ptr())
+  };
+  let already_wrapped = unsafe { JS_ToBool(ctx, marker) } != 0;
+  unsafe { JS_FreeValue(ctx, marker) };
+  if already_wrapped {
+    unsafe { JS_FreeValue(ctx, console) };
+    return;
+  }
+
+  for (name, magic) in [
+    (c"log", 0),
+    (c"debug", 1),
+    (c"info", 2),
+    (c"warn", 3),
+    (c"error", 4),
+    (c"dir", 5),
+    (c"dirxml", 6),
+    (c"table", 7),
+    (c"trace", 8),
+    (c"group", 9),
+    (c"groupCollapsed", 10),
+    (c"groupEnd", 11),
+    (c"clear", 12),
+    (c"assert", 13),
+  ] {
+    let original = unsafe { JS_GetPropertyStr(ctx, console, name.as_ptr()) };
+    if unsafe { JS_IsFunction(ctx, original) } {
+      let mut data = [original];
+      let wrapper = unsafe {
+        JS_NewCFunctionData(
+          ctx,
+          inspector_console_wrapper,
+          0,
+          magic,
+          data.len() as std::ffi::c_int,
+          data.as_mut_ptr(),
+        )
+      };
+      if !jsv_is_exception(&wrapper) {
+        unsafe { JS_SetPropertyStr(ctx, console, name.as_ptr(), wrapper) };
+      }
+    }
+    unsafe { JS_FreeValue(ctx, original) };
+  }
+  unsafe {
+    JS_DefinePropertyValueStr(
+      ctx,
+      console,
+      c"__v8x_inspector_wrapped__".as_ptr(),
+      JS_NewBool(ctx, 1),
+      JS_PROP_CONFIGURABLE,
+    );
+    JS_FreeValue(ctx, console);
+  }
 }
 
 fn schedule_pause_on_next_statement(
@@ -1137,6 +1359,9 @@ mod cdp {
     fn disable_debugger(&self) {
       super::deactivate_debugger_session(self.client, self.channel);
     }
+    fn enable_runtime(&self) {
+      super::activate_runtime_session(self.channel);
+    }
     fn retain(&mut self, ctx: *mut JSContext, v: JSValue) -> u64 {
       let id = self.next_obj_id;
       self.next_obj_id += 1;
@@ -1148,6 +1373,7 @@ mod cdp {
   impl Drop for CdpSession {
     fn drop(&mut self) {
       super::deactivate_debugger_session(self.client, self.channel);
+      super::deactivate_runtime_session(self.channel);
       let ctx = current_ctx();
       if !ctx.is_null() {
         for (_, v) in self.objects.drain() {
@@ -1504,6 +1730,8 @@ mod cdp {
     ctx: *mut JSContext,
     call_id: i32,
   ) {
+    sess.enable_runtime();
+    unsafe { super::install_console_api_wrappers(ctx) };
     unsafe { ack(sess, ctx, call_id) };
     let notif = unsafe { JS_NewObject(ctx) };
     unsafe {
