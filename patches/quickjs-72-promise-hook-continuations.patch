@@ -1,0 +1,273 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1490,7 +1490,8 @@
+ static __exception int perform_promise_then(JSContext *ctx,
+                                             JSValueConst promise,
+                                             JSValueConst *resolve_reject,
+-                                            JSValueConst *cap_resolving_funcs);
++                                            JSValueConst *cap_resolving_funcs,
++                                            JSValueConst hook_promise);
+ static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
+                                   int argc, JSValueConst *argv, int magic);
+ static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
+@@ -22327,6 +22328,7 @@
+             goto resolved;
+         } else {
+             JSValue promise, resolving_funcs[2], resolving_funcs1[2];
++            JSValue hook_promise;
+             int i, res;
+ 
+             /* await */
+@@ -22343,16 +22345,30 @@
+             set_stack_frame_gc_owner(ctx->rt, &s->func_state.frame,
+                                      resolving_funcs[0]);
+ 
+-            /* Note: no need to create 'thrownawayCapability' as in
+-               the spec */
+             for(i = 0; i < 2; i++)
+                 resolving_funcs1[i] = JS_UNDEFINED;
++            hook_promise = JS_UNDEFINED;
++            if (ctx->rt->promise_hook) {
++                JSValueLink link = { ctx->rt->parent_promise, promise };
++                ctx->rt->parent_promise = &link;
++                hook_promise = JS_NewPromiseCapability(ctx, resolving_funcs1);
++                ctx->rt->parent_promise = link.next;
++                if (JS_IsException(hook_promise)) {
++                    JS_FreeValue(ctx, promise);
++                    for(i = 0; i < 2; i++)
++                        JS_FreeValue(ctx, resolving_funcs[i]);
++                    goto fail;
++                }
++            }
+             res = perform_promise_then(ctx, promise,
+                                        vc(resolving_funcs),
+-                                       vc(resolving_funcs1));
++                                       vc(resolving_funcs1), hook_promise);
++            JS_FreeValue(ctx, hook_promise);
+             JS_FreeValue(ctx, promise);
+             for(i = 0; i < 2; i++)
+                 JS_FreeValue(ctx, resolving_funcs[i]);
++            for(i = 0; i < 2; i++)
++                JS_FreeValue(ctx, resolving_funcs1[i]);
+             if (res)
+                 goto fail;
+         }
+@@ -22613,6 +22629,7 @@
+                                     JSValue value)
+ {
+     JSValue promise, resolving_funcs[2], resolving_funcs1[2];
++    JSValue hook_promise;
+     int i, res;
+ 
+     promise = js_promise_resolve(ctx, ctx->promise_ctor,
+@@ -22626,16 +22643,30 @@
+         goto fail;
+     }
+ 
+-    /* Note: no need to create 'thrownawayCapability' as in
+-       the spec */
+     for(i = 0; i < 2; i++)
+         resolving_funcs1[i] = JS_UNDEFINED;
++    hook_promise = JS_UNDEFINED;
++    if (ctx->rt->promise_hook) {
++        JSValueLink link = { ctx->rt->parent_promise, promise };
++        ctx->rt->parent_promise = &link;
++        hook_promise = JS_NewPromiseCapability(ctx, resolving_funcs1);
++        ctx->rt->parent_promise = link.next;
++        if (JS_IsException(hook_promise)) {
++            JS_FreeValue(ctx, promise);
++            for(i = 0; i < 2; i++)
++                JS_FreeValue(ctx, resolving_funcs[i]);
++            goto fail;
++        }
++    }
+     res = perform_promise_then(ctx, promise,
+                                vc(resolving_funcs),
+-                               vc(resolving_funcs1));
++                               vc(resolving_funcs1), hook_promise);
++    JS_FreeValue(ctx, hook_promise);
+     JS_FreeValue(ctx, promise);
+     for(i = 0; i < 2; i++)
+         JS_FreeValue(ctx, resolving_funcs[i]);
++    for(i = 0; i < 2; i++)
++        JS_FreeValue(ctx, resolving_funcs1[i]);
+     if (res)
+         goto fail;
+     return 0;
+@@ -22722,7 +22753,7 @@
+     resolving_funcs[1] = JS_UNDEFINED;
+     res = perform_promise_then(ctx, promise,
+                                vc(resolving_funcs1),
+-                               vc(resolving_funcs));
++                               vc(resolving_funcs), JS_UNDEFINED);
+     JS_FreeValue(ctx, resolving_funcs1[0]);
+     JS_FreeValue(ctx, resolving_funcs1[1]);
+     JS_FreeValue(ctx, promise);
+@@ -58240,6 +58271,7 @@
+     JSValue resolving_funcs[2];
+     JSValue handler;
+     JSValue job_context;
++    JSValue hook_promise;
+ } JSPromiseReactionData;
+ 
+ JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValueConst promise)
+@@ -58296,6 +58328,7 @@
+     JS_FreeValueRT(rt, rd->resolving_funcs[1]);
+     JS_FreeValueRT(rt, rd->handler);
+     JS_FreeValueRT(rt, rd->job_context);
++    JS_FreeValueRT(rt, rd->hook_promise);
+     js_free_rt(rt, rd);
+ }
+ 
+@@ -58315,6 +58348,8 @@
+     JSValueConst handler, func;
+     JSValue res, res2;
+     JSValueConst arg;
++    JSPromiseHook *promise_hook;
++    void *promise_hook_opaque;
+     bool is_reject;
+ 
+     assert(argc == 6);
+@@ -58324,9 +58359,13 @@
+ 
+     promise_trace(ctx, "promise_reaction_job: is_reject=%d\n", is_reject);
+ 
+-    if (ctx->rt->promise_hook) {
+-        ctx->rt->promise_hook(ctx, JS_PROMISE_HOOK_BEFORE, argv[5],
+-                              JS_UNDEFINED, ctx->rt->promise_hook_opaque);
++    promise_hook = ctx->rt->promise_hook;
++    promise_hook_opaque = ctx->rt->promise_hook_opaque;
++    if (promise_hook && JS_IsPromise(argv[5])) {
++        promise_hook(ctx, JS_PROMISE_HOOK_BEFORE, argv[5],
++                     JS_UNDEFINED, promise_hook_opaque);
++    } else {
++        promise_hook = NULL;
+     }
+     if (JS_IsUndefined(handler)) {
+         if (is_reject) {
+@@ -58337,14 +58376,15 @@
+     } else {
+         res = JS_Call(ctx, handler, JS_UNDEFINED, 1, &arg);
+     }
+-    if (ctx->rt->promise_hook) {
+-        ctx->rt->promise_hook(ctx, JS_PROMISE_HOOK_AFTER, argv[5],
+-                              JS_UNDEFINED, ctx->rt->promise_hook_opaque);
+-    }
+     is_reject = JS_IsException(res);
+     if (is_reject) {
+-        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception)))
++        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
++            if (promise_hook) {
++                promise_hook(ctx, JS_PROMISE_HOOK_AFTER, argv[5],
++                             JS_UNDEFINED, promise_hook_opaque);
++            }
+             return JS_EXCEPTION;
++        }
+         res = JS_GetException(ctx);
+     }
+     func = argv[is_reject];
+@@ -58358,6 +58398,11 @@
+     }
+     JS_FreeValue(ctx, res);
+ 
++    if (promise_hook) {
++        promise_hook(ctx, JS_PROMISE_HOOK_AFTER, argv[5],
++                     JS_UNDEFINED, promise_hook_opaque);
++    }
++
+     return res2;
+ }
+ 
+@@ -58390,7 +58435,7 @@
+ 
+     promise_trace(ctx, "fulfill_or_reject_promise: is_reject=%d\n", is_reject);
+ 
+-    if (s->promise_state == JS_PROMISE_FULFILLED) {
++    {
+         JSRuntime *rt = ctx->rt;
+         if (rt->promise_hook) {
+             rt->promise_hook(ctx, JS_PROMISE_HOOK_RESOLVE, promise,
+@@ -58412,7 +58457,7 @@
+         args[2] = rd->handler;
+         args[3] = js_bool(is_reject);
+         args[4] = value;
+-        args[5] = promise;
++        args[5] = rd->hook_promise;
+         js_enqueue_job(ctx, promise_reaction_job, 6, args,
+                        &rd->job_context);
+         list_del(&rd->link);
+@@ -58623,6 +58668,7 @@
+             JS_MarkValue(rt, rd->resolving_funcs[1], mark_func);
+             JS_MarkValue(rt, rd->handler, mark_func);
+             JS_MarkValue(rt, rd->job_context, mark_func);
++            JS_MarkValue(rt, rd->hook_promise, mark_func);
+         }
+     }
+     JS_MarkValue(rt, s->promise_result, mark_func);
+@@ -58788,7 +58834,8 @@
+     if (JS_IsException(result_promise))
+         return result_promise;
+ 
+-    ret = perform_promise_then(ctx, promise, handlers, vc(resolving_funcs));
++    ret = perform_promise_then(ctx, promise, handlers, vc(resolving_funcs),
++                               result_promise);
+     for (i = 0; i < 2; i++)
+         JS_FreeValue(ctx, resolving_funcs[i]);
+     if (ret) {
+@@ -59232,7 +59279,8 @@
+ static __exception int perform_promise_then(JSContext *ctx,
+                                             JSValueConst promise,
+                                             JSValueConst *resolve_reject,
+-                                            JSValueConst *cap_resolving_funcs)
++                                            JSValueConst *cap_resolving_funcs,
++                                            JSValueConst hook_promise)
+ {
+     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
+     JSPromiseReactionData *rd_array[2], *rd;
+@@ -59260,6 +59308,7 @@
+         } else {
+             rd->job_context = JS_UNDEFINED;
+         }
++        rd->hook_promise = js_dup(hook_promise);
+         rd_array[i] = rd;
+     }
+ 
+@@ -59281,7 +59330,7 @@
+         args[2] = rd->handler;
+         args[3] = js_bool(i);
+         args[4] = s->promise_result;
+-        args[5] = promise;
++        args[5] = rd->hook_promise;
+         js_enqueue_job(ctx, promise_reaction_job, 6, args,
+                        &rd->job_context);
+         for(i = 0; i < 2; i++)
+@@ -59321,7 +59370,8 @@
+     JS_FreeValue(ctx, ctor);
+     if (JS_IsException(result_promise))
+         return result_promise;
+-    ret = perform_promise_then(ctx, this_val, argv, vc(resolving_funcs));
++    ret = perform_promise_then(ctx, this_val, argv, vc(resolving_funcs),
++                               result_promise);
+     for(i = 0; i < 2; i++)
+         JS_FreeValue(ctx, resolving_funcs[i]);
+     if (ret) {
+@@ -59616,7 +59666,7 @@
+ 
+         res = perform_promise_then(ctx, value_wrapper_promise,
+                                    vc(resolve_reject),
+-                                   vc(resolving_funcs));
++                                   vc(resolving_funcs), promise);
+         JS_FreeValue(ctx, resolve_reject[0]);
+         JS_FreeValue(ctx, value_wrapper_promise);
+         JS_FreeValue(ctx, resolving_funcs[0]);
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1132,7 +1132,7 @@
+     JS_PROMISE_HOOK_INIT,     // emitted when a new promise is created
+     JS_PROMISE_HOOK_BEFORE,   // runs right before promise.then is invoked
+     JS_PROMISE_HOOK_AFTER,    // runs right after promise.then is invoked
+-    JS_PROMISE_HOOK_RESOLVE,  // not emitted for rejected promises
++    JS_PROMISE_HOOK_RESOLVE,  // emitted when a promise is settled
+ } JSPromiseHookType;
+ 
+ // parent_promise is only passed in when type == JS_PROMISE_HOOK_INIT and

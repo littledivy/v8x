@@ -1201,6 +1201,7 @@ mod api_test {
     assert_suspended_async_capture_survives_gc();
     assert_async_iterator_close_is_awaited();
     assert_native_promise_then_ignores_monkeypatch();
+    assert_promise_hooks_follow_continuations();
     assert_wasm_streaming_respects_explicit_microtasks();
     assert_duplicate_module_requests_resolve_once();
 
@@ -1638,6 +1639,102 @@ mod api_test {
     let script = v8::Script::compile(scope, check, None).unwrap();
     let result = script.run(scope).unwrap();
     assert_eq!(result.to_rust_string_lossy(scope), "closed,token-collected");
+  }
+
+  fn assert_promise_hooks_follow_continuations() {
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let setup = v8::String::new(
+      scope,
+      r#"
+        globalThis.events = [];
+        globalThis.ids = new Map();
+        globalThis.identify = (promise) => {
+          if (!ids.has(promise)) ids.set(promise, `p${ids.size + 1}`);
+          return ids.get(promise);
+        };
+        [
+          (promise, parent) => events.push(
+            `init ${identify(promise)}${parent ? ` from ${identify(parent)}` : ''}`
+          ),
+          promise => events.push(`before ${identify(promise)}`),
+          promise => events.push(`after ${identify(promise)}`),
+          promise => events.push(`resolve ${identify(promise)}`),
+        ];
+      "#,
+    )
+    .unwrap();
+    let hooks = v8::Script::compile(scope, setup, None)
+      .unwrap()
+      .run(scope)
+      .unwrap();
+    let hooks = v8::Local::<v8::Array>::try_from(hooks).unwrap();
+    let init =
+      v8::Local::<v8::Function>::try_from(hooks.get_index(scope, 0).unwrap())
+        .unwrap();
+    let before =
+      v8::Local::<v8::Function>::try_from(hooks.get_index(scope, 1).unwrap())
+        .unwrap();
+    let after =
+      v8::Local::<v8::Function>::try_from(hooks.get_index(scope, 2).unwrap())
+        .unwrap();
+    let resolve =
+      v8::Local::<v8::Function>::try_from(hooks.get_index(scope, 3).unwrap())
+        .unwrap();
+    scope.set_promise_hooks(
+      Some(init),
+      Some(before),
+      Some(after),
+      Some(resolve),
+    );
+
+    let code = v8::String::new(
+      scope,
+      r#"
+        async function run() {
+          await Promise.resolve(1);
+          Promise.reject('expected').catch(() => {});
+        }
+        run();
+      "#,
+    )
+    .unwrap();
+    v8::Script::compile(scope, code, None)
+      .unwrap()
+      .run(scope)
+      .unwrap();
+    scope.perform_microtask_checkpoint();
+
+    let check = v8::String::new(scope, "events.join('\\n')").unwrap();
+    let actual = v8::Script::compile(scope, check, None)
+      .unwrap()
+      .run(scope)
+      .unwrap()
+      .to_rust_string_lossy(scope);
+    assert_eq!(
+      actual,
+      [
+        "init p1",
+        "init p2",
+        "resolve p2",
+        "init p3 from p2",
+        "before p3",
+        "init p4",
+        "resolve p4",
+        "init p5 from p4",
+        "resolve p1",
+        "resolve p3",
+        "after p3",
+        "before p5",
+        "resolve p5",
+        "after p5",
+      ]
+      .join("\n")
+    );
   }
 
   fn assert_unbound_script_preserves_origin() {
