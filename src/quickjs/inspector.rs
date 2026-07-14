@@ -41,8 +41,10 @@ pub(crate) struct CompletedCpuProfile {
 #[derive(Debug)]
 pub(crate) struct CpuProfilerState {
   active: bool,
+  is_idle: bool,
   interval: Duration,
   started_at: Option<Instant>,
+  idle_since: Option<Instant>,
   start_time_us: u64,
   last_sample_at: Option<Instant>,
   samples: Vec<CpuProfileSample>,
@@ -52,8 +54,10 @@ impl CpuProfilerState {
   pub(crate) fn new() -> Self {
     Self {
       active: false,
+      is_idle: false,
       interval: Duration::from_micros(1_000),
       started_at: None,
+      idle_since: None,
       start_time_us: 0,
       last_sample_at: None,
       samples: Vec::new(),
@@ -70,6 +74,7 @@ impl CpuProfilerState {
     let now = Instant::now();
     self.active = true;
     self.started_at = Some(now);
+    self.idle_since = self.is_idle.then_some(now);
     self.start_time_us = SystemTime::now()
       .duration_since(SystemTime::UNIX_EPOCH)
       .unwrap_or_default()
@@ -80,6 +85,7 @@ impl CpuProfilerState {
   }
 
   fn finish(&mut self) -> CompletedCpuProfile {
+    self.record_idle_until(Instant::now());
     let elapsed_us = self
       .started_at
       .map(|start| start.elapsed().as_micros())
@@ -87,12 +93,68 @@ impl CpuProfilerState {
       .min(u64::MAX as u128) as u64;
     self.active = false;
     self.started_at = None;
+    self.idle_since = None;
     self.last_sample_at = None;
     CompletedCpuProfile {
       start_time_us: self.start_time_us,
       end_time_us: self.start_time_us.saturating_add(elapsed_us),
       samples: std::mem::take(&mut self.samples),
     }
+  }
+
+  pub(crate) fn set_idle(&mut self, is_idle: bool) {
+    if self.is_idle == is_idle {
+      return;
+    }
+    let now = Instant::now();
+    if is_idle {
+      self.is_idle = true;
+      if self.active {
+        self.idle_since = Some(now);
+      }
+    } else {
+      self.record_idle_until(now);
+      self.is_idle = false;
+      self.idle_since = None;
+    }
+  }
+
+  fn record_idle_until(&mut self, now: Instant) {
+    if !self.active {
+      return;
+    }
+    let (Some(started_at), Some(idle_since)) =
+      (self.started_at, self.idle_since)
+    else {
+      return;
+    };
+    let interval_us = self.interval.as_micros().max(1);
+    let start_us = idle_since.saturating_duration_since(started_at).as_micros();
+    let end_us = now.saturating_duration_since(started_at).as_micros();
+    let first_sample_us = start_us.saturating_add(interval_us);
+    if first_sample_us > end_us {
+      return;
+    }
+
+    let idle_frame = CpuProfileFrame {
+      function_name: "(idle)".to_string(),
+      url: String::new(),
+      line_number: -1,
+      column_number: -1,
+    };
+    let sample_count = ((end_us - first_sample_us) / interval_us) + 1;
+    self
+      .samples
+      .reserve(sample_count.min(usize::MAX as u128) as usize);
+    for index in 0..sample_count {
+      let timestamp_us = first_sample_us.saturating_add(index * interval_us);
+      self.samples.push(CpuProfileSample {
+        frames: vec![idle_frame.clone()],
+        timestamp_us: timestamp_us.min(u64::MAX as u128) as u64,
+      });
+    }
+    self.last_sample_at = Some(now);
+    self.idle_since = Some(now);
   }
 }
 

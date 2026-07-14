@@ -1256,9 +1256,13 @@ pub extern "C" fn v8__Isolate__RemoveNearHeapLimitCallback(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetIdle(
-  _isolate: *mut RealIsolate,
-  _is_idle: bool,
+  isolate: *mut RealIsolate,
+  is_idle: bool,
 ) {
+  if isolate.is_null() {
+    return;
+  }
+  iso_state(isolate).cpu_profiler.set_idle(is_idle);
 }
 
 #[unsafe(no_mangle)]
