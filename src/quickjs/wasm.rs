@@ -573,10 +573,13 @@ mod tests {
           0x06, 0x67, 0x6c, 0x6f, 0x62, 0x61, 0x6c, 0x03,
           0x00, 0x0a, 0x05, 0x01, 0x03, 0x00, 0x00, 0x0b,
         ]);
-        const { func, memory, table } = new WebAssembly.Instance(
+        const instance = new WebAssembly.Instance(
           new WebAssembly.Module(bytes),
-        ).exports;
+        );
+        const { func, memory, table } = instance.exports;
         [
+          instance instanceof WebAssembly.Instance,
+          Object.prototype.toString.call(instance),
           func.name,
           memory instanceof WebAssembly.Memory,
           table instanceof WebAssembly.Table,
@@ -601,7 +604,7 @@ mod tests {
       assert!(!actual.is_null());
       assert_eq!(
         std::slice::from_raw_parts(actual as *const u8, len),
-        b"0|true|true|[object WebAssembly.Memory]|[object WebAssembly.Table]|0|0"
+        b"true|[object WebAssembly.Instance]|0|true|true|[object WebAssembly.Memory]|[object WebAssembly.Table]|0|0"
       );
 
       JS_FreeCString(ctx, actual);
@@ -1775,6 +1778,7 @@ unsafe fn instantiate(
 
   let inst_obj = unsafe { JS_NewObject(ctx) };
   unsafe { JS_SetPropertyStr(ctx, inst_obj, c"exports".as_ptr(), exports) };
+  unsafe { set_wasm_object_prototype(ctx, inst_obj, c"Instance") };
   Ok(inst_obj)
 }
 
