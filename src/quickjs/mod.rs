@@ -447,6 +447,77 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn async_rejection_stack_deduplicates_await_site() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = c"globalThis.sameSiteStack = 'pending';
+        globalThis.parentStack = 'pending';
+        (async function sameSite() {
+          try {
+            await Promise.reject(new Error('same site'));
+          } catch (error) {
+            globalThis.sameSiteStack = error.stack;
+          }
+        })();
+        async function child() { await 0; throw new Error('child'); }
+        (async function parent() { try { await child(); } catch (error) {
+          globalThis.parentStack = error.stack;
+        } })();";
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"async-stack-test.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "eval threw");
+      JS_FreeValue(ctx, result);
+
+      let mut job_ctx = ptr::null_mut();
+      while JS_IsJobPending(rt) {
+        assert!(JS_ExecutePendingJob(rt, &mut job_ctx) >= 0);
+      }
+
+      let result = JS_Eval(
+        ctx,
+        c"sameSiteStack + '\\n---\\n' + parentStack".as_ptr(),
+        c"sameSiteStack + '\\n---\\n' + parentStack"
+          .to_bytes()
+          .len(),
+        c"async-stack-test.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "result access threw");
+      let mut len = 0;
+      let text = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!text.is_null());
+      let actual =
+        std::str::from_utf8(std::slice::from_raw_parts(text as *const u8, len))
+          .unwrap();
+      let (same_site, parent) = actual.split_once("\n---\n").unwrap();
+      assert_eq!(
+        same_site.matches("async-stack-test.js:5:").count(),
+        1,
+        "same await site was duplicated:\n{same_site}"
+      );
+      assert!(
+        parent.contains("at async parent (async-stack-test.js:11:"),
+        "missing async parent frame:\n{parent}"
+      );
+
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn marking_rejected_promise_handled_notifies_tracker() {
     unsafe {
       UNHANDLED_REJECTIONS.store(0, Ordering::SeqCst);

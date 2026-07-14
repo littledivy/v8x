@@ -1,0 +1,148 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -21699,14 +21699,81 @@
+     JS_FreeAtom(ctx, atom);
+     return skip;
+ }
++
++static bool js_v82jsc_text_stack_has_same_async_site(JSContext *ctx,
++                                                      JSValueConst stack,
++                                                      const char *file,
++                                                      int line,
++                                                      const char *func)
++{
++    const char *text, *frame, *frame_end, *match, *p;
++    const char *func_start, *func_end;
++    size_t len, file_len, func_len;
++    int site_line;
++    bool same = false;
+ 
++    if (!JS_IsString(stack) || line < 0)
++        return false;
++    text = JS_ToCStringLen(ctx, &len, stack);
++    if (!text) {
++        if (JS_HasException(ctx))
++            JS_FreeValue(ctx, JS_GetException(ctx));
++        return false;
++    }
++    frame = text;
++    while (frame < text + len && strncmp(frame, "    at ", 7)) {
++        frame = memchr(frame, '\n', text + len - frame);
++        if (!frame)
++            goto done;
++        frame++;
++    }
++    frame_end = memchr(frame, '\n', text + len - frame);
++    if (!frame_end)
++        frame_end = text + len;
++    file_len = strlen(file);
++    for (match = frame;
++         (size_t)(frame_end - match) > file_len;
++         match++) {
++        if (memcmp(match, file, file_len) || match[file_len] != ':')
++            continue;
++        p = match + file_len + 1;
++        if (p >= frame_end || *p < '0' || *p > '9')
++            continue;
++        site_line = 0;
++        do {
++            site_line = site_line * 10 + (*p++ - '0');
++        } while (p < frame_end && *p >= '0' && *p <= '9');
++        if (site_line != line)
++            continue;
++        if (func && (size_t)(match - frame) >= 9 && match[-1] == '(' &&
++            match[-2] == ' ') {
++            func_start = frame + 7;
++            if (frame_end - func_start >= 6 &&
++                !memcmp(func_start, "async ", 6))
++                func_start += 6;
++            func_end = match - 2;
++            func_len = strlen(func);
++            if ((size_t)(func_end - func_start) != func_len ||
++                memcmp(func_start, func, func_len))
++                continue;
++        }
++        same = true;
++        break;
++    }
++ done:
++    JS_FreeCString(ctx, text);
++    return same;
++}
++
+ static bool js_v82jsc_has_same_async_site(JSContext *ctx,
+                                            JSValueConst error,
+-                                           const char *file, int line)
++                                           const char *file, int line,
++                                           const char *func)
+ {
+     JSAtom key_atom;
+-    JSValue existing, site, method, file_value, line_value;
+-    const char *site_file;
++    JSValue existing, site, method, file_value, line_value, func_value;
++    JSObject *error_obj;
++    const char *site_file, *site_func;
+     int32_t site_line = 0;
+     bool same = false;
+ 
+@@ -21718,7 +21785,13 @@
+     JS_FreeAtom(ctx, key_atom);
+     if (!JS_IsArray(existing)) {
+         JS_FreeValue(ctx, existing);
+-        return false;
++        error_obj = JS_VALUE_GET_OBJ(error);
++        if (error_obj->class_id != JS_CLASS_ERROR)
++            return false;
++        if (!js_error_stack_is_pending(ctx, error_obj->u.object_data))
++            return js_v82jsc_text_stack_has_same_async_site(
++                ctx, error_obj->u.object_data, file, line, func);
++        existing = js_dup(error_obj->u.object_data);
+     }
+     site = JS_GetPropertyUint32(ctx, existing, 0);
+     JS_FreeValue(ctx, existing);
+@@ -21732,16 +21805,25 @@
+     JS_FreeValue(ctx, method);
+     method = JS_GetPropertyStr(ctx, site, "getLineNumber");
+     line_value = JS_IsFunction(ctx, method)
++        ? JS_Call(ctx, method, site, 0, NULL) : JS_UNDEFINED;
++    JS_FreeValue(ctx, method);
++    method = JS_GetPropertyStr(ctx, site, "getFunctionName");
++    func_value = JS_IsFunction(ctx, method)
+         ? JS_Call(ctx, method, site, 0, NULL) : JS_UNDEFINED;
+     JS_FreeValue(ctx, method);
+     JS_FreeValue(ctx, site);
+     site_file = JS_ToCString(ctx, file_value);
++    site_func = JS_IsString(func_value) ? JS_ToCString(ctx, func_value) : NULL;
+     if (site_file && JS_ToInt32(ctx, &site_line, line_value) == 0)
+-        same = !strcmp(site_file, file) && (line < 0 || site_line == line);
++        same = !strcmp(site_file, file) && (line < 0 || site_line == line) &&
++               (!func || !site_func || !strcmp(site_func, func));
+     if (site_file)
+         JS_FreeCString(ctx, site_file);
++    if (site_func)
++        JS_FreeCString(ctx, site_func);
+     JS_FreeValue(ctx, file_value);
+     JS_FreeValue(ctx, line_value);
++    JS_FreeValue(ctx, func_value);
+     if (JS_HasException(ctx))
+         JS_FreeValue(ctx, JS_GetException(ctx));
+     return same;
+@@ -21772,7 +21854,7 @@
+     skip_marked = js_v82jsc_take_skip_next_async_frame(ctx, error, file);
+     if (skip_marked == 2 ||
+         (skip_marked == 1 &&
+-         js_v82jsc_has_same_async_site(ctx, error, file, -1)))
++         js_v82jsc_has_same_async_site(ctx, error, file, -1, NULL)))
+         return;
+     error_obj = JS_VALUE_GET_OBJ(error);
+     stack_prop = find_own_property1(error_obj, JS_ATOM_stack);
+@@ -21780,7 +21862,7 @@
+         (stack_prop->flags & JS_PROP_TMASK) == JS_PROP_GETSET &&
+         !js_error_has_native_stack_accessor(ctx, error_obj))
+         return;
+-    if (js_v82jsc_has_same_async_site(ctx, error, file, line))
++    if (js_v82jsc_has_same_async_site(ctx, error, file, line, func))
+         return;
+     stack = JS_GetProperty(ctx, error, JS_ATOM_stack);
+     if (JS_IsException(stack)) {
