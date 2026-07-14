@@ -3158,7 +3158,9 @@ pub(crate) fn is_module_object(this: *const Value) -> bool {
 }
 
 pub(crate) fn is_module_value(ctx: *mut JSContext, value: JSValue) -> bool {
-  !ctx.is_null() && unsafe { obj_module_id(ctx, value) }.is_some()
+  !ctx.is_null()
+    && jsv_is_object(&value)
+    && unsafe { obj_module_id(ctx, value) }.is_some()
 }
 
 fn compiled_from_entry(entry: &ModuleEntry) -> *mut c_void {
