@@ -1309,6 +1309,7 @@ mod api_test {
     assert_continuation_data_survives_await();
     assert_snapshot_context_data_preserves_global_identity();
     assert_detached_array_buffer_view_contents();
+    assert_detached_backing_store_deleter_runs_once();
     assert_large_array_buffers();
     assert_empty_shared_backing_store_has_null_data();
     assert_backing_store_survives_isolate();
@@ -1352,6 +1353,42 @@ mod api_test {
     let code = v8::String::new(scope, "40 + 2").unwrap();
     let script = v8::Script::compile(scope, code, None).unwrap();
     assert_eq!(script.run(scope).unwrap().integer_value(scope), Some(42));
+  }
+
+  fn assert_detached_backing_store_deleter_runs_once() {
+    static DELETER_CALLS: std::sync::atomic::AtomicUsize =
+      std::sync::atomic::AtomicUsize::new(0);
+
+    unsafe extern "C" fn count_deleter(
+      _data: *mut std::ffi::c_void,
+      _byte_length: usize,
+      _deleter_data: *mut std::ffi::c_void,
+    ) {
+      DELETER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    DELETER_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+    let mut data = [0u8; 1];
+    {
+      let isolate = &mut v8::Isolate::new(Default::default());
+      let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+      let scope = &mut scope.init();
+      let context = v8::Context::new(scope, Default::default());
+      let scope = &mut v8::ContextScope::new(scope, context);
+      let backing_store = unsafe {
+        v8::ArrayBuffer::new_backing_store_from_ptr(
+          data.as_mut_ptr() as *mut std::ffi::c_void,
+          data.len(),
+          count_deleter,
+          std::ptr::null_mut(),
+        )
+      }
+      .make_shared();
+      let buffer = v8::ArrayBuffer::with_backing_store(scope, &backing_store);
+      assert!(buffer.detach(None).unwrap());
+    }
+
+    assert_eq!(DELETER_CALLS.load(std::sync::atomic::Ordering::SeqCst), 1);
   }
 
   fn assert_large_array_buffers() {
