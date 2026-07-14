@@ -2197,6 +2197,11 @@ mod cdp {
     let params = unsafe { JS_GetPropertyStr(ctx, parsed, c"params".as_ptr()) };
 
     match method.as_str() {
+      "Debugger.enable" => unsafe {
+        let response = JS_NewObject(ctx);
+        set_str(ctx, response, c"debuggerId", "1");
+        send_obj(sess, ctx, response, Some(id));
+      },
       "Profiler.enable" => unsafe { ack(sess, ctx, id) },
       "Profiler.disable" | "Profiler.stopPreciseCoverage" => unsafe {
         super::stop_precise_coverage();
