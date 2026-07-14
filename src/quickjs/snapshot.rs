@@ -2354,6 +2354,49 @@ mod tests {
   }
 
   #[test]
+  fn context_global_preserves_private_atoms() {
+    let source = TestContext::new();
+    let setup = source.eval(
+      "(() => {\
+         class PrivateState {\
+           #value = 41;\
+           read() { return this.#value; }\
+         }\
+         globalThis.privateState = new PrivateState();\
+         globalThis.verifyPrivateState = () =>\
+           privateState.read() +\
+           (Object.getOwnPropertySymbols(privateState).length === 0 ? 1 : 100);\
+       })()",
+    );
+    unsafe { JS_FreeValue(source.context, setup) };
+    let source_global = unsafe { JS_GetGlobalObject(source.context) };
+    let bytes = write_object_bytes(source.context, source_global, &[]).unwrap();
+    unsafe { JS_FreeValue(source.context, source_global) };
+
+    let target = TestContext::new();
+    let restored =
+      deserialize_value_with_refs(target.context, &bytes, &[]).unwrap();
+
+    unsafe {
+      let verify = JS_GetPropertyStr(
+        target.context,
+        restored,
+        c"verifyPrivateState".as_ptr(),
+      );
+      let result =
+        JS_Call(target.context, verify, restored, 0, ptr::null_mut());
+      assert!(!jsv_is_exception(&result));
+      let mut checks = 0;
+      assert_eq!(JS_ToInt32(target.context, &mut checks, result), 0);
+      assert_eq!(checks, 42);
+
+      JS_FreeValue(target.context, result);
+      JS_FreeValue(target.context, verify);
+      JS_FreeValue(target.context, restored);
+    }
+  }
+
+  #[test]
   fn bytecode_functions_roundtrip_shared_closure_state() {
     let test = TestContext::new();
     let source_value = test.eval(
