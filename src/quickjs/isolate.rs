@@ -1032,6 +1032,7 @@ pub(crate) unsafe extern "C" fn terminate_interrupt_handler(
   if iso.is_null() {
     return 0;
   }
+  super::inspector::maybe_pause_on_next_statement();
   unsafe { super::inspector::maybe_collect_cpu_profile_sample(iso, rt) };
   run_pending_interrupts(iso);
   maybe_drive_near_heap_limit_callback(iso);

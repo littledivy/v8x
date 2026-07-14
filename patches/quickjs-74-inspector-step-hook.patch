@@ -1,59 +1,14 @@
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -7950,6 +7950,7 @@ fail:
+@@ -2242,6 +2242,11 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
+     rt->interrupt_opaque = opaque;
  }
  
- static _Thread_local bool v82jsc_precise_coverage_enabled;
-+static _Thread_local bool v82jsc_inspector_statement_scheduled;
- 
- extern void v82jsc_coverage_function(const void *key,
-                                      const char *function_name,
-@@ -7974,11 +7975,17 @@ extern void v82jsc_coverage_range_hit(const void *key,
-                                       uint32_t end);
- extern void v82jsc_coverage_function_hit(const void *key);
- extern void v82jsc_debugger_statement(void);
-+extern void v82jsc_inspector_statement(void);
- 
- void JS_SetPreciseCoverageEnabled(bool enabled)
- {
-     v82jsc_precise_coverage_enabled = enabled;
- }
- 
-+void JS_SetInspectorStatementScheduled(bool scheduled)
++void JS_TriggerInterrupt(JSContext *ctx)
 +{
-+    v82jsc_inspector_statement_scheduled = scheduled;
++    ctx->interrupt_counter = 0;
 +}
 +
- static void js_coverage_register_function(JSFunctionBytecode *b)
+ void JS_SetCanBlock(JSRuntime *rt, bool can_block)
  {
-@@ -20974,6 +20981,12 @@ restart:
-         CASE(OP_debugger):
-             v82jsc_debugger_statement();
-             BREAK;
-+        CASE(OP_inspector_statement):
-+            if (unlikely(v82jsc_inspector_statement_scheduled)) {
-+                v82jsc_inspector_statement_scheduled = false;
-+                v82jsc_inspector_statement();
-+            }
-+            BREAK;
-         CASE(OP_nop):
-             BREAK;
-         CASE(OP_is_undefined_or_null):
-@@ -24951,6 +24964,7 @@ static void emit_source_loc_at(JSParseState *s, int line_num, int col_num)
-     dbuf_putc(bc, OP_source_loc);
-     dbuf_put_u32(bc, line_num);
-     dbuf_put_u32(bc, col_num);
-+    dbuf_putc(bc, OP_inspector_statement);
- }
- 
- static void emit_source_loc(JSParseState *s)
---- a/quickjs-opcode.h
-+++ b/quickjs-opcode.h
-@@ -373,6 +373,7 @@ DEF(        is_null, 1, 1, 1, none)
- DEF(typeof_is_undefined, 1, 1, 1, none)
- DEF( typeof_is_function, 1, 1, 1, none)
- DEF(            debugger, 1, 0, 0, none)
-+DEF( inspector_statement, 1, 0, 0, none)
- 
- #undef DEF
- #undef def
+     rt->can_block = can_block;

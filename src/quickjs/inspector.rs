@@ -510,7 +510,7 @@ unsafe extern "C" {
     val: JSValue,
     flags: std::ffi::c_int,
   ) -> std::ffi::c_int;
-  fn JS_SetInspectorStatementScheduled(scheduled: bool);
+  fn JS_TriggerInterrupt(ctx: *mut JSContext);
 }
 
 #[inline]
@@ -861,7 +861,10 @@ fn schedule_pause_on_next_statement(
       scheduled: true,
     });
   });
-  unsafe { JS_SetInspectorStatementScheduled(true) };
+  let ctx = crate::quickjs::core::current_ctx();
+  if !ctx.is_null() {
+    unsafe { JS_TriggerInterrupt(ctx) };
+  }
 }
 
 fn cancel_pause_on_next_statement(
@@ -883,7 +886,6 @@ fn cancel_pause_on_next_statement(
       }
     }
   });
-  unsafe { JS_SetInspectorStatementScheduled(false) };
 }
 
 fn activate_debugger_session(
@@ -902,7 +904,6 @@ fn activate_debugger_session(
       scheduled: false,
     });
   });
-  unsafe { JS_SetInspectorStatementScheduled(false) };
 }
 
 fn deactivate_debugger_session(
@@ -956,7 +957,6 @@ pub(crate) fn maybe_pause_on_next_statement() {
       return None;
     }
     state.scheduled = false;
-    unsafe { JS_SetInspectorStatementScheduled(false) };
     Some(*state)
   }) else {
     return;
@@ -971,11 +971,6 @@ pub extern "C" fn v82jsc_debugger_statement() {
     return;
   };
   pause_inspector(state);
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn v82jsc_inspector_statement() {
-  maybe_pause_on_next_statement();
 }
 
 #[unsafe(no_mangle)]

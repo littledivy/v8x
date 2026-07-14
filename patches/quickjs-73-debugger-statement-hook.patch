@@ -32,11 +32,11 @@
      case TOK_ENUM:
 --- a/quickjs-opcode.h
 +++ b/quickjs-opcode.h
-@@ -372,6 +372,7 @@ DEF(   is_undefined, 1, 1, 1, none)
- DEF(        is_null, 1, 1, 1, none)
- DEF(typeof_is_undefined, 1, 1, 1, none)
- DEF( typeof_is_function, 1, 1, 1, none)
-+DEF(            debugger, 1, 0, 0, none)
+@@ -268,6 +268,7 @@ DEF(using_dispose_async, 3, 0, 1, loc)
+ DEF(using_dispose_merge, 1, 2, 1, none)
+ DEF(  using_dispose_end, 1, 1, 0, none)
+ DEF(        using_check, 2, 1, 2, u8)
++DEF(       debugger, 1, 0, 0, none)
+ /* must be the last non short and non temporary opcode */
+ DEF(            nop, 1, 0, 0, none)
  
- #undef DEF
- #undef def
