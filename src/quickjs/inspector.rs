@@ -1751,6 +1751,36 @@ mod cdp {
     unsafe { send_obj(sess, ctx, notif, None) };
   }
 
+  unsafe fn handle_runtime_get_heap_usage(
+    sess: &CdpSession,
+    ctx: *mut JSContext,
+    call_id: i32,
+  ) {
+    let mut usage = JSMemoryUsage::default();
+    let runtime = unsafe { JS_GetRuntime(ctx) };
+    if !runtime.is_null() {
+      unsafe { JS_ComputeMemoryUsage(runtime, &mut usage) };
+    }
+    let used_size = usage.malloc_size.max(usage.memory_used_size).max(0);
+    let total_size = usage.malloc_limit.max(used_size).max(0);
+    let response = unsafe { JS_NewObject(ctx) };
+    unsafe {
+      set_val(
+        ctx,
+        response,
+        c"usedSize",
+        JS_NewFloat64(ctx, used_size as f64),
+      );
+      set_val(
+        ctx,
+        response,
+        c"totalSize",
+        JS_NewFloat64(ctx, total_size as f64),
+      );
+      send_obj(sess, ctx, response, Some(call_id));
+    }
+  }
+
   unsafe fn handle_evaluate(
     sess: &mut CdpSession,
     ctx: *mut JSContext,
@@ -2531,6 +2561,9 @@ mod cdp {
       "Profiler.start" => unsafe { handle_profiler_start(sess, ctx, id) },
       "Profiler.stop" => unsafe { handle_profiler_stop(sess, ctx, id) },
       "Runtime.enable" => unsafe { handle_runtime_enable(sess, ctx, id) },
+      "Runtime.getHeapUsage" => unsafe {
+        handle_runtime_get_heap_usage(sess, ctx, id)
+      },
       "Runtime.evaluate" => unsafe { handle_evaluate(sess, ctx, params, id) },
       "Runtime.callFunctionOn" => unsafe {
         handle_call_function_on(sess, ctx, params, id)
