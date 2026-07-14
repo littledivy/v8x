@@ -1257,6 +1257,18 @@ pub extern "C" fn v8_inspector__V8Inspector__contextDestroyed(
     return;
   }
   let state = unsafe { &*this.cast::<InspectorState>() };
+  if !state.channel.is_null() {
+    send_channel_notification(
+      state.channel,
+      r#"{"method":"Runtime.executionContextDestroyed","params":{"executionContextId":1,"executionContextUniqueId":"1"}}"#.to_string(),
+    );
+    unsafe {
+      v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
+        state.channel,
+      );
+    }
+  }
+  deactivate_runtime_session(state.channel);
   ACTIVE_INSPECTOR_CLIENT.with(|slot| {
     let mut slot = slot.borrow_mut();
     if matches!(*slot, Some((client, _)) if client == state.client) {
