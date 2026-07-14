@@ -1202,6 +1202,7 @@ mod api_test {
     assert_async_iterator_close_is_awaited();
     assert_native_promise_then_ignores_monkeypatch();
     assert_promise_hooks_follow_continuations();
+    assert_bigint_words_preserve_u64_max();
     assert_wasm_streaming_respects_explicit_microtasks();
     assert_duplicate_module_requests_resolve_once();
 
@@ -1735,6 +1736,27 @@ mod api_test {
       ]
       .join("\n")
     );
+  }
+
+  fn assert_bigint_words_preserve_u64_max() {
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let source = v8::String::new(scope, "0xffffffffffffffffn").unwrap();
+    let value = v8::Script::compile(scope, source, None)
+      .unwrap()
+      .run(scope)
+      .unwrap();
+    let bigint = v8::Local::<v8::BigInt>::try_from(value).unwrap();
+    assert_eq!(bigint.word_count(), 1);
+    let mut words = [0];
+    let (negative, written) = bigint.to_words_array(&mut words);
+    assert!(!negative);
+    assert_eq!(written.len(), 1);
+    assert_eq!(words, [u64::MAX]);
   }
 
   fn assert_unbound_script_preserves_origin() {

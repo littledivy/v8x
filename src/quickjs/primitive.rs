@@ -426,16 +426,23 @@ pub extern "C" fn v8__BigInt__ToWordsArray(
 unsafe fn bigint_word_at(ctx: *mut JSContext, dec: &str, i: usize) -> u64 {
   let shift = 64u64 * i as u64;
   let src = format!(
-    "(()=>{{let x=BigInt(\"{dec}\");if(x<0n)x=-x;return BigInt.asUintN(64,x>>{shift}n).toString();}})()"
+    "(()=>{{let x=BigInt(\"{dec}\");if(x<0n)x=-x;return BigInt.asUintN(64,x>>{shift}n);}})()"
   );
   let r = eval(ctx, &src);
   if r.tag == JS_TAG_EXCEPTION {
     JS_FreeValue(ctx, r);
     return 0;
   }
-  let s = to_dec_string(ctx, r);
+  let mut word = 0;
+  let rc = JS_ToBigUint64(ctx, &mut word, r);
   JS_FreeValue(ctx, r);
-  s.parse::<u64>().unwrap_or(0)
+  if rc == 0 {
+    word
+  } else {
+    let exc = JS_GetException(ctx);
+    JS_FreeValue(ctx, exc);
+    0
+  }
 }
 
 #[unsafe(no_mangle)]
