@@ -1197,6 +1197,7 @@ mod api_test {
     assert_global_drop_uses_owning_isolate();
     assert_internal_globals_are_not_enumerable();
     assert_suspended_async_capture_survives_gc();
+    assert_async_iterator_close_is_awaited();
     assert_wasm_streaming_respects_explicit_microtasks();
     assert_duplicate_module_requests_resolve_once();
 
@@ -1318,6 +1319,57 @@ mod api_test {
     let source = v8::String::new(scope, "observed").unwrap();
     let script = v8::Script::compile(scope, source, None).unwrap();
     assert_eq!(script.run(scope).unwrap().integer_value(scope), Some(42));
+  }
+
+  fn assert_async_iterator_close_is_awaited() {
+    let isolate = &mut v8::Isolate::new(Default::default());
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let source = v8::String::new(
+      scope,
+      "globalThis.asyncIteratorCloseResult = null;\
+       const iterator = returnMethod => ({\
+         [Symbol.asyncIterator]() {\
+           return {\
+             next() { return Promise.resolve({ value: 1, done: false }); },\
+             return: returnMethod,\
+           };\
+         },\
+       });\
+       (async () => {\
+         let breakClosed = false;\
+         for await (const _ of iterator(async () => {\
+           await 0; breakClosed = true; return {};\
+         })) { break; }\
+         let returnClosed = false;\
+         const returnValue = await (async () => {\
+           for await (const _ of iterator(async () => {\
+             await 0; returnClosed = true; return {};\
+           })) { return 42; }\
+         })();\
+         let primitiveRejected = false;\
+         try {\
+           for await (const _ of iterator(async () => 1)) { break; }\
+         } catch (error) {\
+           primitiveRejected = error instanceof TypeError;\
+         }\
+         asyncIteratorCloseResult =\
+           `${breakClosed}:${returnClosed}:${returnValue}:${primitiveRejected}`;\
+       })();",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    script.run(scope).unwrap();
+    scope.perform_microtask_checkpoint();
+
+    let source = v8::String::new(scope, "asyncIteratorCloseResult").unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    assert_eq!(
+      script.run(scope).unwrap().to_rust_string_lossy(scope),
+      "true:true:42:true",
+    );
   }
 
   fn assert_wasm_streaming_respects_explicit_microtasks() {
