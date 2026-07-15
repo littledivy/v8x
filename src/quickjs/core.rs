@@ -198,9 +198,10 @@ fn rewrite_script_source(source: &str) -> Option<String> {
   rewritten
 }
 
-fn rewrite_v8_native_intrinsics(source: &str) -> Option<String> {
+pub(crate) fn rewrite_v8_native_intrinsics(source: &str) -> Option<String> {
   if !source.contains("%PrepareFunctionForOptimization")
     && !source.contains("%OptimizeFunctionOnNextCall")
+    && !source.contains("%NeverOptimizeFunction")
     && !source.contains("%AtomicsNumWaitersForTesting")
     && !source.contains("%AtomicsNumUnresolvedAsyncPromisesForTesting")
   {
@@ -228,6 +229,17 @@ fn rewrite_v8_native_intrinsics(source: &str) -> Option<String> {
         out.push_str(
           "(globalThis.__v8x_fast_api_next_call=((globalThis.__v8x_fast_api_next_call|0)+1),void (",
         );
+        out.push_str(args);
+        out.push_str("))");
+        pos = end;
+        continue;
+      }
+    }
+    if source[pos..].starts_with("%NeverOptimizeFunction(") {
+      if let Some((end, args)) =
+        read_intrinsic_args(source, pos, "%NeverOptimizeFunction")
+      {
+        out.push_str("(void (");
         out.push_str(args);
         out.push_str("))");
         pos = end;
@@ -295,6 +307,25 @@ fn read_intrinsic_args<'a>(
     pos += 1;
   }
   None
+}
+
+#[cfg(test)]
+mod v8_native_intrinsic_tests {
+  use super::rewrite_v8_native_intrinsics;
+
+  #[test]
+  fn rewrites_optimization_intrinsics() {
+    let source = concat!(
+      "%PrepareFunctionForOptimization(f);",
+      "%NeverOptimizeFunction(g);",
+      "%OptimizeFunctionOnNextCall(f);",
+    );
+    let rewritten = rewrite_v8_native_intrinsics(source).unwrap();
+    assert!(!rewritten.contains('%'));
+    assert!(rewritten.contains("void (f)"));
+    assert!(rewritten.contains("void (g)"));
+    assert!(rewritten.contains("__v8x_fast_api_next_call"));
+  }
 }
 
 pub(crate) fn note_compilation_cache_miss() {

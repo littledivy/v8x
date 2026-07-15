@@ -364,8 +364,11 @@ struct RawCFunction {
 }
 
 const CTYPE_VOID: u8 = 0;
+const CTYPE_BOOL: u8 = 1;
 const CTYPE_UINT32: u8 = 4;
 const CTYPE_UINT64: u8 = 6;
+const CTYPE_FLOAT32: u8 = 7;
+const CTYPE_FLOAT64: u8 = 8;
 const CTYPE_POINTER: u8 = 9;
 const CTYPE_V8_VALUE: u8 = 10;
 const CTYPE_SEQ_ONE_BYTE_STRING: u8 = 11;
@@ -2304,6 +2307,27 @@ unsafe fn call_fast_overload(
 
   let result =
     match (info.return_info_.type_, arg_types.as_slice(), has_options) {
+      (CTYPE_POINTER, [CTYPE_V8_VALUE], true) => {
+        let f: unsafe fn(
+          Local<'static, Object>,
+          *mut crate::fast_api::FastApiCallbackOptions<'static>,
+        ) -> *mut c_void = unsafe { std::mem::transmute(overload.address_) };
+        let out = unsafe { f(recv, options_ptr) };
+        if out.is_null() {
+          jsv_null()
+        } else {
+          make_external_jsvalue(iso, ctx, out)
+        }
+      }
+      (CTYPE_BOOL, [CTYPE_V8_VALUE, CTYPE_V8_VALUE], true) => {
+        let value = unsafe { fast_local_value(ctx, js_argv(argc, argv, 0)?) };
+        let f: unsafe fn(
+          Local<'static, Object>,
+          Local<'static, Value>,
+          *mut crate::fast_api::FastApiCallbackOptions<'static>,
+        ) -> bool = unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewBool(ctx, f(recv, value, options_ptr) as c_int) }
+      }
       (CTYPE_UINT32, [CTYPE_V8_VALUE, CTYPE_UINT32, CTYPE_UINT32], true) => {
         let a = unsafe { fast_u32(ctx, js_argv(argc, argv, 0)?)? };
         let b = unsafe { fast_u32(ctx, js_argv(argc, argv, 1)?)? };
@@ -2314,6 +2338,71 @@ unsafe fn call_fast_overload(
           *mut crate::fast_api::FastApiCallbackOptions<'static>,
         ) -> u32 = unsafe { std::mem::transmute(overload.address_) };
         unsafe { JS_NewUint32(ctx, f(recv, a, b, options_ptr)) }
+      }
+      (CTYPE_UINT32, [CTYPE_V8_VALUE, CTYPE_UINT64, CTYPE_UINT64], true) => {
+        let a = unsafe { fast_u64(ctx, js_argv(argc, argv, 0)?, info.repr_)? };
+        let b = unsafe { fast_u64(ctx, js_argv(argc, argv, 1)?, info.repr_)? };
+        let f: unsafe fn(
+          Local<'static, Object>,
+          u64,
+          u64,
+          *mut crate::fast_api::FastApiCallbackOptions<'static>,
+        ) -> u32 = unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewUint32(ctx, f(recv, a, b, options_ptr)) }
+      }
+      (CTYPE_FLOAT32, [CTYPE_V8_VALUE, CTYPE_FLOAT32, CTYPE_FLOAT32], true) => {
+        let a = unsafe { fast_f64(ctx, js_argv(argc, argv, 0)?)? } as f32;
+        let b = unsafe { fast_f64(ctx, js_argv(argc, argv, 1)?)? } as f32;
+        let f: unsafe fn(
+          Local<'static, Object>,
+          f32,
+          f32,
+          *mut crate::fast_api::FastApiCallbackOptions<'static>,
+        ) -> f32 = unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewFloat64(ctx, f(recv, a, b, options_ptr) as f64) }
+      }
+      (CTYPE_FLOAT64, [CTYPE_V8_VALUE, CTYPE_FLOAT64, CTYPE_FLOAT64], true) => {
+        let a = unsafe { fast_f64(ctx, js_argv(argc, argv, 0)?)? };
+        let b = unsafe { fast_f64(ctx, js_argv(argc, argv, 1)?)? };
+        let f: unsafe fn(
+          Local<'static, Object>,
+          f64,
+          f64,
+          *mut crate::fast_api::FastApiCallbackOptions<'static>,
+        ) -> f64 = unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewFloat64(ctx, f(recv, a, b, options_ptr)) }
+      }
+      (CTYPE_UINT32, [CTYPE_V8_VALUE, CTYPE_UINT32], true) => {
+        let value = unsafe { fast_u32(ctx, js_argv(argc, argv, 0)?)? };
+        let f: unsafe fn(
+          Local<'static, Object>,
+          u32,
+          *mut crate::fast_api::FastApiCallbackOptions<'static>,
+        ) -> u32 = unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewUint32(ctx, f(recv, value, options_ptr)) }
+      }
+      (CTYPE_UINT32, [CTYPE_V8_VALUE, CTYPE_V8_VALUE, CTYPE_UINT64], true) => {
+        let value = unsafe { fast_local_value(ctx, js_argv(argc, argv, 0)?) };
+        let len =
+          unsafe { fast_u64(ctx, js_argv(argc, argv, 1)?, info.repr_)? };
+        let f: unsafe fn(
+          Local<'static, Object>,
+          Local<'static, Value>,
+          u64,
+          *mut crate::fast_api::FastApiCallbackOptions<'static>,
+        ) -> u32 = unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewUint32(ctx, f(recv, value, len, options_ptr)) }
+      }
+      (CTYPE_UINT32, [CTYPE_V8_VALUE, CTYPE_V8_VALUE, CTYPE_UINT32], true) => {
+        let value = unsafe { fast_local_value(ctx, js_argv(argc, argv, 0)?) };
+        let len = unsafe { fast_u32(ctx, js_argv(argc, argv, 1)?)? };
+        let f: unsafe fn(
+          Local<'static, Object>,
+          Local<'static, Value>,
+          u32,
+          *mut crate::fast_api::FastApiCallbackOptions<'static>,
+        ) -> u32 = unsafe { std::mem::transmute(overload.address_) };
+        unsafe { JS_NewUint32(ctx, f(recv, value, len, options_ptr)) }
       }
       (CTYPE_VOID, [CTYPE_V8_VALUE, CTYPE_V8_VALUE], false) => {
         let value = unsafe { fast_local_value(ctx, js_argv(argc, argv, 0)?) };
@@ -2484,6 +2573,19 @@ unsafe fn fast_u32(ctx: *mut JSContext, value: JSValue) -> Option<u32> {
     None
   } else {
     Some(out as u32)
+  }
+}
+
+unsafe fn fast_f64(ctx: *mut JSContext, value: JSValue) -> Option<f64> {
+  let mut out = 0f64;
+  if unsafe { JS_ToFloat64(ctx, &mut out, value) } < 0 {
+    unsafe {
+      let exc = JS_GetException(ctx);
+      JS_FreeValue(ctx, exc);
+    }
+    None
+  } else {
+    Some(out)
   }
 }
 

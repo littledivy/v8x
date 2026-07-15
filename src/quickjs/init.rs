@@ -261,7 +261,9 @@ fn parse_v8_flag(flag: &str) -> Option<V8Flag> {
     "gc_interval" => value
       .and_then(|value| value.parse::<usize>().ok())
       .map(|_| V8Flag::Noop),
-    "expose_gc" | "jitless" | "trace_gc" if value.is_none() => {
+    "allow_natives_syntax" | "expose_gc" | "jitless" | "trace_gc"
+      if value.is_none() =>
+    {
       Some(V8Flag::Noop)
     }
     "help" if value.is_none() => Some(V8Flag::Help),
@@ -343,6 +345,7 @@ mod tests {
       Some(V8Flag::MaxOldSpaceSize(3072 * 1024 * 1024))
     );
     assert_eq!(parse_v8_flag("--expose-gc"), Some(V8Flag::Noop));
+    assert_eq!(parse_v8_flag("--allow-natives-syntax"), Some(V8Flag::Noop));
     assert_eq!(parse_v8_flag("--trace-gc"), Some(V8Flag::Noop));
     assert_eq!(parse_v8_flag("--jitless"), Some(V8Flag::Noop));
     assert_eq!(parse_v8_flag("--gc-interval=100"), Some(V8Flag::Noop));

@@ -1235,6 +1235,19 @@ pub extern "C" fn v8__ArrayBufferView__GetContents(
       size: 0,
     };
   }
+  let owner = owner_get(base as usize);
+  let externally_backed = !owner.is_null()
+    && unsafe {
+      (*owner).retained_ctx.is_null()
+        && !(*owner).owns_malloc
+        && super::allocator::allocator_shared_get(&(*owner).allocator).is_null()
+    };
+  if len == 0 && buf_len == 0 && !externally_backed {
+    return memory_span_t {
+      data: storage.data,
+      size: 0,
+    };
+  }
   memory_span_t {
     data: unsafe { base.add(off) },
     size: len,

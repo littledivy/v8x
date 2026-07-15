@@ -3901,11 +3901,13 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   let src_val = jsval_of(src);
   let raw_text = unsafe { jsval_to_rust(ctx, src_val) };
 
-  let dynamic_text = rewrite_dynamic_phase_imports(&raw_text, true);
-  if dynamic_text.is_some() && raw_text.contains("import.defer") {
+  let intrinsic_text = super::core::rewrite_v8_native_intrinsics(&raw_text);
+  let input = intrinsic_text.as_deref().unwrap_or(&raw_text);
+  let dynamic_text = rewrite_dynamic_phase_imports(input, true);
+  if dynamic_text.is_some() && input.contains("import.defer") {
     unsafe { ensure_dynamic_defer_import_global(ctx) };
   }
-  let input = dynamic_text.as_deref().unwrap_or(&raw_text);
+  let input = dynamic_text.as_deref().unwrap_or(input);
   let (deferred_text, deferred_imports) = rewrite_deferred_imports(input);
   let (text, source_imports) = rewrite_source_phase(&deferred_text);
   let specifier = unsafe { resource_name_of(ctx, source) };
