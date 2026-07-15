@@ -911,6 +911,10 @@ pub(crate) unsafe fn install_dynamic_source_import_global(
   }
 }
 
+fn empty_host_defined_options(ctx: *mut JSContext) -> *const Data {
+  intern::<Data>(unsafe { JS_NewArray(ctx) })
+}
+
 pub(crate) unsafe fn ensure_dynamic_defer_import_global(ctx: *mut JSContext) {
   let global = unsafe { JS_GetGlobalObject(ctx) };
   let existing =
@@ -999,7 +1003,7 @@ unsafe fn dynamic_phase_import_js_cb(
 
   let host_opts = current_host_defined_options();
   let host_opts = if host_opts.is_null() {
-    intern::<Data>(jsv_undefined())
+    empty_host_defined_options(ctx)
   } else {
     host_opts
   };
@@ -1289,7 +1293,7 @@ unsafe extern "C" fn dynamic_import_hook(
     host_opts = host_defined_options_for_name(&base_str);
   }
   let host_opts = if host_opts.is_null() {
-    intern::<Data>(jsv_undefined())
+    empty_host_defined_options(ctx)
   } else {
     host_opts
   };

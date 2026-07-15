@@ -1282,6 +1282,44 @@ mod raw_smoke_test {
 mod api_test {
   use crate as v8;
 
+  thread_local! {
+    static DYNAMIC_IMPORT_HOST_OPTIONS: std::cell::Cell<Option<(bool, usize)>> =
+      const { std::cell::Cell::new(None) };
+  }
+
+  fn resolve_dynamic_import<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    host_defined_options: v8::Local<'s, v8::Data>,
+    _resource_name: v8::Local<'s, v8::Value>,
+    _specifier: v8::Local<'s, v8::String>,
+    _import_attributes: v8::Local<'s, v8::FixedArray>,
+  ) -> Option<v8::Local<'s, v8::Promise>> {
+    let options: v8::Local<v8::Value> = unsafe {
+      std::mem::transmute::<v8::Local<v8::Data>, v8::Local<v8::Value>>(
+        host_defined_options,
+      )
+    };
+    let is_array = options.is_array();
+    let length = if is_array {
+      let options: v8::Local<v8::PrimitiveArray> = unsafe {
+        std::mem::transmute::<v8::Local<v8::Data>, v8::Local<v8::PrimitiveArray>>(
+          host_defined_options,
+        )
+      };
+      options.length()
+    } else {
+      usize::MAX
+    };
+    DYNAMIC_IMPORT_HOST_OPTIONS
+      .with(|state| state.set(Some((is_array, length))));
+
+    let resolver = v8::PromiseResolver::new(scope).unwrap();
+    let promise = resolver.get_promise(scope);
+    let namespace = v8::Object::new(scope);
+    resolver.resolve(scope, namespace.into());
+    Some(promise)
+  }
+
   #[test]
   fn qjs_api_eval() {
     let platform = v8::new_default_platform(0, false).make_shared();
@@ -1323,11 +1361,38 @@ mod api_test {
     assert_bigint_words_preserve_u64_max();
     assert_wasm_streaming_respects_explicit_microtasks();
     assert_duplicate_module_requests_resolve_once();
+    assert_dynamic_import_gets_empty_host_options();
 
     unsafe {
       v8::V8::dispose();
     }
     v8::V8::dispose_platform();
+  }
+
+  fn assert_dynamic_import_gets_empty_host_options() {
+    DYNAMIC_IMPORT_HOST_OPTIONS.with(|state| state.set(None));
+    let isolate = &mut v8::Isolate::new(Default::default());
+    isolate.set_host_import_module_dynamically_callback(resolve_dynamic_import);
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let source = v8::String::new(scope, "import('dependency')").unwrap();
+    let promise = v8::Local::<v8::Promise>::try_from(
+      v8::Script::compile(scope, source, None)
+        .unwrap()
+        .run(scope)
+        .unwrap(),
+    )
+    .unwrap();
+    scope.perform_microtask_checkpoint();
+
+    assert_eq!(promise.state(), v8::PromiseState::Fulfilled);
+    assert_eq!(
+      DYNAMIC_IMPORT_HOST_OPTIONS.with(|state| state.get()),
+      Some((true, 0))
+    );
   }
 
   fn assert_detached_array_buffer_view_contents() {
