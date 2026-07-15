@@ -37,6 +37,7 @@ use crate::{
   Object, ObjectTemplate, PropertyAttribute, PropertyDescriptor, RealIsolate,
   Signature, String, Value,
 };
+use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::os::raw::{c_char, c_int, c_uint, c_void};
 use std::ptr;
@@ -288,6 +289,10 @@ struct SignatureInfo {
 }
 
 struct ObjTemplate {
+  state: UnsafeCell<ObjTemplateState>,
+}
+
+struct ObjTemplateState {
   internal_field_count: i32,
   props: Vec<(JSValue, JSValue, u32)>,
   accessors: Vec<TemplAccessor>,
@@ -299,17 +304,31 @@ struct ObjTemplate {
 }
 
 impl ObjTemplate {
+  fn new(parent_fn: *const FnTemplate) -> Self {
+    Self {
+      state: UnsafeCell::new(ObjTemplateState {
+        internal_field_count: 0,
+        props: Vec::new(),
+        accessors: Vec::new(),
+        named_handler: None,
+        indexed_handler: None,
+        immutable_proto: false,
+        parent_fn,
+      }),
+    }
+  }
+
   /// Bare template for tape replay.
   fn default_for_tape() -> ObjTemplate {
-    ObjTemplate {
-      internal_field_count: 0,
-      props: Vec::new(),
-      accessors: Vec::new(),
-      named_handler: None,
-      indexed_handler: None,
-      immutable_proto: false,
-      parent_fn: std::ptr::null(),
-    }
+    Self::new(std::ptr::null())
+  }
+
+  unsafe fn state(&self) -> &ObjTemplateState {
+    unsafe { &*self.state.get() }
+  }
+
+  unsafe fn state_mut(&self) -> &mut ObjTemplateState {
+    unsafe { &mut *self.state.get() }
   }
 }
 
@@ -722,7 +741,7 @@ fn clone_indexed_handler(
 
 fn new_object_for_template(
   ctx: *mut JSContext,
-  templ: &ObjTemplate,
+  templ: &ObjTemplateState,
 ) -> JSValue {
   if templ.named_handler.is_none() && templ.indexed_handler.is_none() {
     return unsafe { JS_NewObject(ctx) };
@@ -2775,7 +2794,7 @@ unsafe extern "C" fn fn_construct_trampoline(
   let new_target = this_or_new_target;
 
   let this = if !instance.is_null() {
-    let t = unsafe { &*instance };
+    let t = unsafe { (&*instance).state() };
     new_object_for_template(ctx, t)
   } else {
     unsafe { JS_NewObject(ctx) }
@@ -2806,7 +2825,7 @@ unsafe extern "C" fn fn_construct_trampoline(
   }
 
   if !instance.is_null() {
-    let t = unsafe { &*instance };
+    let t = unsafe { (&*instance).state() };
     super::object::set_internal_field_count_for_value(
       this,
       t.internal_field_count,
@@ -4185,7 +4204,7 @@ pub(crate) fn snapshot_function_template_info(
     return None;
   }
   let template = unsafe { &*(template as *const FnTemplate) };
-  let instance = unsafe { &*template.instance };
+  let instance = unsafe { (&*template.instance).state() };
   Some(SnapshotFunctionTemplateInfo {
     callback: template.callback,
     data_external: external_pointer_from_value(template.data),
@@ -4215,7 +4234,7 @@ pub(crate) fn restore_function_template_from_snapshot(
     template_mut.cached_proto = cached_proto;
   }
   unsafe {
-    (*template_mut.instance).internal_field_count =
+    (*template_mut.instance).state_mut().internal_field_count =
       instance_internal_field_count;
   }
   template
@@ -4232,7 +4251,7 @@ fn with_template_props(
       f(&mut t.props);
     }
     Some(TemplKind::Obj) => {
-      let t = unsafe { &mut *(p as *mut ObjTemplate) };
+      let t = unsafe { (&*(p as *const ObjTemplate)).state_mut() };
       f(&mut t.props);
     }
     None => {}
@@ -4322,24 +4341,8 @@ pub extern "C" fn v8__FunctionTemplate__New(
       jsv_undefined()
     }
   };
-  let proto = Box::into_raw(Box::new(ObjTemplate {
-    internal_field_count: 0,
-    props: Vec::new(),
-    accessors: Vec::new(),
-    named_handler: None,
-    indexed_handler: None,
-    immutable_proto: false,
-    parent_fn: ptr::null(),
-  }));
-  let instance = Box::into_raw(Box::new(ObjTemplate {
-    internal_field_count: 0,
-    props: Vec::new(),
-    accessors: Vec::new(),
-    named_handler: None,
-    indexed_handler: None,
-    immutable_proto: false,
-    parent_fn: ptr::null(),
-  }));
+  let proto = Box::into_raw(Box::new(ObjTemplate::new(ptr::null())));
+  let instance = Box::into_raw(Box::new(ObjTemplate::new(ptr::null())));
   register_template(proto as usize, TemplKind::Obj);
   register_template(instance as usize, TemplKind::Obj);
   let t = Box::into_raw(Box::new(FnTemplate {
@@ -4357,7 +4360,7 @@ pub extern "C" fn v8__FunctionTemplate__New(
     cached_proto: jsv_undefined(),
     fast_overloads,
   }));
-  unsafe { (*instance).parent_fn = t };
+  unsafe { (*instance).state_mut().parent_fn = t };
   register_template(t as usize, TemplKind::Func);
   t as *const FunctionTemplate
 }
@@ -4396,7 +4399,7 @@ pub(crate) fn tape_make_template(
     cached_proto: jsv_undefined(),
     fast_overloads: Vec::new(),
   }));
-  unsafe { (*instance).parent_fn = t };
+  unsafe { (*instance).state_mut().parent_fn = t };
   register_template(t as usize, TemplKind::Func);
   t as *const FunctionTemplate
 }
@@ -4480,7 +4483,7 @@ unsafe fn build_prototype_object(
   }
   let _tm = timing::now();
   let proto_obj = unsafe { JS_NewObject(ctx) };
-  let proto = unsafe { &*t.proto };
+  let proto = unsafe { (&*t.proto).state() };
   if std::env::var_os("QJS_DEBUG_TMPL").is_some() {
     eprintln!(
       "[QJS build_proto] class={:?} n_props={} n_accessors={}",
@@ -4795,15 +4798,7 @@ pub extern "C" fn v8__ObjectTemplate__New(
   templ: *const FunctionTemplate,
 ) -> *const ObjectTemplate {
   let _ = isolate;
-  let t = Box::into_raw(Box::new(ObjTemplate {
-    internal_field_count: 0,
-    props: Vec::new(),
-    accessors: Vec::new(),
-    named_handler: None,
-    indexed_handler: None,
-    immutable_proto: false,
-    parent_fn: templ as *const FnTemplate,
-  }));
+  let t = Box::into_raw(Box::new(ObjTemplate::new(templ as *const FnTemplate)));
   register_template(t as usize, TemplKind::Obj);
   t as *const ObjectTemplate
 }
@@ -4819,7 +4814,7 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
   }
   let _tm = timing::now();
   if !this.is_null() {
-    let t = unsafe { &*(this as *const ObjTemplate) };
+    let t = unsafe { (&*(this as *const ObjTemplate)).state() };
     let obj = new_object_for_template(ctx, t);
     if jsv_is_exception(&obj) {
       return ptr::null();
@@ -4963,7 +4958,7 @@ pub(crate) fn apply_object_template_to_global(
   if ctx.is_null() || templ.is_null() {
     return;
   }
-  let t = unsafe { &*(templ as *const ObjTemplate) };
+  let t = unsafe { (&*(templ as *const ObjTemplate)).state() };
   super::object::set_internal_field_count_for_value(
     global,
     t.internal_field_count,
@@ -5050,7 +5045,7 @@ fn free_named_handler_instance(
 pub(crate) fn snapshot_object_template_info(
   templ: *const ObjectTemplate,
 ) -> Option<SnapshotObjectTemplateInfo> {
-  let templ = unsafe { (templ as *const ObjTemplate).as_ref() }?;
+  let templ = unsafe { (templ as *const ObjTemplate).as_ref()?.state() };
   Some(SnapshotObjectTemplateInfo {
     internal_field_count: templ.internal_field_count,
     named_handler: templ.named_handler.as_ref().map(|handler| {
@@ -5142,7 +5137,7 @@ pub extern "C" fn v8__ObjectTemplate__SetAccessorProperty(
   if this.is_null() {
     return;
   }
-  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  let t = unsafe { (&*(this as *const ObjTemplate)).state_mut() };
   // Own the key for the accessor's lifetime — see `own_template_value` in
   // `v8__Template__Set`: the borrowed handle would otherwise dangle.
   let key_owned = own_template_value(current_ctx(), jsval_of(key));
@@ -5240,9 +5235,12 @@ fn apply_accessors(
   }
 }
 
+// rusty_v8's opaque API types are zero-sized. Keep handler mutation behind a
+// real ABI boundary so optimized Rust code cannot discard the pointer identity.
 #[unsafe(no_mangle)]
+#[inline(never)]
 pub extern "C" fn v8__ObjectTemplate__SetIndexedPropertyHandler(
-  this: *const ObjectTemplate,
+  this: *const c_void,
   getter: Option<crate::IndexedPropertyGetterCallback>,
   setter: Option<crate::IndexedPropertySetterCallback>,
   query: Option<crate::IndexedPropertyQueryCallback>,
@@ -5261,7 +5259,7 @@ pub extern "C" fn v8__ObjectTemplate__SetIndexedPropertyHandler(
   } else {
     own_template_value(current_ctx(), jsval_of(data_or_null))
   };
-  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  let t = unsafe { (&*(this as *const ObjTemplate)).state_mut() };
   t.indexed_handler = Some(IndexedHandler {
     getter,
     setter,
@@ -5284,13 +5282,14 @@ pub extern "C" fn v8__ObjectTemplate__SetInternalFieldCount(
   if this.is_null() {
     return;
   }
-  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  let t = unsafe { (&*(this as *const ObjTemplate)).state_mut() };
   t.internal_field_count = value;
 }
 
 #[unsafe(no_mangle)]
+#[inline(never)]
 pub extern "C" fn v8__ObjectTemplate__SetNamedPropertyHandler(
-  this: *const ObjectTemplate,
+  this: *const c_void,
   getter: Option<crate::NamedPropertyGetterCallback>,
   setter: Option<crate::NamedPropertySetterCallback>,
   query: Option<crate::NamedPropertyQueryCallback>,
@@ -5309,7 +5308,7 @@ pub extern "C" fn v8__ObjectTemplate__SetNamedPropertyHandler(
   } else {
     own_template_value(current_ctx(), jsval_of(data_or_null))
   };
-  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  let t = unsafe { (&*(this as *const ObjTemplate)).state_mut() };
   t.named_handler = Some(NamedHandler {
     getter,
     setter,
@@ -5502,7 +5501,7 @@ pub extern "C" fn v8__ObjectTemplate__InternalFieldCount(
   if this.is_null() {
     return 0;
   }
-  let t = unsafe { &*(this as *const ObjTemplate) };
+  let t = unsafe { (&*(this as *const ObjTemplate)).state() };
   t.internal_field_count
 }
 
@@ -5513,7 +5512,7 @@ pub extern "C" fn v8__ObjectTemplate__SetImmutableProto(
   if this.is_null() {
     return;
   }
-  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  let t = unsafe { (&*(this as *const ObjTemplate)).state_mut() };
   t.immutable_proto = true;
 }
 
@@ -5536,7 +5535,7 @@ pub extern "C" fn v8__ObjectTemplate__SetNativeDataProperty(
   } else {
     own_template_value(ctx, jsval_of(data_or_null))
   };
-  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  let t = unsafe { (&*(this as *const ObjTemplate)).state_mut() };
   t.accessors.push(TemplAccessor {
     key: key_owned,
     getter: ptr::null(),
