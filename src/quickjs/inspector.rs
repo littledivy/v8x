@@ -1366,7 +1366,7 @@ pub extern "C" fn v8_inspector__V8StackTrace__DELETE(this: *mut V8StackTrace) {
   unsafe { free_inert(this) };
 }
 
-mod cdp {
+pub(crate) mod cdp {
   use super::CompletedCpuProfile;
   use super::CpuProfileFrame;
   use super::PreciseCoverageFunction;
@@ -1445,8 +1445,21 @@ mod cdp {
     debugger_enabled: bool,
 
     objects: HashMap<u64, JSValue>,
+    pending_evaluations: Vec<PendingEvaluation>,
     scripts: HashMap<String, String>,
     script_ids_by_url: HashMap<String, String>,
+  }
+
+  struct PendingEvaluation {
+    call_id: i32,
+    kind: PendingEvaluationKind,
+    promise: JSValue,
+  }
+
+  #[derive(Clone, Copy)]
+  enum PendingEvaluationKind {
+    AsyncEval,
+    Promise,
   }
 
   impl CdpSession {
@@ -1467,6 +1480,7 @@ mod cdp {
         next_script_id: 1,
         debugger_enabled: false,
         objects: HashMap::new(),
+        pending_evaluations: Vec::new(),
         scripts: HashMap::new(),
         script_ids_by_url: HashMap::new(),
       }
@@ -1574,6 +1588,9 @@ mod cdp {
       if !ctx.is_null() {
         for (_, v) in self.objects.drain() {
           unsafe { JS_FreeValue(ctx, v) };
+        }
+        for pending in self.pending_evaluations.drain(..) {
+          unsafe { JS_FreeValue(ctx, pending.promise) };
         }
       }
     }
@@ -1868,21 +1885,62 @@ mod cdp {
     }
   }
 
-  unsafe fn await_value(ctx: *mut JSContext, v: JSValue) -> JSValue {
-    if !jsv_is_object(&v) || !unsafe { JS_IsPromise(v) } {
-      return v;
-    }
+  unsafe fn poll_async_eval(
+    ctx: *mut JSContext,
+    promise: JSValue,
+    kind: PendingEvaluationKind,
+  ) -> Option<JSValue> {
+    debug_assert!(jsv_is_object(&promise) && unsafe { JS_IsPromise(promise) });
     unsafe { drain_jobs(ctx) };
-    let state = unsafe { JS_PromiseState(ctx, v) };
-
-    let res = unsafe { JS_PromiseResult(ctx, v) };
-    unsafe { JS_FreeValue(ctx, v) };
-    if state == 2 {
-      unsafe { JS_Throw(ctx, JS_DupValue(ctx, res)) };
-      unsafe { JS_FreeValue(ctx, res) };
-      return jsv_exception();
+    let state = unsafe { JS_PromiseState(ctx, promise) };
+    if state == 0 {
+      return None;
     }
-    res
+
+    let result = unsafe { JS_PromiseResult(ctx, promise) };
+    unsafe { JS_FreeValue(ctx, promise) };
+    if state == 2 {
+      unsafe { JS_Throw(ctx, JS_DupValue(ctx, result)) };
+      unsafe { JS_FreeValue(ctx, result) };
+      return Some(jsv_exception());
+    }
+
+    if !matches!(kind, PendingEvaluationKind::AsyncEval)
+      || !jsv_is_object(&result)
+    {
+      return Some(result);
+    }
+    let value = unsafe { JS_GetPropertyStr(ctx, result, c"value".as_ptr()) };
+    if jsv_is_exception(&value) {
+      unsafe { drain_exc(ctx) };
+      return Some(result);
+    }
+    unsafe { JS_FreeValue(ctx, result) };
+    Some(value)
+  }
+
+  pub(crate) fn poll_pending_evaluations(ctx: *mut JSContext) {
+    if ctx.is_null() {
+      return;
+    }
+    ACTIVE_SESSIONS.with(|sessions| {
+      for session in sessions.borrow().iter().copied() {
+        let Some(session) = (unsafe { session.as_mut() }) else {
+          continue;
+        };
+        let pending = std::mem::take(&mut session.pending_evaluations);
+        for evaluation in pending {
+          match unsafe {
+            poll_async_eval(ctx, evaluation.promise, evaluation.kind)
+          } {
+            Some(result) => unsafe {
+              send_eval_result(session, ctx, result, evaluation.call_id)
+            },
+            None => session.pending_evaluations.push(evaluation),
+          }
+        }
+      }
+    });
   }
 
   fn send(channel: *mut RawChannel, json: &str, call_id: Option<i32>) {
@@ -2190,16 +2248,19 @@ mod cdp {
         )
       };
     }
-    let mut val = unsafe { await_value(ctx, val) };
-
-    if was_async && !jsv_is_exception(&val) && jsv_is_object(&val) {
-      let inner = unsafe { JS_GetPropertyStr(ctx, val, c"value".as_ptr()) };
-      if !jsv_is_exception(&inner) {
-        unsafe { JS_FreeValue(ctx, val) };
-        val = inner;
+    if was_async && !jsv_is_exception(&val) && unsafe { JS_IsPromise(val) } {
+      if let Some(result) =
+        unsafe { poll_async_eval(ctx, val, PendingEvaluationKind::AsyncEval) }
+      {
+        unsafe { send_eval_result(sess, ctx, result, call_id) };
       } else {
-        unsafe { drain_exc(ctx) };
+        sess.pending_evaluations.push(PendingEvaluation {
+          call_id,
+          kind: PendingEvaluationKind::AsyncEval,
+          promise: val,
+        });
       }
+      return;
     }
     unsafe { send_eval_result(sess, ctx, val, call_id) };
   }
@@ -2361,6 +2422,8 @@ mod cdp {
       .unwrap_or_default();
     let this_id = unsafe { get_str(ctx, params, c"objectId") }
       .and_then(|s| s.parse::<u64>().ok());
+    let await_promise =
+      unsafe { get_bool(ctx, params, c"awaitPromise") }.unwrap_or(false);
     let this_val = match this_id.and_then(|id| sess.objects.get(&id).copied()) {
       Some(v) => v,
       None => jsv_undefined(),
@@ -2404,7 +2467,21 @@ mod cdp {
       unsafe { JS_FreeValue(ctx, *a) };
     }
     unsafe { JS_FreeValue(ctx, func) };
-    let ret = unsafe { await_value(ctx, ret) };
+    if await_promise && !jsv_is_exception(&ret) && unsafe { JS_IsPromise(ret) }
+    {
+      if let Some(result) =
+        unsafe { poll_async_eval(ctx, ret, PendingEvaluationKind::Promise) }
+      {
+        unsafe { send_eval_result(sess, ctx, result, call_id) };
+      } else {
+        sess.pending_evaluations.push(PendingEvaluation {
+          call_id,
+          kind: PendingEvaluationKind::Promise,
+          promise: ret,
+        });
+      }
+      return;
+    }
     unsafe { send_eval_result(sess, ctx, ret, call_id) };
   }
 

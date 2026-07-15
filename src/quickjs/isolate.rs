@@ -1315,6 +1315,7 @@ fn drain_jobs(rt: *mut JSRuntime) {
 
 fn perform_microtask_checkpoint(rt: *mut JSRuntime) {
   drain_jobs(rt);
+  super::inspector::cdp::poll_pending_evaluations(current_ctx());
   if !rt.is_null() {
     unsafe { JS_ClearKeptObjects(rt) };
   }
