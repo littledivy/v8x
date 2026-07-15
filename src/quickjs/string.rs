@@ -32,16 +32,34 @@ const K_NULL_TERMINATE: int =
 const K_MAX_STRING_LENGTH: usize =
   crate::binding::v8__String__kMaxLength as usize;
 
-fn default_locale_compare(left: &str, right: &str) -> std::cmp::Ordering {
-  static COLLATOR: OnceLock<Option<icu_collator::CollatorBorrowed<'static>>> =
-    OnceLock::new();
-  let collator = COLLATOR.get_or_init(|| {
-    icu_collator::Collator::try_new(
-      icu_locale::locale!("en-US").into(),
-      Default::default(),
-    )
-    .ok()
-  });
+fn locale_compare(
+  left: &str,
+  right: &str,
+  numeric: bool,
+) -> std::cmp::Ordering {
+  static DEFAULT_COLLATOR: OnceLock<
+    Option<icu_collator::CollatorBorrowed<'static>>,
+  > = OnceLock::new();
+  static NUMERIC_COLLATOR: OnceLock<
+    Option<icu_collator::CollatorBorrowed<'static>>,
+  > = OnceLock::new();
+  let collator = if numeric {
+    NUMERIC_COLLATOR.get_or_init(|| {
+      let mut preferences: icu_collator::CollatorPreferences =
+        icu_locale::locale!("en-US").into();
+      preferences.numeric_ordering =
+        Some(icu_collator::preferences::CollationNumericOrdering::True);
+      icu_collator::Collator::try_new(preferences, Default::default()).ok()
+    })
+  } else {
+    DEFAULT_COLLATOR.get_or_init(|| {
+      icu_collator::Collator::try_new(
+        icu_locale::locale!("en-US").into(),
+        Default::default(),
+      )
+      .ok()
+    })
+  };
   collator
     .as_ref()
     .map(|collator| collator.compare(left, right))
@@ -54,6 +72,7 @@ pub unsafe extern "C" fn v82jsc_locale_compare_utf32(
   left_len: c_int,
   right: *const u32,
   right_len: c_int,
+  numeric: c_int,
 ) -> c_int {
   if left_len < 0
     || right_len < 0
@@ -80,7 +99,7 @@ pub unsafe extern "C" fn v82jsc_locale_compare_utf32(
     .iter()
     .filter_map(|&c| std::char::from_u32(c))
     .collect();
-  match default_locale_compare(&left, &right) {
+  match locale_compare(&left, &right, numeric != 0) {
     std::cmp::Ordering::Less => -1,
     std::cmp::Ordering::Equal => 0,
     std::cmp::Ordering::Greater => 1,
@@ -891,18 +910,19 @@ pub extern "C" fn v8__String__NewExternalTwoByteStatic(
 
 #[cfg(test)]
 mod tests {
-  use super::default_locale_compare;
+  use super::locale_compare;
   use std::cmp::Ordering;
 
   #[test]
   fn default_locale_compare_matches_v8() {
     assert_eq!(
-      default_locale_compare("assert.ts", "assert_equals.ts"),
+      locale_compare("assert.ts", "assert_equals.ts", false),
       Ordering::Greater
     );
-    assert_eq!(default_locale_compare("a-b", "ab"), Ordering::Less);
-    assert_eq!(default_locale_compare("A", "a"), Ordering::Greater);
-    assert_eq!(default_locale_compare("\u{e4}", "z"), Ordering::Less);
-    assert_eq!(default_locale_compare("2", "10"), Ordering::Greater);
+    assert_eq!(locale_compare("a-b", "ab", false), Ordering::Less);
+    assert_eq!(locale_compare("A", "a", false), Ordering::Greater);
+    assert_eq!(locale_compare("\u{e4}", "z", false), Ordering::Less);
+    assert_eq!(locale_compare("2", "10", false), Ordering::Greater);
+    assert_eq!(locale_compare("a2", "a10", true), Ordering::Less);
   }
 }

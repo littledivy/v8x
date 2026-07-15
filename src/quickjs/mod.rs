@@ -2317,6 +2317,10 @@ mod api_test {
          new Intl.Locale('de-DE-1996-fonipa').variants,\
          Object.prototype.toString.call(locale),\
          Object.keys(locale).length,\
+         new Intl.Collator(undefined, { numeric: true })\
+           .compare('a2', 'a10'),\
+         new Intl.Collator(undefined, { sensitivity: 'variant' })\
+           .compare('bar', 'Bar'),\
        ].join('|')",
     )
     .unwrap();
@@ -2324,7 +2328,7 @@ mod api_test {
     assert_eq!(
       script.run(scope).unwrap().to_rust_string_lossy(scope),
       "red, green, and blue|Rust or Go|zh-Hant-TW|zh|Hant|TW|h12|false|\
-       1996-fonipa|[object Intl.Locale]|0",
+       1996-fonipa|[object Intl.Locale]|0|-1|-1",
     );
   }
 

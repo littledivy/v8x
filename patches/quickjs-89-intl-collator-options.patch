@@ -1,0 +1,45 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -51097,14 +51097,15 @@ static int to_utf32_buf(JSContext *ctx, JSString *p, uint32_t **pbuf)
+ }
+ 
+ extern int v82jsc_locale_compare_utf32(const uint32_t *left, int left_len,
+-                                       const uint32_t *right, int right_len);
++                                       const uint32_t *right, int right_len,
++                                       int numeric);
+ 
+ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
+                                        int argc, JSValueConst *argv)
+ {
+-    int an, bn, cmp;
++    int an, bn, cmp, numeric;
+     uint32_t *as, *bs, *ts;
+-    JSValue a, b, ret;
++    JSValue a, b, numeric_value, ret;
+ 
+     ret = JS_EXCEPTION;
+     as = NULL;
+@@ -51141,7 +51142,21 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
+     js_free(ctx, bs);
+     bs = ts;
+ 
+-    cmp = v82jsc_locale_compare_utf32(as, an, bs, bn);
++    numeric = 0;
++    if (argc > 2 && JS_IsObject(argv[2])) {
++        numeric_value = JS_GetPropertyStr(ctx, argv[2], "numeric");
++        if (JS_IsException(numeric_value))
++            goto exception;
++        if (!JS_IsUndefined(numeric_value)) {
++            numeric = JS_ToBool(ctx, numeric_value);
++            JS_FreeValue(ctx, numeric_value);
++            if (numeric < 0)
++                goto exception;
++        } else {
++            JS_FreeValue(ctx, numeric_value);
++        }
++    }
++    cmp = v82jsc_locale_compare_utf32(as, an, bs, bn, numeric);
+     ret = js_int32(cmp);
+ 
+ exception:

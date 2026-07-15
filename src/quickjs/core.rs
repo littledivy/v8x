@@ -2002,9 +2002,25 @@ fn install_intl_stub(ctx: *mut JSContext, _global: JSValue) {
         NumberFormat.prototype.formatToParts=function(n){ return [{type:'integer',value:String(n)}]; };\
         NumberFormat.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US')}; };\
         NumberFormat.supportedLocalesOf=function(l){ return Array.isArray(l)?l:(l?[l]:[]); };\
-        function Collator(l,o){ if(!(this instanceof Collator)) return new Collator(l,o); this._l=l; }\
-        Collator.prototype.compare=function(a,b){ return a<b?-1:(a>b?1:0); };\
-        Collator.prototype.resolvedOptions=function(){ return {locale:(this._l||'en-US')}; };\
+        function Collator(l,o){\
+          if(!(this instanceof Collator)) return new Collator(l,o);\
+          var locale=l,options=o||{};\
+          Object.defineProperty(this,'_compare',{value:function(a,b){\
+            return String(a).localeCompare(String(b),locale,options);\
+          }});\
+          Object.defineProperty(this,'_l',{value:l});\
+          Object.defineProperty(this,'_o',{value:options});\
+        }\
+        Object.defineProperty(Collator.prototype,'compare',{\
+          configurable:true,get:function(){ return this._compare; }\
+        });\
+        Collator.prototype.resolvedOptions=function(){\
+          return {locale:(this._l||'en-US'),usage:(this._o.usage||'sort'),\
+            sensitivity:(this._o.sensitivity||'variant'),\
+            ignorePunctuation:!!this._o.ignorePunctuation,\
+            collation:'default',numeric:!!this._o.numeric,\
+            caseFirst:(this._o.caseFirst||'false')};\
+        };\
         Collator.supportedLocalesOf=function(l){ return Array.isArray(l)?l:(l?[l]:[]); };\
         function PluralRules(l,o){ if(!(this instanceof PluralRules)) return new PluralRules(l,o); this._l=l; }\
         PluralRules.prototype.select=function(){ return 'other'; };\
