@@ -1584,16 +1584,120 @@ unsafe fn rc_set_word(c: *mut RC, idx: usize, v: usize) {
   unsafe { *(c as *mut usize).add(idx) = v };
 }
 
+const KB: usize = 1024;
+const MB: usize = 1024 * KB;
+const GB: usize = 1024 * MB;
+const V8_PAGE_SIZE: usize = 256 * KB;
+
+fn round_up(value: usize, alignment: usize) -> usize {
+  value.div_ceil(alignment) * alignment
+}
+
+fn v8_default_max_semi_space_size(physical_memory: u64) -> usize {
+  #[cfg(target_os = "android")]
+  if cfg!(target_pointer_width = "32") || physical_memory < 8 * GB as u64 {
+    return 8 * MB;
+  }
+
+  32 * MB
+}
+
+fn v8_heap_size_to_semi_space_ratio(physical_memory: u64) -> usize {
+  #[cfg(target_os = "android")]
+  if cfg!(target_pointer_width = "32") || physical_memory < 8 * GB as u64 {
+    return 128;
+  }
+
+  32
+}
+
+fn v8_default_young_generation_size(physical_memory: u64) -> usize {
+  let target_heap_size =
+    usize::try_from(physical_memory / 4).unwrap_or(usize::MAX);
+  let semi_space_size = target_heap_size
+    .checked_div(v8_heap_size_to_semi_space_ratio(physical_memory))
+    .unwrap_or(0)
+    .clamp(2 * MB, v8_default_max_semi_space_size(physical_memory));
+  round_up(semi_space_size, V8_PAGE_SIZE) * 3
+}
+
+fn v8_default_old_generation_size(physical_memory: u64) -> usize {
+  let ratio =
+    if cfg!(target_os = "android") || cfg!(target_pointer_width = "32") {
+      4
+    } else {
+      2
+    };
+  let maximum = if cfg!(target_pointer_width = "32") {
+    GB as u64
+  } else {
+    4 * GB as u64
+  };
+  let old_generation = usize::try_from(
+    (physical_memory / ratio).clamp((256 * MB) as u64, maximum),
+  )
+  .unwrap_or(usize::MAX);
+  round_up(old_generation, V8_PAGE_SIZE)
+}
+
+fn v8_maximal_code_range_size() -> usize {
+  if cfg!(target_pointer_width = "32") {
+    return 0;
+  }
+
+  if cfg!(feature = "v8_enable_pointer_compression") {
+    return 128 * MB;
+  }
+
+  if cfg!(target_arch = "x86_64") || cfg!(target_arch = "powerpc64") {
+    512 * MB
+  } else if cfg!(target_arch = "aarch64")
+    || cfg!(target_arch = "loongarch64")
+    || cfg!(target_arch = "riscv64")
+  {
+    256 * MB
+  } else {
+    128 * MB
+  }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ResourceConstraints__ConfigureDefaults(
   constraints: *mut RC,
-  _physical_memory: u64,
-  _virtual_memory_limit: u64,
+  physical_memory: u64,
+  virtual_memory_limit: u64,
 ) {
-  if !constraints.is_null() {
-    unsafe {
-      ptr::write_bytes(constraints as *mut u8, 0, std::mem::size_of::<RC>())
-    };
+  if constraints.is_null() {
+    return;
+  }
+
+  unsafe {
+    rc_set_word(
+      constraints,
+      1,
+      v8_default_old_generation_size(physical_memory),
+    );
+    rc_set_word(
+      constraints,
+      2,
+      v8_default_young_generation_size(physical_memory),
+    );
+    ptr::write_unaligned(
+      (constraints as *mut u8)
+        .add(round_up(
+          5 * std::mem::size_of::<usize>(),
+          std::mem::align_of::<u64>(),
+        ))
+        .cast::<u64>(),
+      physical_memory,
+    );
+
+    if virtual_memory_limit > 0 {
+      let code_range_size = (virtual_memory_limit / 8)
+        .min(v8_maximal_code_range_size() as u64)
+        as usize;
+      rc_set_word(constraints, 0, code_range_size);
+    }
   }
 }
 
