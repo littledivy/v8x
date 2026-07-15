@@ -1176,14 +1176,14 @@ pub extern "C" fn v8__TryCatch__Exception(
   unsafe {
     let ctx = tc_ctx(this);
     let isolate = tc_iso(this);
-    if !isolate.is_null() && iso_state(isolate).is_terminating() {
-      return intern::<Value>(make_named_error_from_str(
-        ctx,
-        "Error",
-        "execution terminated",
-      ));
-    }
     match tc_caught(this as *mut TryCatch) {
+      Some(_) if !isolate.is_null() && iso_state(isolate).is_terminating() => {
+        intern::<Value>(make_named_error_from_str(
+          ctx,
+          "Error",
+          "execution terminated",
+        ))
+      }
       Some(exc) => intern_dup::<Value>(ctx, exc),
       None => ptr::null(),
     }
