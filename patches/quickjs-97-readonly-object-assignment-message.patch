@@ -1,0 +1,35 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -8762,6 +8762,22 @@ static int JS_ThrowTypeErrorReadOnly(JSContext *ctx, int flags, JSAtom atom)
+     }
+ }
+ 
++static int JS_ThrowTypeErrorReadOnlyProperty(JSContext *ctx, int flags,
++                                             JSAtom atom,
++                                             JSValueConst receiver)
++{
++    if (JS_VALUE_GET_TAG(receiver) == JS_TAG_OBJECT &&
++        JS_VALUE_GET_OBJ(receiver)->class_id == JS_CLASS_OBJECT &&
++        ((flags & JS_PROP_THROW) ||
++         ((flags & JS_PROP_THROW_STRICT) && is_strict_mode(ctx)))) {
++        JS_ThrowTypeErrorAtom(ctx,
++                              "Cannot assign to read only property '%s' of object '#<Object>'",
++                              atom);
++        return -1;
++    }
++    return JS_ThrowTypeErrorReadOnly(ctx, flags, atom);
++}
++
+ static int JS_ThrowTypeErrorNotExtensible(JSContext *ctx, int flags,
+                                           JSAtom atom)
+ {
+@@ -11038,7 +11052,8 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop,
+         } else if (!(desc_flags & JS_PROP_WRITABLE) ||
+                    p->class_id == JS_CLASS_MODULE_NS) {
+         read_only_prop:
+-            ret = JS_ThrowTypeErrorReadOnly(ctx, flags, prop);
++            ret = JS_ThrowTypeErrorReadOnlyProperty(ctx, flags, prop,
++                                                    this_obj);
+             goto done;
+         }
+         ret = JS_DefineProperty(ctx, this_obj, prop, val,

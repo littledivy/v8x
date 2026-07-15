@@ -1160,6 +1160,45 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn readonly_object_assignment_uses_v8_message() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = c"'use strict';
+        const object = {};
+        Object.defineProperty(object, 'self', { value: object });
+        object.self = 1;";
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"readonly-object.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert_eq!(result.tag, JS_TAG_EXCEPTION);
+
+      let exception = JS_GetException(ctx);
+      let message = JS_GetPropertyStr(ctx, exception, c"message".as_ptr());
+      let text = JS_ToCString(ctx, message);
+      assert!(!text.is_null());
+      assert_eq!(
+        CStr::from_ptr(text).to_bytes(),
+        b"Cannot assign to read only property 'self' of object '#<Object>'"
+      );
+
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, message);
+      JS_FreeValue(ctx, exception);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn nonextensible_assignment_names_property() {
     unsafe {
       let rt = JS_NewRuntime();
