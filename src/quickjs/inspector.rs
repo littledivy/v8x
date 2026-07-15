@@ -1377,6 +1377,7 @@ mod cdp {
   use crate::quickjs::core::current_ctx;
   use crate::quickjs::core::current_iso;
   use crate::quickjs::core::iso_state;
+  use crate::quickjs::core::replace_script_source;
   use crate::quickjs::core::script_source;
   use crate::quickjs::core::script_sources;
   use crate::quickjs::quickjs_sys::*;
@@ -2027,7 +2028,7 @@ mod cdp {
   }
 
   unsafe fn handle_debugger_set_script_source(
-    sess: &CdpSession,
+    sess: &mut CdpSession,
     ctx: *mut JSContext,
     params: JSValue,
     call_id: i32,
@@ -2051,14 +2052,28 @@ mod cdp {
       return;
     }
 
-    let source = CString::new(source)
+    let Some(url) = sess
+      .script_ids_by_url
+      .iter()
+      .find_map(|(url, id)| (id == &script_id).then(|| url.clone()))
+    else {
+      unsafe {
+        set_str(ctx, response, c"status", "BlockedByTopLevelEsModuleChange");
+        send_obj(sess, ctx, response, Some(call_id));
+      }
+      return;
+    };
+
+    let source_c = CString::new(source.as_str())
       .unwrap_or_else(|_| CString::new("").expect("empty CString"));
+    let url_c = CString::new(url.as_str())
+      .unwrap_or_else(|_| CString::new("<live-edit>").expect("static CString"));
     let compiled = unsafe {
       JS_Eval(
         ctx,
-        source.as_ptr(),
-        source.as_bytes().len(),
-        c"<live-edit>".as_ptr(),
+        source_c.as_ptr(),
+        source.len(),
+        url_c.as_ptr(),
         JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
       )
     };
@@ -2074,9 +2089,24 @@ mod cdp {
         JS_FreeValue(ctx, exception);
       }
     } else {
+      let status =
+        unsafe { v82jsc_live_edit_module(ctx, url_c.as_ptr(), compiled) };
       unsafe {
         JS_FreeValue(ctx, compiled);
-        set_str(ctx, response, c"status", "BlockedByTopLevelEsModuleChange");
+        set_str(
+          ctx,
+          response,
+          c"status",
+          match status {
+            0 => "Ok",
+            1 => "BlockedByActiveFunction",
+            _ => "BlockedByTopLevelEsModuleChange",
+          },
+        );
+      }
+      if status == 0 {
+        sess.scripts.insert(script_id, source.clone());
+        replace_script_source(&url, &source);
       }
     }
     unsafe { send_obj(sess, ctx, response, Some(call_id)) };

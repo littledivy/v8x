@@ -1,0 +1,200 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -68308,6 +68308,184 @@ void v82jsc_ensure_error_backtrace(JSContext *ctx, JSValueConst error)
+     build_backtrace(ctx, error, JS_UNDEFINED, NULL, 0, 0, 0);
+ }
+ 
++static int v82jsc_bytecode_child_count(JSFunctionBytecode *bytecode)
++{
++    int count = 0;
++    int i;
++
++    for (i = 0; i < bytecode->cpool_count; i++) {
++        if (JS_VALUE_GET_TAG(bytecode->cpool[i]) == JS_TAG_FUNCTION_BYTECODE)
++            count++;
++    }
++    return count;
++}
++
++static JSFunctionBytecode *v82jsc_bytecode_child_at(JSFunctionBytecode *bytecode,
++                                                     int index)
++{
++    int i;
++
++    for (i = 0; i < bytecode->cpool_count; i++) {
++        if (JS_VALUE_GET_TAG(bytecode->cpool[i]) != JS_TAG_FUNCTION_BYTECODE)
++            continue;
++        if (index-- == 0)
++            return JS_VALUE_GET_PTR(bytecode->cpool[i]);
++    }
++    return NULL;
++}
++
++static bool v82jsc_bytecode_layout_matches(JSFunctionBytecode *old_bytecode,
++                                            JSFunctionBytecode *new_bytecode)
++{
++    int child_count;
++    int i;
++
++    if (old_bytecode->func_kind != new_bytecode->func_kind ||
++        old_bytecode->func_name != new_bytecode->func_name ||
++        old_bytecode->defined_arg_count != new_bytecode->defined_arg_count ||
++        old_bytecode->closure_var_count != new_bytecode->closure_var_count)
++        return false;
++    for (i = 0; i < old_bytecode->closure_var_count; i++) {
++        JSClosureVar *old_var = &old_bytecode->closure_var[i];
++        JSClosureVar *new_var = &new_bytecode->closure_var[i];
++        if (old_var->closure_type != new_var->closure_type ||
++            old_var->is_lexical != new_var->is_lexical ||
++            old_var->is_const != new_var->is_const ||
++            old_var->var_kind != new_var->var_kind ||
++            old_var->var_idx != new_var->var_idx ||
++            old_var->var_name != new_var->var_name)
++            return false;
++    }
++
++    child_count = v82jsc_bytecode_child_count(old_bytecode);
++    if (child_count != v82jsc_bytecode_child_count(new_bytecode))
++        return false;
++    for (i = 0; i < child_count; i++) {
++        if (!v82jsc_bytecode_layout_matches(
++                v82jsc_bytecode_child_at(old_bytecode, i),
++                v82jsc_bytecode_child_at(new_bytecode, i)))
++            return false;
++    }
++    return true;
++}
++
++static JSFunctionBytecode *v82jsc_replacement_bytecode(
++    JSFunctionBytecode *old_bytecode, JSFunctionBytecode *new_bytecode,
++    JSFunctionBytecode *target)
++{
++    int child_count;
++    int i;
++
++    if (old_bytecode == target)
++        return new_bytecode;
++    child_count = v82jsc_bytecode_child_count(old_bytecode);
++    for (i = 0; i < child_count; i++) {
++        JSFunctionBytecode *replacement = v82jsc_replacement_bytecode(
++            v82jsc_bytecode_child_at(old_bytecode, i),
++            v82jsc_bytecode_child_at(new_bytecode, i), target);
++        if (replacement)
++            return replacement;
++    }
++    return NULL;
++}
++
++/* Replace the bytecode of closures created by an evaluated module. The
++   replacement module must have an identical function and closure layout.
++   Returns 0 on success, 1 when a replaced function is active, and 2 when the
++   module's top-level structure is incompatible with live editing. */
++int v82jsc_live_edit_module(JSContext *ctx, const char *filename,
++                            JSValueConst replacement_module)
++{
++    JSFunctionBytecode **old_bytecodes;
++    JSFunctionBytecode *old_root;
++    JSFunctionBytecode *new_root;
++    JSFunctionBytecode *replacement;
++    JSModuleDef *old_module;
++    JSModuleDef *new_module;
++    JSStackFrame *frame;
++    JSObject *object;
++    JSAtom module_name;
++    struct list_head *el;
++    size_t closure_count = 0;
++    size_t closure_index = 0;
++
++    if (!ctx || !filename ||
++        JS_VALUE_GET_TAG(replacement_module) != JS_TAG_MODULE)
++        return 2;
++    module_name = JS_NewAtom(ctx, filename);
++    if (module_name == JS_ATOM_NULL)
++        return 2;
++    old_module = js_find_loaded_module(ctx, module_name);
++    JS_FreeAtom(ctx, module_name);
++    new_module = JS_VALUE_GET_PTR(replacement_module);
++    if (!old_module || old_module == new_module ||
++        JS_VALUE_GET_TAG(old_module->func_obj) != JS_TAG_OBJECT ||
++        JS_VALUE_GET_TAG(new_module->func_obj) != JS_TAG_FUNCTION_BYTECODE)
++        return 2;
++    object = JS_VALUE_GET_OBJ(old_module->func_obj);
++    if (!js_class_has_bytecode(object->class_id))
++        return 2;
++    old_root = object->u.func.function_bytecode;
++    new_root = JS_VALUE_GET_PTR(new_module->func_obj);
++    if (!v82jsc_bytecode_layout_matches(old_root, new_root))
++        return 2;
++
++    for (frame = ctx->rt->current_stack_frame; frame; frame = frame->prev_frame) {
++        if (JS_VALUE_GET_TAG(frame->cur_func) != JS_TAG_OBJECT)
++            continue;
++        object = JS_VALUE_GET_OBJ(frame->cur_func);
++        if (!js_class_has_bytecode(object->class_id) ||
++            object->u.func.function_bytecode == old_root)
++            continue;
++        replacement = v82jsc_replacement_bytecode(
++            old_root, new_root, object->u.func.function_bytecode);
++        if (replacement)
++            return 1;
++    }
++
++    list_for_each(el, &ctx->rt->gc_obj_list) {
++        JSGCObjectHeader *header = list_entry(el, JSGCObjectHeader, link);
++        if (header->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
++            continue;
++        object = (JSObject *)header;
++        if (!js_class_has_bytecode(object->class_id) ||
++            object->u.func.function_bytecode == old_root)
++            continue;
++        replacement = v82jsc_replacement_bytecode(
++            old_root, new_root, object->u.func.function_bytecode);
++        if (replacement)
++            closure_count++;
++    }
++    if (closure_count == 0)
++        return 2;
++    old_bytecodes = js_malloc(ctx, closure_count * sizeof(*old_bytecodes));
++    if (!old_bytecodes)
++        return 2;
++
++    list_for_each(el, &ctx->rt->gc_obj_list) {
++        JSGCObjectHeader *header = list_entry(el, JSGCObjectHeader, link);
++        if (header->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
++            continue;
++        object = (JSObject *)header;
++        if (!js_class_has_bytecode(object->class_id) ||
++            object->u.func.function_bytecode == old_root)
++            continue;
++        replacement = v82jsc_replacement_bytecode(
++            old_root, new_root, object->u.func.function_bytecode);
++        if (!replacement)
++            continue;
++        old_bytecodes[closure_index++] = object->u.func.function_bytecode;
++        replacement->header.ref_count++;
++        object->u.func.function_bytecode = replacement;
++    }
++    for (closure_index = 0; closure_index < closure_count; closure_index++) {
++        JS_FreeValueRT(ctx->rt, JS_MKPTR(JS_TAG_FUNCTION_BYTECODE,
++                                         old_bytecodes[closure_index]));
++    }
++    js_free(ctx, old_bytecodes);
++    return 0;
++}
++
+ #undef malloc
+ #undef free
+ #undef realloc
+diff --git a/quickjs.h b/quickjs.h
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1278,6 +1278,8 @@ JS_EXTERN JSValue v82jsc_eval_no_side_effect(JSContext *ctx,
+                                              const char *input,
+                                              size_t input_len,
+                                              const char *filename);
++JS_EXTERN int v82jsc_live_edit_module(JSContext *ctx, const char *filename,
++                                      JSValueConst replacement_module);
+ /* load the dependencies of the module 'obj'. Useful when JS_ReadObject()
+    returns a module. */
+ JS_EXTERN int JS_ResolveModule(JSContext *ctx, JSValueConst obj);

@@ -2388,6 +2388,11 @@ pub(crate) fn register_script_source(filename: &str, source: &str) {
   if filename.is_empty() {
     return;
   }
+  replace_script_source(filename, source);
+  super::inspector::script_source_registered(filename, source);
+}
+
+pub(crate) fn replace_script_source(filename: &str, source: &str) {
   SCRIPT_SOURCES.with(|m| {
     let mut map = m.borrow_mut();
     if map.len() > 256 && !map.contains_key(filename) {
@@ -2395,7 +2400,6 @@ pub(crate) fn register_script_source(filename: &str, source: &str) {
     }
     map.insert(filename.to_string(), source.to_string());
   });
-  super::inspector::script_source_registered(filename, source);
 }
 
 pub(crate) fn script_source(filename: &str) -> Option<std::string::String> {

@@ -535,6 +535,11 @@ unsafe extern "C" {
     input_len: usize,
     filename: *const c_char,
   ) -> JSValue;
+  pub fn v82jsc_live_edit_module(
+    ctx: *mut JSContext,
+    filename: *const c_char,
+    replacement_module: JSValue,
+  ) -> c_int;
 
   pub fn JS_ParseJSON(
     ctx: *mut JSContext,
