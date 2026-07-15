@@ -649,7 +649,7 @@ fn parse_qjs_backtrace(raw: &str) -> Vec<QjsStackFrame> {
     if url == "native" {
       continue;
     }
-    let has_url = !url.is_empty() && url != "<anonymous>";
+    let has_url = !url.is_empty();
     frames.push(QjsStackFrame {
       line: line_no,
       col: col_no,

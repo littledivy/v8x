@@ -599,6 +599,24 @@ unsafe fn js_value_to_string(
   Some(text)
 }
 
+unsafe fn js_exception_description(
+  ctx: *mut JSContext,
+  value: JSValue,
+) -> String {
+  let stack = unsafe { JS_GetPropertyStr(ctx, value, c"stack".as_ptr()) };
+  let description = if stack.tag == JS_TAG_EXCEPTION {
+    let exception = unsafe { JS_GetException(ctx) };
+    unsafe { JS_FreeValue(ctx, exception) };
+    None
+  } else {
+    unsafe { js_value_to_string(ctx, stack) }
+  };
+  unsafe { JS_FreeValue(ctx, stack) };
+  description
+    .or_else(|| unsafe { js_value_to_string(ctx, value) })
+    .unwrap_or_else(|| "Error".to_string())
+}
+
 unsafe fn exception_description_and_message(
   exception: *const Value,
 ) -> (String, String) {
@@ -607,8 +625,7 @@ unsafe fn exception_description_and_message(
     return ("Error".to_string(), String::new());
   }
   let value = crate::quickjs::core::jsval_of(exception);
-  let description = unsafe { js_value_to_string(ctx, value) }
-    .unwrap_or_else(|| "Error".to_string());
+  let description = unsafe { js_exception_description(ctx, value) };
   let message_value =
     unsafe { JS_GetPropertyStr(ctx, value, c"message".as_ptr()) };
   let message = if message_value.tag == JS_TAG_EXCEPTION {
@@ -1377,6 +1394,7 @@ pub(crate) mod cdp {
   use crate::quickjs::core::current_ctx;
   use crate::quickjs::core::current_iso;
   use crate::quickjs::core::iso_state;
+  use crate::quickjs::core::register_script_source;
   use crate::quickjs::core::replace_script_source;
   use crate::quickjs::core::script_source;
   use crate::quickjs::core::script_sources;
@@ -1799,7 +1817,7 @@ pub(crate) mod cdp {
           let is_err = is_error(ctx, val);
           let desc = if is_err {
             set_str(ctx, ro, c"subtype", "error");
-            cstr_value(ctx, val).unwrap_or(cname.clone())
+            super::js_exception_description(ctx, val)
           } else {
             object_description(ctx, val, &cname)
           };
@@ -2207,6 +2225,7 @@ pub(crate) mod cdp {
   ) {
     let expr =
       unsafe { get_str(ctx, params, c"expression") }.unwrap_or_default();
+    register_script_source("<anonymous>", &expr);
     let throw_on_side_effect =
       unsafe { get_bool(ctx, params, c"throwOnSideEffect") }.unwrap_or(false);
     let cexpr = CString::new(expr.as_str())
@@ -2217,7 +2236,7 @@ pub(crate) mod cdp {
           ctx,
           cexpr.as_ptr(),
           expr.len(),
-          c"<repl>".as_ptr(),
+          c"<anonymous>".as_ptr(),
         )
       }
     } else {
@@ -2226,7 +2245,7 @@ pub(crate) mod cdp {
           ctx,
           cexpr.as_ptr(),
           expr.len(),
-          c"<repl>".as_ptr(),
+          c"<anonymous>".as_ptr(),
           JS_EVAL_TYPE_GLOBAL,
         )
       }
@@ -2243,7 +2262,7 @@ pub(crate) mod cdp {
           ctx,
           cexpr.as_ptr(),
           expr.len(),
-          c"<repl>".as_ptr(),
+          c"<anonymous>".as_ptr(),
           JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_ASYNC,
         )
       };
