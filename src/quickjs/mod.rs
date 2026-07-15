@@ -136,6 +136,55 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn eval_no_side_effect_rejects_global_write() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let setup = c"globalThis.sideEffect = 0";
+      let result = JS_Eval(
+        ctx,
+        setup.as_ptr(),
+        setup.to_bytes().len(),
+        c"<setup>".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert_ne!(result.tag, JS_TAG_EXCEPTION);
+      JS_FreeValue(ctx, result);
+
+      let expression = c"(globalThis.sideEffect++, 0)";
+      let result = v82jsc_eval_no_side_effect(
+        ctx,
+        expression.as_ptr(),
+        expression.to_bytes().len(),
+        c"<preview>".as_ptr(),
+      );
+      assert_eq!(result.tag, JS_TAG_EXCEPTION);
+      let error = JS_GetException(ctx);
+      JS_FreeValue(ctx, error);
+
+      let read = c"globalThis.sideEffect";
+      let result = JS_Eval(
+        ctx,
+        read.as_ptr(),
+        read.to_bytes().len(),
+        c"<read>".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      let mut value = -1;
+      assert_eq!(JS_ToInt32(ctx, &mut value, result), 0);
+      assert_eq!(value, 0);
+
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn nested_call_error_uses_inner_call_location() {
     unsafe {
       let rt = JS_NewRuntime();

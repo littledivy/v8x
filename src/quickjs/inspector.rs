@@ -1589,6 +1589,21 @@ mod cdp {
     }
   }
 
+  unsafe fn get_bool(
+    ctx: *mut JSContext,
+    obj: JSValue,
+    key: &CStr,
+  ) -> Option<bool> {
+    let v = unsafe { JS_GetPropertyStr(ctx, obj, key.as_ptr()) };
+    if jsv_is_exception(&v) {
+      unsafe { drain_exc(ctx) };
+      return None;
+    }
+    let result = unsafe { JS_ToBool(ctx, v) };
+    unsafe { JS_FreeValue(ctx, v) };
+    (result >= 0).then_some(result != 0)
+  }
+
   unsafe fn cstr_value(ctx: *mut JSContext, v: JSValue) -> Option<String> {
     let p = unsafe { JS_ToCString(ctx, v) };
     if p.is_null() {
@@ -1966,20 +1981,34 @@ mod cdp {
   ) {
     let expr =
       unsafe { get_str(ctx, params, c"expression") }.unwrap_or_default();
+    let throw_on_side_effect =
+      unsafe { get_bool(ctx, params, c"throwOnSideEffect") }.unwrap_or(false);
     let cexpr = CString::new(expr.as_str())
       .unwrap_or_else(|_| CString::new("undefined").unwrap());
-    let mut val = unsafe {
-      JS_Eval(
-        ctx,
-        cexpr.as_ptr(),
-        expr.len(),
-        c"<repl>".as_ptr(),
-        JS_EVAL_TYPE_GLOBAL,
-      )
+    let mut val = if throw_on_side_effect {
+      unsafe {
+        v82jsc_eval_no_side_effect(
+          ctx,
+          cexpr.as_ptr(),
+          expr.len(),
+          c"<repl>".as_ptr(),
+        )
+      }
+    } else {
+      unsafe {
+        JS_Eval(
+          ctx,
+          cexpr.as_ptr(),
+          expr.len(),
+          c"<repl>".as_ptr(),
+          JS_EVAL_TYPE_GLOBAL,
+        )
+      }
     };
 
     let mut was_async = false;
-    if jsv_is_exception(&val) && expr.contains("await") {
+    if !throw_on_side_effect && jsv_is_exception(&val) && expr.contains("await")
+    {
       unsafe { drain_exc(ctx) };
 
       was_async = true;

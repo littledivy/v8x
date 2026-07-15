@@ -529,6 +529,12 @@ unsafe extern "C" {
     eval_flags: c_int,
   ) -> JSValue;
   pub fn JS_EvalFunction(ctx: *mut JSContext, fun_obj: JSValue) -> JSValue;
+  pub fn v82jsc_eval_no_side_effect(
+    ctx: *mut JSContext,
+    input: *const c_char,
+    input_len: usize,
+    filename: *const c_char,
+  ) -> JSValue;
 
   pub fn JS_ParseJSON(
     ctx: *mut JSContext,

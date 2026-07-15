@@ -1,0 +1,147 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -504,6 +504,8 @@
+        - the prototype of Object.prototype is null (always true as it is immutable)
+     */
+     uint8_t std_array_prototype : 1;
++    uint8_t v82jsc_throw_on_side_effect : 1;
++    JSObject *v82jsc_side_effect_root;
+ 
+     JSShape *array_shape;   /* initial shape for Array objects */
+     JSShape *arguments_shape;  /* shape for arguments objects */
+@@ -8666,6 +8668,7 @@
+ }
+ 
+ #define JS_ERROR_MAP(X)     \
++    X(Eval, EVAL)           \
+     X(Internal, INTERNAL)   \
+     X(Plain, PLAIN)         \
+     X(Range, RANGE)         \
+@@ -10801,6 +10804,12 @@
+     int desc_flags;
+     int ret;
+ 
++    if (unlikely(ctx->v82jsc_throw_on_side_effect)) {
++        JS_FreeValue(ctx, val);
++        JS_ThrowEvalError(ctx, "Possible side-effect in debug-evaluate");
++        return -1;
++    }
++
+     switch(JS_VALUE_GET_TAG(this_obj)) {
+     case JS_TAG_NULL:
+         JS_ThrowTypeErrorAtom(ctx, "Cannot set properties of null (setting '%s')", prop);
+@@ -12092,6 +12101,12 @@
+     JSProperty *pr;
+     int ret;
+ 
++    if (unlikely(ctx->v82jsc_throw_on_side_effect)) {
++        JS_FreeValue(ctx, val);
++        JS_ThrowEvalError(ctx, "Possible side-effect in debug-evaluate");
++        return -1;
++    }
++
+     /* no exotic behavior is possible in global_var_obj */
+     p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+     prs = find_own_property(&pr, p, prop);
+@@ -12168,6 +12183,11 @@
+     JSValue obj1;
+     JSObject *p;
+     int res;
++
++    if (unlikely(ctx->v82jsc_throw_on_side_effect)) {
++        JS_ThrowEvalError(ctx, "Possible side-effect in debug-evaluate");
++        return -1;
++    }
+ 
+     obj1 = JS_ToObject(ctx, obj);
+     if (JS_IsException(obj1))
+@@ -18361,6 +18381,14 @@
+         }
+     }
+     p = JS_VALUE_GET_OBJ(func_obj);
++    if (unlikely(caller_ctx->v82jsc_throw_on_side_effect)) {
++        if (p == caller_ctx->v82jsc_side_effect_root) {
++            caller_ctx->v82jsc_side_effect_root = NULL;
++        } else {
++            return JS_ThrowEvalError(caller_ctx,
++                                     "Possible side-effect in debug-evaluate");
++        }
++    }
+     if (unlikely(p->class_id != JS_CLASS_BYTECODE_FUNCTION)) {
+         JSClassCall *call_func;
+         call_func = rt->class_array[p->class_id].call;
+@@ -19924,6 +19952,10 @@
+                 atom = get_u32(pc);
+                 pc += 4;
+ 
++                if (unlikely(ctx->v82jsc_throw_on_side_effect)) {
++                    JS_ThrowEvalError(ctx, "Possible side-effect in debug-evaluate");
++                    goto exception;
++                }
+                 obj = sp[-2];
+                 if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
+                     p = JS_VALUE_GET_OBJ(obj);
+@@ -20205,6 +20237,10 @@
+                 JSObject *p;
+ 
+                 val = sp[-1];
++                if (unlikely(ctx->v82jsc_throw_on_side_effect)) {
++                    JS_ThrowEvalError(ctx, "Possible side-effect in debug-evaluate");
++                    goto exception;
++                }
+                 if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_INT)) {
+                     idx = JS_VALUE_GET_INT(sp[-2]);
+                     if (likely(JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT)) {
+@@ -39491,6 +39527,39 @@
+         .eval_flags = eval_flags
+     };
+     return JS_EvalThis2(ctx, ctx->global_obj, input, input_len, &options);
++}
++
++JSValue v82jsc_eval_no_side_effect(JSContext *ctx,
++                                   const char *input,
++                                   size_t input_len,
++                                   const char *filename)
++{
++    JSValue bytecode, function, result;
++
++    if (unlikely(ctx->v82jsc_throw_on_side_effect))
++        return JS_ThrowEvalError(ctx,
++                                 "Possible side-effect in debug-evaluate");
++
++    bytecode = JS_Eval(ctx, input, input_len, filename,
++                       JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY);
++    if (JS_IsException(bytecode))
++        return bytecode;
++    if (JS_VALUE_GET_TAG(bytecode) != JS_TAG_FUNCTION_BYTECODE) {
++        JS_FreeValue(ctx, bytecode);
++        return JS_ThrowEvalError(ctx,
++                                 "Possible side-effect in debug-evaluate");
++    }
++
++    function = js_closure(ctx, bytecode, NULL, NULL);
++    if (JS_IsException(function))
++        return function;
++
++    ctx->v82jsc_throw_on_side_effect = true;
++    ctx->v82jsc_side_effect_root = JS_VALUE_GET_OBJ(function);
++    result = JS_CallFree(ctx, function, ctx->global_obj, 0, NULL);
++    ctx->v82jsc_side_effect_root = NULL;
++    ctx->v82jsc_throw_on_side_effect = false;
++    return result;
+ }
+ 
+ JSValue JS_Eval2(JSContext *ctx, const char *input, size_t input_len, JSEvalOptions *options)
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1277,6 +1277,10 @@
+ /* instantiate and evaluate a bytecode function. Only used when
+    reading a script or module with JS_ReadObject() */
+ JS_EXTERN JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
++JS_EXTERN JSValue v82jsc_eval_no_side_effect(JSContext *ctx,
++                                             const char *input,
++                                             size_t input_len,
++                                             const char *filename);
+ /* load the dependencies of the module 'obj'. Useful when JS_ReadObject()
+    returns a module. */
+ JS_EXTERN int JS_ResolveModule(JSContext *ctx, JSValueConst obj);
