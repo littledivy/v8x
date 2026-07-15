@@ -1385,8 +1385,37 @@ mod cdp {
   use crate::support::int;
   use std::collections::BTreeMap;
   use std::collections::HashMap;
+  use std::collections::HashSet;
   use std::ffi::{CStr, CString};
   use std::os::raw::c_char;
+
+  #[repr(C)]
+  struct JSPropertyEnum {
+    is_enumerable: bool,
+    atom: JSAtom,
+  }
+
+  const JS_GPN_STRING_MASK: i32 = 1 << 0;
+
+  unsafe extern "C" {
+    fn JS_GetOwnPropertyNames(
+      ctx: *mut JSContext,
+      ptab: *mut *mut JSPropertyEnum,
+      plen: *mut u32,
+      obj: JSValue,
+      flags: i32,
+    ) -> i32;
+    fn JS_FreePropertyEnum(
+      ctx: *mut JSContext,
+      tab: *mut JSPropertyEnum,
+      len: u32,
+    );
+    fn JS_AtomToCStringLen(
+      ctx: *mut JSContext,
+      plen: *mut usize,
+      atom: JSAtom,
+    ) -> *const c_char;
+  }
 
   thread_local! {
     static ACTIVE_SESSIONS: std::cell::RefCell<Vec<*mut CdpSession>> =
@@ -2175,6 +2204,153 @@ mod cdp {
     unsafe { send_eval_result(sess, ctx, val, call_id) };
   }
 
+  fn is_indexed_property(name: &str) -> bool {
+    name
+      .parse::<u32>()
+      .ok()
+      .is_some_and(|index| index != u32::MAX && index.to_string() == name)
+  }
+
+  unsafe fn collect_property_names(
+    ctx: *mut JSContext,
+    value: JSValue,
+    include_prototypes: bool,
+    non_indexed_only: bool,
+  ) -> Vec<String> {
+    if !jsv_is_object(&value) {
+      return Vec::new();
+    }
+
+    let mut names = Vec::new();
+    let mut seen_names = HashSet::new();
+    let mut seen_objects = HashSet::new();
+    let mut current = unsafe { JS_DupValue(ctx, value) };
+
+    for _ in 0..64 {
+      let object_key = unsafe { current.u.ptr } as usize;
+      if object_key == 0 || !seen_objects.insert(object_key) {
+        break;
+      }
+
+      let mut properties = std::ptr::null_mut();
+      let mut property_count = 0u32;
+      let result = unsafe {
+        JS_GetOwnPropertyNames(
+          ctx,
+          &mut properties,
+          &mut property_count,
+          current,
+          JS_GPN_STRING_MASK,
+        )
+      };
+      if result < 0 {
+        unsafe { drain_exc(ctx) };
+        break;
+      }
+      for index in 0..property_count as usize {
+        let atom = unsafe { (*properties.add(index)).atom };
+        let mut text_len = 0usize;
+        let text = unsafe { JS_AtomToCStringLen(ctx, &mut text_len, atom) };
+        if text.is_null() {
+          unsafe { drain_exc(ctx) };
+          continue;
+        }
+        let name = String::from_utf8_lossy(unsafe {
+          std::slice::from_raw_parts(text as *const u8, text_len)
+        })
+        .into_owned();
+        unsafe { JS_FreeCString(ctx, text) };
+        if (!non_indexed_only || !is_indexed_property(&name))
+          && seen_names.insert(name.clone())
+        {
+          names.push(name);
+        }
+      }
+      unsafe { JS_FreePropertyEnum(ctx, properties, property_count) };
+
+      if !include_prototypes {
+        break;
+      }
+      let prototype = unsafe { JS_GetPrototype(ctx, current) };
+      unsafe { JS_FreeValue(ctx, current) };
+      if jsv_is_exception(&prototype) {
+        unsafe { drain_exc(ctx) };
+        return names;
+      }
+      if jsv_is_null(&prototype) {
+        unsafe { JS_FreeValue(ctx, prototype) };
+        return names;
+      }
+      current = prototype;
+    }
+
+    unsafe { JS_FreeValue(ctx, current) };
+    names
+  }
+
+  unsafe fn handle_get_properties(
+    sess: &CdpSession,
+    ctx: *mut JSContext,
+    params: JSValue,
+    call_id: i32,
+  ) {
+    let object_id = unsafe { get_str(ctx, params, c"objectId") }
+      .and_then(|id| id.parse::<u64>().ok());
+    let own_properties =
+      unsafe { get_bool(ctx, params, c"ownProperties") }.unwrap_or(false);
+    let non_indexed_only =
+      unsafe { get_bool(ctx, params, c"nonIndexedPropertiesOnly") }
+        .unwrap_or(false);
+    let names = object_id
+      .and_then(|id| sess.objects.get(&id).copied())
+      .map(|value| unsafe {
+        collect_property_names(ctx, value, !own_properties, non_indexed_only)
+      })
+      .unwrap_or_default();
+
+    let descriptors = unsafe { JS_NewArray(ctx) };
+    for (index, name) in names.iter().enumerate() {
+      let descriptor = unsafe { JS_NewObject(ctx) };
+      unsafe {
+        set_str(ctx, descriptor, c"name", name);
+        JS_SetPropertyUint32(ctx, descriptors, index as u32, descriptor);
+      }
+    }
+    let response = unsafe { JS_NewObject(ctx) };
+    unsafe {
+      set_val(ctx, response, c"result", descriptors);
+      send_obj(sess, ctx, response, Some(call_id));
+    }
+  }
+
+  unsafe fn handle_global_lexical_scope_names(
+    sess: &CdpSession,
+    ctx: *mut JSContext,
+    call_id: i32,
+  ) {
+    let lexical = unsafe { v82jsc_global_var_obj(ctx) };
+    let names = if jsv_is_exception(&lexical) {
+      unsafe { drain_exc(ctx) };
+      Vec::new()
+    } else {
+      let names = unsafe { collect_property_names(ctx, lexical, false, false) };
+      unsafe { JS_FreeValue(ctx, lexical) };
+      names
+    };
+    let values = unsafe { JS_NewArray(ctx) };
+    for (index, name) in names.iter().enumerate() {
+      let value = unsafe {
+        JS_NewStringLen(ctx, name.as_ptr() as *const c_char, name.len())
+      };
+      unsafe { JS_SetPropertyUint32(ctx, values, index as u32, value) };
+    }
+    let response = unsafe { JS_NewObject(ctx) };
+    unsafe {
+      set_val(ctx, response, c"names", values);
+      send_obj(sess, ctx, response, Some(call_id));
+    }
+  }
+
   unsafe fn handle_call_function_on(
     sess: &mut CdpSession,
     ctx: *mut JSContext,
@@ -2920,6 +3096,9 @@ mod cdp {
         handle_runtime_get_heap_usage(sess, ctx, id)
       },
       "Runtime.evaluate" => unsafe { handle_evaluate(sess, ctx, params, id) },
+      "Runtime.getProperties" => unsafe {
+        handle_get_properties(sess, ctx, params, id)
+      },
       "Runtime.callFunctionOn" => unsafe {
         handle_call_function_on(sess, ctx, params, id)
       },
@@ -2927,9 +3106,7 @@ mod cdp {
         handle_compile_script(sess, ctx, params, id)
       },
       "Runtime.globalLexicalScopeNames" => unsafe {
-        let resp = JS_NewObject(ctx);
-        set_val(ctx, resp, c"names", JS_NewArray(ctx));
-        send_obj(sess, ctx, resp, Some(id));
+        handle_global_lexical_scope_names(sess, ctx, id)
       },
       "Runtime.releaseObject" => unsafe {
         if let Some(oid) =
