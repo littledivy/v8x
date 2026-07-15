@@ -112,12 +112,12 @@ unsafe extern "C" {
 }
 
 thread_local! {
-  static TRY_CATCH_DEPTH: std::cell::Cell<usize> =
-    const { std::cell::Cell::new(0) };
+  static TRY_CATCH_STACK: std::cell::RefCell<Vec<*mut usize>> =
+    const { std::cell::RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn has_active_try_catch() -> bool {
-  TRY_CATCH_DEPTH.with(|depth| depth.get() != 0)
+  TRY_CATCH_STACK.with(|stack| !stack.borrow().is_empty())
 }
 
 unsafe fn peek_pending(ctx: *mut JSContext) -> Option<JSValue> {
@@ -1055,37 +1055,8 @@ pub extern "C" fn v8__PromiseRejectMessage__GetEvent(
 #[allow(non_camel_case_types)]
 type TryCatch = usize;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__CONSTRUCT(
-  buf: *mut usize,
-  isolate: *mut RealIsolate,
-) {
-  TRY_CATCH_DEPTH.with(|depth| depth.set(depth.get().saturating_add(1)));
-  unsafe {
-    *buf.add(0) = isolate as usize;
-    *buf.add(1) = 0;
-    *buf.add(2) = 0;
-    *buf.add(3) = 0;
-    *buf.add(4) = 0;
-    *buf.add(5) = 0;
-
-    let ctx = if isolate.is_null() {
-      current_ctx()
-    } else {
-      let st = iso_state(isolate);
-      st.contexts.last().copied().unwrap_or(st.ctx)
-    };
-    clear_pending(ctx);
-  }
-}
-
 unsafe fn tc_ctx(this: *const TryCatch) -> *mut JSContext {
-  let isolate = *(this as *const usize).add(0) as *mut RealIsolate;
-  if isolate.is_null() {
-    return current_ctx();
-  }
-  let st = iso_state(isolate);
-  st.contexts.last().copied().unwrap_or(st.ctx)
+  *(this as *const usize).add(2) as *mut JSContext
 }
 
 unsafe fn tc_iso(this: *const TryCatch) -> *mut RealIsolate {
@@ -1095,18 +1066,100 @@ unsafe fn tc_iso(this: *const TryCatch) -> *mut RealIsolate {
   *(this as *const usize).add(0) as *mut RealIsolate
 }
 
+unsafe fn tc_caught_ptr(this: *mut TryCatch) -> *mut JSValue {
+  (this as *mut usize).add(3).cast()
+}
+
+unsafe fn tc_has_caught(this: *const TryCatch) -> bool {
+  *(this as *const usize).add(5) != 0
+}
+
+unsafe fn tc_capture_pending(this: *mut TryCatch) -> bool {
+  if tc_has_caught(this) {
+    return true;
+  }
+  let ctx = tc_ctx(this);
+  if ctx.is_null() || !JS_HasException(ctx) {
+    return false;
+  }
+  tc_caught_ptr(this).write(JS_GetException(ctx));
+  *(this as *mut usize).add(5) = 1;
+  true
+}
+
+unsafe fn tc_clear_caught(this: *mut TryCatch) {
+  if !tc_has_caught(this) {
+    return;
+  }
+  let ctx = tc_ctx(this);
+  JS_FreeValue(ctx, tc_caught_ptr(this).read());
+  tc_caught_ptr(this).write(jsv_undefined());
+  *(this as *mut usize).add(5) = 0;
+}
+
+unsafe fn tc_caught(this: *mut TryCatch) -> Option<JSValue> {
+  if tc_capture_pending(this) {
+    Some(*tc_caught_ptr(this))
+  } else {
+    None
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__CONSTRUCT(
+  buf: *mut usize,
+  isolate: *mut RealIsolate,
+) {
+  unsafe {
+    *buf.add(0) = isolate as usize;
+    *buf.add(1) = 0;
+    let ctx = if isolate.is_null() {
+      current_ctx()
+    } else {
+      let st = iso_state(isolate);
+      st.contexts.last().copied().unwrap_or(st.ctx)
+    };
+    *buf.add(2) = ctx as usize;
+    tc_caught_ptr(buf).write(jsv_undefined());
+    *buf.add(5) = 0;
+
+    TRY_CATCH_STACK.with(|stack| {
+      let mut stack = stack.borrow_mut();
+      if let Some(outer) = stack.last().copied() {
+        tc_capture_pending(outer);
+      } else {
+        clear_pending(ctx);
+      }
+      stack.push(buf);
+    });
+  }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TryCatch__DESTRUCT(this: *mut usize) {
   if this.is_null() {
     return;
   }
-  TRY_CATCH_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
   unsafe {
     let rethrow = *this.add(1) != 0;
-
-    if !rethrow {
-      clear_pending(tc_ctx(this as *const TryCatch));
+    tc_capture_pending(this);
+    let ctx = tc_ctx(this as *const TryCatch);
+    if rethrow {
+      if let Some(exc) = tc_caught(this)
+        && !JS_HasException(ctx)
+      {
+        JS_Throw(ctx, JS_DupValue(ctx, exc));
+      }
+    } else {
+      clear_pending(ctx);
     }
+    tc_clear_caught(this);
+    TRY_CATCH_STACK.with(|stack| {
+      let mut stack = stack.borrow_mut();
+      if let Some(index) = stack.iter().rposition(|entry| *entry == this) {
+        stack.remove(index);
+      }
+    });
   }
 }
 
@@ -1115,10 +1168,7 @@ pub extern "C" fn v8__TryCatch__HasCaught(this: *const TryCatch) -> bool {
   if this.is_null() {
     return false;
   }
-  unsafe {
-    let ctx = tc_ctx(this);
-    !ctx.is_null() && JS_HasException(ctx)
-  }
+  unsafe { tc_capture_pending(this as *mut TryCatch) }
 }
 
 #[unsafe(no_mangle)]
@@ -1147,8 +1197,8 @@ pub extern "C" fn v8__TryCatch__Exception(
         "execution terminated",
       ));
     }
-    match peek_pending(ctx) {
-      Some(exc) => intern::<Value>(exc),
+    match tc_caught(this as *mut TryCatch) {
+      Some(exc) => intern_dup::<Value>(ctx, exc),
       None => ptr::null(),
     }
   }
@@ -1163,7 +1213,9 @@ pub extern "C" fn v8__TryCatch__Reset(this: *mut TryCatch) {
     if *(this as *const usize).add(1) != 0 {
       return;
     }
-    clear_pending(tc_ctx(this as *const TryCatch));
+    let ctx = tc_ctx(this as *const TryCatch);
+    clear_pending(ctx);
+    tc_clear_caught(this);
   }
 }
 
@@ -1174,10 +1226,13 @@ pub extern "C" fn v8__TryCatch__ReThrow(this: *mut TryCatch) -> *const Value {
   }
   unsafe {
     let ctx = tc_ctx(this as *const TryCatch);
-    match peek_pending(ctx) {
+    match tc_caught(this) {
       Some(exc) => {
         *(this as *mut usize).add(1) = 1;
-        intern::<Value>(exc)
+        if !JS_HasException(ctx) {
+          JS_Throw(ctx, JS_DupValue(ctx, exc));
+        }
+        intern_dup::<Value>(ctx, exc)
       }
       None => ptr::null(),
     }
@@ -1194,8 +1249,8 @@ pub extern "C" fn v8__TryCatch__Message(
 
   unsafe {
     let ctx = tc_ctx(this);
-    match peek_pending(ctx) {
-      Some(exc) => intern::<Message>(exc),
+    match tc_caught(this as *mut TryCatch) {
+      Some(exc) => intern_dup::<Message>(ctx, exc),
       None => ptr::null(),
     }
   }
@@ -1467,21 +1522,16 @@ pub extern "C" fn v8__TryCatch__StackTrace(
   }
   unsafe {
     let ctx = tc_ctx(this);
-    if ctx.is_null() || !JS_HasException(ctx) {
+    let Some(exc) = tc_caught(this as *mut TryCatch) else {
       return ptr::null();
-    }
+    };
 
-    let exc = JS_GetException(ctx);
     let stack = JS_GetPropertyStr(ctx, exc, c"stack".as_ptr());
     if stack.tag == JS_TAG_EXCEPTION {
       clear_pending(ctx);
-      JS_Throw(ctx, JS_DupValue(ctx, exc));
-      JS_FreeValue(ctx, exc);
       return ptr::null();
     }
 
-    JS_Throw(ctx, JS_DupValue(ctx, exc));
-    JS_FreeValue(ctx, exc);
     if jsv_is_undefined(&stack) || jsv_is_null(&stack) {
       JS_FreeValue(ctx, stack);
       return ptr::null();
