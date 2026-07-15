@@ -2395,6 +2395,7 @@ pub(crate) fn register_script_source(filename: &str, source: &str) {
     }
     map.insert(filename.to_string(), source.to_string());
   });
+  super::inspector::script_source_registered(filename, source);
 }
 
 pub(crate) fn script_source(filename: &str) -> Option<std::string::String> {

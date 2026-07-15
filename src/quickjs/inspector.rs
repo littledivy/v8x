@@ -638,6 +638,10 @@ fn activate_runtime_session(channel: *mut RawChannel) {
   }
 }
 
+pub(crate) fn script_source_registered(url: &str, source: &str) {
+  cdp::script_source_registered(url, source);
+}
+
 fn deactivate_runtime_session(channel: *mut RawChannel) {
   ACTIVE_RUNTIME_CHANNEL.with(|slot| {
     let mut slot = slot.borrow_mut();
@@ -1205,13 +1209,14 @@ pub extern "C" fn v8_inspector__V8Inspector__connect(
     context_name.clone_from(&state.context_name);
     context_aux_data.clone_from(&state.context_aux_data);
   }
-  let sess = Box::new(cdp::CdpSession::new(
+  let mut sess = Box::new(cdp::CdpSession::new(
     channel,
     client,
     _context_group_id,
     context_name,
     context_aux_data,
   ));
+  cdp::register_session(&mut *sess);
   Box::into_raw(sess).cast::<RawV8InspectorSession>()
 }
 
@@ -1382,6 +1387,11 @@ mod cdp {
   use std::ffi::{CStr, CString};
   use std::os::raw::c_char;
 
+  thread_local! {
+    static ACTIVE_SESSIONS: std::cell::RefCell<Vec<*mut CdpSession>> =
+      const { std::cell::RefCell::new(Vec::new()) };
+  }
+
   unsafe extern "C" {
     fn v8_inspector__V8Inspector__Channel__BASE__sendResponse(
       this: *mut RawChannel,
@@ -1402,6 +1412,7 @@ mod cdp {
     context_aux_data: String,
     next_obj_id: u64,
     next_script_id: u64,
+    debugger_enabled: bool,
 
     objects: HashMap<u64, JSValue>,
     scripts: HashMap<String, String>,
@@ -1424,6 +1435,7 @@ mod cdp {
         context_aux_data,
         next_obj_id: 1,
         next_script_id: 1,
+        debugger_enabled: false,
         objects: HashMap::new(),
         scripts: HashMap::new(),
         script_ids_by_url: HashMap::new(),
@@ -1457,41 +1469,50 @@ mod cdp {
       self.schedule_pause_on_next_statement();
       self.resume();
     }
+    fn register_script(&mut self, url: &str, source: &str) -> bool {
+      if let Some(script_id) = self.script_ids_by_url.get(url) {
+        self.scripts.insert(script_id.clone(), source.to_string());
+        return false;
+      }
+      let script_id = self.next_script_id.to_string();
+      self.next_script_id += 1;
+      self
+        .script_ids_by_url
+        .insert(url.to_string(), script_id.clone());
+      self.scripts.insert(script_id.clone(), source.to_string());
+      if !self.debugger_enabled {
+        return false;
+      }
+      let (end_line, end_column) = source
+        .rsplit_once('\n')
+        .map(|(lines, last)| {
+          (
+            lines.bytes().filter(|b| *b == b'\n').count() + 1,
+            last.len(),
+          )
+        })
+        .unwrap_or((0, source.len()));
+      super::send_channel_notification(
+        self.channel,
+        format!(
+          r#"{{"method":"Debugger.scriptParsed","params":{{"scriptId":{},"url":{},"startLine":0,"startColumn":0,"endLine":{end_line},"endColumn":{end_column},"executionContextId":1,"hash":""}}}}"#,
+          super::json_string(&script_id),
+          super::json_string(url),
+        ),
+      );
+      true
+    }
     fn enable_debugger(&mut self) {
       super::activate_debugger_session(
         self.client,
         self.context_group_id,
         self.channel,
       );
+      self.debugger_enabled = true;
       let mut sources = script_sources();
       sources.sort_by(|(left, _), (right, _)| left.cmp(right));
       for (url, source) in sources {
-        if self.script_ids_by_url.contains_key(&url) {
-          continue;
-        }
-        let script_id = self.next_script_id.to_string();
-        self.next_script_id += 1;
-        self
-          .script_ids_by_url
-          .insert(url.clone(), script_id.clone());
-        self.scripts.insert(script_id.clone(), source.clone());
-        let (end_line, end_column) = source
-          .rsplit_once('\n')
-          .map(|(lines, last)| {
-            (
-              lines.bytes().filter(|b| *b == b'\n').count() + 1,
-              last.len(),
-            )
-          })
-          .unwrap_or((0, source.len()));
-        super::send_channel_notification(
-          self.channel,
-          format!(
-            r#"{{"method":"Debugger.scriptParsed","params":{{"scriptId":{},"url":{},"startLine":0,"startColumn":0,"endLine":{end_line},"endColumn":{end_column},"executionContextId":1,"hash":""}}}}"#,
-            super::json_string(&script_id),
-            super::json_string(&url),
-          ),
-        );
+        self.register_script(&url, &source);
       }
       unsafe {
         super::v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
@@ -1499,7 +1520,8 @@ mod cdp {
         );
       }
     }
-    fn disable_debugger(&self) {
+    fn disable_debugger(&mut self) {
+      self.debugger_enabled = false;
       super::deactivate_debugger_session(self.client, self.channel);
     }
     fn enable_runtime(&self) {
@@ -1515,6 +1537,7 @@ mod cdp {
 
   impl Drop for CdpSession {
     fn drop(&mut self) {
+      unregister_session(self);
       super::deactivate_debugger_session(self.client, self.channel);
       super::deactivate_runtime_session(self.channel);
       let ctx = current_ctx();
@@ -1524,6 +1547,36 @@ mod cdp {
         }
       }
     }
+  }
+
+  pub fn register_session(session: *mut CdpSession) {
+    ACTIVE_SESSIONS.with(|sessions| sessions.borrow_mut().push(session));
+  }
+
+  fn unregister_session(session: *mut CdpSession) {
+    ACTIVE_SESSIONS.with(|sessions| {
+      sessions.borrow_mut().retain(|active| *active != session);
+    });
+  }
+
+  pub fn script_source_registered(url: &str, source: &str) {
+    ACTIVE_SESSIONS.with(|sessions| {
+      for session in sessions.borrow().iter().copied() {
+        let Some(session) = (unsafe { session.as_mut() }) else {
+          continue;
+        };
+        if !session.debugger_enabled {
+          continue;
+        }
+        if session.register_script(url, source) {
+          unsafe {
+            super::v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
+              session.channel,
+            );
+          }
+        }
+      }
+    });
   }
 
   unsafe fn set_str(ctx: *mut JSContext, obj: JSValue, key: &CStr, val: &str) {
@@ -1971,6 +2024,62 @@ mod cdp {
       set_str(ctx, response, c"scriptSource", &source);
       send_obj(sess, ctx, response, Some(call_id));
     }
+  }
+
+  unsafe fn handle_debugger_set_script_source(
+    sess: &CdpSession,
+    ctx: *mut JSContext,
+    params: JSValue,
+    call_id: i32,
+  ) {
+    let script_id = unsafe { get_str(ctx, params, c"scriptId") };
+    let source = unsafe { get_str(ctx, params, c"scriptSource") };
+    let response = unsafe { JS_NewObject(ctx) };
+
+    let Some((script_id, source)) = script_id.zip(source) else {
+      unsafe {
+        set_str(ctx, response, c"status", "BlockedByTopLevelEsModuleChange");
+        send_obj(sess, ctx, response, Some(call_id));
+      }
+      return;
+    };
+    if !sess.scripts.contains_key(&script_id) {
+      unsafe {
+        set_str(ctx, response, c"status", "BlockedByTopLevelEsModuleChange");
+        send_obj(sess, ctx, response, Some(call_id));
+      }
+      return;
+    }
+
+    let source = CString::new(source)
+      .unwrap_or_else(|_| CString::new("").expect("empty CString"));
+    let compiled = unsafe {
+      JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.as_bytes().len(),
+        c"<live-edit>".as_ptr(),
+        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+      )
+    };
+    if jsv_is_exception(&compiled) {
+      let exception = unsafe { JS_GetException(ctx) };
+      let description = unsafe { cstr_value(ctx, exception) }
+        .unwrap_or_else(|| "SyntaxError".to_string());
+      let details = unsafe { JS_NewObject(ctx) };
+      unsafe {
+        set_str(ctx, response, c"status", "CompileError");
+        set_str(ctx, details, c"text", &format!("Uncaught {description}"));
+        set_val(ctx, response, c"exceptionDetails", details);
+        JS_FreeValue(ctx, exception);
+      }
+    } else {
+      unsafe {
+        JS_FreeValue(ctx, compiled);
+        set_str(ctx, response, c"status", "BlockedByTopLevelEsModuleChange");
+      }
+    }
+    unsafe { send_obj(sess, ctx, response, Some(call_id)) };
   }
 
   unsafe fn handle_evaluate(
@@ -2756,6 +2865,9 @@ mod cdp {
       },
       "Debugger.getScriptSource" => unsafe {
         handle_debugger_get_script_source(sess, ctx, params, id)
+      },
+      "Debugger.setScriptSource" => unsafe {
+        handle_debugger_set_script_source(sess, ctx, params, id)
       },
       "Profiler.enable" => unsafe { ack(sess, ctx, id) },
       "Profiler.disable" | "Profiler.stopPreciseCoverage" => unsafe {
