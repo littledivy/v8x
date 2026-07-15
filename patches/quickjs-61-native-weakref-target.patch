@@ -1,0 +1,27 @@
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -936,6 +936,7 @@ JS_EXTERN bool JS_IsSet(JSValueConst val);
+ JS_EXTERN bool JS_IsWeakRef(JSValueConst val);
+ JS_EXTERN JSValue v82jsc_new_weak_ref(JSContext *ctx, JSValueConst target);
+ JS_EXTERN bool v82jsc_weak_ref_is_live(JSValueConst weak_ref);
++JS_EXTERN JSValue v82jsc_weak_ref_target(JSValueConst weak_ref);
+ JS_EXTERN bool JS_IsWeakSet(JSValueConst val);
+ JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
+ JS_EXTERN bool JS_IsDataView(JSValueConst val);
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -66004,6 +66004,14 @@ bool v82jsc_weak_ref_is_live(JSValueConst weak_ref)
+     return wrd && wrd != &js_weakref_sentinel;
+ }
+ 
++JSValue v82jsc_weak_ref_target(JSValueConst weak_ref)
++{
++    JSWeakRefData *wrd = JS_GetOpaque(weak_ref, JS_CLASS_WEAK_REF);
++    if (!wrd || wrd == &js_weakref_sentinel)
++        return JS_UNDEFINED;
++    return js_dup(wrd->target);
++}
++
+ static JSValue js_weakref_deref(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+ {
+     JSWeakRefData *wrd = JS_GetOpaque2(ctx, this_val, JS_CLASS_WEAK_REF);

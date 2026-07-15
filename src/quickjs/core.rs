@@ -69,6 +69,8 @@ pub(crate) struct WeakHandle {
   pub handle: *const Data,
   pub parameter: *const c_void,
   pub callback: WeakCallback,
+  pub weak_ref: JSValue,
+  pub context: *mut JSContext,
 }
 
 pub(crate) struct PersistentHandle {
@@ -1010,7 +1012,9 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
   unsafe {
     let mut st = Box::from_raw(this as *mut IsoState);
 
-    st.weak_handles.clear();
+    for weak in st.weak_handles.drain(..) {
+      JS_FreeValue(weak.context, weak.weak_ref);
+    }
 
     while let Some(slot) = st.handles.pop() {
       let v = *slot;

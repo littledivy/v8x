@@ -194,11 +194,24 @@ fn collect_weak_handles(isolate: *mut RealIsolate) {
 
   let mut survivors = Vec::new();
   for weak in weak_handles {
-    if is_strongly_reachable_from_handles(isolate, weak.handle) {
+    let is_live = if jsv_is_undefined(&weak.weak_ref) {
+      is_strongly_reachable_from_handles(isolate, weak.handle)
+    } else {
+      unsafe { v82jsc_weak_ref_is_live(weak.weak_ref) }
+    };
+    if is_live {
+      if !jsv_is_undefined(&weak.weak_ref) {
+        let cell = weak.handle as *mut PersistentCell;
+        let target = unsafe { v82jsc_weak_ref_target(weak.weak_ref) };
+        if target.tag != JS_TAG_EXCEPTION {
+          unsafe { (*cell).value = target };
+        }
+      }
       survivors.push(weak);
       continue;
     }
 
+    unsafe { JS_FreeValue(weak.context, weak.weak_ref) };
     let mut info = WeakCallbackInfoShim {
       isolate,
       parameter: weak.parameter,
@@ -212,6 +225,22 @@ fn collect_weak_handles(isolate: *mut RealIsolate) {
 
   if !survivors.is_empty() {
     iso_state(isolate).weak_handles.extend(survivors);
+  }
+}
+
+fn release_weak_handle_targets(isolate: *mut RealIsolate) {
+  if isolate.is_null() {
+    return;
+  }
+  for weak in &iso_state(isolate).weak_handles {
+    if jsv_is_undefined(&weak.weak_ref) || weak.handle.is_null() {
+      continue;
+    }
+    let cell = weak.handle as *mut PersistentCell;
+    unsafe {
+      JS_FreeValue((*cell).context, (*cell).value);
+      (*cell).value = jsv_undefined();
+    }
   }
 }
 
@@ -356,11 +385,8 @@ fn cppgc_mark_wrapper_key(wrapper_key: usize) -> bool {
   found
 }
 
-unsafe fn cppgc_new_weak_wrapper(
-  ctx: *mut JSContext,
-  wrapper: JSValue,
-) -> JSValue {
-  let weak = unsafe { v82jsc_new_weak_ref(ctx, wrapper) };
+unsafe fn new_native_weak_ref(ctx: *mut JSContext, target: JSValue) -> JSValue {
+  let weak = unsafe { v82jsc_new_weak_ref(ctx, target) };
   if weak.tag == JS_TAG_EXCEPTION {
     let exception = unsafe { JS_GetException(ctx) };
     unsafe { JS_FreeValue(ctx, exception) };
@@ -560,7 +586,7 @@ pub(crate) fn cppgc_register_wrapper(wrapper: JSValue, value: *const RustObj) {
   let weak_wrapper = if ctx.is_null() {
     jsv_undefined()
   } else {
-    unsafe { cppgc_new_weak_wrapper(ctx, wrapper) }
+    unsafe { new_native_weak_ref(ctx, wrapper) }
   };
   CPPGC_OBJECTS.with(|objects| {
     if let Some(object) = objects
@@ -687,6 +713,7 @@ pub extern "C" fn v8__Isolate__RequestGarbageCollectionForTesting(
   let st = iso_state(isolate);
   let prologue_callbacks = st.gc_prologue_callbacks.clone();
   run_gc_callbacks(isolate, &prologue_callbacks);
+  release_weak_handle_targets(isolate);
   if !st.rt.is_null() {
     unsafe { JS_RunGC(st.rt) };
   }
@@ -858,7 +885,7 @@ mod cppgc_persistent_tests {
       assert!(!ctx.is_null());
 
       let wrapper = JS_NewObject(ctx);
-      let weak_wrapper = cppgc_new_weak_wrapper(ctx, wrapper);
+      let weak_wrapper = new_native_weak_ref(ctx, wrapper);
       assert!(!jsv_is_undefined(&weak_wrapper));
       let native = 8usize as *mut RustObj;
       CPPGC_OBJECTS.with(|objects| {
@@ -952,6 +979,8 @@ pub extern "C" fn v8__Global__NewWeak(
   callback: unsafe extern "C" fn(*const c_void),
 ) -> *const Data {
   let handle = v8__Global__New(isolate, data);
+  let mut weak_ref = jsv_undefined();
+  let mut context = ptr::null_mut();
   if !handle.is_null() && !isolate.is_null() {
     let st = iso_state(isolate);
     if let Some(persistent) =
@@ -960,11 +989,16 @@ pub extern "C" fn v8__Global__NewWeak(
       })
     {
       persistent.is_weak = true;
+      let cell = handle as *const PersistentCell;
+      context = unsafe { (*cell).context };
+      weak_ref = unsafe { new_native_weak_ref(context, (*cell).value) };
     }
     st.weak_handles.push(crate::quickjs::core::WeakHandle {
       handle,
       parameter,
       callback,
+      weak_ref,
+      context,
     });
   }
   handle
@@ -984,7 +1018,12 @@ pub extern "C" fn v8__Global__Reset(data: *const Data) {
   let iso = unsafe { (*cell).isolate };
   if !iso.is_null() {
     let st = iso_state(iso);
-    st.weak_handles.retain(|weak| weak.handle != data);
+    if let Some(index) =
+      st.weak_handles.iter().position(|weak| weak.handle == data)
+    {
+      let weak = st.weak_handles.remove(index);
+      unsafe { JS_FreeValue(weak.context, weak.weak_ref) };
+    }
     st.persistent_handles
       .retain(|handle| !std::ptr::addr_eq(handle.slot, data as *const JSValue));
     if st.global_handles.load(Ordering::SeqCst) > 0 {
