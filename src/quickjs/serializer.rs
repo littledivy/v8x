@@ -56,6 +56,7 @@ const JS_GPN_OWN_ENUM: c_int = (1 << 0) | (1 << 1) | (1 << 4); // string|symbol|
 
 unsafe extern "C" {
   fn JS_IsInstanceOf(ctx: *mut JSContext, val: JSValue, obj: JSValue) -> c_int;
+  fn JS_GetTypedArrayType(obj: JSValue) -> c_int;
   fn JS_IsWeakMap(val: JSValue) -> bool;
   fn JS_IsWeakSet(val: JSValue) -> bool;
   fn JS_ValueToAtom(ctx: *mut JSContext, val: JSValue) -> JSAtom;
@@ -188,8 +189,37 @@ fn is_serialized_host_object(
   if crate::quickjs::object::internal_field_count_for_value(v) > 0 {
     return true;
   }
-  is_host_object(ctx, v, brand)
+  (st.treat_array_buffer_views_as_host_objects && is_array_buffer_view(ctx, v))
+    || is_host_object(ctx, v, brand)
     || is_custom_host_object(st, ctx, v, custom_hosts)
+}
+
+fn is_array_buffer_view(ctx: *mut JSContext, v: JSValue) -> bool {
+  if ctx.is_null() || !jsv_is_object(&v) {
+    return false;
+  }
+  if unsafe { JS_GetTypedArrayType(v) } >= 0 {
+    return true;
+  }
+  unsafe {
+    let global = JS_GetGlobalObject(ctx);
+    let ctor = JS_GetPropertyStr(ctx, global, c"DataView".as_ptr());
+    let result = if jsv_is_object(&ctor) {
+      let r = JS_IsInstanceOf(ctx, v, ctor);
+      if r < 0 {
+        let exc = JS_GetException(ctx);
+        JS_FreeValue(ctx, exc);
+        false
+      } else {
+        r > 0
+      }
+    } else {
+      false
+    };
+    JS_FreeValue(ctx, ctor);
+    JS_FreeValue(ctx, global);
+    result
+  }
 }
 
 fn is_shared_array_buffer(ctx: *mut JSContext, v: JSValue) -> bool {
@@ -308,6 +338,7 @@ fn for_each_own<F: FnMut(JSAtom, JSValue)>(
 
 struct SerState {
   buf: Vec<u8>,
+  treat_array_buffer_views_as_host_objects: bool,
   // JSObject pointer of each transferred ArrayBuffer -> its transfer id.
   xfer_ab: std::collections::HashMap<usize, u32>,
   // The deno delegate + isolate, needed to drive host-object serialization
@@ -319,6 +350,7 @@ struct SerState {
 
 struct DeState {
   buf: Vec<u8>,
+  source_data: *const u8,
   pos: usize,
   // transfer id -> the reconstructed ArrayBuffer (owns one ref; freed in DESTRUCT
   // if never consumed).
@@ -378,6 +410,7 @@ pub extern "C" fn v8__ValueSerializer__CONSTRUCT(
 ) {
   let state = Box::new(SerState {
     buf: Vec::new(),
+    treat_array_buffer_views_as_host_objects: false,
     xfer_ab: std::collections::HashMap::new(),
     isolate,
     delegate,
@@ -432,9 +465,11 @@ pub extern "C" fn v8__ValueSerializer__Release(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ValueSerializer__SetTreatArrayBufferViewsAsHostObjects(
-  _this: *mut CxxValueSerializer,
-  _mode: bool,
+  this: *mut CxxValueSerializer,
+  mode: bool,
 ) {
+  let st = unsafe { ser_state(this) };
+  st.treat_array_buffer_views_as_host_objects = mode;
 }
 
 #[unsafe(no_mangle)]
@@ -786,6 +821,7 @@ pub extern "C" fn v8__ValueDeserializer__CONSTRUCT(
   };
   let state = Box::new(DeState {
     buf: bytes,
+    source_data: data,
     pos: 0,
     xfer_ab: std::collections::HashMap::new(),
     ctx: std::ptr::null_mut(),
@@ -1070,10 +1106,10 @@ pub extern "C" fn v8__ValueDeserializer__ReadRawBytes(
   data: *mut *const c_void,
 ) -> bool {
   let st = unsafe { de_state(this) };
-  if st.pos + length > st.buf.len() {
+  if st.source_data.is_null() || st.pos + length > st.buf.len() {
     return false;
   }
-  let p = unsafe { st.buf.as_ptr().add(st.pos) } as *const c_void;
+  let p = unsafe { st.source_data.add(st.pos) } as *const c_void;
   st.pos += length;
   unsafe { *data = p };
   true
