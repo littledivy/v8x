@@ -1123,15 +1123,7 @@ pub extern "C" fn v8__TryCatch__CONSTRUCT(
     tc_caught_ptr(buf).write(jsv_undefined());
     *buf.add(5) = 0;
 
-    TRY_CATCH_STACK.with(|stack| {
-      let mut stack = stack.borrow_mut();
-      if let Some(outer) = stack.last().copied() {
-        tc_capture_pending(outer);
-      } else {
-        clear_pending(ctx);
-      }
-      stack.push(buf);
-    });
+    TRY_CATCH_STACK.with(|stack| stack.borrow_mut().push(buf));
   }
 }
 
