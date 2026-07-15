@@ -829,6 +829,7 @@ unsafe fn call_named_getter(
   handler: &NamedHandler,
   getter: crate::NamedPropertyGetterCallback,
 ) -> (c_int, JSValue) {
+  let _context_guard = push_callback_context(ctx);
   let iso = current_iso();
   let saved_depth = if iso.is_null() {
     0
@@ -885,6 +886,7 @@ unsafe fn call_named_query(
   handler: &NamedHandler,
   query: crate::NamedPropertyQueryCallback,
 ) -> (c_int, c_int) {
+  let _context_guard = push_callback_context(ctx);
   let iso = current_iso();
   let saved_depth = if iso.is_null() {
     0
@@ -1003,6 +1005,7 @@ unsafe fn call_named_deleter(
   handler: &NamedHandler,
   deleter: crate::NamedPropertyDeleterCallback,
 ) -> c_int {
+  let _context_guard = push_callback_context(ctx);
   let iso = current_iso();
   let saved_depth = if iso.is_null() {
     0
@@ -1057,6 +1060,7 @@ unsafe fn call_named_enumerator(
   handler: &NamedHandler,
   enumerator: crate::NamedPropertyEnumeratorCallback,
 ) -> JSValue {
+  let _context_guard = push_callback_context(ctx);
   let iso = current_iso();
   let saved_depth = if iso.is_null() {
     0
@@ -1159,6 +1163,7 @@ unsafe fn call_named_definer(
   handler: &NamedHandler,
   definer: crate::NamedPropertyDefinerCallback,
 ) -> c_int {
+  let _context_guard = push_callback_context(ctx);
   let iso = current_iso();
   let saved_depth = if iso.is_null() {
     0
@@ -1222,6 +1227,7 @@ unsafe fn call_indexed_getter(
   handler: &IndexedHandler,
   getter: crate::IndexedPropertyGetterCallback,
 ) -> (c_int, JSValue) {
+  let _context_guard = push_callback_context(ctx);
   let iso = current_iso();
   let saved_depth = if iso.is_null() {
     0
@@ -1270,6 +1276,7 @@ unsafe fn call_indexed_query(
   handler: &IndexedHandler,
   query: crate::IndexedPropertyQueryCallback,
 ) -> (c_int, c_int) {
+  let _context_guard = push_callback_context(ctx);
   let iso = current_iso();
   let saved_depth = if iso.is_null() {
     0
@@ -1320,6 +1327,7 @@ unsafe fn call_indexed_setter(
   handler: &IndexedHandler,
   setter: crate::IndexedPropertySetterCallback,
 ) -> c_int {
+  let _context_guard = push_callback_context(ctx);
   let iso = current_iso();
   let saved_depth = if iso.is_null() {
     0
@@ -1369,6 +1377,7 @@ unsafe fn call_indexed_deleter(
   handler: &IndexedHandler,
   deleter: crate::IndexedPropertyDeleterCallback,
 ) -> (c_int, c_int) {
+  let _context_guard = push_callback_context(ctx);
   let iso = current_iso();
   let saved_depth = if iso.is_null() {
     0
@@ -1416,6 +1425,7 @@ unsafe fn call_indexed_enumerator(
   handler: &IndexedHandler,
   enumerator: crate::IndexedPropertyEnumeratorCallback,
 ) -> JSValue {
+  let _context_guard = push_callback_context(ctx);
   let iso = current_iso();
   let saved_depth = if iso.is_null() {
     0
@@ -1462,6 +1472,7 @@ unsafe fn call_indexed_definer(
   handler: &IndexedHandler,
   definer: crate::IndexedPropertyDefinerCallback,
 ) -> c_int {
+  let _context_guard = push_callback_context(ctx);
   let iso = current_iso();
   let saved_depth = if iso.is_null() {
     0
