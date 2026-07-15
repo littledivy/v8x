@@ -160,33 +160,6 @@ fn class_tag_is(this: *const Value, tag: &str) -> bool {
   }
 }
 
-fn instance_of_global(this: *const Value, ctor_name: &[u8]) -> bool {
-  let c = ctx();
-  if c.is_null() || !is_obj(this) {
-    return false;
-  }
-  let v = jsval_of(this);
-  unsafe {
-    let global = JS_GetGlobalObject(c);
-    let ctor =
-      JS_GetPropertyStr(c, global, ctor_name.as_ptr() as *const c_char);
-    let mut result = false;
-    if jsv_is_object(&ctor) {
-      let r = JS_IsInstanceOf(c, v, ctor);
-
-      if r < 0 {
-        let exc = JS_GetException(c);
-        JS_FreeValue(c, exc);
-      } else {
-        result = r == 1;
-      }
-    }
-    JS_FreeValue(c, ctor);
-    JS_FreeValue(c, global);
-    result
-  }
-}
-
 #[inline]
 fn typed_array_type(this: *const Value) -> i32 {
   if !is_obj(this) {
@@ -360,7 +333,10 @@ pub extern "C" fn v8__Value__IsSymbolObject(this: *const Value) -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsNativeError(this: *const Value) -> bool {
-  instance_of_global(this, b"Error\0")
+  if this.is_null() {
+    return false;
+  }
+  unsafe { JS_IsError(jsval_of(this)) }
 }
 
 #[unsafe(no_mangle)]
