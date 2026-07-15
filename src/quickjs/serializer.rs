@@ -24,6 +24,7 @@ const JS_WRITE_OBJ_SAB: c_int = 1 << 2;
 const JS_READ_OBJ_REFERENCE: c_int = 1 << 3;
 const JS_READ_OBJ_SAB: c_int = 1 << 2;
 
+const WIRE_HEADER: &[u8; 2] = &[0xff, 0x0f];
 const MAGIC: &[u8; 4] = b"QJSV";
 
 const TAG_VALUE: u8 = b'V';
@@ -495,6 +496,7 @@ pub extern "C" fn v8__ValueSerializer__WriteHeader(
   this: *mut CxxValueSerializer,
 ) {
   let st = unsafe { ser_state(this) };
+  st.buf.extend_from_slice(WIRE_HEADER);
   st.buf.extend_from_slice(MAGIC);
 }
 
@@ -895,7 +897,17 @@ pub extern "C" fn v8__ValueDeserializer__ReadHeader(
 ) -> MaybeBool {
   let st = unsafe { de_state(this) };
 
-  if st.buf.len() - st.pos >= 4 && &st.buf[st.pos..st.pos + 4] == &MAGIC[..] {
+  if st.buf.len() - st.pos >= WIRE_HEADER.len() + MAGIC.len()
+    && &st.buf[st.pos..st.pos + WIRE_HEADER.len()] == &WIRE_HEADER[..]
+    && &st.buf
+      [st.pos + WIRE_HEADER.len()..st.pos + WIRE_HEADER.len() + MAGIC.len()]
+      == &MAGIC[..]
+  {
+    st.pos += WIRE_HEADER.len() + MAGIC.len();
+    MaybeBool::JustTrue
+  } else if st.buf.len() - st.pos >= MAGIC.len()
+    && &st.buf[st.pos..st.pos + MAGIC.len()] == &MAGIC[..]
+  {
     st.pos += 4;
     MaybeBool::JustTrue
   } else {
