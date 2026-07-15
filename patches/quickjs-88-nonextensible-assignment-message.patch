@@ -1,0 +1,43 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -8756,6 +8756,19 @@ static int JS_ThrowTypeErrorReadOnly(JSContext *ctx, int flags, JSAtom atom)
+     }
+ }
+ 
++static int JS_ThrowTypeErrorNotExtensible(JSContext *ctx, int flags,
++                                          JSAtom atom)
++{
++    if ((flags & JS_PROP_THROW) ||
++        ((flags & JS_PROP_THROW_STRICT) && is_strict_mode(ctx))) {
++        JS_ThrowTypeErrorAtom(ctx,
++                              "Cannot add property %s, object is not extensible",
++                              atom);
++        return -1;
++    }
++    return false;
++}
++
+ JSValue JS_ThrowOutOfMemory(JSContext *ctx)
+ {
+     if (!ctx->rt->in_out_of_memory) {
+@@ -10984,7 +10996,7 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop,
+ 
+     if (p == JS_VALUE_GET_OBJ(obj)) {
+         if (unlikely(!p->extensible)) {
+-            ret = JS_ThrowTypeErrorOrFalse(ctx, flags, "object is not extensible");
++            ret = JS_ThrowTypeErrorNotExtensible(ctx, flags, prop);
+             goto done;
+         }
+         if (p->is_exotic) {
+@@ -11028,9 +11040,9 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop,
+         ret = JS_DefineProperty(ctx, this_obj, prop, val,
+                                 JS_UNDEFINED, JS_UNDEFINED,
+                                 JS_PROP_HAS_VALUE);
+     } else {
+         if (unlikely(!p->extensible)) {
+-            ret = JS_ThrowTypeErrorOrFalse(ctx, flags, "object is not extensible");
++            ret = JS_ThrowTypeErrorNotExtensible(ctx, flags, prop);
+             goto done;
+         }
+     generic_create_prop:

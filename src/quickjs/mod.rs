@@ -1080,6 +1080,43 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn nonextensible_assignment_names_property() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source =
+        c"'use strict'; const a = Object.preventExtensions({}); a.c = 1;";
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"nonextensible-test.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert_eq!(result.tag, JS_TAG_EXCEPTION);
+
+      let exception = JS_GetException(ctx);
+      let message = JS_GetPropertyStr(ctx, exception, c"message".as_ptr());
+      let text = JS_ToCString(ctx, message);
+      assert!(!text.is_null());
+      assert_eq!(
+        CStr::from_ptr(text).to_str().unwrap(),
+        "Cannot add property c, object is not extensible"
+      );
+
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, message);
+      JS_FreeValue(ctx, exception);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn class_method_name_does_not_shadow_outer_binding() {
     unsafe {
       let rt = JS_NewRuntime();
