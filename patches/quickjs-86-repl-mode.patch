@@ -1,0 +1,77 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -505,6 +505,7 @@ struct JSContext {
+     */
+     uint8_t std_array_prototype : 1;
+     uint8_t v82jsc_throw_on_side_effect : 1;
++    uint8_t v82jsc_repl_mode : 1;
+     JSObject *v82jsc_side_effect_root;
+ 
+     JSShape *array_shape;   /* initial shape for Array objects */
+@@ -11960,6 +11961,14 @@ static int JS_CheckDefineGlobalVar(JSContext *ctx, JSAtom prop, int flags)
+     p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
+     prs = find_own_property1(p, prop);
+     if (prs) {
++        /* V8 REPL mode allows a top-level `let` to replace an earlier
++           top-level `let`, while const, class, and mixed redeclarations
++           remain errors. */
++        if (ctx->v82jsc_repl_mode &&
++            (flags & (DEFINE_GLOBAL_LEX_VAR | JS_PROP_WRITABLE)) ==
++                (DEFINE_GLOBAL_LEX_VAR | JS_PROP_WRITABLE) &&
++            (prs->flags & JS_PROP_WRITABLE))
++            return 0;
+     fail_redeclaration:
+         JS_ThrowSyntaxErrorVarRedeclaration(ctx, prop);
+         return -1;
+@@ -36295,8 +36304,11 @@ static int resolve_variables(JSContext *ctx, JSFunctionDef *s)
+         dbuf_putc(&bc_out, OP_check_define_var);
+         dbuf_put_u32(&bc_out, JS_DupAtom(ctx, hf->var_name));
+         flags = 0;
+-        if (hf->is_lexical)
++        if (hf->is_lexical) {
+             flags |= DEFINE_GLOBAL_LEX_VAR;
++            if (!hf->is_const)
++                flags |= JS_PROP_WRITABLE;
++        }
+         if (hf->cpool_idx >= 0)
+             flags |= DEFINE_GLOBAL_FUNC_VAR;
+         dbuf_putc(&bc_out, flags);
+@@ -39525,6 +39536,21 @@ JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
+     return JS_EvalThis2(ctx, ctx->global_obj, input, input_len, &options);
+ }
+ 
++JSValue v82jsc_eval_repl(JSContext *ctx,
++                         const char *input,
++                         size_t input_len,
++                         const char *filename,
++                         int eval_flags)
++{
++    JSValue result;
++    bool previous_repl_mode = ctx->v82jsc_repl_mode;
++
++    ctx->v82jsc_repl_mode = true;
++    result = JS_Eval(ctx, input, input_len, filename, eval_flags);
++    ctx->v82jsc_repl_mode = previous_repl_mode;
++    return result;
++}
++
+ JSValue v82jsc_eval_no_side_effect(JSContext *ctx,
+                                    const char *input,
+                                    size_t input_len,
+diff --git a/quickjs.h b/quickjs.h
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1277,7 +1277,12 @@ JS_EXTERN JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
+ JS_EXTERN JSValue v82jsc_eval_no_side_effect(JSContext *ctx,
+                                              const char *input,
+                                              size_t input_len,
+                                              const char *filename);
++JS_EXTERN JSValue v82jsc_eval_repl(JSContext *ctx,
++                                   const char *input,
++                                   size_t input_len,
++                                   const char *filename,
++                                   int eval_flags);
+ JS_EXTERN int v82jsc_live_edit_module(JSContext *ctx, const char *filename,
+                                       JSValueConst replacement_module);
+ /* load the dependencies of the module 'obj'. Useful when JS_ReadObject()

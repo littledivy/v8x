@@ -535,6 +535,13 @@ unsafe extern "C" {
     input_len: usize,
     filename: *const c_char,
   ) -> JSValue;
+  pub fn v82jsc_eval_repl(
+    ctx: *mut JSContext,
+    input: *const c_char,
+    input_len: usize,
+    filename: *const c_char,
+    eval_flags: c_int,
+  ) -> JSValue;
   pub fn v82jsc_live_edit_module(
     ctx: *mut JSContext,
     filename: *const c_char,

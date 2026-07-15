@@ -994,6 +994,56 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn repl_mode_redeclares_let_but_not_const() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      for source in [c"let foo = 0;", c"let foo = foo + 1;"] {
+        let result = v82jsc_eval_repl(
+          ctx,
+          source.as_ptr(),
+          source.to_bytes().len(),
+          c"<repl>".as_ptr(),
+          JS_EVAL_TYPE_GLOBAL,
+        );
+        assert_ne!(result.tag, JS_TAG_EXCEPTION, "REPL let threw");
+        JS_FreeValue(ctx, result);
+      }
+
+      let value = JS_Eval(
+        ctx,
+        c"foo".as_ptr(),
+        c"foo".to_bytes().len(),
+        c"<repl>".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      let mut actual = 0;
+      assert_eq!(JS_ToInt32(ctx, &mut actual, value), 0);
+      assert_eq!(actual, 1);
+      JS_FreeValue(ctx, value);
+
+      let source = c"const foo = 2;";
+      let result = v82jsc_eval_repl(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"<repl>".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert_eq!(result.tag, JS_TAG_EXCEPTION);
+      let exception = JS_GetException(ctx);
+      JS_FreeValue(ctx, exception);
+
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn class_method_name_does_not_shadow_outer_binding() {
     unsafe {
       let rt = JS_NewRuntime();

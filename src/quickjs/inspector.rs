@@ -2228,6 +2228,8 @@ pub(crate) mod cdp {
     register_script_source("<anonymous>", &expr);
     let throw_on_side_effect =
       unsafe { get_bool(ctx, params, c"throwOnSideEffect") }.unwrap_or(false);
+    let repl_mode =
+      unsafe { get_bool(ctx, params, c"replMode") }.unwrap_or(false);
     let cexpr = CString::new(expr.as_str())
       .unwrap_or_else(|_| CString::new("undefined").unwrap());
     let mut val = if throw_on_side_effect {
@@ -2237,6 +2239,16 @@ pub(crate) mod cdp {
           cexpr.as_ptr(),
           expr.len(),
           c"<anonymous>".as_ptr(),
+        )
+      }
+    } else if repl_mode {
+      unsafe {
+        v82jsc_eval_repl(
+          ctx,
+          cexpr.as_ptr(),
+          expr.len(),
+          c"<anonymous>".as_ptr(),
+          JS_EVAL_TYPE_GLOBAL,
         )
       }
     } else {
@@ -2257,14 +2269,26 @@ pub(crate) mod cdp {
       unsafe { drain_exc(ctx) };
 
       was_async = true;
-      val = unsafe {
-        JS_Eval(
-          ctx,
-          cexpr.as_ptr(),
-          expr.len(),
-          c"<anonymous>".as_ptr(),
-          JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_ASYNC,
-        )
+      val = if repl_mode {
+        unsafe {
+          v82jsc_eval_repl(
+            ctx,
+            cexpr.as_ptr(),
+            expr.len(),
+            c"<anonymous>".as_ptr(),
+            JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_ASYNC,
+          )
+        }
+      } else {
+        unsafe {
+          JS_Eval(
+            ctx,
+            cexpr.as_ptr(),
+            expr.len(),
+            c"<anonymous>".as_ptr(),
+            JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_ASYNC,
+          )
+        }
       };
     }
     if was_async && !jsv_is_exception(&val) && unsafe { JS_IsPromise(val) } {
