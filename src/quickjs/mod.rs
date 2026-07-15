@@ -2280,7 +2280,18 @@ mod api_test {
        const transition = Temporal.ZonedDateTime.from(\n\
          '2020-01-01T00:00:00-05:00[America/New_York]'\n\
        ).getTimeZoneTransition('next');\n\
-       `${names}|${duration}|${transition}`;\n\
+       const descriptors = Object.getOwnPropertyDescriptors(Temporal);\n\
+       const namespaceShape = [\n\
+         Object.getPrototypeOf(Temporal) === Object.prototype,\n\
+         Object.prototype.toString.call(Temporal),\n\
+         descriptors.Duration.enumerable,\n\
+         descriptors.Duration.writable,\n\
+         descriptors.Duration.configurable,\n\
+         descriptors[Symbol.toStringTag].enumerable,\n\
+         descriptors[Symbol.toStringTag].writable,\n\
+         descriptors[Symbol.toStringTag].configurable,\n\
+       ].join(',');\n\
+       `${names}|${duration}|${transition}|${namespaceShape}`;\n\
        } catch (error) { `ERROR:${error.stack}`; }",
     )
     .unwrap();
@@ -2290,7 +2301,8 @@ mod api_test {
       result.to_rust_string_lossy(scope),
       "Duration,Instant,Now,PlainDate,PlainDateTime,PlainMonthDay,PlainTime,\
        PlainYearMonth,ZonedDateTime|1 day, 6 hr, 30 min|\
-       2020-03-08T03:00:00-04:00[America/New_York]"
+       2020-03-08T03:00:00-04:00[America/New_York]|\
+       true,[object Temporal],false,true,true,false,false,true"
     );
   }
 

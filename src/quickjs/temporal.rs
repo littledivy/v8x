@@ -254,8 +254,20 @@ pub(crate) unsafe fn install(ctx: *mut JSContext, global: JSValue) {
     (function(g) {
       const implementation = g.temporal;
       if (!implementation || !implementation.Temporal) return;
+      const temporal = {};
+      for (const name of Object.getOwnPropertyNames(implementation.Temporal)) {
+        Object.defineProperty(temporal, name, {
+          value: implementation.Temporal[name],
+          writable: true,
+          configurable: true
+        });
+      }
+      Object.defineProperty(temporal, Symbol.toStringTag, {
+        value: "Temporal",
+        configurable: true
+      });
       Object.defineProperty(g, "Temporal", {
-        value: implementation.Temporal,
+        value: temporal,
         writable: true,
         configurable: true
       });
