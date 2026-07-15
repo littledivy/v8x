@@ -892,6 +892,52 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn module_array_destructuring_exports_all_bindings() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = c"export const [libPrefix, libSuffix] = ['lib', 'dylib']";
+      let module = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"array-destructuring-module.js".as_ptr(),
+        JS_EVAL_TYPE_MODULE | JS_EVAL_FLAG_COMPILE_ONLY,
+      );
+      assert_eq!(module.tag, JS_TAG_MODULE);
+      let module_def = module.u.ptr.cast::<JSModuleDef>();
+
+      let evaluated = JS_EvalFunction(ctx, JS_DupValue(ctx, module));
+      assert_ne!(evaluated.tag, JS_TAG_EXCEPTION);
+      let namespace = JS_GetModuleNamespace(ctx, module_def);
+      assert_ne!(namespace.tag, JS_TAG_EXCEPTION);
+
+      let prefix = JS_GetPropertyStr(ctx, namespace, c"libPrefix".as_ptr());
+      let suffix = JS_GetPropertyStr(ctx, namespace, c"libSuffix".as_ptr());
+      let prefix_text = JS_ToCString(ctx, prefix);
+      let suffix_text = JS_ToCString(ctx, suffix);
+      assert!(!prefix_text.is_null());
+      assert!(!suffix_text.is_null());
+      assert_eq!(CStr::from_ptr(prefix_text).to_bytes(), b"lib");
+      assert_eq!(CStr::from_ptr(suffix_text).to_bytes(), b"dylib");
+
+      JS_FreeCString(ctx, suffix_text);
+      JS_FreeCString(ctx, prefix_text);
+      JS_FreeValue(ctx, suffix);
+      JS_FreeValue(ctx, prefix);
+      JS_FreeValue(ctx, namespace);
+      JS_FreeValue(ctx, evaluated);
+      JS_FreeValue(ctx, module);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn missing_member_call_names_callee() {
     unsafe {
       let rt = JS_NewRuntime();
