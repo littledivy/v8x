@@ -1572,6 +1572,7 @@ mod raw_smoke_test {
 #[cfg(feature = "link_quickjs")]
 mod api_test {
   use crate as v8;
+  use v8::MapFnTo;
 
   thread_local! {
     static DYNAMIC_IMPORT_HOST_OPTIONS: std::cell::Cell<Option<(bool, usize)>> =
@@ -1611,6 +1612,30 @@ mod api_test {
     Some(promise)
   }
 
+  fn snapshot_global_setter(
+    scope: &mut v8::PinScope,
+    key: v8::Local<v8::Name>,
+    value: v8::Local<v8::Value>,
+    args: v8::PropertyCallbackArguments,
+    mut rv: v8::ReturnValue<()>,
+  ) -> v8::Intercepted {
+    let key = key.to_rust_string_lossy(scope);
+    if key == "seen" {
+      return v8::Intercepted::kNo;
+    }
+
+    let seen = v8::String::new(scope, "seen").unwrap();
+    if args
+      .holder()
+      .create_data_property(scope, seen.into(), value)
+      != Some(true)
+    {
+      return v8::Intercepted::kNo;
+    }
+    rv.set_bool(true);
+    v8::Intercepted::kYes
+  }
+
   #[test]
   fn qjs_api_eval() {
     let platform = v8::new_default_platform(0, false).make_shared();
@@ -1637,6 +1662,7 @@ mod api_test {
     assert_unbound_script_preserves_origin();
     assert_continuation_data_survives_await();
     assert_snapshot_context_data_preserves_global_identity();
+    assert_snapshot_global_template_handlers();
     assert_detached_array_buffer_view_contents();
     assert_detached_backing_store_deleter_runs_once();
     assert_large_array_buffers();
@@ -2555,5 +2581,56 @@ mod api_test {
       let script = v8::Script::compile(scope, code, None).unwrap();
       assert!(script.run(scope).unwrap().is_true());
     }
+  }
+
+  fn assert_snapshot_global_template_handlers() {
+    let setter = snapshot_global_setter.map_fn_to();
+    let external_references: std::borrow::Cow<
+      'static,
+      [v8::ExternalReference],
+    > = std::borrow::Cow::Owned(vec![v8::ExternalReference {
+      named_setter: setter,
+    }]);
+    let context_index;
+    let startup_data = {
+      let mut creator =
+        v8::Isolate::snapshot_creator(Some(external_references.clone()), None);
+      {
+        let scope = std::pin::pin!(v8::HandleScope::new(&mut creator));
+        let scope = &mut scope.init();
+        let template = v8::ObjectTemplate::new(scope);
+        template.set_named_property_handler(
+          v8::NamedPropertyHandlerConfiguration::new().setter_raw(setter),
+        );
+        let context = v8::Context::new(
+          scope,
+          v8::ContextOptions {
+            global_template: Some(template),
+            ..Default::default()
+          },
+        );
+        context_index = scope.add_context(context);
+      }
+      creator.create_blob(v8::FunctionCodeHandling::Keep).unwrap()
+    };
+
+    let params = v8::Isolate::create_params()
+      .external_references(external_references)
+      .snapshot_blob(startup_data);
+    let isolate = &mut v8::Isolate::new(params);
+    let scope = std::pin::pin!(v8::HandleScope::new(isolate));
+    let scope = &mut scope.init();
+    let context = v8::Context::from_snapshot(
+      scope,
+      context_index,
+      v8::ContextOptions::default(),
+    )
+    .unwrap();
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let code =
+      v8::String::new(scope, "globalThis.answer = 42; globalThis.seen")
+        .unwrap();
+    let script = v8::Script::compile(scope, code, None).unwrap();
+    assert_eq!(script.run(scope).unwrap().int32_value(scope), Some(42));
   }
 }
