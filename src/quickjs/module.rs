@@ -184,21 +184,29 @@ fn default_bc_cache_dir() -> std::path::PathBuf {
     .join("v8x/quickjs-bytecode")
 }
 
-/// FNV-1a over 8-byte lanes. Cache keys hash multiple MB of extension source
-/// on EVERY boot (each module eval + each transpile lookup); SipHash
-/// (DefaultHasher) was a measurable slice of denort startup. Collision
-/// resistance only needs to beat accidental edits, not adversaries.
+/// Fast non-cryptographic hash over 8-byte lanes. Cache keys hash multiple MB
+/// of extension source on every boot, so avoid SipHash's per-byte overhead.
 pub(crate) fn fast_content_hash(seed: u64, bytes: &[u8]) -> u64 {
-  const PRIME: u64 = 0x0000_0100_0000_01B3;
-  let mut h = 0xcbf2_9ce4_8422_2325u64 ^ seed;
+  const MIX_1: u64 = 0xa076_1d64_78bd_642f;
+  const MIX_2: u64 = 0xe703_7ed1_a0b4_28db;
+  const MIX_3: u64 = 0x8ebc_6af0_9c88_c6e3;
+
+  #[inline]
+  fn mix(a: u64, b: u64) -> u64 {
+    let product = (a as u128).wrapping_mul(b as u128);
+    product as u64 ^ (product >> 64) as u64
+  }
+
+  let mut h = seed ^ MIX_1 ^ bytes.len() as u64;
   let mut chunks = bytes.chunks_exact(8);
   for c in &mut chunks {
-    h = (h ^ u64::from_le_bytes(c.try_into().unwrap())).wrapping_mul(PRIME);
+    h = mix(h ^ u64::from_le_bytes(c.try_into().unwrap()), MIX_2);
   }
-  for &b in chunks.remainder() {
-    h = (h ^ b as u64).wrapping_mul(PRIME);
+  let mut tail = 0u64;
+  for (shift, &byte) in chunks.remainder().iter().enumerate() {
+    tail |= (byte as u64) << (shift * 8);
   }
-  h ^ (bytes.len() as u64)
+  mix(mix(h ^ tail, MIX_3), MIX_1)
 }
 
 fn versioned_bc_seed(seed: u64) -> u64 {
@@ -237,6 +245,16 @@ mod cache_key_tests {
       bc_key("export const value = 1;", "file:///a.ts"),
       bc_key("export const value = 1;", "file:///b.ts")
     );
+  }
+
+  #[test]
+  fn module_bytecode_cache_keys_do_not_alias_correlated_sources_and_names() {
+    let mut keys = std::collections::HashSet::new();
+    for i in 0..200 {
+      let source = format!("export const value = {i};\n");
+      let name = format!("file:///tmp/modules/mod_{i}.ts");
+      assert!(keys.insert(bc_key(&source, &name)), "collision at {i}");
+    }
   }
 
   #[test]
