@@ -513,3 +513,50 @@ index 37d7b6e478..a2e22e27b6 100644
        startup_phase_end(_phase, "load module map from snapshot");
  
        if context_state.ext_import_meta_proto.borrow().is_none() {
+diff --git a/runtime/ops/worker_host.rs b/runtime/ops/worker_host.rs
+index 2d6703245f..4c9440f82c 100644
+--- a/runtime/ops/worker_host.rs
++++ b/runtime/ops/worker_host.rs
+@@ -95,6 +95,7 @@ struct FormatJsErrorFnHolder(Option<Arc<FormatJsErrorFn>>);
+ 
+ pub struct WorkerThread {
+   worker_handle: WebWorkerHandle,
++  join_handle: Option<std::thread::JoinHandle<()>>,
+   worker_type: WorkerThreadType,
+   cancel_handle: Rc<CancelHandle>,
+   cpu_thread_handle: Arc<AtomicU64>,
+@@ -113,10 +114,16 @@ impl WorkerThread {
+     self.worker_handle.clone().terminate();
+   }
+ 
+-  fn finish_termination(self) {
++  fn finish_termination(mut self) {
+     // Cancel recv ops when terminating the worker, so they don't show up as
+     // pending ops.
+     self.cancel_handle.cancel();
++    self.worker_handle.clone().terminate();
++    // Worker teardown may still be flushing profiler output after its
++    // communication channels close.
++    if let Some(join_handle) = self.join_handle.take() {
++      let _ = join_handle.join();
++    }
+   }
+ }
+ 
+@@ -334,7 +341,7 @@ fn op_create_worker(
+   let cpu_thread_handle_writer = cpu_thread_handle.clone();
+ 
+   // Spawn it
+-  thread_builder.spawn(move || {
++  let join_handle = thread_builder.spawn(move || {
+     // Capture the OS thread handle for CPU usage queries from the host.
+     cpu_thread_handle_writer
+       .store(capture_current_thread_handle(), Ordering::Release);
+@@ -402,6 +409,7 @@ fn op_create_worker(
+ 
+   let worker_thread = WorkerThread {
+     worker_handle: worker_handle.into(),
++    join_handle: Some(join_handle),
+     worker_type: args.worker_type,
+     cancel_handle: CancelHandle::new_rc(),
+     cpu_thread_handle,

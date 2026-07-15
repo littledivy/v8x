@@ -1406,6 +1406,7 @@ pub(crate) mod cdp {
   use std::collections::HashSet;
   use std::ffi::{CStr, CString};
   use std::os::raw::c_char;
+  use std::sync::atomic::Ordering;
 
   #[repr(C)]
   struct JSPropertyEnum {
@@ -1414,6 +1415,35 @@ pub(crate) mod cdp {
   }
 
   const JS_GPN_STRING_MASK: i32 = 1 << 0;
+
+  struct TerminationSuppression {
+    isolate: *mut crate::isolate::RealIsolate,
+    restore: bool,
+  }
+
+  impl TerminationSuppression {
+    fn new() -> Self {
+      let isolate = current_iso();
+      let restore = !isolate.is_null()
+        && iso_state(isolate).terminating.swap(false, Ordering::AcqRel);
+      Self { isolate, restore }
+    }
+
+    fn restore(&mut self) {
+      if self.restore {
+        iso_state(self.isolate)
+          .terminating
+          .store(true, Ordering::Release);
+        self.restore = false;
+      }
+    }
+  }
+
+  impl Drop for TerminationSuppression {
+    fn drop(&mut self) {
+      self.restore();
+    }
+  }
 
   unsafe extern "C" {
     fn JS_GetOwnPropertyNames(
@@ -2773,22 +2803,76 @@ pub(crate) mod cdp {
     ranges: Vec<CoverageRangeData>,
   }
 
-  fn utf16_offset(source: &str, line_number: i32, column_number: i32) -> usize {
-    let target_line = line_number.max(1) as usize;
-    let target_column = column_number.max(0) as usize;
-    let mut offset = 0usize;
-    for (index, line) in source.split_inclusive('\n').enumerate() {
-      if index + 1 == target_line {
-        let column_offset = line
-          .chars()
-          .take(target_column)
-          .map(char::len_utf16)
-          .sum::<usize>();
-        return offset.saturating_add(column_offset);
+  struct SourceOffsets {
+    source: String,
+    utf16_by_byte: Vec<usize>,
+    line_starts: Vec<usize>,
+    utf16_len: usize,
+  }
+
+  impl SourceOffsets {
+    fn new(source: String) -> Self {
+      let mut utf16_by_byte = vec![0; source.len() + 1];
+      let mut line_starts = vec![0];
+      let mut utf16_len = 0;
+      for (byte_offset, ch) in source.char_indices() {
+        let next_byte_offset = byte_offset + ch.len_utf8();
+        utf16_by_byte[byte_offset..next_byte_offset].fill(utf16_len);
+        utf16_len += ch.len_utf16();
+        utf16_by_byte[next_byte_offset] = utf16_len;
+        if ch == '\n' {
+          line_starts.push(next_byte_offset);
+        }
       }
-      offset = offset.saturating_add(line.encode_utf16().count());
+      Self {
+        source,
+        utf16_by_byte,
+        line_starts,
+        utf16_len,
+      }
     }
-    source.encode_utf16().count()
+
+    fn line_column(&self, line_number: i32, column_number: i32) -> usize {
+      let line_index = line_number.max(1) as usize - 1;
+      let Some(&line_start) = self.line_starts.get(line_index) else {
+        return self.utf16_len;
+      };
+      let line_end = self
+        .line_starts
+        .get(line_index + 1)
+        .copied()
+        .unwrap_or(self.source.len());
+      let column = column_number.max(0) as usize;
+      let byte_offset = self.source[line_start..line_end]
+        .char_indices()
+        .nth(column)
+        .map(|(offset, _)| line_start + offset)
+        .unwrap_or(line_end);
+      self.utf16_by_byte[byte_offset]
+    }
+
+    fn byte_offset(&self, byte_offset: usize) -> usize {
+      self.utf16_by_byte[byte_offset.min(self.source.len())]
+    }
+  }
+
+  #[cfg(test)]
+  mod source_offsets_tests {
+    use super::SourceOffsets;
+
+    #[test]
+    fn maps_lines_columns_and_utf8_bytes_to_utf16() {
+      let offsets = SourceOffsets::new("a😀\nβ".to_string());
+
+      assert_eq!(offsets.line_column(1, 0), 0);
+      assert_eq!(offsets.line_column(1, 1), 1);
+      assert_eq!(offsets.line_column(1, 2), 3);
+      assert_eq!(offsets.line_column(2, 0), 4);
+      assert_eq!(offsets.line_column(2, 1), 5);
+      assert_eq!(offsets.byte_offset(2), 1);
+      assert_eq!(offsets.byte_offset(5), 3);
+      assert_eq!(offsets.byte_offset(8), 5);
+    }
   }
 
   fn source_for_url(url: &str) -> Option<String> {
@@ -2807,34 +2891,25 @@ pub(crate) mod cdp {
     }
   }
 
-  fn utf16_offset_from_byte(source: &str, byte_offset: usize) -> usize {
-    let mut byte_offset = byte_offset.min(source.len());
-    while !source.is_char_boundary(byte_offset) {
-      byte_offset -= 1;
-    }
-    source[..byte_offset].encode_utf16().count()
-  }
-
   fn function_coverage_data(
     function: PreciseCoverageFunction,
+    script: &SourceOffsets,
   ) -> Option<FunctionCoverageData> {
-    if function.url.is_empty() {
-      return None;
-    }
-    let script = source_for_url(&function.url)?;
-    let script_len = script.encode_utf16().count();
     let is_script_root = function.source.is_empty();
     let start_offset = if is_script_root {
       0
     } else {
-      utf16_offset(&script, function.start_line, function.start_column)
-        .min(script_len)
+      script
+        .line_column(function.start_line, function.start_column)
+        .min(script.utf16_len)
     };
     let source_len = function.source.encode_utf16().count();
     let end_offset = if source_len == 0 {
-      script_len
+      script.utf16_len
     } else {
-      start_offset.saturating_add(source_len).min(script_len)
+      start_offset
+        .saturating_add(source_len)
+        .min(script.utf16_len)
     };
     if end_offset <= start_offset {
       return None;
@@ -2844,8 +2919,8 @@ pub(crate) mod cdp {
       .ranges
       .into_iter()
       .filter_map(|((start, end), count)| {
-        let start = utf16_offset_from_byte(&script, start as usize);
-        let end = utf16_offset_from_byte(&script, end as usize);
+        let start = script.byte_offset(start as usize);
+        let end = script.byte_offset(end as usize);
         (start < end && start >= start_offset && end <= end_offset)
           .then_some(((start, end), count))
       })
@@ -2862,13 +2937,13 @@ pub(crate) mod cdp {
       // reporting the prologue of an executed function as an uncovered block.
       location_counts.insert(start_offset, call_count);
       for (line, column) in function.locations {
-        let offset = utf16_offset(&script, line, column);
+        let offset = script.line_column(line, column);
         if offset >= start_offset && offset < end_offset {
           location_counts.entry(offset).or_insert(0);
         }
       }
       for hit in function.hits.into_values() {
-        let offset = utf16_offset(&script, hit.line_number, hit.column_number);
+        let offset = script.line_column(hit.line_number, hit.column_number);
         if offset >= start_offset && offset < end_offset {
           location_counts
             .entry(offset)
@@ -2937,6 +3012,85 @@ pub(crate) mod cdp {
     })
   }
 
+  fn precise_coverage_data(
+    functions: Vec<PreciseCoverageFunction>,
+  ) -> Vec<(String, Vec<FunctionCoverageData>)> {
+    let mut scripts = BTreeMap::<String, Vec<FunctionCoverageData>>::new();
+    let mut functions_by_url =
+      BTreeMap::<String, Vec<PreciseCoverageFunction>>::new();
+    for function in functions {
+      if !function.url.is_empty() {
+        functions_by_url
+          .entry(function.url.clone())
+          .or_default()
+          .push(function);
+      }
+    }
+    for (source_url, functions) in functions_by_url {
+      let Some(script) = source_for_url(&source_url) else {
+        continue;
+      };
+      let script = SourceOffsets::new(script);
+      let url = inspector_script_url(&source_url);
+      let script_functions = scripts.entry(url).or_default();
+      for function in functions {
+        if let Some(function) = function_coverage_data(function, &script) {
+          script_functions.push(function);
+        }
+      }
+    }
+
+    scripts
+      .into_iter()
+      .map(|(url, mut functions)| {
+        functions.sort_by_key(|function| {
+          function
+            .ranges
+            .first()
+            .map(|range| range.start_offset)
+            .unwrap_or_default()
+        });
+        let mut index = 0;
+        while index < functions.len() {
+          if functions[index].function_name != "<static_initializer>" {
+            index += 1;
+            continue;
+          }
+          let Some(root) = functions[index].ranges.first() else {
+            index += 1;
+            continue;
+          };
+          let mut cursor = root.end_offset;
+          let mut next = index + 1;
+          while next < functions.len() {
+            let Some(candidate_root) = functions[next].ranges.first() else {
+              next += 1;
+              continue;
+            };
+            let candidate_start = candidate_root.start_offset;
+            let candidate_end = candidate_root.end_offset;
+            let candidate_count = candidate_root.count;
+            if candidate_start > cursor.saturating_add(16) {
+              break;
+            }
+            cursor = cursor.max(candidate_end);
+            if functions[next].function_name == "<static_initializer>" {
+              functions[index].ranges[0].end_offset = cursor;
+              functions[index].ranges[0].count =
+                functions[index].ranges[0].count.min(candidate_count);
+              functions[index].ranges.truncate(1);
+              functions.remove(next);
+              continue;
+            }
+            next += 1;
+          }
+          index += 1;
+        }
+        (url, functions)
+      })
+      .collect()
+  }
+
   unsafe fn coverage_range_to_value(
     ctx: *mut JSContext,
     range: CoverageRangeData,
@@ -2993,60 +3147,9 @@ pub(crate) mod cdp {
     ctx: *mut JSContext,
     functions: Vec<PreciseCoverageFunction>,
   ) -> JSValue {
-    let mut scripts = BTreeMap::<String, Vec<FunctionCoverageData>>::new();
-    for function in functions {
-      let url = inspector_script_url(&function.url);
-      if let Some(function) = function_coverage_data(function) {
-        scripts.entry(url).or_default().push(function);
-      }
-    }
-
+    let scripts = precise_coverage_data(functions);
     let result = unsafe { JS_NewArray(ctx) };
-    for (script_index, (url, mut functions)) in scripts.into_iter().enumerate()
-    {
-      functions.sort_by_key(|function| {
-        function
-          .ranges
-          .first()
-          .map(|range| range.start_offset)
-          .unwrap_or_default()
-      });
-      let mut index = 0;
-      while index < functions.len() {
-        if functions[index].function_name != "<static_initializer>" {
-          index += 1;
-          continue;
-        }
-        let Some(root) = functions[index].ranges.first() else {
-          index += 1;
-          continue;
-        };
-        let mut cursor = root.end_offset;
-        let mut next = index + 1;
-        while next < functions.len() {
-          let Some(candidate_root) = functions[next].ranges.first() else {
-            next += 1;
-            continue;
-          };
-          let candidate_start = candidate_root.start_offset;
-          let candidate_end = candidate_root.end_offset;
-          let candidate_count = candidate_root.count;
-          if candidate_start > cursor.saturating_add(16) {
-            break;
-          }
-          cursor = cursor.max(candidate_end);
-          if functions[next].function_name == "<static_initializer>" {
-            functions[index].ranges[0].end_offset = cursor;
-            functions[index].ranges[0].count =
-              functions[index].ranges[0].count.min(candidate_count);
-            functions[index].ranges.truncate(1);
-            functions.remove(next);
-            continue;
-          }
-          next += 1;
-        }
-        index += 1;
-      }
+    for (script_index, (url, functions)) in scripts.into_iter().enumerate() {
       let script = unsafe { JS_NewObject(ctx) };
       let function_values = unsafe { JS_NewArray(ctx) };
       for (index, function) in functions.into_iter().enumerate() {
@@ -3069,15 +3172,6 @@ pub(crate) mod cdp {
     result
   }
 
-  unsafe fn handle_start_precise_coverage(
-    sess: &CdpSession,
-    ctx: *mut JSContext,
-    call_id: i32,
-  ) {
-    super::start_precise_coverage();
-    unsafe { ack(sess, ctx, call_id) };
-  }
-
   unsafe fn handle_take_precise_coverage(
     sess: &CdpSession,
     ctx: *mut JSContext,
@@ -3095,6 +3189,15 @@ pub(crate) mod cdp {
       set_val(ctx, response, c"timestamp", JS_NewFloat64(ctx, timestamp));
       send_obj(sess, ctx, response, Some(call_id));
     }
+  }
+
+  unsafe fn handle_start_precise_coverage(
+    sess: &CdpSession,
+    ctx: *mut JSContext,
+    call_id: i32,
+  ) {
+    super::start_precise_coverage();
+    unsafe { ack(sess, ctx, call_id) };
   }
 
   unsafe fn handle_profiler_set_sampling_interval(
@@ -3150,6 +3253,11 @@ pub(crate) mod cdp {
   }
 
   pub fn dispatch(sess: &mut CdpSession, message: &str) {
+    // V8's inspector remains usable while execution termination is pending.
+    // QuickJS applies its interrupt flag to the JSON work used by this shim,
+    // so clear it while decoding the method and for non-executing profiler
+    // commands. Restore it before dispatching every other protocol domain.
+    let mut termination = TerminationSuppression::new();
     let ctx = current_ctx();
     if ctx.is_null() {
       return;
@@ -3168,6 +3276,9 @@ pub(crate) mod cdp {
     let id = unsafe { get_int(ctx, parsed, c"id") }.unwrap_or(0) as i32;
     let method = unsafe { get_str(ctx, parsed, c"method") }.unwrap_or_default();
     let params = unsafe { JS_GetPropertyStr(ctx, parsed, c"params".as_ptr()) };
+    if !method.starts_with("Profiler.") {
+      termination.restore();
+    }
 
     match method.as_str() {
       "Debugger.enable" => unsafe {
