@@ -170,6 +170,53 @@ pub(crate) unsafe fn install_host_functions(
   }
 }
 
+const JS_WRITE_OBJ_BYTECODE: c_int = 1 << 0;
+const JS_READ_OBJ_BYTECODE: c_int = 1 << 0;
+
+unsafe fn eval_cached_script(
+  ctx: *mut JSContext,
+  source: &[u8],
+  filename: &std::ffi::CStr,
+  cache: &OnceLock<Vec<u8>>,
+) -> JSValue {
+  if let Some(bytes) = cache.get() {
+    let function = unsafe {
+      JS_ReadObject(ctx, bytes.as_ptr(), bytes.len(), JS_READ_OBJ_BYTECODE)
+    };
+    if function.tag == JS_TAG_EXCEPTION {
+      return function;
+    }
+    return unsafe { JS_EvalFunction(ctx, function) };
+  }
+
+  let source = CString::new(source).expect("bootstrap script contains NUL");
+  let function = unsafe {
+    JS_Eval(
+      ctx,
+      source.as_ptr(),
+      source.as_bytes().len(),
+      filename.as_ptr(),
+      JS_EVAL_TYPE_GLOBAL | JS_EVAL_FLAG_COMPILE_ONLY,
+    )
+  };
+  if function.tag == JS_TAG_EXCEPTION {
+    return function;
+  }
+
+  let mut size = 0;
+  let bytes =
+    unsafe { JS_WriteObject(ctx, &mut size, function, JS_WRITE_OBJ_BYTECODE) };
+  if !bytes.is_null() {
+    if size > 0 {
+      let bytecode = unsafe { std::slice::from_raw_parts(bytes, size) };
+      let _ = cache.set(bytecode.to_vec());
+    }
+    unsafe { js_free(ctx, bytes.cast()) };
+  }
+
+  unsafe { JS_EvalFunction(ctx, function) }
+}
+
 pub(crate) unsafe fn install(ctx: *mut JSContext, global: JSValue) {
   let existing =
     unsafe { JS_GetPropertyStr(ctx, global, c"Temporal".as_ptr()) };
@@ -181,15 +228,13 @@ pub(crate) unsafe fn install(ctx: *mut JSContext, global: JSValue) {
 
   const POLYFILL: &[u8] =
     include_bytes!("../../vendor/temporal-polyfill/index.umd.js");
-  let polyfill =
-    CString::new(POLYFILL).expect("Temporal polyfill contains NUL");
+  static POLYFILL_BYTECODE: OnceLock<Vec<u8>> = OnceLock::new();
   let result = unsafe {
-    JS_Eval(
+    eval_cached_script(
       ctx,
-      polyfill.as_ptr(),
-      POLYFILL.len(),
-      c"<temporal-polyfill>".as_ptr(),
-      JS_EVAL_TYPE_GLOBAL,
+      POLYFILL,
+      c"<temporal-polyfill>",
+      &POLYFILL_BYTECODE,
     )
   };
   if result.tag == JS_TAG_EXCEPTION {
@@ -227,15 +272,9 @@ pub(crate) unsafe fn install(ctx: *mut JSContext, global: JSValue) {
       delete g.temporal;
     })(globalThis);
   "#;
-  let install = CString::new(INSTALL).expect("Temporal installer contains NUL");
+  static INSTALL_BYTECODE: OnceLock<Vec<u8>> = OnceLock::new();
   let result = unsafe {
-    JS_Eval(
-      ctx,
-      install.as_ptr(),
-      INSTALL.len(),
-      c"<temporal-install>".as_ptr(),
-      JS_EVAL_TYPE_GLOBAL,
-    )
+    eval_cached_script(ctx, INSTALL, c"<temporal-install>", &INSTALL_BYTECODE)
   };
   if result.tag == JS_TAG_EXCEPTION {
     let exception = unsafe { JS_GetException(ctx) };
