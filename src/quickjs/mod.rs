@@ -1467,7 +1467,10 @@ mod api_test {
       "const size = 2 ** 32 + 1;\n\
        const ab = new ArrayBuffer(size);\n\
        const sab = new SharedArrayBuffer(size);\n\
-       ab.byteLength === size && sab.byteLength === size",
+       const viewSize = 2 ** 31;\n\
+       const view = new Uint8Array(viewSize);\n\
+       ab.byteLength === size && sab.byteLength === size &&\n\
+         view.length === viewSize",
     )
     .unwrap();
     let script = v8::Script::compile(scope, source, None).unwrap();

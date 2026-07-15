@@ -1,0 +1,11 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -62764,7 +62764,7 @@ static JSValue js_typed_array_get_length(JSContext *ctx, JSValueConst this_val)
+     p = get_typed_array(ctx, this_val);
+     if (!p)
+         return JS_EXCEPTION;
+-    return js_int32(p->u.array.count);
++    return js_uint32(p->u.array.count);
+ }
+ 
+ static JSValue js_typed_array_get_buffer(JSContext *ctx, JSValueConst this_val)
