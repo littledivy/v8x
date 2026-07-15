@@ -1,0 +1,35 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -8034,26 +8034,31 @@ static void js_coverage_register_function(JSFunctionBytecode *b)
+     const char *function_name = "";
+     const char *filename = "";
+     bool free_function_name = false;
+     bool free_filename = false;
+-    int line_num, column_num, pc, value, ret;
++    int i, line_num, column_num, pc, value, ret;
+     unsigned int op;
+ 
+     if (b->func_name != JS_ATOM_NULL) {
+         function_name = JS_AtomToCString(b->realm, b->func_name);
+         free_function_name = function_name != NULL;
+     }
+     if (b->filename != JS_ATOM_NULL) {
+         filename = JS_AtomToCString(b->realm, b->filename);
+         free_filename = filename != NULL;
+     }
+     v82jsc_coverage_function(b, function_name ? function_name : "",
+                              filename ? filename : "", b->source,
+                              b->source_len, b->line_num, b->col_num);
+     if (free_function_name)
+         JS_FreeCString(b->realm, function_name);
+     if (free_filename)
+         JS_FreeCString(b->realm, filename);
+ 
++    for (i = 0; i < b->cpool_count; i++) {
++        if (JS_VALUE_GET_TAG(b->cpool[i]) == JS_TAG_FUNCTION_BYTECODE)
++            js_coverage_register_function(JS_VALUE_GET_PTR(b->cpool[i]));
++    }
++
+     line_num = b->line_num;
+     column_num = b->col_num;
+     v82jsc_coverage_location(b, line_num, column_num);
