@@ -1313,6 +1313,13 @@ fn drain_jobs(rt: *mut JSRuntime) {
   }
 }
 
+fn perform_microtask_checkpoint(rt: *mut JSRuntime) {
+  drain_jobs(rt);
+  if !rt.is_null() {
+    unsafe { JS_ClearKeptObjects(rt) };
+  }
+}
+
 pub(crate) fn run_microtasks_if_auto() {
   let iso = current_iso();
   if iso.is_null() {
@@ -1332,7 +1339,7 @@ pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(
     return;
   }
   let st = iso_state(isolate);
-  drain_jobs(st.rt);
+  perform_microtask_checkpoint(st.rt);
 }
 
 fn enqueue_microtask_function(ctx: *mut JSContext, function: *const Function) {
@@ -1539,7 +1546,7 @@ pub extern "C" fn v8__MicrotaskQueue__PerformCheckpoint(
     return;
   }
   let st = iso_state(isolate);
-  drain_jobs(st.rt);
+  perform_microtask_checkpoint(st.rt);
 }
 
 #[unsafe(no_mangle)]
