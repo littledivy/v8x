@@ -892,6 +892,40 @@ mod raw_smoke_test {
 
   #[test]
   #[cfg(feature = "link_quickjs")]
+  fn bigint_as_uint_n_wraps_negative_values() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let source = c"[
+        BigInt.asUintN(32, -1n) === 4294967295n,
+        BigInt.asUintN(64, -1n) === 18446744073709551615n,
+        BigInt.asUintN(100, -1n) === (1n << 100n) - 1n,
+        BigInt.asUintN(32, -(1n << 80n) - 1n) === 4294967295n,
+        BigInt.asUintN(64, -(1n << 80n) - 1233n) === 18446744073709550383n,
+        BigInt.asIntN(64, -1n) === -1n,
+        BigInt.asUintN(64, 1n) === 1n,
+      ].every(Boolean)";
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"bigint-asuintn.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert_ne!(result.tag, JS_TAG_EXCEPTION);
+      assert_eq!(JS_ToBool(ctx, result), 1);
+
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
   fn module_array_destructuring_exports_all_bindings() {
     unsafe {
       let rt = JS_NewRuntime();
