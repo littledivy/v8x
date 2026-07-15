@@ -1,0 +1,52 @@
+diff --git a/quickjs.c b/quickjs.c
+index 11caae0..11caae0 100644
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -1678,6 +1678,47 @@ JSValue v82jsc_global_var_obj(JSContext *ctx) {
+     return js_dup(ctx->global_var_obj);
+ }
+ 
++/* v82jsc: return stable references to every live JavaScript object. This is
++   used to implement the V8 heap-profiler surface without walking properties
++   through JavaScript accessors. The caller must release the array with
++   v82jsc_free_heap_objects(). */
++JSValue *v82jsc_heap_objects(JSContext *ctx, size_t *count) {
++    struct list_head *el;
++    JSValue *objects;
++    size_t capacity = 0;
++    size_t index = 0;
++
++    if (!ctx || !count)
++        return NULL;
++    *count = 0;
++    list_for_each(el, &ctx->rt->gc_obj_list) {
++        JSGCObjectHeader *header = list_entry(el, JSGCObjectHeader, link);
++        if (header->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT)
++            capacity++;
++    }
++    if (capacity == 0)
++        return NULL;
++    objects = malloc(capacity * sizeof(*objects));
++    if (!objects)
++        return NULL;
++    list_for_each(el, &ctx->rt->gc_obj_list) {
++        JSGCObjectHeader *header = list_entry(el, JSGCObjectHeader, link);
++        if (header->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT) {
++            JSObject *object = (JSObject *)header;
++            objects[index++] = js_dup(JS_MKPTR(JS_TAG_OBJECT, object));
++        }
++    }
++    *count = index;
++    return objects;
++}
++
++void v82jsc_free_heap_objects(JSContext *ctx, JSValue *objects, size_t count) {
++    size_t index;
++    for (index = 0; index < count; index++)
++        JS_FreeValue(ctx, objects[index]);
++    free(objects);
++}
++
+ static void js_trigger_gc(JSRuntime *rt, size_t size)
+ {
+     bool force_gc;

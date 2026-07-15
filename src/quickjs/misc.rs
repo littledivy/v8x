@@ -57,9 +57,18 @@ struct JSPropertyEnum {
   atom: JSAtom,
 }
 
+#[repr(C)]
+struct JSPropertyDescriptorQjs {
+  flags: c_int,
+  value: JSValue,
+  getter: JSValue,
+  setter: JSValue,
+}
+
 const JS_GPN_STRING_MASK: c_int = 1 << 0;
 const JS_GPN_SYMBOL_MASK: c_int = 1 << 1;
 const JS_GPN_ENUM_ONLY: c_int = 1 << 4;
+const JS_PROP_GETSET_QJS: c_int = 1 << 4;
 const JS_PROP_CONFIGURABLE_QJS: c_int = 1 << 0;
 const JS_PROP_WRITABLE_QJS: c_int = 1 << 1;
 const JS_PROP_HAS_CONFIGURABLE_QJS: c_int = 1 << 8;
@@ -83,6 +92,12 @@ unsafe extern "C" {
     this_obj: JSValue,
     prop: JSAtom,
   ) -> JSValue;
+  fn JS_GetOwnProperty(
+    ctx: *mut JSContext,
+    desc: *mut JSPropertyDescriptorQjs,
+    obj: JSValue,
+    prop: JSAtom,
+  ) -> c_int;
   fn JS_DefinePropertyValueStr(
     ctx: *mut JSContext,
     this_obj: JSValue,
@@ -2425,6 +2440,104 @@ fn push_snapshot_name(
   }
 }
 
+unsafe fn snapshot_data_property(
+  ctx: *mut JSContext,
+  value: JSValue,
+  atom: JSAtom,
+) -> Option<JSValue> {
+  let mut current = unsafe { JS_DupValue(ctx, value) };
+  loop {
+    if !jsv_is_object(&current) || unsafe { JS_IsProxy(current) } {
+      unsafe { JS_FreeValue(ctx, current) };
+      return None;
+    }
+    let mut desc = JSPropertyDescriptorQjs {
+      flags: 0,
+      value: jsv_undefined(),
+      getter: jsv_undefined(),
+      setter: jsv_undefined(),
+    };
+    let result = unsafe { JS_GetOwnProperty(ctx, &mut desc, current, atom) };
+    if result < 0 {
+      unsafe {
+        JS_FreeValue(ctx, current);
+        crate::quickjs::exception::clear_pending(ctx);
+      }
+      return None;
+    }
+    if result > 0 {
+      unsafe {
+        JS_FreeValue(ctx, current);
+        JS_FreeValue(ctx, desc.getter);
+        JS_FreeValue(ctx, desc.setter);
+      }
+      if desc.flags & JS_PROP_GETSET_QJS != 0 {
+        unsafe { JS_FreeValue(ctx, desc.value) };
+        return None;
+      }
+      return Some(desc.value);
+    }
+    unsafe {
+      JS_FreeValue(ctx, desc.value);
+      JS_FreeValue(ctx, desc.getter);
+      JS_FreeValue(ctx, desc.setter);
+    }
+    let prototype = unsafe { JS_GetPrototype(ctx, current) };
+    unsafe { JS_FreeValue(ctx, current) };
+    if jsv_is_exception(&prototype) {
+      unsafe { crate::quickjs::exception::clear_pending(ctx) };
+      return None;
+    }
+    if jsv_is_null(&prototype) {
+      unsafe { JS_FreeValue(ctx, prototype) };
+      return None;
+    }
+    current = prototype;
+  }
+}
+
+unsafe fn snapshot_constructor_name(
+  ctx: *mut JSContext,
+  value: JSValue,
+  constructor_atom: JSAtom,
+  name_atom: JSAtom,
+) -> Option<String> {
+  let constructor =
+    unsafe { snapshot_data_property(ctx, value, constructor_atom) }?;
+  let name = unsafe { snapshot_data_property(ctx, constructor, name_atom) };
+  unsafe { JS_FreeValue(ctx, constructor) };
+  let name = name?;
+  let text = unsafe { qjs_value_to_string(ctx, name) };
+  unsafe { JS_FreeValue(ctx, name) };
+  if text.is_none() {
+    unsafe { crate::quickjs::exception::clear_pending(ctx) };
+  }
+  text.filter(|name| !name.is_empty())
+}
+
+unsafe fn quickjs_heap_object_names(ctx: *mut JSContext) -> Vec<String> {
+  let constructor_atom = unsafe { JS_NewAtom(ctx, c"constructor".as_ptr()) };
+  let name_atom = unsafe { JS_NewAtom(ctx, c"name".as_ptr()) };
+  let mut count = 0usize;
+  let objects = unsafe { v82jsc_heap_objects(ctx, &mut count) };
+  let mut names = Vec::with_capacity(count);
+  if !objects.is_null() {
+    for value in unsafe { std::slice::from_raw_parts(objects, count) } {
+      if let Some(name) = unsafe {
+        snapshot_constructor_name(ctx, *value, constructor_atom, name_atom)
+      } {
+        names.push(name);
+      }
+    }
+    unsafe { v82jsc_free_heap_objects(ctx, objects, count) };
+  }
+  unsafe {
+    JS_FreeAtom(ctx, constructor_atom);
+    JS_FreeAtom(ctx, name_atom);
+  }
+  names
+}
+
 unsafe fn collect_constructor_name(
   ctx: *mut JSContext,
   value: JSValue,
@@ -2582,30 +2695,48 @@ fn quickjs_heap_snapshot_json(isolate: *mut RealIsolate) -> Vec<u8> {
     return br#"{"snapshot":{"meta":{}},"nodes":[],"strings":[]}"#.to_vec();
   }
 
-  let mut names = Vec::new();
-  let mut seen_names = HashSet::new();
-  let mut seen_objects = HashSet::new();
-  unsafe {
-    let global = JS_GetGlobalObject(ctx);
-    collect_heap_snapshot_names(
-      ctx,
-      global,
-      0,
-      &mut seen_objects,
-      &mut seen_names,
-      &mut names,
-    );
-    JS_FreeValue(ctx, global);
-  }
-  collect_cppgc_snapshot_names(&mut names, &mut seen_names);
+  let mut object_names = unsafe { quickjs_heap_object_names(ctx) };
+  let mut cppgc_names = Vec::new();
+  let mut seen_cppgc_names = HashSet::new();
+  collect_cppgc_snapshot_names(&mut cppgc_names, &mut seen_cppgc_names);
+  object_names.extend(cppgc_names);
 
-  let mut json =
-    String::from("{\"snapshot\":{\"meta\":{}},\"nodes\":[],\"strings\":[");
-  for (index, name) in names.iter().enumerate() {
+  let mut strings = vec![String::new()];
+  let mut string_indices = HashMap::new();
+  string_indices.insert(String::new(), 0usize);
+  let name_indices = object_names
+    .into_iter()
+    .map(|name| {
+      if let Some(index) = string_indices.get(&name) {
+        *index
+      } else {
+        let index = strings.len();
+        string_indices.insert(name.clone(), index);
+        strings.push(name);
+        index
+      }
+    })
+    .collect::<Vec<_>>();
+
+  let mut json = String::from(
+    "{\"snapshot\":{\"meta\":{\"node_fields\":[\"type\",\"name\",\"id\",\"self_size\",\"edge_count\",\"trace_node_id\",\"detachedness\"],\"node_types\":[[\"hidden\",\"array\",\"string\",\"object\",\"code\",\"closure\",\"regexp\",\"number\",\"native\",\"synthetic\",\"concatenated string\",\"sliced string\",\"symbol\",\"bigint\"],\"string\",\"number\",\"number\",\"number\",\"number\",\"number\"],\"edge_fields\":[\"type\",\"name_or_index\",\"to_node\"],\"edge_types\":[[\"context\",\"element\",\"property\",\"internal\",\"hidden\",\"shortcut\",\"weak\"],\"string_or_number\",\"node\"]},\"node_count\":",
+  );
+  json.push_str(&name_indices.len().to_string());
+  json.push_str(",\"edge_count\":0,\"trace_function_count\":0},\"nodes\":[");
+  for (index, name_index) in name_indices.iter().enumerate() {
     if index > 0 {
       json.push(',');
     }
-    push_json_string(&mut json, name);
+    let id = index.saturating_mul(2).saturating_add(1);
+    use std::fmt::Write;
+    let _ = write!(json, "3,{name_index},{id},0,0,0,0");
+  }
+  json.push_str("],\"edges\":[],\"trace_function_infos\":[],\"trace_tree\":[],\"samples\":[],\"locations\":[],\"strings\":[");
+  for (index, value) in strings.iter().enumerate() {
+    if index > 0 {
+      json.push(',');
+    }
+    push_json_string(&mut json, value);
   }
   json.push_str("]}");
   json.into_bytes()

@@ -627,6 +627,15 @@ unsafe extern "C" {
     value: JSValue,
   ) -> c_int;
   pub fn v82jsc_global_var_obj(ctx: *mut JSContext) -> JSValue;
+  pub fn v82jsc_heap_objects(
+    ctx: *mut JSContext,
+    count: *mut usize,
+  ) -> *mut JSValue;
+  pub fn v82jsc_free_heap_objects(
+    ctx: *mut JSContext,
+    objects: *mut JSValue,
+    count: usize,
+  );
   pub fn JS_NewCModule(
     ctx: *mut JSContext,
     name_str: *const c_char,
