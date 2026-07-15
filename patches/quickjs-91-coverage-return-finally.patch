@@ -1,0 +1,47 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -30525,7 +30525,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+ {
+     JSContext *ctx = s->ctx;
+     JSAtom label_name;
+-    int tok;
++    int tok, coverage_pos;
++    uint32_t statement_start;
+ 
+     /* specific label handling */
+     /* XXX: support multiple labels on loop statements */
+@@ -30577,6 +30578,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+             goto fail;
+         break;
+     case TOK_RETURN:
++        statement_start = s->token.ptr - s->buf_start;
++        coverage_pos = emit_coverage(s, statement_start);
+         if (s->cur_func->is_eval) {
+             js_parse_error(s, "Illegal return statement");
+             goto fail;
+@@ -30596,6 +30599,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+         }
+         if (js_parse_expect_semi(s))
+             goto fail;
++        close_coverage(s, coverage_pos, s->last_ptr - s->buf_start);
+         break;
+     case TOK_THROW:
+         if (next_token(s))
+@@ -31252,6 +31256,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+             }
+             emit_label(s, label_finally);
+             if (s->token.val == TOK_FINALLY) {
++                statement_start = s->token.ptr - s->buf_start;
++                coverage_pos = emit_coverage(s, statement_start);
+                 int saved_eval_ret_idx = 0; /* avoid warning */
+ 
+                 if (next_token(s))
+@@ -31276,6 +31282,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+ 
+                 if (js_parse_block(s))
+                     goto fail;
++                close_coverage(s, coverage_pos,
++                               s->last_ptr - s->buf_start);
+ 
+                 if (s->cur_func->eval_ret_idx >= 0) {
+                     emit_op(s, OP_get_loc);

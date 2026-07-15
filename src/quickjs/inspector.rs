@@ -2859,8 +2859,7 @@ pub(crate) mod cdp {
     if !is_script_root && range_counts.is_empty() {
       // Function entry has no executable QuickJS bytecode, so it never gets a
       // location hit of its own. Seed it from the invocation count to avoid
-      // reporting the prologue of an executed straight-line function as an
-      // uncovered block.
+      // reporting the prologue of an executed function as an uncovered block.
       location_counts.insert(start_offset, call_count);
       for (line, column) in function.locations {
         let offset = utf16_offset(&script, line, column);
@@ -2888,11 +2887,11 @@ pub(crate) mod cdp {
         continue;
       }
       if let Some(previous) = ranges.last_mut()
-        && previous.end_offset == range_start
+        && range_start <= previous.end_offset
         && previous.count == count
         && previous.start_offset != start_offset
       {
-        previous.end_offset = range_end;
+        previous.end_offset = previous.end_offset.max(range_end);
       } else {
         ranges.push(CoverageRangeData {
           start_offset: range_start,
@@ -2914,11 +2913,11 @@ pub(crate) mod cdp {
         continue;
       }
       if let Some(previous) = ranges.last_mut()
-        && previous.end_offset == range_start
+        && range_start <= previous.end_offset
         && previous.count == count
         && previous.start_offset != start_offset
       {
-        previous.end_offset = range_end;
+        previous.end_offset = previous.end_offset.max(range_end);
       } else {
         ranges.push(CoverageRangeData {
           start_offset: range_start,

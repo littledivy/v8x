@@ -1,0 +1,10 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -30579,7 +30579,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+         break;
+     case TOK_RETURN:
+-        statement_start = s->token.ptr - s->buf_start;
++        statement_start = s->last_ptr - s->buf_start;
+         coverage_pos = emit_coverage(s, statement_start);
+         if (s->cur_func->is_eval) {
+             js_parse_error(s, "Illegal return statement");

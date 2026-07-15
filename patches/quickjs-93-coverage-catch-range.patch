@@ -1,0 +1,67 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -29905,7 +29905,7 @@
+     return js_parse_statement_or_decl(s, 0);
+ }
+ 
+-static __exception int js_parse_block(JSParseState *s)
++static __exception int js_parse_block(JSParseState *s, uint32_t *end_pos)
+ {
+     JSFunctionDef *fd = s->cur_func;
+ 
+@@ -29956,6 +29956,8 @@
+         }
+         pop_scope(s);
+     }
++    if (end_pos)
++        *end_pos = s->last_ptr - s->buf_start;
+     if (next_token(s))
+         return -1;
+     return 0;
+@@ -30574,7 +30576,7 @@
+ 
+     switch(tok = s->token.val) {
+     case '{':
+-        if (js_parse_block(s))
++        if (js_parse_block(s, NULL))
+             goto fail;
+         break;
+     case TOK_RETURN:
+@@ -31158,7 +31160,7 @@
+                              JS_ATOM_NULL, -1, -1, 1);
+             block_env.label_finally = label_finally;
+ 
+-            if (js_parse_block(s))
++            if (js_parse_block(s, &statement_start))
+                 goto fail;
+ 
+             pop_break_entry(s->cur_func);
+@@ -31180,6 +31182,7 @@
+ 
+                 push_scope(s);  /* catch variable */
+                 emit_label(s, label_catch);
++                coverage_pos = emit_coverage(s, statement_start);
+ 
+                 if (s->token.val == '{') {
+                     /* support optional-catch-binding feature */
+@@ -31219,8 +31222,10 @@
+                                  -1, -1, 1);
+                 block_env.label_finally = label_finally;
+ 
+-                if (js_parse_block(s))
++                if (js_parse_block(s, NULL))
+                     goto fail;
++                close_coverage(s, coverage_pos,
++                               s->last_ptr - s->buf_start);
+ 
+                 pop_break_entry(s->cur_func);
+                 pop_scope(s);  /* catch block */
+@@ -31280,7 +31285,7 @@
+                     set_eval_ret_undefined(s);
+                 }
+ 
+-                if (js_parse_block(s))
++                if (js_parse_block(s, NULL))
+                     goto fail;
+                 close_coverage(s, coverage_pos,
+                                s->last_ptr - s->buf_start);
