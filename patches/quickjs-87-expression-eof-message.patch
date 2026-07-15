@@ -1,0 +1,12 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -28436,6 +28436,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+         }
+         break;
+     default:
++        if (s->token.val == TOK_EOF)
++            return js_parse_error(s, "Unexpected end of input");
+         return js_parse_error(s, "unexpected token in expression: '%.*s'",
+                               (int)(s->buf_ptr - s->token.ptr), s->token.ptr);
+     }
