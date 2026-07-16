@@ -336,13 +336,13 @@ pub extern "C" fn v82jsc_coverage_range_hit(
   });
 }
 
-fn start_precise_coverage() {
+fn start_precise_coverage(ctx: *mut JSContext) {
   PRECISE_COVERAGE.with(|state| state.borrow_mut().functions.clear());
-  unsafe { JS_SetPreciseCoverageEnabled(true) };
+  unsafe { JS_SetPreciseCoverageEnabled(ctx, true) };
 }
 
-fn stop_precise_coverage() {
-  unsafe { JS_SetPreciseCoverageEnabled(false) };
+fn stop_precise_coverage(ctx: *mut JSContext) {
+  unsafe { JS_SetPreciseCoverageEnabled(ctx, false) };
   PRECISE_COVERAGE.with(|state| state.borrow_mut().functions.clear());
 }
 
@@ -352,6 +352,44 @@ fn take_precise_coverage() -> Vec<PreciseCoverageFunction> {
       .into_values()
       .collect()
   })
+}
+
+#[cfg(all(test, feature = "link_quickjs"))]
+mod coverage_dispatch_tests {
+  use super::*;
+
+  #[test]
+  fn instrumented_dispatch_records_coverage() {
+    unsafe {
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      start_precise_coverage(ctx);
+      let source = c"function add(a, b) { return a + b; } add(1, 2);";
+      let result = JS_Eval(
+        ctx,
+        source.as_ptr(),
+        source.to_bytes().len(),
+        c"coverage-dispatch.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert_ne!(result.tag, JS_TAG_EXCEPTION);
+      JS_FreeValue(ctx, result);
+
+      let functions = take_precise_coverage();
+      assert!(functions.iter().any(|function| {
+        function.url == "coverage-dispatch.js"
+          && function.call_count > 0
+          && function.hits.values().any(|hit| hit.count > 0)
+      }));
+
+      stop_precise_coverage(ctx);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
 }
 
 unsafe extern "C" fn collect_cpu_profile_frame(
@@ -3196,7 +3234,7 @@ pub(crate) mod cdp {
     ctx: *mut JSContext,
     call_id: i32,
   ) {
-    super::start_precise_coverage();
+    super::start_precise_coverage(ctx);
     unsafe { ack(sess, ctx, call_id) };
   }
 
@@ -3307,7 +3345,7 @@ pub(crate) mod cdp {
       },
       "Profiler.enable" => unsafe { ack(sess, ctx, id) },
       "Profiler.disable" | "Profiler.stopPreciseCoverage" => unsafe {
-        super::stop_precise_coverage();
+        super::stop_precise_coverage(ctx);
         ack(sess, ctx, id)
       },
       "Profiler.startPreciseCoverage" => unsafe {

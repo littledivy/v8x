@@ -1,0 +1,109 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -308,6 +308,7 @@ struct JSRuntime {
+     bool in_build_stack_trace;
+     /* true if inside JS_FreeRuntime */
+     bool in_free;
++    bool v82jsc_precise_coverage_enabled;
+ 
+     struct JSStackFrame *current_stack_frame;
+ 
+@@ -7998,8 +7999,6 @@ fail:
+     return b->line_num;
+ }
+ 
+-static _Thread_local bool v82jsc_precise_coverage_enabled;
+-
+ extern void v82jsc_coverage_function(const void *key,
+                                      const char *function_name,
+                                      const char *filename,
+@@ -8023,9 +8022,9 @@ extern void v82jsc_coverage_range_hit(const void *key,
+ extern void v82jsc_coverage_function_hit(const void *key);
+ extern void v82jsc_debugger_statement(void);
+ 
+-void JS_SetPreciseCoverageEnabled(bool enabled)
++void JS_SetPreciseCoverageEnabled(JSContext *ctx, bool enabled)
+ {
+-    v82jsc_precise_coverage_enabled = enabled;
++    ctx->rt->v82jsc_precise_coverage_enabled = enabled;
+ }
+ 
+ static void js_coverage_register_function(JSFunctionBytecode *b)
+@@ -18372,6 +18371,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+     JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
+     JSVarRef **var_refs;
+     size_t alloca_size;
++#if DIRECT_DISPATCH
++    const void * const *active_dispatch_table;
++#endif
+ 
+ #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
+ #define DUMP_BYTECODE_OR_DONT(pc) \
+@@ -18382,7 +18384,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+ #endif
+ 
+ #if !DIRECT_DISPATCH
+-#define SWITCH(pc)      do { if (unlikely(v82jsc_precise_coverage_enabled)) js_coverage_record_hit(b, (uint32_t)((pc) - b->byte_code_buf)); } while (0); DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
++#define SWITCH(pc)      do { if (unlikely(rt->v82jsc_precise_coverage_enabled)) js_coverage_record_hit(b, (uint32_t)((pc) - b->byte_code_buf)); } while (0); DUMP_BYTECODE_OR_DONT(pc) switch (opcode = *pc++)
+ #define CASE(op)        case op
+ #define DEFAULT         default
+ #define BREAK           break
+@@ -18393,8 +18395,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+ #include "quickjs-opcode.h"
+         [ OP_COUNT ... 255 ] = &&case_default
+     };
+-#define SWITCH(pc)      do { if (unlikely(v82jsc_precise_coverage_enabled)) js_coverage_record_hit(b, (uint32_t)((pc) - b->byte_code_buf)); } while (0); DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *dispatch_table[opcode = *pc++]; });
++    __extension__ static const void * const coverage_dispatch_table[256] = {
++        [ 0 ... 255 ] = &&coverage_dispatch
++    };
++    active_dispatch_table = rt->v82jsc_precise_coverage_enabled
++                                ? coverage_dispatch_table
++                                : dispatch_table;
++#define SWITCH(pc)      DUMP_BYTECODE_OR_DONT(pc) __extension__ ({ goto *active_dispatch_table[opcode = *pc++]; });
+ #define CASE(op)        case_ ## op
+ #define DEFAULT         case_default
+ #define BREAK           SWITCH(pc)
++    goto coverage_dispatch_done;
++coverage_dispatch:
++    js_coverage_record_hit(b, (uint32_t)(pc - b->byte_code_buf - 1));
++    __extension__ ({ goto *dispatch_table[opcode]; });
++coverage_dispatch_done:
+ #endif
+@@ -18420,7 +18419,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+             pc = sf->cur_pc;
+             sf->prev_frame = rt->current_stack_frame;
+             rt->current_stack_frame = sf;
+-            if (unlikely(v82jsc_precise_coverage_enabled) &&
++            if (unlikely(rt->v82jsc_precise_coverage_enabled) &&
+                 pc == b->byte_code_buf) {
+                 js_coverage_register_function(b);
+                 v82jsc_coverage_function_hit(b);
+@@ -18504,7 +18503,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+     sf->prev_frame = rt->current_stack_frame;
+     rt->current_stack_frame = sf;
+     ctx = b->realm; /* set the current realm */
+-    if (unlikely(v82jsc_precise_coverage_enabled))
++    if (unlikely(rt->v82jsc_precise_coverage_enabled))
+     {
+         js_coverage_register_function(b);
+         v82jsc_coverage_function_hit(b);
+@@ -38366,7 +38365,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+     b->realm = JS_DupContext(ctx);
+ 
+     add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
+-    if (unlikely(v82jsc_precise_coverage_enabled))
++    if (unlikely(ctx->rt->v82jsc_precise_coverage_enabled))
+         js_coverage_register_function(b);
+ 
+ #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_FINAL
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1161,7 +1161,7 @@ typedef void JSStackFrameVisitor(void *opaque, const char *function_name,
+                                  int column_num);
+ JS_EXTERN void JS_VisitStackFrames(JSRuntime *rt, JSStackFrameVisitor *visitor,
+                                    void *opaque);
+-JS_EXTERN void JS_SetPreciseCoverageEnabled(bool enabled);
++JS_EXTERN void JS_SetPreciseCoverageEnabled(JSContext *ctx, bool enabled);
+ /* if can_block is true, Atomics.wait() can be used */
+ JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
+ /* set the [IsHTMLDDA] internal slot */
