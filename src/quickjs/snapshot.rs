@@ -137,8 +137,8 @@ unsafe extern "C" {
 
 #[derive(Clone)]
 pub(crate) struct SnapshotBlob {
-  pub default_context: Option<ContextSnapshot>,
-  pub contexts: Vec<ContextSnapshot>,
+  pub default_context: Option<Arc<ContextSnapshot>>,
+  pub contexts: Vec<Arc<ContextSnapshot>>,
   pub isolate_data: Vec<SnapshotBytes>,
 }
 
@@ -1091,8 +1091,10 @@ pub(crate) unsafe fn blob_from_params(
 pub(crate) fn encode_blob(blob: &SnapshotBlob) -> Box<[u8]> {
   let mut out = Vec::new();
   out.extend_from_slice(MAGIC);
-  put_opt_context(&mut out, blob.default_context.as_ref());
-  put_vec(&mut out, &blob.contexts, put_context);
+  put_opt_context(&mut out, blob.default_context.as_deref());
+  put_vec(&mut out, &blob.contexts, |out, context| {
+    put_context(out, context)
+  });
   put_vec(&mut out, &blob.isolate_data, |out, bytes| {
     put_bytes(out, bytes)
   });
@@ -1645,8 +1647,12 @@ unsafe fn decode_blob(bytes: &[u8]) -> Option<SnapshotBlob> {
     return None;
   }
   Some(SnapshotBlob {
-    default_context: input.get_opt_context()?,
-    contexts: input.get_vec(Reader::get_context)?,
+    default_context: input.get_opt_context()?.map(Arc::new),
+    contexts: input
+      .get_vec(Reader::get_context)?
+      .into_iter()
+      .map(Arc::new)
+      .collect(),
     isolate_data: input.get_vec(Reader::get_bytes)?,
   })
 }

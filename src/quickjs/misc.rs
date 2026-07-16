@@ -32,6 +32,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 struct WeakCallbackInfoShim {
@@ -1301,18 +1302,22 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
   let st = crate::quickjs::core::iso_state(iso);
   let default_context =
     st.snap_default_context_capture.as_ref().map(|capture| {
-      finalize_context_snapshot(st, st.snap_default_context, capture)
+      Arc::new(finalize_context_snapshot(
+        st,
+        st.snap_default_context,
+        capture,
+      ))
     });
   let contexts = st
     .snap_context_captures
     .iter()
     .enumerate()
     .map(|(index, capture)| {
-      finalize_context_snapshot(
+      Arc::new(finalize_context_snapshot(
         st,
         st.snap_contexts.get(index).copied(),
         capture,
-      )
+      ))
     })
     .collect();
   let blob = super::snapshot::SnapshotBlob {
