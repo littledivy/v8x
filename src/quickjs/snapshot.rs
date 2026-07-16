@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 use std::ptr;
+use std::sync::Arc;
 
 use super::quickjs_sys::*;
 use crate::{
@@ -51,6 +52,8 @@ const JS_PROP_CONFIGURABLE: c_int = 1 << 0;
 const JS_PROP_WRITABLE: c_int = 1 << 1;
 const JS_PROP_ENUMERABLE: c_int = 1 << 2;
 const NOOP_FUNCTION_SRC: &str = "(function(){})\0";
+
+pub(crate) type SnapshotBytes = Arc<[u8]>;
 
 #[repr(C)]
 struct JSPropertyEnum {
@@ -94,17 +97,17 @@ unsafe extern "C" {
 pub(crate) struct SnapshotBlob {
   pub default_context: Option<ContextSnapshot>,
   pub contexts: Vec<ContextSnapshot>,
-  pub isolate_data: Vec<Vec<u8>>,
+  pub isolate_data: Vec<SnapshotBytes>,
 }
 
 #[derive(Clone)]
 pub(crate) struct ContextSnapshot {
-  pub global_object: Option<Vec<u8>>,
+  pub global_object: Option<SnapshotBytes>,
   pub global_template: Option<SnapshotObjectTemplate>,
   pub globals: Vec<GlobalEntry>,
   pub lexical_globals: Vec<GlobalEntry>,
-  pub embedder_data: Vec<Option<Vec<u8>>>,
-  pub context_data: Vec<Vec<u8>>,
+  pub embedder_data: Vec<Option<SnapshotBytes>>,
+  pub context_data: Vec<SnapshotBytes>,
   pub context_data_refs: Vec<bool>,
 }
 
@@ -118,7 +121,7 @@ pub(crate) struct SnapshotObjectTemplate {
 #[derive(Clone)]
 struct SnapshotPropertyHandler {
   callbacks: [Option<ExternalRefSlot>; 7],
-  data: Option<Vec<u8>>,
+  data: Option<SnapshotBytes>,
   flags: u8,
 }
 
@@ -126,12 +129,12 @@ struct SnapshotPropertyHandler {
 pub(crate) enum GlobalEntry {
   Value {
     name: String,
-    bytes: Vec<u8>,
+    bytes: SnapshotBytes,
     enumerable: bool,
   },
   LexicalValue {
     name: String,
-    bytes: Vec<u8>,
+    bytes: SnapshotBytes,
   },
   Function {
     name: String,
@@ -218,6 +221,7 @@ pub(crate) fn capture_object_template(
         None
       } else {
         write_object_bytes(handler.owner_ctx, handler.data, external_refs)
+          .map(Into::into)
       },
       flags: u8::from(handler.non_masking)
         | (u8::from(handler.only_intercept_strings) << 1),
@@ -237,6 +241,7 @@ pub(crate) fn capture_object_template(
         None
       } else {
         write_object_bytes(handler.owner_ctx, handler.data, external_refs)
+          .map(Into::into)
       },
       flags: u8::from(handler.non_masking),
     });
@@ -1263,7 +1268,7 @@ pub(crate) fn capture_context(
   let global_object = Some(unsafe {
     super::core::refresh_snapshot_intrinsics(ctx);
     let global = JS_GetGlobalObject(ctx);
-    let bytes = write_object_bytes(ctx, global, external_refs);
+    let bytes = write_object_bytes(ctx, global, external_refs).map(Into::into);
     JS_FreeValue(ctx, global);
     bytes.expect(
       "QuickJS snapshot must serialize the context global as one object graph",
@@ -1286,7 +1291,7 @@ pub(crate) fn capture_context(
     globals: Vec::new(),
     lexical_globals: capture_global_lexicals(ctx, external_refs),
     embedder_data: capture_embedder_data(ctx, external_refs),
-    context_data: context_data.to_vec(),
+    context_data: context_data.iter().cloned().map(Into::into).collect(),
     context_data_refs: vec![false; context_data.len()],
   };
   remove_snapshot_module_exports(ctx);
@@ -1512,7 +1517,10 @@ fn capture_global_lexicals(
         && let Some(bytes) =
           serialize_value_with_refs(ctx, value, external_refs)
       {
-        out.push(GlobalEntry::LexicalValue { name, bytes });
+        out.push(GlobalEntry::LexicalValue {
+          name,
+          bytes: bytes.into(),
+        });
       }
       JS_FreeValue(ctx, value);
     }
@@ -1525,12 +1533,13 @@ fn capture_global_lexicals(
 fn capture_embedder_data(
   ctx: *mut JSContext,
   external_refs: &[usize],
-) -> Vec<Option<Vec<u8>>> {
+) -> Vec<Option<SnapshotBytes>> {
   super::misc::embedder_data_snapshot(ctx)
     .into_iter()
     .map(|value| {
       value
         .and_then(|value| serialize_value_with_refs(ctx, value, external_refs))
+        .map(Into::into)
     })
     .collect()
 }
@@ -1668,11 +1677,11 @@ fn put_opt_context(out: &mut Vec<u8>, context: Option<&ContextSnapshot>) {
   }
 }
 
-fn put_opt_bytes(out: &mut Vec<u8>, bytes: &Option<Vec<u8>>) {
+fn put_opt_bytes<T: AsRef<[u8]>>(out: &mut Vec<u8>, bytes: &Option<T>) {
   match bytes {
     Some(bytes) => {
       out.push(1);
-      put_bytes(out, bytes);
+      put_bytes(out, bytes.as_ref());
     }
     None => out.push(0),
   }
@@ -1779,13 +1788,14 @@ impl<'a> Reader<'a> {
     Some(out)
   }
 
-  fn get_bytes(&mut self) -> Option<Vec<u8>> {
+  fn get_bytes(&mut self) -> Option<SnapshotBytes> {
     let len = self.get_u32()? as usize;
-    Some(self.take(len)?.to_vec())
+    Some(self.take(len)?.into())
   }
 
   fn get_string(&mut self) -> Option<String> {
-    String::from_utf8(self.get_bytes()?).ok()
+    let len = self.get_u32()? as usize;
+    String::from_utf8(self.take(len)?.to_vec()).ok()
   }
 
   fn get_context(&mut self) -> Option<ContextSnapshot> {
@@ -1865,7 +1875,7 @@ impl<'a> Reader<'a> {
     }
   }
 
-  fn get_opt_bytes(&mut self) -> Option<Option<Vec<u8>>> {
+  fn get_opt_bytes(&mut self) -> Option<Option<SnapshotBytes>> {
     match self.get_u8()? {
       0 => Some(None),
       1 => Some(Some(self.get_bytes()?)),

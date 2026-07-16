@@ -1318,7 +1318,12 @@ pub extern "C" fn v8__SnapshotCreator__CreateBlob(
   let blob = super::snapshot::SnapshotBlob {
     default_context,
     contexts,
-    isolate_data: st.snap_isolate_data.clone(),
+    isolate_data: st
+      .snap_isolate_data
+      .iter()
+      .cloned()
+      .map(Into::into)
+      .collect(),
   };
   let (data, raw_size) =
     super::snapshot::leak_blob(super::snapshot::encode_blob(&blob));
@@ -1355,7 +1360,7 @@ fn finalize_context_snapshot(
     )
   } else {
     let mut capture = capture.clone();
-    capture.context_data = context_data;
+    capture.context_data = context_data.into_iter().map(Into::into).collect();
     capture.context_data_refs = vec![false; capture.context_data.len()];
     capture
   }

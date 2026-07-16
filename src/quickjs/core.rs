@@ -406,8 +406,9 @@ pub(crate) struct IsoState {
   pub snap_context_data: HashMap<usize, Vec<Vec<u8>>>,
   pub snap_context_data_values: HashMap<usize, Vec<Option<JSValue>>>,
   pub restored_snapshot: Option<super::snapshot::SnapshotBlob>,
-  pub restored_isolate_data: Vec<Option<Vec<u8>>>,
-  pub restored_context_data: HashMap<usize, Vec<Option<Vec<u8>>>>,
+  pub restored_isolate_data: Vec<Option<super::snapshot::SnapshotBytes>>,
+  pub restored_context_data:
+    HashMap<usize, Vec<Option<super::snapshot::SnapshotBytes>>>,
   pub restored_context_values: HashMap<usize, Vec<Option<JSValue>>>,
   pub external_references: Vec<usize>,
 
