@@ -40,7 +40,7 @@ apply_series() {
     git submodule update --init "$sub"
   fi
   mkdir -p "$stamp_dir"
-  for p in patches/"$prefix"-[0-9]*.patch; do
+  while IFS= read -r p; do
     local stamp="$stamp_dir/$(basename "$p")"
     local checksum
     [ -e "$p" ] || continue
@@ -61,7 +61,7 @@ apply_series() {
       fi
     fi
     printf '%s\n' "$checksum" > "$stamp"
-  done
+  done < <(printf '%s\n' patches/"$prefix"-[0-9]*.patch | sort -V)
 }
 
 # rusty_v8 is always needed — it's the crate's own source, used by both backends.
