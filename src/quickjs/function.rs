@@ -4985,23 +4985,26 @@ pub(crate) fn apply_object_template_to_global(
   let isolate = current_iso();
   let is_snapshot_creator =
     !isolate.is_null() && iso_state(isolate).is_snapshot_creator;
-  if !is_snapshot_creator
-    && (t.named_handler.is_some() || t.indexed_handler.is_some())
-  {
-    install_global_handler_proxy(
-      ctx,
-      global,
-      NamedHandlerInstance {
-        named_handler: t
-          .named_handler
-          .as_ref()
-          .map(|handler| clone_named_handler(ctx, handler)),
-        indexed_handler: t
-          .indexed_handler
-          .as_ref()
-          .map(|handler| clone_indexed_handler(ctx, handler)),
-      },
-    );
+  if !is_snapshot_creator {
+    if let Some(handler) = t.named_handler.as_ref() {
+      install_named_global_handler(ctx, global, handler);
+    }
+    if t.named_handler.is_some() || t.indexed_handler.is_some() {
+      install_global_handler_proxy(
+        ctx,
+        global,
+        NamedHandlerInstance {
+          named_handler: t
+            .named_handler
+            .as_ref()
+            .map(|handler| clone_named_handler(ctx, handler)),
+          indexed_handler: t
+            .indexed_handler
+            .as_ref()
+            .map(|handler| clone_indexed_handler(ctx, handler)),
+        },
+      );
+    }
   }
   if t.immutable_proto {
     unsafe { JS_PreventExtensions(ctx, global) };
