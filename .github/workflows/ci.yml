@@ -66,8 +66,8 @@ jobs:
         if: matrix.ninja
         run: brew install ninja
       # Cache the vendored WebKit static-lib build (~13min from scratch). Keyed
-      # on the pinned submodule commit + the patches/setup script, so it's
-      # reused until WebKit or our patches change. build.rs skips the heavy
+      # on the pinned submodule commit + WebKit patches/setup script, so it's
+      # reused until WebKit inputs change. build.rs skips the heavy
       # build when libJavaScriptCore.a is already present (patches-only).
       - name: WebKit cache key
         if: matrix.ninja
@@ -78,7 +78,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vendor/webkit/WebKitBuild
-          key: webkit-${{ runner.os }}-${{ steps.wk.outputs.sha }}-${{ hashFiles('patches/**', 'tools/setup_webkit.sh') }}
+          key: webkit-${{ runner.os }}-${{ steps.wk.outputs.sha }}-${{ hashFiles('patches/webkit-*.patch', 'tools/setup_webkit.sh') }}
       - name: Build --lib (${{ matrix.features }})
         run: cargo build --no-default-features --features ${{ matrix.features }} --lib
 
@@ -169,7 +169,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vendor/webkit/WebKitBuild
-          key: webkit-${{ runner.os }}-${{ steps.wk.outputs.sha }}-${{ hashFiles('patches/**', 'tools/setup_webkit.sh') }}
+          key: webkit-${{ runner.os }}-${{ steps.wk.outputs.sha }}-${{ hashFiles('patches/webkit-*.patch', 'tools/setup_webkit.sh') }}
 
       - name: Clone deno + apply the v82jsc integration patch
         run: |
