@@ -765,10 +765,10 @@ pub(crate) fn deserialize_function_template_with_cached_proto(
     1 => Some(input.get_string()?),
     _ => return None,
   };
-  let cached_proto_bytes = input.get_opt_bytes()?;
+  let cached_proto_bytes = input.get_opt_slice()?;
   let cached_proto = rooted_cached_proto.or_else(|| {
     cached_proto_bytes
-      .and_then(|bytes| deserialize_value_with_refs(ctx, &bytes, external_refs))
+      .and_then(|bytes| deserialize_value_with_refs(ctx, bytes, external_refs))
   });
   let instance_internal_field_count = input.get_i32()?;
   Some(super::function::restore_function_template_from_snapshot(
@@ -800,12 +800,12 @@ fn decode_special_data(
       let evaluated = input.get_u8()? != 0;
       let synthetic = input.get_u8()? != 0;
       let registry_exports = input.get_u8()? != 0;
-      let serialized_exports = input.get_opt_bytes()?;
+      let serialized_exports = input.get_opt_slice()?;
       let export_object = if registry_exports {
         None
       } else {
         serialized_exports.and_then(|bytes| {
-          deserialize_value_with_refs(ctx, &bytes, external_refs)
+          deserialize_value_with_refs(ctx, bytes, external_refs)
         })
       };
       let had_snapshot_exports = export_object.is_some();
@@ -1876,14 +1876,18 @@ impl<'a> Reader<'a> {
   }
 
   fn get_bytes(&mut self) -> Option<SnapshotBytes> {
-    let len = self.get_u32()? as usize;
     let borrow_snapshot_bytes = self.borrow_snapshot_bytes;
-    let bytes = self.take(len)?;
+    let bytes = self.get_slice()?;
     Some(if borrow_snapshot_bytes {
       unsafe { SnapshotBytes::from_startup_data(bytes) }
     } else {
       bytes.to_vec().into()
     })
+  }
+
+  fn get_slice(&mut self) -> Option<&'a [u8]> {
+    let len = self.get_u32()? as usize;
+    self.take(len)
   }
 
   fn get_string(&mut self) -> Option<String> {
@@ -1976,6 +1980,14 @@ impl<'a> Reader<'a> {
     }
   }
 
+  fn get_opt_slice(&mut self) -> Option<Option<&'a [u8]>> {
+    match self.get_u8()? {
+      0 => Some(None),
+      1 => Some(Some(self.get_slice()?)),
+      _ => None,
+    }
+  }
+
   fn get_opt_string(&mut self) -> Option<Option<String>> {
     match self.get_u8()? {
       0 => Some(None),
@@ -2038,6 +2050,22 @@ mod tests {
 
     assert_eq!(decoded.as_ptr(), payload_ptr);
     assert_eq!(decoded.as_ref(), b"snapshot payload");
+  }
+
+  #[test]
+  fn reader_borrows_nested_bytes() {
+    let mut encoded = Vec::new();
+    put_opt_bytes(&mut encoded, &Some(b"nested payload".as_slice()));
+    let payload_ptr = unsafe {
+      encoded
+        .as_ptr()
+        .add(std::mem::size_of::<u8>() + std::mem::size_of::<u32>())
+    };
+    let mut reader = Reader::new(&encoded, 0);
+    let decoded = reader.get_opt_slice().unwrap().unwrap();
+
+    assert_eq!(decoded.as_ptr(), payload_ptr);
+    assert_eq!(decoded, b"nested payload");
   }
 
   struct TestContext {
