@@ -1294,7 +1294,15 @@ pub extern "C" fn v8__Context__New(
     st.context_microtask_queues
       .insert(ctx as usize, microtask_queue as *mut MicrotaskQueue);
   }
-  install_default_globals(isolate, ctx);
+  let snapshot = st
+    .restored_snapshot
+    .as_ref()
+    .and_then(|blob| blob.default_context.clone());
+  if snapshot.is_some() {
+    install_snapshot_restore_prerequisites(isolate, ctx);
+  } else {
+    install_default_globals(isolate, ctx);
+  }
   if !templ.is_null() {
     if st.is_snapshot_creator {
       let external_references = st.external_references.clone();
@@ -1318,11 +1326,7 @@ pub extern "C" fn v8__Context__New(
 
   // Snapshot restore: every plain Context::New on a snapshot-backed isolate
   // materializes the snapshot's default context (matches V8 semantics).
-  if let Some(snapshot) = st
-    .restored_snapshot
-    .as_ref()
-    .and_then(|blob| blob.default_context.clone())
-  {
+  if let Some(snapshot) = snapshot {
     let external_references = st.external_references.clone();
     super::snapshot::replay_context(
       isolate,
@@ -1334,6 +1338,7 @@ pub extern "C" fn v8__Context__New(
       ctx as usize,
       snapshot.context_data.iter().cloned().map(Some).collect(),
     );
+    finish_snapshot_restore(isolate, ctx);
   }
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
     eprintln!("[qjs snapshot] Context__New ctx={ctx:?}");
@@ -1374,7 +1379,7 @@ pub(crate) fn context_from_snapshot(
     st.context_microtask_queues
       .insert(ctx as usize, microtask_queue as *mut MicrotaskQueue);
   }
-  install_default_globals(isolate, ctx);
+  install_snapshot_restore_prerequisites(isolate, ctx);
   let external_references = st.external_references.clone();
   super::snapshot::replay_context(
     isolate,
@@ -1386,12 +1391,33 @@ pub(crate) fn context_from_snapshot(
     ctx as usize,
     snapshot.context_data.iter().cloned().map(Some).collect(),
   );
+  finish_snapshot_restore(isolate, ctx);
   intern_ctx(ctx)
 }
 
 pub(crate) fn install_default_globals(
   isolate: *mut RealIsolate,
   ctx: *mut JSContext,
+) {
+  install_default_globals_inner(isolate, ctx, true, true);
+}
+
+fn install_snapshot_restore_prerequisites(
+  isolate: *mut RealIsolate,
+  ctx: *mut JSContext,
+) {
+  install_default_globals_inner(isolate, ctx, false, true);
+}
+
+fn finish_snapshot_restore(isolate: *mut RealIsolate, ctx: *mut JSContext) {
+  install_default_globals_inner(isolate, ctx, true, false);
+}
+
+fn install_default_globals_inner(
+  isolate: *mut RealIsolate,
+  ctx: *mut JSContext,
+  install_polyfills: bool,
+  refresh_intrinsics: bool,
 ) {
   if ctx.is_null() {
     return;
@@ -1402,7 +1428,9 @@ pub(crate) fn install_default_globals(
     {
       install_entropy_math_random(ctx, global);
     }
-    refresh_snapshot_intrinsics(ctx);
+    if refresh_intrinsics {
+      refresh_snapshot_intrinsics(ctx);
+    }
 
     let existing = JS_GetPropertyStr(ctx, global, c"console".as_ptr());
     let absent = jsv_is_undefined(&existing) || existing.tag == JS_TAG_NULL;
@@ -1430,10 +1458,12 @@ pub(crate) fn install_default_globals(
     let intl_absent = jsv_is_undefined(&intl) || intl.tag == JS_TAG_NULL;
     JS_FreeValue(ctx, intl);
     super::temporal::install_host_functions(ctx, global);
-    if intl_absent {
-      install_intl_stub(ctx, global);
+    if install_polyfills {
+      if intl_absent {
+        install_intl_stub(ctx, global);
+      }
+      super::temporal::install(ctx, global);
     }
-    super::temporal::install(ctx, global);
 
     let gc = JS_GetPropertyStr(ctx, global, c"gc".as_ptr());
     let gc_absent = jsv_is_undefined(&gc) || gc.tag == JS_TAG_NULL;
@@ -1447,7 +1477,9 @@ pub(crate) fn install_default_globals(
     super::module::install_dynamic_source_import_global(ctx, global);
     super::arraybuffer::install_array_buffer_constructor(isolate, ctx, global);
     install_atomics_wait_async_shim(ctx, global);
-    refresh_snapshot_intrinsics(ctx);
+    if refresh_intrinsics {
+      refresh_snapshot_intrinsics(ctx);
+    }
     super::isolate::install_snapshot_intrinsics(ctx, global);
     JS_FreeValue(ctx, global);
   }
