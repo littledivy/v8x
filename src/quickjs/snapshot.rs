@@ -46,6 +46,7 @@ const JS_READ_OBJ_SAB: c_int = 1 << 2;
 const JS_READ_OBJ_REFERENCE: c_int = 1 << 3;
 const SNAPSHOT_READ_FLAGS: c_int =
   JS_READ_OBJ_BYTECODE | JS_READ_OBJ_SAB | JS_READ_OBJ_REFERENCE;
+const QUICKJS_CHECKSUM_RANGE: std::ops::Range<usize> = 1..5;
 const JS_GPN_STRING_MASK: c_int = 1 << 0;
 const JS_GPN_ENUM_ONLY: c_int = 1 << 4;
 const JS_PROP_CONFIGURABLE: c_int = 1 << 0;
@@ -474,8 +475,11 @@ fn write_object_bytes(
     unsafe { JS_FreeValue(ctx, exc) };
     return None;
   }
-  let out = unsafe { std::slice::from_raw_parts(buf, size) }.to_vec();
+  let mut out = unsafe { std::slice::from_raw_parts(buf, size) }.to_vec();
   unsafe { js_free(ctx, buf as *mut std::os::raw::c_void) };
+  // Bytecode input is already trusted by SNAPSHOT_READ_FLAGS. QuickJS treats
+  // UINT32_MAX as the explicit escape hatch for skipping its checksum scan.
+  out[QUICKJS_CHECKSUM_RANGE].fill(u8::MAX);
   Some(out)
 }
 
@@ -2149,6 +2153,20 @@ mod tests {
       unsafe { JS_GetGCThreshold(test.runtime) },
       malloc_size.saturating_add(malloc_size / 2),
     );
+  }
+
+  #[test]
+  fn trusted_snapshot_objects_skip_quickjs_checksum() {
+    let test = TestContext::new();
+    let value = test.eval("({ value: 42 })");
+    let bytes = write_object_bytes(test.context, value, &[]).unwrap();
+    assert_eq!(&bytes[QUICKJS_CHECKSUM_RANGE], &[u8::MAX; 4]);
+    let restored = deserialize_value_with_refs(test.context, &bytes, &[])
+      .expect("trusted object should deserialize without a checksum");
+    unsafe {
+      JS_FreeValue(test.context, restored);
+      JS_FreeValue(test.context, value);
+    }
   }
 
   fn value_to_string(
