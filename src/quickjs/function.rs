@@ -359,6 +359,18 @@ struct DispatchEntry {
   fast_overloads: Vec<RawCFunction>,
 }
 
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+struct ReusableDispatchKey {
+  callback: usize,
+  data_external: Option<usize>,
+  data_is_undefined: bool,
+}
+
+struct DispatchTable {
+  entries: Vec<DispatchEntry>,
+  reusable: std::collections::HashMap<ReusableDispatchKey, c_int>,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct RawCTypeInfo {
@@ -408,8 +420,11 @@ fn copy_fast_overloads(
 }
 
 thread_local! {
-    static DISPATCH: std::cell::RefCell<Vec<DispatchEntry>> =
-        const { std::cell::RefCell::new(Vec::new()) };
+    static DISPATCH: std::cell::RefCell<DispatchTable> =
+        std::cell::RefCell::new(DispatchTable {
+          entries: Vec::new(),
+          reusable: std::collections::HashMap::new(),
+        });
     static SNAPSHOT_FUNCTIONS: std::cell::RefCell<
       std::collections::HashMap<usize, SnapshotFunctionInfo>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -557,24 +572,23 @@ fn register_dispatch(
 ) -> c_int {
   DISPATCH.with(|t| {
     let mut t = t.borrow_mut();
-    if instance.is_null()
+    let reusable_key = (instance.is_null()
       && signature.is_null()
       && fast_overloads.is_empty()
-      && (data_is_undefined || data_external.is_some())
-      && let Some(index) = t.iter().position(|entry| {
-        entry.instance.is_null()
-          && entry.signature.is_null()
-          && entry.fast_overloads.is_empty()
-          && entry.callback as usize == callback as usize
-          && entry.data_external == data_external
-          && entry.data_is_undefined == data_is_undefined
-      })
+      && (data_is_undefined || data_external.is_some()))
+    .then_some(ReusableDispatchKey {
+      callback: callback as usize,
+      data_external: data_external.map(|data| data as usize),
+      data_is_undefined,
+    });
+    if let Some(key) = reusable_key
+      && let Some(&index) = t.reusable.get(&key)
     {
       unsafe { JS_FreeValue(ctx, data) };
-      return index as c_int;
+      return index;
     }
-    let idx = t.len() as c_int;
-    t.push(DispatchEntry {
+    let idx = t.entries.len() as c_int;
+    t.entries.push(DispatchEntry {
       callback,
       data,
       data_external,
@@ -583,6 +597,9 @@ fn register_dispatch(
       signature,
       fast_overloads,
     });
+    if let Some(key) = reusable_key {
+      t.reusable.insert(key, idx);
+    }
     idx
   })
 }
@@ -597,7 +614,7 @@ fn lookup_dispatch(
   Vec<RawCFunction>,
 )> {
   DISPATCH.with(|t| {
-    t.borrow().get(idx as usize).map(|e| {
+    t.borrow().entries.get(idx as usize).map(|e| {
       (
         e.callback,
         e.data,
@@ -611,7 +628,7 @@ fn lookup_dispatch(
 
 #[cfg(test)]
 pub(crate) fn dispatch_entry_count() -> usize {
-  DISPATCH.with(|entries| entries.borrow().len())
+  DISPATCH.with(|entries| entries.borrow().entries.len())
 }
 
 fn register_named_getter(
