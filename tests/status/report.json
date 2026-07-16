@@ -1,6 +1,6 @@
 {
-  "generated": "2026-07-16T22:29:08.878Z",
-  "commit": "d98e640a13b7677b6efa6f5fb4f391d658d9c87c",
+  "generated": "2026-07-16T23:43:43.537Z",
+  "commit": "424a439b92141767ebcbee96f1d3d6752beb96ee",
   "backends": [
     {
       "id": "jsc",
@@ -34,7 +34,7 @@
     "jsc": {
       "rusty_v8": {
         "pass": 46,
-        "total": 267,
+        "total": 268,
         "baseline": 46,
         "fail": null,
         "tier": "build",
@@ -52,7 +52,7 @@
     "sys-jsc": {
       "rusty_v8": {
         "pass": 46,
-        "total": 267,
+        "total": 268,
         "baseline": 46,
         "fail": 221,
         "tier": "build",
@@ -69,17 +69,17 @@
     },
     "quickjs": {
       "rusty_v8": {
-        "pass": 268,
-        "total": 267,
+        "pass": 261,
+        "total": 268,
         "baseline": 268,
-        "fail": null,
+        "fail": 7,
         "tier": "build",
-        "fresh": false
+        "fresh": true
       },
       "deno_core": {
-        "pass": 0,
+        "pass": 429,
         "total": 429,
-        "baseline": 429,
+        "baseline": 430,
         "fail": 0,
         "tier": "build",
         "fresh": true
@@ -87,7 +87,7 @@
     }
   },
   "totals": {
-    "pass": 745,
-    "known": 2088
+    "pass": 1167,
+    "known": 2091
   }
 }
