@@ -2127,6 +2127,15 @@ static NAMED_HANDLER_EXOTIC: JSClassExoticMethods = JSClassExoticMethods {
   set_property: Some(named_handler_set_property),
 };
 
+unsafe fn throw_termination_exception(ctx: *mut JSContext) -> JSValue {
+  unsafe {
+    JS_ThrowInternalError(ctx, c"interrupted".as_ptr());
+    let exc = JS_GetException(ctx);
+    JS_SetUncatchableError(ctx, exc);
+    JS_Throw(ctx, exc)
+  }
+}
+
 unsafe fn dispatch(
   ctx: *mut JSContext,
   callback: FunctionCallback,
@@ -2148,15 +2157,7 @@ unsafe fn dispatch(
   // rejection, overwriting the reported one. Refuse to run the op and surface an
   // uncatchable "interrupted" error instead.
   if !iso.is_null() && iso_state(iso).is_terminating() {
-    unsafe {
-      // `JS_GetException` takes the pending exception (clearing it), so mark it
-      // uncatchable and re-throw — mirroring QuickJS's own `JS_ThrowInterrupted`.
-      JS_ThrowInternalError(ctx, c"interrupted".as_ptr());
-      let exc = JS_GetException(ctx);
-      JS_SetUncatchableError(ctx, exc);
-      JS_Throw(ctx, exc);
-    }
-    return jsv_exception();
+    return unsafe { throw_termination_exception(ctx) };
   }
 
   let n = argc.max(0) as usize;
@@ -3863,6 +3864,11 @@ pub extern "C" fn v8__Function__Call(
 ) -> *const Value {
   let ctx = ctx_of(context);
   if ctx.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let iso = current_iso();
+  if !iso.is_null() && iso_state(iso).is_terminating() {
+    unsafe { throw_termination_exception(ctx) };
     return ptr::null();
   }
   let func = jsval_of(this);
