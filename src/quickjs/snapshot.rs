@@ -311,9 +311,15 @@ fn replay_object_template(
   unsafe { JS_FreeValue(ctx, global) };
 }
 
+#[derive(Clone, Copy)]
+struct SnapshotExternalReferences {
+  ptr: *const usize,
+  len: usize,
+}
+
 thread_local! {
-  static SNAPSHOT_EXTERNAL_REFERENCES: std::cell::RefCell<Vec<usize>> =
-    const { std::cell::RefCell::new(Vec::new()) };
+  static SNAPSHOT_EXTERNAL_REFERENCES: std::cell::Cell<SnapshotExternalReferences> =
+    const { std::cell::Cell::new(SnapshotExternalReferences { ptr: ptr::null(), len: 0 }) };
   static CAPTURED_SNAPSHOT_MODULE_EXPORTS: std::cell::RefCell<HashMap<usize, HashSet<String>>> =
     std::cell::RefCell::new(HashMap::new());
 }
@@ -326,24 +332,38 @@ fn with_snapshot_external_references<T>(
   external_refs: &[usize],
   f: impl FnOnce() -> T,
 ) -> T {
-  struct Guard(Vec<usize>);
+  struct Guard(SnapshotExternalReferences);
 
   impl Drop for Guard {
     fn drop(&mut self) {
       SNAPSHOT_EXTERNAL_REFERENCES.with(|refs| {
-        refs.replace(std::mem::take(&mut self.0));
+        refs.set(self.0);
       });
     }
   }
 
-  let previous = SNAPSHOT_EXTERNAL_REFERENCES
-    .with(|refs| refs.replace(external_refs.to_vec()));
+  let current = SnapshotExternalReferences {
+    ptr: external_refs.as_ptr(),
+    len: external_refs.len(),
+  };
+  let previous =
+    SNAPSHOT_EXTERNAL_REFERENCES.with(|refs| refs.replace(current));
   let _guard = Guard(previous);
   f()
 }
 
-fn current_snapshot_external_references() -> Vec<usize> {
-  SNAPSHOT_EXTERNAL_REFERENCES.with(|refs| refs.borrow().clone())
+fn with_current_snapshot_external_references<T>(
+  f: impl FnOnce(&[usize]) -> T,
+) -> T {
+  let current = SNAPSHOT_EXTERNAL_REFERENCES.with(|refs| refs.get());
+  let external_refs = if current.len == 0 {
+    &[]
+  } else {
+    // The outer serializer call owns this slice for the duration of all
+    // synchronous QuickJS host-object callbacks.
+    unsafe { std::slice::from_raw_parts(current.ptr, current.len) }
+  };
+  f(external_refs)
 }
 
 /// Structured-clone one JS value to bytes (no bytecode: plain data graph).
@@ -566,8 +586,9 @@ pub unsafe extern "C" fn v82jsc_snapshot_write_host_object(
   let Some(info) = super::function::snapshot_function_info(value) else {
     return 0;
   };
-  let external_refs = current_snapshot_external_references();
-  let bytes = encode_function_data(info, &external_refs);
+  let bytes = with_current_snapshot_external_references(|external_refs| {
+    encode_function_data(info, external_refs)
+  });
   if output.is_null() {
     unsafe { *size = bytes.len() };
     return 1;
@@ -600,8 +621,10 @@ pub unsafe extern "C" fn v82jsc_snapshot_read_host_object(
     return -1;
   }
   let bytes = unsafe { std::slice::from_raw_parts(input, size) };
-  let external_refs = current_snapshot_external_references();
-  let Some(value) = decode_special_data(ctx, bytes, &external_refs) else {
+  let value = with_current_snapshot_external_references(|external_refs| {
+    decode_special_data(ctx, bytes, external_refs)
+  });
+  let Some(value) = value else {
     return 0;
   };
   unsafe { *output = value };
