@@ -526,6 +526,33 @@ pub(crate) fn deserialize_value_with_refs(
   Some(value)
 }
 
+struct AutomaticGcDeferral {
+  runtime: *mut JSRuntime,
+  threshold: usize,
+}
+
+impl AutomaticGcDeferral {
+  unsafe fn new(ctx: *mut JSContext) -> Self {
+    let runtime = unsafe { JS_GetRuntime(ctx) };
+    let threshold = unsafe { JS_GetGCThreshold(runtime) };
+    unsafe { JS_SetGCThreshold(runtime, usize::MAX) };
+    Self { runtime, threshold }
+  }
+}
+
+impl Drop for AutomaticGcDeferral {
+  fn drop(&mut self) {
+    if self.threshold == usize::MAX {
+      return;
+    }
+    let malloc_size = unsafe { v82jsc_malloc_size(self.runtime) };
+    let threshold = self
+      .threshold
+      .max(malloc_size.saturating_add(malloc_size / 2));
+    unsafe { JS_SetGCThreshold(self.runtime, threshold) };
+  }
+}
+
 fn encode_module_data(
   ctx: *mut JSContext,
   info: super::module::ModuleSnapshotInfo,
@@ -1493,6 +1520,7 @@ pub(crate) fn replay_context(
   if isolate.is_null() || ctx.is_null() {
     return;
   }
+  let _gc_deferral = unsafe { AutomaticGcDeferral::new(ctx) };
   unsafe { super::core::refresh_snapshot_intrinsics(ctx) };
   let bytes = snapshot
     .global_object
@@ -2106,6 +2134,21 @@ mod tests {
         JS_FreeRuntime(self.runtime);
       }
     }
+  }
+
+  #[test]
+  fn snapshot_gc_deferral_advances_threshold_to_live_heap_size() {
+    let test = TestContext::new();
+    unsafe { JS_SetGCThreshold(test.runtime, 1) };
+    {
+      let _deferral = unsafe { AutomaticGcDeferral::new(test.context) };
+      assert_eq!(unsafe { JS_GetGCThreshold(test.runtime) }, usize::MAX);
+    }
+    let malloc_size = unsafe { v82jsc_malloc_size(test.runtime) };
+    assert_eq!(
+      unsafe { JS_GetGCThreshold(test.runtime) },
+      malloc_size.saturating_add(malloc_size / 2),
+    );
   }
 
   fn value_to_string(

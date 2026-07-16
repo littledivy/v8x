@@ -1,0 +1,25 @@
+diff --git a/quickjs.c b/quickjs.c
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -2269,6 +2269,10 @@ uint64_t JS_GetDumpFlags(JSRuntime *rt)
+ #endif
+ }
+ 
++size_t v82jsc_malloc_size(JSRuntime *rt) {
++    return rt->malloc_state.malloc_size;
++}
++
+ size_t JS_GetGCThreshold(JSRuntime *rt) {
+     return rt->malloc_gc_threshold;
+ }
+diff --git a/quickjs.h b/quickjs.h
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -498,6 +498,7 @@ JS_EXTERN void JS_SetMemoryLimitHandler(JSRuntime *rt,
+                                         void *opaque);
+ JS_EXTERN void JS_SetDumpFlags(JSRuntime *rt, uint64_t flags);
+ JS_EXTERN uint64_t JS_GetDumpFlags(JSRuntime *rt);
++JS_EXTERN size_t v82jsc_malloc_size(JSRuntime *rt);
+ JS_EXTERN size_t JS_GetGCThreshold(JSRuntime *rt);
+ JS_EXTERN void JS_SetGCThreshold(JSRuntime *rt, size_t gc_threshold);
+ /* use 0 to disable maximum stack size check */

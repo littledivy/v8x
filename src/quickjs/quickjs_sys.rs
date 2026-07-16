@@ -322,6 +322,8 @@ unsafe extern "C" {
     rt: *mut JSRuntime,
     sf: *const JSSharedArrayBufferFunctions,
   );
+  pub fn v82jsc_malloc_size(rt: *mut JSRuntime) -> usize;
+  pub fn JS_GetGCThreshold(rt: *mut JSRuntime) -> usize;
   pub fn JS_SetGCThreshold(rt: *mut JSRuntime, gc_threshold: usize);
   pub fn JS_RunGC(rt: *mut JSRuntime);
   pub fn JS_ClearKeptObjects(rt: *mut JSRuntime);
