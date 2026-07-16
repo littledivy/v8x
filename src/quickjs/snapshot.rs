@@ -53,7 +53,49 @@ const JS_PROP_WRITABLE: c_int = 1 << 1;
 const JS_PROP_ENUMERABLE: c_int = 1 << 2;
 const NOOP_FUNCTION_SRC: &str = "(function(){})\0";
 
-pub(crate) type SnapshotBytes = Arc<[u8]>;
+#[derive(Clone)]
+pub(crate) enum SnapshotBytes {
+  Owned(Arc<[u8]>),
+  StartupData { ptr: usize, len: usize },
+}
+
+impl SnapshotBytes {
+  /// # Safety
+  ///
+  /// `bytes` must remain valid until every clone of the returned value is
+  /// dropped. Rusty_v8 retains snapshot `StartupData` for the isolate lifetime.
+  unsafe fn from_startup_data(bytes: &[u8]) -> Self {
+    Self::StartupData {
+      ptr: bytes.as_ptr() as usize,
+      len: bytes.len(),
+    }
+  }
+}
+
+impl From<Vec<u8>> for SnapshotBytes {
+  fn from(bytes: Vec<u8>) -> Self {
+    Self::Owned(bytes.into())
+  }
+}
+
+impl AsRef<[u8]> for SnapshotBytes {
+  fn as_ref(&self) -> &[u8] {
+    match self {
+      Self::Owned(bytes) => bytes,
+      Self::StartupData { ptr, len } => unsafe {
+        std::slice::from_raw_parts(*ptr as *const u8, *len)
+      },
+    }
+  }
+}
+
+impl std::ops::Deref for SnapshotBytes {
+  type Target = [u8];
+
+  fn deref(&self) -> &Self::Target {
+    self.as_ref()
+  }
+}
 
 #[repr(C)]
 struct JSPropertyEnum {
@@ -702,10 +744,7 @@ pub(crate) fn deserialize_function_template_with_cached_proto(
   if !bytes.starts_with(DATA_MAGIC) {
     return None;
   }
-  let mut input = Reader {
-    bytes,
-    pos: DATA_MAGIC.len(),
-  };
+  let mut input = Reader::new(bytes, DATA_MAGIC.len());
   if input.get_u8()? != SNAPSHOT_DATA_FUNCTION_TEMPLATE {
     return None;
   }
@@ -751,10 +790,7 @@ fn decode_special_data(
   if !bytes.starts_with(DATA_MAGIC) {
     return None;
   }
-  let mut input = Reader {
-    bytes,
-    pos: DATA_MAGIC.len(),
-  };
+  let mut input = Reader::new(bytes, DATA_MAGIC.len());
   match input.get_u8()? {
     SNAPSHOT_DATA_MODULE => {
       let name = input.get_string()?;
@@ -1027,7 +1063,12 @@ pub(crate) fn external_references_from_params(
   out
 }
 
-pub(crate) fn blob_from_params(
+/// # Safety
+///
+/// The snapshot data referenced by `raw_params` must outlive the returned
+/// blob. Rusty_v8's `CreateParamAllocations` provides that ownership through
+/// isolate disposal.
+pub(crate) unsafe fn blob_from_params(
   raw_params: *const crate::isolate_create_params::raw::CreateParams,
 ) -> Option<SnapshotBlob> {
   if raw_params.is_null() {
@@ -1044,7 +1085,7 @@ pub(crate) fn blob_from_params(
   }
   let bytes =
     unsafe { std::slice::from_raw_parts(data as *const u8, raw_size as usize) };
-  decode_blob(bytes)
+  unsafe { decode_blob(bytes) }
 }
 
 pub(crate) fn encode_blob(blob: &SnapshotBlob) -> Box<[u8]> {
@@ -1598,8 +1639,8 @@ unsafe fn atom_to_string(ctx: *mut JSContext, atom: JSAtom) -> Option<String> {
   out
 }
 
-fn decode_blob(bytes: &[u8]) -> Option<SnapshotBlob> {
-  let mut input = Reader { bytes, pos: 0 };
+unsafe fn decode_blob(bytes: &[u8]) -> Option<SnapshotBlob> {
+  let mut input = unsafe { Reader::from_startup_data(bytes, 0) };
   if input.take(MAGIC.len())? != MAGIC {
     return None;
   }
@@ -1770,9 +1811,26 @@ fn put_u64(out: &mut Vec<u8>, value: u64) {
 struct Reader<'a> {
   bytes: &'a [u8],
   pos: usize,
+  borrow_snapshot_bytes: bool,
 }
 
 impl<'a> Reader<'a> {
+  fn new(bytes: &'a [u8], pos: usize) -> Self {
+    Self {
+      bytes,
+      pos,
+      borrow_snapshot_bytes: false,
+    }
+  }
+
+  unsafe fn from_startup_data(bytes: &'a [u8], pos: usize) -> Self {
+    Self {
+      bytes,
+      pos,
+      borrow_snapshot_bytes: true,
+    }
+  }
+
   fn take(&mut self, len: usize) -> Option<&'a [u8]> {
     let end = self.pos.checked_add(len)?;
     if end > self.bytes.len() {
@@ -1813,7 +1871,13 @@ impl<'a> Reader<'a> {
 
   fn get_bytes(&mut self) -> Option<SnapshotBytes> {
     let len = self.get_u32()? as usize;
-    Some(self.take(len)?.into())
+    let borrow_snapshot_bytes = self.borrow_snapshot_bytes;
+    let bytes = self.take(len)?;
+    Some(if borrow_snapshot_bytes {
+      unsafe { SnapshotBytes::from_startup_data(bytes) }
+    } else {
+      bytes.to_vec().into()
+    })
   }
 
   fn get_string(&mut self) -> Option<String> {
@@ -1956,6 +2020,19 @@ pub(crate) fn free_blob(ptr: *const u8) {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn startup_reader_borrows_snapshot_bytes() {
+    let mut encoded = Vec::new();
+    put_bytes(&mut encoded, b"snapshot payload");
+    let payload_ptr =
+      unsafe { encoded.as_ptr().add(std::mem::size_of::<u32>()) };
+    let mut reader = unsafe { Reader::from_startup_data(&encoded, 0) };
+    let decoded = reader.get_bytes().unwrap();
+
+    assert_eq!(decoded.as_ptr(), payload_ptr);
+    assert_eq!(decoded.as_ref(), b"snapshot payload");
+  }
 
   struct TestContext {
     runtime: *mut JSRuntime,

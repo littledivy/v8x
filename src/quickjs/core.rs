@@ -911,7 +911,8 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
   };
   let external_references =
     super::snapshot::external_references_from_params(raw_params);
-  let restored_snapshot = super::snapshot::blob_from_params(raw_params);
+  let restored_snapshot =
+    unsafe { super::snapshot::blob_from_params(raw_params) };
   let restored_isolate_data = restored_snapshot
     .as_ref()
     .map(|blob| blob.isolate_data.iter().cloned().map(Some).collect())
