@@ -1852,22 +1852,18 @@ fn v8_member_call_column(line: &str, col: i32) -> i32 {
       return col;
     }
   }
-  for open in (0..=i).rev().filter(|index| chars[*index] == '(') {
-    if chars[open..=i]
-      .windows(2)
-      .any(|window| window == ['=', '>'])
-    {
-      continue;
+  let mut balance = 0i32;
+  let mut crossed_arrow = false;
+  for open in (0..=i).rev() {
+    if chars.get(open + 1) == Some(&'>') && chars[open] == '=' {
+      crossed_arrow = true;
     }
-    let balance =
-      chars[open..=i]
-        .iter()
-        .fold(0i32, |balance, char| match char {
-          '(' => balance + 1,
-          ')' => balance - 1,
-          _ => balance,
-        });
-    if balance <= 0 {
+    balance += match chars[open] {
+      '(' => 1,
+      ')' => -1,
+      _ => 0,
+    };
+    if chars[open] != '(' || crossed_arrow || balance <= 0 {
       continue;
     }
     let mut end = open;

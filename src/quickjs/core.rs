@@ -2179,7 +2179,7 @@ thread_local! {
   // construct CALL position (the `(`), V8 records the `new` token, and the only
   // way to bridge that gap shim-side is to re-read the source line.
   static SCRIPT_SOURCES: RefCell<
-    std::collections::HashMap<std::string::String, std::string::String>,
+    std::collections::HashMap<std::string::String, ScriptSource>,
   > = RefCell::new(std::collections::HashMap::new());
 
   static CURRENT_SCRIPT_NAMES: RefCell<Vec<std::string::String>> =
@@ -2187,6 +2187,42 @@ thread_local! {
 
   static CURRENT_HOST_DEFINED_OPTIONS: RefCell<Vec<usize>> =
     const { RefCell::new(Vec::new()) };
+}
+
+struct ScriptSource {
+  text: std::string::String,
+  line_ranges: Vec<std::ops::Range<usize>>,
+}
+
+impl ScriptSource {
+  fn new(text: &str) -> Self {
+    let mut line_ranges = Vec::new();
+    let mut start = 0;
+    for line in text.split_inclusive('\n') {
+      let next = start + line.len();
+      let mut end = next;
+      if line.ends_with('\n') {
+        end -= 1;
+        if end > start && text.as_bytes()[end - 1] == b'\r' {
+          end -= 1;
+        }
+      }
+      line_ranges.push(start..end);
+      start = next;
+    }
+    Self {
+      text: text.to_string(),
+      line_ranges,
+    }
+  }
+
+  fn line(&self, line: i32) -> Option<&str> {
+    let index = usize::try_from(line.checked_sub(1)?).ok()?;
+    self
+      .line_ranges
+      .get(index)
+      .map(|range| &self.text[range.clone()])
+  }
 }
 
 struct CurrentScriptNameGuard {
@@ -2445,12 +2481,17 @@ pub(crate) fn replace_script_source(filename: &str, source: &str) {
     if map.len() > 256 && !map.contains_key(filename) {
       map.clear();
     }
-    map.insert(filename.to_string(), source.to_string());
+    map.insert(filename.to_string(), ScriptSource::new(source));
   });
 }
 
 pub(crate) fn script_source(filename: &str) -> Option<std::string::String> {
-  SCRIPT_SOURCES.with(|sources| sources.borrow().get(filename).cloned())
+  SCRIPT_SOURCES.with(|sources| {
+    sources
+      .borrow()
+      .get(filename)
+      .map(|source| source.text.clone())
+  })
 }
 
 pub(crate) fn script_sources() -> Vec<(std::string::String, std::string::String)>
@@ -2459,7 +2500,7 @@ pub(crate) fn script_sources() -> Vec<(std::string::String, std::string::String)
     sources
       .borrow()
       .iter()
-      .map(|(name, source)| (name.clone(), source.clone()))
+      .map(|(name, source)| (name.clone(), source.text.clone()))
       .collect()
   })
 }
@@ -2475,8 +2516,41 @@ pub(crate) fn script_source_line(
   SCRIPT_SOURCES.with(|m| {
     m.borrow()
       .get(filename)
-      .and_then(|src| src.lines().nth((line - 1) as usize).map(str::to_string))
+      .and_then(|source| source.line(line).map(str::to_string))
   })
+}
+
+#[cfg(test)]
+mod script_source_tests {
+  use super::replace_script_source;
+  use super::script_source_line;
+
+  #[test]
+  fn indexes_script_lines_once() {
+    replace_script_source("line-index.js", "one\r\ntwo\n\nfour\n");
+    assert_eq!(script_source_line("line-index.js", 0), None);
+    assert_eq!(
+      script_source_line("line-index.js", 1).as_deref(),
+      Some("one")
+    );
+    assert_eq!(
+      script_source_line("line-index.js", 2).as_deref(),
+      Some("two")
+    );
+    assert_eq!(script_source_line("line-index.js", 3).as_deref(), Some(""));
+    assert_eq!(
+      script_source_line("line-index.js", 4).as_deref(),
+      Some("four")
+    );
+    assert_eq!(script_source_line("line-index.js", 5), None);
+
+    replace_script_source("line-index.js", "replacement");
+    assert_eq!(
+      script_source_line("line-index.js", 1).as_deref(),
+      Some("replacement")
+    );
+    assert_eq!(script_source_line("line-index.js", 2), None);
+  }
 }
 
 // Pull the resource-name string out of a `ScriptOrigin` (slot 0 holds the
