@@ -1,5 +1,4 @@
 diff --git a/core/iwasm/interpreter/wasm_interp_classic.c b/core/iwasm/interpreter/wasm_interp_classic.c
-index 0000000..0000000 100644
 --- a/core/iwasm/interpreter/wasm_interp_classic.c
 +++ b/core/iwasm/interpreter/wasm_interp_classic.c
 @@ -7577,9 +7577,7 @@ wasm_interp_call_wasm(WASMExecEnv *exec_env,
@@ -14,7 +13,6 @@ index 0000000..0000000 100644
      }
  
 diff --git a/core/iwasm/interpreter/wasm_interp_fast.c b/core/iwasm/interpreter/wasm_interp_fast.c
-index 0000000..0000000 100644
 --- a/core/iwasm/interpreter/wasm_interp_fast.c
 +++ b/core/iwasm/interpreter/wasm_interp_fast.c
 @@ -8009,9 +8009,7 @@ wasm_interp_call_wasm(WASMExecEnv *exec_env,
@@ -29,10 +27,9 @@ index 0000000..0000000 100644
      }
  
 diff --git a/core/iwasm/interpreter/wasm_runtime.c b/core/iwasm/interpreter/wasm_runtime.c
-index 0000000..0000000 100644
 --- a/core/iwasm/interpreter/wasm_runtime.c
 +++ b/core/iwasm/interpreter/wasm_runtime.c
-@@ -3667,9 +3667,7 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
+@@ -3667,8 +3667,6 @@ wasm_interp_call_func_native(WASMModuleInstance *module_inst,
       * then the stack-frame is already freed inside wasm_interp_call_wasm */
      if (!ret) {
  #if WASM_ENABLE_DUMP_CALL_STACK != 0
