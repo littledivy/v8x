@@ -1,0 +1,48 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -8386,6 +8386,15 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+     }
+     rt->in_build_stack_trace = true;
+     error_obj = js_dup(error_val);
++    if ((backtrace_flags & JS_BACKTRACE_FLAG_FILTER_FUNC) &&
++        JS_VALUE_GET_TAG(error_obj) == JS_TAG_OBJECT) {
++        p = JS_VALUE_GET_OBJ(error_obj);
++        if (p->class_id == JS_CLASS_ERROR &&
++            js_error_has_native_stack_accessor(ctx, p)) {
++            JS_FreeValue(ctx, p->u.object_data);
++            p->u.object_data = JS_UNDEFINED;
++        }
++    }
+ 
+     // Save exception because conversion to double may fail.
+     saved_exception = JS_GetException(ctx);
+@@ -8570,7 +8580,14 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+ 
+     if (JS_IsUndefined(ctx->error_back_trace))
+         ctx->error_back_trace = js_dup(stack);
+-    if (has_filter_func) {
++    if (can_store_error_stack(ctx, error_obj)) {
++        /* Error.captureStackTrace replaces an Error's existing internal stack
++           while preserving its lazy native accessor. */
++        p = JS_VALUE_GET_OBJ(error_obj);
++        JS_FreeValue(ctx, p->u.object_data);
++        p->u.object_data = stack;
++        js_error_define_stack_accessor(ctx, error_obj);
++    } else if (has_filter_func) {
+         /* Error.captureStackTrace(target, ...): install an own data property
+            on the (possibly non-Error) target, shadowing the accessor. Because
+            it shadows js_error_get_stack, prepend the v8 `name: message` header
+@@ -8578,13 +8595,6 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+         stack = js_error_prepend_stack_header(ctx, error_obj, stack);
+         JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack,
+                                JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+-    } else if (can_store_error_stack(ctx, error_obj)) {
+-        /* genuine Error instance: store as the [[ErrorData]] stack value;
+-           js_error_get_stack prepends the header lazily on read. */
+-        p = JS_VALUE_GET_OBJ(error_obj);
+-        JS_FreeValue(ctx, p->u.object_data);
+-        p->u.object_data = stack;
+-        js_error_define_stack_accessor(ctx, error_obj);
+     } else if (can_add_backtrace(error_obj)) {
+         /* DOMException and the like keep an own "stack" data property (no
+            Error.prototype accessor), so prepend the header here (v82jsc). */

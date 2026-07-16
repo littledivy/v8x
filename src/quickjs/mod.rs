@@ -40,6 +40,7 @@ mod raw_smoke_test {
   use std::sync::atomic::Ordering;
 
   static PREPARE_STACK_CALLS: AtomicUsize = AtomicUsize::new(0);
+  static RECAPTURE_PREPARE_STACK_CALLS: AtomicUsize = AtomicUsize::new(0);
   static UNHANDLED_REJECTIONS: AtomicUsize = AtomicUsize::new(0);
   static HANDLED_REJECTIONS: AtomicUsize = AtomicUsize::new(0);
 
@@ -55,6 +56,16 @@ mod raw_smoke_test {
     _argv: *mut JSValue,
   ) -> JSValue {
     PREPARE_STACK_CALLS.fetch_add(1, Ordering::SeqCst);
+    unsafe { JS_NewString(ctx, c"embedder stack".as_ptr()) }
+  }
+
+  unsafe extern "C" fn test_recapture_prepare_stack_trace(
+    ctx: *mut JSContext,
+    _this: JSValue,
+    _argc: std::ffi::c_int,
+    _argv: *mut JSValue,
+  ) -> JSValue {
+    RECAPTURE_PREPARE_STACK_CALLS.fetch_add(1, Ordering::SeqCst);
     unsafe { JS_NewString(ctx, c"embedder stack".as_ptr()) }
   }
 
@@ -491,6 +502,74 @@ mod raw_smoke_test {
           .unwrap();
       assert_eq!(actual, "embedder stack");
       assert_eq!(PREPARE_STACK_CALLS.load(Ordering::SeqCst), 1);
+
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, result);
+      JS_FreeContext(ctx);
+      JS_FreeRuntime(rt);
+    }
+  }
+
+  #[test]
+  #[cfg(feature = "link_quickjs")]
+  fn capture_stack_trace_replaces_error_stack_lazily() {
+    unsafe {
+      RECAPTURE_PREPARE_STACK_CALLS.store(0, Ordering::SeqCst);
+      let rt = JS_NewRuntime();
+      assert!(!rt.is_null());
+      let ctx = JS_NewContext(rt);
+      assert!(!ctx.is_null());
+
+      let callback = JS_NewCFunction(
+        ctx,
+        test_recapture_prepare_stack_trace,
+        c"prepareStackTrace".as_ptr(),
+        2,
+      );
+      JS_SetPrepareStackTraceCallback(ctx, callback);
+      JS_FreeValue(ctx, callback);
+
+      let setup = c"globalThis.error = new Error('boom');
+        function recapture() {
+          Error.captureStackTrace(error, recapture);
+        }
+        recapture();
+        typeof Object.getOwnPropertyDescriptor(error, 'stack').get";
+      let result = JS_Eval(
+        ctx,
+        setup.as_ptr(),
+        setup.to_bytes().len(),
+        c"capture-stack-test.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "setup threw");
+      let mut len = 0;
+      let text = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!text.is_null());
+      let actual =
+        std::str::from_utf8(std::slice::from_raw_parts(text as *const u8, len))
+          .unwrap();
+      assert_eq!(actual, "function");
+      assert_eq!(RECAPTURE_PREPARE_STACK_CALLS.load(Ordering::SeqCst), 0);
+      JS_FreeCString(ctx, text);
+      JS_FreeValue(ctx, result);
+
+      let result = JS_Eval(
+        ctx,
+        c"error.stack".as_ptr(),
+        c"error.stack".to_bytes().len(),
+        c"capture-stack-test.js".as_ptr(),
+        JS_EVAL_TYPE_GLOBAL,
+      );
+      assert!(result.tag != JS_TAG_EXCEPTION, "stack access threw");
+      let mut len = 0;
+      let text = JS_ToCStringLen(ctx, &mut len, result);
+      assert!(!text.is_null());
+      let actual =
+        std::str::from_utf8(std::slice::from_raw_parts(text as *const u8, len))
+          .unwrap();
+      assert_eq!(actual, "embedder stack");
+      assert_eq!(RECAPTURE_PREPARE_STACK_CALLS.load(Ordering::SeqCst), 1);
 
       JS_FreeCString(ctx, text);
       JS_FreeValue(ctx, result);
