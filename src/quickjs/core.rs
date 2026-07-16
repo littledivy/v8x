@@ -50,7 +50,7 @@ use std::ptr;
 use std::sync::atomic::{
   AtomicBool, AtomicI64, AtomicPtr, AtomicUsize, Ordering,
 };
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 pub(crate) type WeakCallback = unsafe extern "C" fn(*const c_void);
 
@@ -410,7 +410,7 @@ pub(crate) struct IsoState {
   pub restored_context_data:
     HashMap<usize, Vec<Option<super::snapshot::SnapshotBytes>>>,
   pub restored_context_values: HashMap<usize, Vec<Option<JSValue>>>,
-  pub external_references: Vec<usize>,
+  pub external_references: Arc<[usize]>,
 
   pub external_memory: AtomicI64,
 
@@ -910,7 +910,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     super::allocator::allocator_shared_copy(shared)
   };
   let external_references =
-    super::snapshot::external_references_from_params(raw_params);
+    super::snapshot::external_references_from_params(raw_params).into();
   let restored_snapshot =
     unsafe { super::snapshot::blob_from_params(raw_params) };
   let restored_isolate_data = restored_snapshot
