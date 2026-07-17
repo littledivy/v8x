@@ -1,0 +1,221 @@
+--- a/quickjs.c
++++ b/quickjs.c
+@@ -39877,7 +39877,14 @@
+     BC_TAG_SNAPSHOT_INTRINSIC,
+ } BCTagEnum;
+ 
+-#define BC_VERSION 27
++#define BC_VERSION_LEGACY 27
++#define BC_VERSION 28
++
++typedef struct BCSourceEntry {
++    const uint8_t *data;
++    uint32_t len;
++    uint32_t hash;
++} BCSourceEntry;
+ 
+ typedef struct BCWriterState {
+     JSContext *ctx;
+@@ -39902,6 +39909,10 @@
+     JSVarRef **var_ref_tab;
+     int var_ref_count;
+     int var_ref_size;
++    /* Function sources are commonly shared by many bytecode records. */
++    BCSourceEntry *source_tab;
++    int source_count;
++    int source_size;
+ } BCWriterState;
+ 
+ #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
+@@ -40360,6 +40371,43 @@
+     js_object_list_end(ctx, &s.registered);
+ }
+ 
++static int JS_WriteFunctionSource(BCWriterState *s,
++                                  const JSFunctionBytecode *b)
++{
++    uint32_t hash;
++    int i;
++
++    if (!s->allow_source || !b->source || b->source_len <= 0) {
++        bc_put_leb128(s, 0);
++        return 0;
++    }
++    hash = bc_csum((const uint8_t *)b->source, b->source_len);
++    for (i = 0; i < s->source_count; i++) {
++        BCSourceEntry *entry = &s->source_tab[i];
++        if (entry->len == (uint32_t)b->source_len &&
++            entry->hash == hash &&
++            !memcmp(entry->data, b->source, b->source_len)) {
++            /* 2+n references table entry n. */
++            bc_put_leb128(s, i + 2);
++            return 0;
++        }
++    }
++    if (js_resize_array(s->ctx, (void **)&s->source_tab,
++                        sizeof(s->source_tab[0]), &s->source_size,
++                        s->source_count + 1))
++        return -1;
++    s->source_tab[s->source_count++] = (BCSourceEntry) {
++        .data = (const uint8_t *)b->source,
++        .len = (uint32_t)b->source_len,
++        .hash = hash,
++    };
++    /* 1 introduces the next table entry. */
++    bc_put_leb128(s, 1);
++    bc_put_leb128(s, b->source_len);
++    dbuf_put(&s->dbuf, (const uint8_t *)b->source, b->source_len);
++    return 0;
++}
++
+ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+ {
+     JSFunctionBytecode *b = JS_VALUE_GET_PTR(obj);
+@@ -40443,12 +40491,8 @@
+         bc_put_leb128(s, b->col_num);
+         bc_put_leb128(s, b->pc2line_len);
+         dbuf_put(&s->dbuf, b->pc2line_buf, b->pc2line_len);
+-        if (s->allow_source && b->source) {
+-            bc_put_leb128(s, b->source_len);
+-            dbuf_put(&s->dbuf, b->source, b->source_len);
+-        } else {
+-            bc_put_leb128(s, 0);
+-        }
++        if (JS_WriteFunctionSource(s, b))
++            goto fail;
+     }
+     return 0;
+  fail:
+@@ -41631,6 +41675,7 @@
+         goto fail;
+     js_object_list_end(ctx, &s->object_list);
+     js_free(ctx, s->var_ref_tab);
++    js_free(ctx, s->source_tab);
+     js_free(ctx, s->atom_to_idx);
+     js_free(ctx, s->idx_to_atom);
+     *psize = s->dbuf.size;
+@@ -41648,6 +41693,7 @@
+  fail:
+     js_object_list_end(ctx, &s->object_list);
+     js_free(ctx, s->var_ref_tab);
++    js_free(ctx, s->source_tab);
+     js_free(ctx, s->atom_to_idx);
+     js_free(ctx, s->idx_to_atom);
+     dbuf_free(&s->dbuf);
+@@ -41683,6 +41729,9 @@
+     JSVarRef **var_refs;
+     int var_refs_count;
+     int var_refs_size;
++    BCSourceEntry *source_tab;
++    int source_count;
++    int source_size;
+     /* weak targets retained until the complete object graph is restored */
+     JSValue *weak_targets;
+     int weak_targets_count;
+@@ -41694,6 +41743,7 @@
+     /* used for JS_DUMP_READ_OBJECT */
+     const uint8_t *ptr_last;
+     int level;
++    uint8_t version;
+ } BCReaderState;
+ 
+ #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
+@@ -42059,6 +42109,7 @@
+     JSValue obj = JS_UNDEFINED;
+     uint16_t v16;
+     uint8_t v8;
++    uint32_t source_ref;
+     int idx, i, local_count, has_debug_info;
+     int function_size, cpool_offset, byte_code_offset;
+     int closure_var_offset, vardefs_offset;
+@@ -42266,18 +42317,56 @@
+         if (bc_get_buf(s, b->pc2line_buf, b->pc2line_len))
+             goto fail;
+     }
+-    if (bc_get_leb128_int(s, &b->source_len))
+-        goto fail;
+-    if (b->source_len) {
+-        bc_read_trace(s, "source: %d bytes\n", b->source_len);
+-        if (s->ptr_last)
+-            s->ptr_last += b->source_len;  // omit source code hex dump
+-        /* b->source is a UTF-8 encoded null terminated C string */
+-        b->source = js_mallocz(ctx, b->source_len + 1);
+-        if (!b->source)
++    if (s->version == BC_VERSION_LEGACY) {
++        if (bc_get_leb128_int(s, &b->source_len))
+             goto fail;
+-        if (bc_get_buf(s, b->source, b->source_len))
++        if (b->source_len) {
++            bc_read_trace(s, "source: %d bytes\n", b->source_len);
++            if (s->ptr_last)
++                s->ptr_last += b->source_len;
++            b->source = js_mallocz(ctx, b->source_len + 1);
++            if (!b->source || bc_get_buf(s, b->source, b->source_len))
++                goto fail;
++        }
++    } else {
++        if (bc_get_leb128(s, &source_ref))
+             goto fail;
++        if (source_ref == 1) {
++            const uint8_t *source;
++            uint32_t source_len;
++
++            if (bc_get_leb128(s, &source_len) || source_len > INT32_MAX)
++                goto fail;
++            source = s->ptr;
++            b->source_len = source_len;
++            bc_read_trace(s, "source: %d bytes\n", b->source_len);
++            if (s->ptr_last)
++                s->ptr_last += b->source_len;
++            b->source = js_mallocz(ctx, b->source_len + 1);
++            if (!b->source || bc_get_buf(s, b->source, b->source_len))
++                goto fail;
++            if (js_resize_array(ctx, (void **)&s->source_tab,
++                                sizeof(s->source_tab[0]), &s->source_size,
++                                s->source_count + 1))
++                goto fail;
++            s->source_tab[s->source_count++] = (BCSourceEntry) {
++                .data = source,
++                .len = source_len,
++                .hash = 0,
++            };
++        } else if (source_ref >= 2) {
++            BCSourceEntry *entry;
++            uint32_t source_index = source_ref - 2;
++
++            if (source_index >= (uint32_t)s->source_count)
++                goto fail;
++            entry = &s->source_tab[source_index];
++            b->source_len = entry->len;
++            b->source = js_mallocz(ctx, b->source_len + 1);
++            if (!b->source)
++                goto fail;
++            memcpy(b->source, entry->data, b->source_len);
++        }
+     }
+     bc_read_trace(s, "}\n");
+ 
+@@ -43629,11 +43718,12 @@
+ 
+     if (bc_get_u8(s, &v8))
+         return -1;
+-    if (v8 != BC_VERSION) {
+-        JS_ThrowSyntaxError(s->ctx, "invalid version (%d expected=%d)",
+-                            v8, BC_VERSION);
++    if (v8 != BC_VERSION && v8 != BC_VERSION_LEGACY) {
++        JS_ThrowSyntaxError(s->ctx, "invalid version (%d expected=%d or %d)",
++                            v8, BC_VERSION_LEGACY, BC_VERSION);
+         return -1;
+     }
++    s->version = v8;
+     if (bc_get_u32(s, &h))
+         return -1;
+     // allow UINT32_MAX as an escape hatch, otherwise updating
+@@ -43703,6 +43793,7 @@
+     }
+     js_free(s->ctx, s->objects);
+     js_free(s->ctx, s->var_refs);
++    js_free(s->ctx, s->source_tab);
+     for (i = 0; i < s->weak_targets_count; i++)
+         JS_FreeValue(s->ctx, s->weak_targets[i]);
+     js_free(s->ctx, s->weak_targets);

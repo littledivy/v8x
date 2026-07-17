@@ -397,6 +397,10 @@ pub(crate) struct IsoState {
   pub iso_added_contexts: usize,
   pub snap_default_context: Option<usize>,
   pub snap_contexts: Vec<usize>,
+  // Fresh context captures let the snapshot writer omit an unchanged QuickJS
+  // global graph. Snapshot restore already creates the same initialized
+  // context, so serializing that baseline would only copy built-ins.
+  pub snap_context_baselines: HashMap<usize, super::snapshot::ContextSnapshot>,
   // Capture while the rusty_v8 annex and embedder callbacks are still alive.
   pub snap_default_context_capture: Option<super::snapshot::ContextSnapshot>,
   pub snap_context_captures: Vec<super::snapshot::ContextSnapshot>,
@@ -939,6 +943,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     iso_added_contexts: 0,
     snap_default_context: None,
     snap_contexts: Vec::new(),
+    snap_context_baselines: HashMap::new(),
     snap_default_context_capture: None,
     snap_context_captures: Vec::new(),
     context_global_templates: HashMap::new(),
@@ -1339,6 +1344,11 @@ pub extern "C" fn v8__Context__New(
       snapshot.context_data.iter().cloned().map(Some).collect(),
     );
     finish_snapshot_restore(isolate, ctx);
+  } else if st.is_snapshot_creator && st.restored_snapshot.is_none() {
+    let external_references = st.external_references.clone();
+    let baseline =
+      super::snapshot::capture_context(ctx, &external_references, &[]);
+    st.snap_context_baselines.insert(ctx as usize, baseline);
   }
   if std::env::var_os("QJS_DEBUG_SNAPSHOT").is_some() {
     eprintln!("[qjs snapshot] Context__New ctx={ctx:?}");

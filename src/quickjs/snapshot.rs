@@ -1405,6 +1405,20 @@ pub(crate) fn capture_context_with_data_roots(
   let mut snapshot = capture_context(ctx, external_refs, context_data);
   remove_context_data_registry(ctx);
 
+  // Ordinary context-data values are already part of `global_object` through
+  // the temporary registry above. Keeping their standalone JS_WriteObject
+  // encodings as well serializes the same reachable graph once per slot. Deno's
+  // module map has more than a hundred such slots, which turns a few-megabyte
+  // context graph into tens of megabytes of duplicate snapshot data.
+  //
+  // FunctionTemplate slots are the exception: the rooted value is only their
+  // cached prototype, while the standalone bytes also carry the native
+  // callback/template metadata needed by GetDataFromSnapshotOnce.
+  for (bytes, is_ref) in snapshot.context_data.iter_mut().zip(&refs) {
+    if *is_ref && !is_serialized_function_template(bytes) {
+      *bytes = Vec::new().into();
+    }
+  }
   snapshot.context_data_refs = refs;
   snapshot
 }
@@ -1526,13 +1540,11 @@ pub(crate) fn replay_context(
   }
   let _gc_deferral = unsafe { AutomaticGcDeferral::new(ctx) };
   unsafe { super::core::refresh_snapshot_intrinsics(ctx) };
-  let bytes = snapshot
-    .global_object
-    .as_ref()
-    .expect("QuickJS snapshot is missing its context-global object graph");
-  let global = deserialize_value_with_refs(ctx, bytes, external_refs)
-    .expect("QuickJS snapshot context-global graph failed to deserialize");
-  unsafe { JS_FreeValue(ctx, global) };
+  if let Some(bytes) = snapshot.global_object.as_ref() {
+    let global = deserialize_value_with_refs(ctx, bytes, external_refs)
+      .expect("QuickJS snapshot context-global graph failed to deserialize");
+    unsafe { JS_FreeValue(ctx, global) };
+  }
   if let Some(template) = snapshot.global_template.as_ref() {
     replay_object_template(ctx, template, external_refs);
   }
@@ -2663,6 +2675,66 @@ mod tests {
       JS_FreeValue(test.context, increment);
       JS_FreeValue(test.context, restored);
       JS_FreeValue(test.context, source_value);
+    }
+  }
+
+  #[test]
+  fn repeated_function_sources_are_interned() {
+    let source = TestContext::new();
+    let marker = "x".repeat(64 * 1024);
+    let function_source =
+      format!("(function repeatedSource() {{ /* {marker} */ return 42; }})");
+    let first = source.eval(&function_source);
+    let second = source.eval(&function_source);
+    let array = unsafe { JS_NewArray(source.context) };
+    assert!(
+      unsafe { JS_SetPropertyUint32(source.context, array, 0, first) } >= 0
+    );
+    assert!(
+      unsafe { JS_SetPropertyUint32(source.context, array, 1, second) } >= 0
+    );
+    let bytes = write_object_bytes(source.context, array, &[]).unwrap();
+    unsafe { JS_FreeValue(source.context, array) };
+    assert!(
+      bytes.len() < function_source.len() + 32 * 1024,
+      "repeated function source was serialized more than once: {} bytes",
+      bytes.len(),
+    );
+
+    let target = TestContext::new();
+    let restored =
+      deserialize_value_with_refs(target.context, &bytes, &[]).unwrap();
+    unsafe {
+      let first = JS_GetPropertyUint32(target.context, restored, 0);
+      let second = JS_GetPropertyUint32(target.context, restored, 1);
+      let to_string =
+        JS_GetPropertyStr(target.context, first, c"toString".as_ptr());
+      let first_source =
+        JS_Call(target.context, to_string, first, 0, ptr::null_mut());
+      let second_source =
+        JS_Call(target.context, to_string, second, 0, ptr::null_mut());
+      assert_eq!(
+        value_to_string(target.context, first_source),
+        value_to_string(target.context, second_source),
+      );
+      assert!(
+        value_to_string(target.context, first_source)
+          .unwrap()
+          .contains(&marker)
+      );
+      let result =
+        JS_Call(target.context, first, jsv_undefined(), 0, ptr::null_mut());
+      let mut number = 0;
+      assert_eq!(JS_ToInt32(target.context, &mut number, result), 0);
+      assert_eq!(number, 42);
+
+      JS_FreeValue(target.context, result);
+      JS_FreeValue(target.context, second_source);
+      JS_FreeValue(target.context, first_source);
+      JS_FreeValue(target.context, to_string);
+      JS_FreeValue(target.context, second);
+      JS_FreeValue(target.context, first);
+      JS_FreeValue(target.context, restored);
     }
   }
 

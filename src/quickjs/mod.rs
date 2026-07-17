@@ -2613,7 +2613,7 @@ mod api_test {
   }
 
   fn assert_snapshot_context_data_preserves_global_identity() {
-    let context_data_index;
+    let context_data_indices;
     let startup_data = {
       let mut creator = v8::Isolate::snapshot_creator(None, None);
       {
@@ -2624,17 +2624,25 @@ mod api_test {
         let code = v8::String::new(
           scope,
           "globalThis.sharedSnapshotValue = {\
-             marker: 1, typeErrorPrototype: TypeError.prototype\
+             marker: 1, typeErrorPrototype: TypeError.prototype,\
+             payload: 'x'.repeat(64 * 1024)\
            }; sharedSnapshotValue",
         )
         .unwrap();
         let script = v8::Script::compile(scope, code, None).unwrap();
         let shared = script.run(scope).unwrap();
         scope.set_default_context(context);
-        context_data_index = scope.add_context_data(context, shared);
+        context_data_indices = (0..32)
+          .map(|_| scope.add_context_data(context, shared))
+          .collect::<Vec<_>>();
       }
       creator.create_blob(v8::FunctionCodeHandling::Keep).unwrap()
     };
+    assert!(
+      startup_data.len() < 1024 * 1024,
+      "reference-backed context data was serialized repeatedly: {} bytes",
+      startup_data.len(),
+    );
 
     {
       let params = v8::Isolate::create_params().snapshot_blob(startup_data);
@@ -2643,14 +2651,16 @@ mod api_test {
       let scope = &mut scope.init();
       let context = v8::Context::new(scope, Default::default());
       let scope = &mut v8::ContextScope::new(scope, context);
-      let restored = scope
-        .get_context_data_from_snapshot_once::<v8::Value>(context_data_index)
-        .unwrap();
       let code =
         v8::String::new(scope, "globalThis.sharedSnapshotValue").unwrap();
       let script = v8::Script::compile(scope, code, None).unwrap();
       let global_value = script.run(scope).unwrap();
-      assert!(restored.strict_equals(global_value));
+      for context_data_index in context_data_indices {
+        let restored = scope
+          .get_context_data_from_snapshot_once::<v8::Value>(context_data_index)
+          .unwrap();
+        assert!(restored.strict_equals(global_value));
+      }
       let code = v8::String::new(
         scope,
         "globalThis.sharedSnapshotValue.typeErrorPrototype ===\
@@ -2692,6 +2702,11 @@ mod api_test {
       }
       creator.create_blob(v8::FunctionCodeHandling::Keep).unwrap()
     };
+    assert!(
+      startup_data.len() < 16 * 1024,
+      "an unchanged context serialized its initialized global graph: {} bytes",
+      startup_data.len(),
+    );
 
     let params = v8::Isolate::create_params()
       .external_references(external_references)

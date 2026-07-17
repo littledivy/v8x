@@ -1287,6 +1287,25 @@ fn creator_iso(this: *const c_void) -> *mut RealIsolate {
   current_iso()
 }
 
+fn omit_unchanged_context_global(
+  st: &crate::quickjs::core::IsoState,
+  context: usize,
+  capture: &mut super::snapshot::ContextSnapshot,
+) {
+  let Some(baseline) = st.snap_context_baselines.get(&context) else {
+    return;
+  };
+  let Some(current) = capture.global_object.as_deref() else {
+    return;
+  };
+  let Some(baseline) = baseline.global_object.as_deref() else {
+    return;
+  };
+  if current == baseline {
+    capture.global_object = None;
+  }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__CreateBlob(
   this: *mut c_void,
@@ -1384,9 +1403,10 @@ pub extern "C" fn v8__SnapshotCreator__SetDefaultContext(
   let external_references = crate::quickjs::core::iso_state(iso)
     .external_references
     .clone();
-  let capture =
+  let mut capture =
     super::snapshot::capture_context(qctx, &external_references, &[]);
   let st = crate::quickjs::core::iso_state(iso);
+  omit_unchanged_context_global(st, qctx as usize, &mut capture);
   st.snap_default_context = Some(qctx as usize);
   st.snap_default_context_capture = Some(capture);
 }
@@ -1404,9 +1424,10 @@ pub extern "C" fn v8__SnapshotCreator__AddContext(
   let external_references = crate::quickjs::core::iso_state(iso)
     .external_references
     .clone();
-  let capture =
+  let mut capture =
     super::snapshot::capture_context(qctx, &external_references, &[]);
   let st = crate::quickjs::core::iso_state(iso);
+  omit_unchanged_context_global(st, qctx as usize, &mut capture);
   let n = st.snap_contexts.len();
   st.snap_contexts.push(qctx as usize);
   st.snap_context_captures.push(capture);
