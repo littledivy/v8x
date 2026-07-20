@@ -1,8 +1,8 @@
 [package]
-# Package name is `v8` so it can replace the real crate via `[patch]` in
-# downstream projects (Deno). The project is a v8 C-ABI compat layer with
-# pluggable JS-engine backends (JavaScriptCore, QuickJS-ng).
-name = "v8"
+# The library target remains `v8` so the vendored rusty_v8 integration tests
+# can run unmodified. Downstream crates should depend on this package under an
+# explicit alias when both rusty_v8 and v8x are available.
+name = "v8x"
 version = "149.4.0"
 edition = "2024"
 description = "rusty_v8 API surface backed by a pluggable JS engine (JSC / QuickJS)"
