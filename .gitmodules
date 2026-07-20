@@ -3,15 +3,19 @@
 	url = https://github.com/WebKit/WebKit.git
 	shallow = true
 	ignore = dirty
+	update = none
 [submodule "vendor/quickjs-ng"]
 	path = vendor/quickjs-ng
 	url = https://github.com/quickjs-ng/quickjs.git
 	ignore = dirty
+	update = none
 [submodule "vendor/wamr"]
 	path = vendor/wamr
 	url = https://github.com/bytecodealliance/wasm-micro-runtime.git
 	ignore = dirty
+	update = none
 [submodule "vendor/rusty_v8"]
 	path = vendor/rusty_v8
 	url = https://github.com/denoland/rusty_v8.git
 	ignore = dirty
+	update = none

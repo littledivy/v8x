@@ -37,7 +37,7 @@ apply_series() {
   local sub="$1" prefix="$2"
   local stamp_dir="$sub/.v8x-patches"
   if [ ! -e "$sub/.git" ]; then
-    git submodule update --init "$sub"
+    git -c "submodule.$sub.update=checkout" submodule update --init "$sub"
   fi
   mkdir -p "$stamp_dir"
   while IFS= read -r p; do

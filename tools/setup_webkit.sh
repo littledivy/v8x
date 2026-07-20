@@ -17,7 +17,8 @@ PATCHES_ONLY=0
 
 # Fetch WebKit at the pinned submodule commit.
 if [ ! -d "$WK/Source/JavaScriptCore" ]; then
-  git submodule update --init --depth 1 "$WK"
+  git -c submodule.vendor/webkit.update=checkout \
+    submodule update --init --depth 1 "$WK"
 fi
 
 # Apply our WebKit patches (idempotent — skip if already applied). Patch paths
