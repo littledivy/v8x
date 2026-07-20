@@ -46,7 +46,7 @@ REL="$WK/WebKitBuild/JSCOnly/Release"
 # ld64.lld — lld reorders/strips the LLInt opcode assembly, breaking the exact-
 # offset RELEASE_ASSERT in IPInt::initialize() (SIGKILL at startup). And the
 # binary must be code-signed with the com.apple.security.cs.allow-jit
-# entitlement (JSC JIT). See the v82jsc README / deno [patch] notes.
+# entitlement (JSC JIT). See the v8x README / Deno integration notes.
 JITDIR="$REL/Source/JavaScriptCore/CMakeFiles/JavaScriptCoreJIT.dir"
 if [ -d "$JITDIR" ] && [ ! -f "$REL/lib/libJavaScriptCoreJIT.a" ]; then
   find "$JITDIR" -name '*.o' -print0 \

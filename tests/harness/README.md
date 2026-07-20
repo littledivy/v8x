@@ -38,7 +38,7 @@ Suite kinds (`config.json`):
 - `cargo-self` (rusty_v8): each `[[test]]` target built **separately** so one
   unlinkable target scores 0 without zeroing the rest. Parsed from libtest text.
 - `cargo-deno` (deno_core): `cargo nextest run -p deno_core` in the deno
-  checkout; the v8 backend comes from deno's `[patch.crates-io] v8` features
+  checkout; the v8 backend comes from deno's aliased `v8x` dependency features
   (not our flags).
 - `deno-test` (built deno binary's `deno test --junit-path`, parsed from JUnit):
   supported by `run.mjs` but **not currently in `config.json`** — the full-deno

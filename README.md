@@ -2,7 +2,7 @@
 
 ```diff
 -v8 = "0.155.0"
-+v8x = { version = "0.155.0", features = ["jsc"] }
++v8 = { package = "v8x", version = "0.155.0", features = ["jsc"] }
 ```
 
 Supported engines:
@@ -16,8 +16,7 @@ Swap the engine under Deno without touching `deno_core`:
 
 ```toml
 # deno's workspace Cargo.toml
-[patch.crates-io]
-v8 = { package = "v8x", features = ["jsc"] }
+v8 = { package = "v8x", version = "0.155.0", features = ["jsc"] }
 ```
 
 ```diff

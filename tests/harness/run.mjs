@@ -111,7 +111,7 @@ function codesign(bin) {
 // compile/link counts as 0 passing — exactly the thing agents climb).
 // selectBackend=true picks our v8 backend via OUR crate's features (cargo-self).
 // For the deno checkout (cargo-deno) the v8 backend is chosen by deno's
-// [patch.crates-io] v8 features, so we must NOT pass them here.
+// aliased v8x dependency features, so we must NOT pass them here.
 function cargoBuild(extraArgs, cwd, selectBackend = true) {
   const base = selectBackend
     ? ["test", "--no-default-features", "--features", b.features, "--no-run"]
@@ -508,19 +508,27 @@ function reqDenoDir() {
 }
 
 function ensureDenoV8Patch(denoDir) {
-  const cargoToml = path.join(denoDir, "Cargo.toml");
-  const text = fs.existsSync(cargoToml) ? fs.readFileSync(cargoToml, "utf8") : "";
   const patchedPaths = [];
-  const re = /^\s*v8\s*=\s*\{[^}]*\bpath\s*=\s*"([^"]+)"/gm;
-  for (let m; (m = re.exec(text)) !== null; ) {
-    patchedPaths.push(path.resolve(denoDir, m[1]));
+  const re =
+    /^\s*(?:v8|v8x_backend)\s*=\s*\{[^}]*\bpath\s*=\s*"([^"]+)"/gm;
+  const manifests = [
+    path.join(denoDir, "Cargo.toml"),
+    path.join(denoDir, "libs/deno_v8/Cargo.toml"),
+  ];
+  for (const cargoToml of manifests) {
+    if (!fs.existsSync(cargoToml)) continue;
+    const text = fs.readFileSync(cargoToml, "utf8");
+    re.lastIndex = 0;
+    for (let m; (m = re.exec(text)) !== null; ) {
+      patchedPaths.push(path.resolve(path.dirname(cargoToml), m[1]));
+    }
   }
   if (!patchedPaths.some((p) => p === ROOT)) {
     const found = patchedPaths.length ? patchedPaths.join(", ") : "none";
     die(
-      `deno checkout is not patched to use this v8x checkout.\n` +
-        `expected [patch.crates-io] v8 path: ${ROOT}\n` +
-        `found v8 patch path(s): ${found}`,
+      `deno checkout is not configured to use this v8x checkout.\n` +
+        `expected aliased v8 dependency path: ${ROOT}\n` +
+        `found v8 dependency path(s): ${found}`,
     );
   }
 }

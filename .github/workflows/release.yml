@@ -57,7 +57,7 @@ jobs:
           git -C ../deno remote add origin https://github.com/denoland/deno
           git -C ../deno fetch --depth 1 origin "$DENO_REF"
           git -C ../deno checkout -q FETCH_HEAD
-          sed "s#/Users/divy/gh/v82jsc#${GITHUB_WORKSPACE}#g" \
+          sed "s#/Users/divy/gh/v8x#${GITHUB_WORKSPACE}#g" \
             tools/deno/deno-jsc-integration.patch > /tmp/deno.patch
           (cd ../deno && patch -p1 < /tmp/deno.patch)
           perl -0pi -e 's/"engine_jsc", "vendor_jsc"/${{ matrix.features }}/g' ../deno/Cargo.toml
