@@ -715,10 +715,15 @@ pub extern "C" fn v8__Isolate__RequestGarbageCollectionForTesting(
   let prologue_callbacks = st.gc_prologue_callbacks.clone();
   run_gc_callbacks(isolate, &prologue_callbacks);
   release_weak_handle_targets(isolate);
-  if !st.rt.is_null() {
-    unsafe { JS_RunGC(st.rt) };
+  // Two passes: freeing a cppgc-wrapped object can release references held by
+  // its native member (e.g. a wrapper wrapping another wrapper), and those only
+  // become collectable after the first sweep + cppgc drop round.
+  for _ in 0..2 {
+    if !st.rt.is_null() {
+      unsafe { JS_RunGC(st.rt) };
+    }
+    cppgc_collect_garbage();
   }
-  cppgc_collect_garbage();
   release_external_string_memory(st);
   let epilogue_callbacks = st.gc_epilogue_callbacks.clone();
   run_gc_callbacks(isolate, &epilogue_callbacks);
@@ -1383,10 +1388,19 @@ fn finalize_context_snapshot(
       &context_values,
     )
   } else {
-    let mut capture = capture.clone();
-    capture.context_data = context_data.into_iter().map(Into::into).collect();
-    capture.context_data_refs = vec![false; capture.context_data.len()];
-    capture
+    // Re-capture at blob time: V8 serializes contexts in CreateBlob, so
+    // mutations made after SetDefaultContext/AddContext (e.g. globals added
+    // once the context is set) must be part of the snapshot. The capture taken
+    // when the context was registered only serves as a fallback below.
+    let mut fresh = super::snapshot::capture_context(
+      context as *mut JSContext,
+      &st.external_references,
+      &[],
+    );
+    omit_unchanged_context_global(st, context, &mut fresh);
+    fresh.context_data = context_data.into_iter().map(Into::into).collect();
+    fresh.context_data_refs = vec![false; fresh.context_data.len()];
+    fresh
   }
 }
 

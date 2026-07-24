@@ -984,6 +984,14 @@ fn deactivate_debugger_session(
   });
 }
 
+thread_local! {
+  static PAUSE_RESUMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn note_pause_resumed() {
+  PAUSE_RESUMED.with(|c| c.set(true));
+}
+
 fn pause_inspector(state: ScheduledPause) {
   if state.client.is_null() || state.channel.is_null() {
     return;
@@ -997,6 +1005,7 @@ fn pause_inspector(state: ScheduledPause) {
     state.channel,
     r#"{"method":"Debugger.paused","params":{"callFrames":[],"reason":"other","hitBreakpoints":[]}}"#.to_string(),
   );
+  PAUSE_RESUMED.with(|c| c.set(false));
   unsafe {
     v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
       state.channel,
@@ -1004,6 +1013,14 @@ fn pause_inspector(state: ScheduledPause) {
     v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause(
       state.client,
       state.context_group_id,
+    );
+  }
+  // When the embedder's message loop returns without an explicit
+  // Debugger.resume, V8 still reports the pause as over.
+  if !PAUSE_RESUMED.with(|c| c.get()) {
+    send_channel_notification(
+      state.channel,
+      r#"{"method":"Debugger.resumed","params":{}}"#.to_string(),
     );
   }
 }
@@ -1306,7 +1323,12 @@ pub extern "C" fn v8_inspector__V8Inspector__contextDestroyed(
     return;
   }
   let state = unsafe { &*this.cast::<InspectorState>() };
-  if !state.channel.is_null() {
+  // V8 only emits Runtime.executionContextDestroyed to sessions that enabled
+  // the Runtime domain; an unenabled session gets no event (and may not even
+  // be re-entrant, e.g. a test holding a borrow across contextDestroyed).
+  let runtime_active = ACTIVE_RUNTIME_CHANNEL
+    .with(|slot| *slot.borrow() == Some(state.channel));
+  if !state.channel.is_null() && runtime_active {
     send_channel_notification(
       state.channel,
       r#"{"method":"Runtime.executionContextDestroyed","params":{"executionContextId":1,"executionContextUniqueId":"1"}}"#.to_string(),
@@ -1582,6 +1604,7 @@ pub(crate) mod cdp {
       super::cancel_pause_on_next_statement(self.client, self.channel);
     }
     fn resume(&self) {
+      super::note_pause_resumed();
       super::send_channel_notification(
         self.channel,
         r#"{"method":"Debugger.resumed","params":{}}"#.to_string(),
@@ -1641,13 +1664,18 @@ pub(crate) mod cdp {
       self.debugger_enabled = true;
       let mut sources = script_sources();
       sources.sort_by(|(left, _), (right, _)| left.cmp(right));
+      let mut notified = false;
       for (url, source) in sources {
-        self.register_script(&url, &source);
+        notified |= self.register_script(&url, &source);
       }
-      unsafe {
-        super::v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
-          self.channel,
-        );
+      // Flush only when scriptParsed notifications were actually queued —
+      // V8 sends nothing on Debugger.enable in a fresh isolate.
+      if notified {
+        unsafe {
+          super::v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
+            self.channel,
+          );
+        }
       }
     }
     fn disable_debugger(&mut self) {
@@ -1701,13 +1729,10 @@ pub(crate) mod cdp {
         if !session.debugger_enabled {
           continue;
         }
-        if session.register_script(url, source) {
-          unsafe {
-            super::v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications(
-              session.channel,
-            );
-          }
-        }
+        // No flush here: V8 batches scriptParsed events into the next
+        // protocol flush (e.g. the pause sequence) instead of flushing per
+        // compiled script; the notification itself is already delivered.
+        session.register_script(url, source);
       }
     });
   }
