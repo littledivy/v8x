@@ -629,6 +629,16 @@ function report(res) {
   const r = ratchet(baseline, _sets);
   if (r.regressions.length)
     console.error(`\nREGRESSIONS (${r.regressions.length}):\n  ${r.regressions.join("\n  ")}`);
+  // Show each regression's captured test output (nextest suites only) so a CI
+  // log is enough to see *why* a baselined test now fails.
+  if (r.regressions.length && _sets.failOutput) {
+    for (const name of r.regressions) {
+      const out = _sets.failOutput.get(name);
+      if (!out) continue;
+      const clipped = out.length > 8000 ? out.slice(-8000) : out;
+      console.error(`\n--- output: ${name} ---\n${clipped}\n--- end ---`);
+    }
+  }
   if (r.missing.length)
     console.error(`\nMISSING — baselined but not seen (${r.missing.length}):\n  ${r.missing.join("\n  ")}`);
   if (r.newPasses.length)
