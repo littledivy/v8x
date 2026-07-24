@@ -1,8 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
-index 11caae0..a5d29c7 100644
+index db307b0..615034f 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -8184,6 +8265,10 @@ static JSValue JS_ThrowReferenceErrorNotDefined(JSContext *ctx, JSAtom name)
+@@ -8651,6 +8651,10 @@ static JSValue JS_ThrowReferenceErrorNotDefined(JSContext *ctx, JSAtom name)
  static JSValue JS_ThrowReferenceErrorUninitialized(JSContext *ctx, JSAtom name)
  {
      char buf[ATOM_GET_STR_BUF_SIZE];
@@ -13,7 +13,7 @@ index 11caae0..a5d29c7 100644
      return JS_ThrowReferenceError(ctx, "%s is not initialized",
                                    name == JS_ATOM_NULL ? "lexical variable" :
                                    JS_AtomGetStr(ctx, buf, sizeof(buf), name));
-@@ -18187,6 +18273,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -18668,6 +18672,18 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              BREAK;
  
          CASE(OP_throw):

@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 3c95132..7d6fc67 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -23339,7 +23339,7 @@ static int js_parse_expect_semi(JSParseState *s)
+@@ -23836,7 +23836,7 @@ static int js_parse_expect_semi(JSParseState *s)
          if (s->token.val == TOK_EOF || s->token.val == '}' || s->got_lf) {
              return 0;
          }
@@ -10,7 +11,7 @@ diff --git a/quickjs.c b/quickjs.c
      }
      return next_token(s);
  }
-@@ -30200,7 +30200,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s, int decl_mask
+@@ -30726,7 +30726,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
          break;
      case TOK_RETURN:
          if (s->cur_func->is_eval) {
@@ -19,7 +20,7 @@ diff --git a/quickjs.c b/quickjs.c
              goto fail;
          }
          if (s->cur_func->func_type == JS_PARSE_FUNC_CLASS_STATIC_INIT) {
-@@ -33293,8 +33293,7 @@ static __exception int js_parse_from_clause(JSParseState *s, JSModuleDef *m)
+@@ -33849,8 +33849,7 @@ static __exception int js_parse_from_clause(JSParseState *s, JSModuleDef *m)
      int idx;
  
      if (!token_is_pseudo_keyword(s, JS_ATOM_from)) {

@@ -1,7 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index f1e6127..143ee0d 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -8034,26 +8034,31 @@ static void js_coverage_register_function(JSFunctionBytecode *b)
-     const char *function_name = "";
+@@ -8408,7 +8408,7 @@ static void js_coverage_register_function(JSFunctionBytecode *b)
      const char *filename = "";
      bool free_function_name = false;
      bool free_filename = false;
@@ -10,18 +11,7 @@
      unsigned int op;
  
      if (b->func_name != JS_ATOM_NULL) {
-         function_name = JS_AtomToCString(b->realm, b->func_name);
-         free_function_name = function_name != NULL;
-     }
-     if (b->filename != JS_ATOM_NULL) {
-         filename = JS_AtomToCString(b->realm, b->filename);
-         free_filename = filename != NULL;
-     }
-     v82jsc_coverage_function(b, function_name ? function_name : "",
-                              filename ? filename : "", b->source,
-                              b->source_len, b->line_num, b->col_num);
-     if (free_function_name)
-         JS_FreeCString(b->realm, function_name);
+@@ -8427,6 +8427,11 @@ static void js_coverage_register_function(JSFunctionBytecode *b)
      if (free_filename)
          JS_FreeCString(b->realm, filename);
  

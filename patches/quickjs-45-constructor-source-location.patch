@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index f19cd35..6591aa7 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22645,6 +22645,8 @@
+@@ -23158,6 +23158,8 @@ typedef struct JSFunctionDef {
  
      DynBuf byte_code;
      int last_opcode_pos; /* -1 if no last opcode */
@@ -9,7 +11,7 @@
  
      LabelSlot *label_slots;
      int label_size; /* allocated size for label_slots[] */
-@@ -27392,10 +27394,16 @@
+@@ -27905,10 +27907,16 @@ static void optional_chain_test(JSParseState *s, int *poptional_chaining_label,
  static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
  {
      FuncCallType call_type;
@@ -27,7 +29,7 @@
      switch(s->token.val) {
      case TOK_NUMBER:
          {
-@@ -27578,6 +27586,12 @@
+@@ -28100,6 +28108,12 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
          }
          break;
      case TOK_NEW:
@@ -40,7 +42,7 @@
          if (next_token(s))
              return -1;
          if (s->token.val == '.') {
-@@ -27593,13 +27607,20 @@
+@@ -28115,13 +28129,20 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
              emit_atom(s, JS_ATOM_new_target);
              emit_u16(s, 0);
          } else {
@@ -61,7 +63,7 @@
                  emit_op(s, OP_call_constructor);
                  emit_u16(s, 0);
              } else {
-@@ -27829,6 +27850,8 @@
+@@ -28351,6 +28372,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
              }
  
              /* parse arguments */
@@ -70,7 +72,7 @@
              arg_count = 0;
              while (s->token.val != ')') {
                  if (arg_count >= 65535) {
-@@ -27876,6 +27899,8 @@
+@@ -28398,6 +28421,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                  }
                  if (next_token(s))
                      return -1;
@@ -79,7 +81,7 @@
                  /* drop the index */
                  emit_op(s, OP_drop);
  
-@@ -27909,6 +27934,10 @@
+@@ -28431,6 +28456,10 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
                      } else if (call_type == FUNC_CALL_NEW) {
                          /* obj func array -> func obj array */
                          emit_op(s, OP_perm3);
@@ -90,7 +92,7 @@
                          emit_op(s, OP_apply);
                          emit_u16(s, 1);
                      } else {
-@@ -27923,6 +27952,8 @@
+@@ -28445,6 +28474,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
              } else {
                  if (next_token(s))
                      return -1;
@@ -99,7 +101,7 @@
              emit_func_call:
                  switch(opcode) {
                  case OP_get_field:
-@@ -27951,6 +27982,10 @@
+@@ -28473,6 +28504,10 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
  
                          emit_class_field_init(s);
                      } else if (call_type == FUNC_CALL_NEW) {

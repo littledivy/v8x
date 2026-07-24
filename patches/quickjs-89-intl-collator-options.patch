@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index ee36220..f1e6127 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -51097,14 +51097,15 @@ static int to_utf32_buf(JSContext *ctx, JSString *p, uint32_t **pbuf)
+@@ -51562,14 +51562,15 @@ static int to_utf32_buf(JSContext *ctx, JSString *p, uint32_t **pbuf)
  }
  
  extern int v82jsc_locale_compare_utf32(const uint32_t *left, int left_len,
@@ -20,7 +21,7 @@ diff --git a/quickjs.c b/quickjs.c
  
      ret = JS_EXCEPTION;
      as = NULL;
-@@ -51141,7 +51142,21 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
+@@ -51607,7 +51608,21 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
      js_free(ctx, bs);
      bs = ts;
  

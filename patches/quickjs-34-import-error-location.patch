@@ -1,8 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
-index 11caae0..11caae0 100644
+index 1328a8f..5259af8 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -30950,7 +30950,42 @@ static void js_resolve_export_throw_error(JSContext *ctx,
+@@ -31579,6 +31579,41 @@ static void js_resolve_export_throw_error(JSContext *ctx,
      }
  }
  
@@ -14,7 +14,7 @@ index 11caae0..11caae0 100644
 +    const char *specifier;
 +    const char *export_name;
 +    JSValue exception;
- 
++
 +    if (res != JS_RESOLVE_RES_NOT_FOUND) {
 +        JSModuleDef *target =
 +            importer->req_module_entries[mi->req_module_idx].module;
@@ -41,11 +41,10 @@ index 11caae0..11caae0 100644
 +        JS_FreeCString(ctx, export_name);
 +}
 +
-+
+ 
  typedef enum {
      EXPORTED_NAME_AMBIGUOUS,
-     EXPORTED_NAME_NORMAL,
-@@ -31470,7 +31505,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
+@@ -32111,7 +32146,7 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
                  ret = js_resolve_export(ctx, &res_m,
                                          &res_me, m1, mi->import_name);
                  if (ret != JS_RESOLVE_RES_FOUND) {
@@ -54,7 +53,7 @@ index 11caae0..11caae0 100644
                      goto fail;
                  }
                  if (res_me->local_name == JS_ATOM__star_) {
-@@ -38292,6 +38327,45 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj)
+@@ -38938,6 +38973,45 @@ int JS_ResolveModule(JSContext *ctx, JSValueConst obj)
      return 0;
  }
  

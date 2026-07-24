@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 954957f..4c4860c 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -505,6 +505,7 @@ struct JSContext {
+@@ -562,6 +562,7 @@ struct JSContext {
      */
      uint8_t std_array_prototype : 1;
      uint8_t v82jsc_throw_on_side_effect : 1;
@@ -9,7 +10,7 @@ diff --git a/quickjs.c b/quickjs.c
      JSObject *v82jsc_side_effect_root;
  
      JSShape *array_shape;   /* initial shape for Array objects */
-@@ -11960,6 +11961,14 @@ static int JS_CheckDefineGlobalVar(JSContext *ctx, JSAtom prop, int flags)
+@@ -12334,6 +12335,14 @@ static int JS_CheckDefineGlobalVar(JSContext *ctx, JSAtom prop, int flags)
      p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
      prs = find_own_property1(p, prop);
      if (prs) {
@@ -24,7 +25,7 @@ diff --git a/quickjs.c b/quickjs.c
      fail_redeclaration:
          JS_ThrowSyntaxErrorVarRedeclaration(ctx, prop);
          return -1;
-@@ -36295,8 +36304,11 @@ static int resolve_variables(JSContext *ctx, JSFunctionDef *s)
+@@ -36785,8 +36794,11 @@ static __exception int resolve_variables(JSContext *ctx, JSFunctionDef *s)
          dbuf_putc(&bc_out, OP_check_define_var);
          dbuf_put_u32(&bc_out, JS_DupAtom(ctx, hf->var_name));
          flags = 0;
@@ -37,7 +38,7 @@ diff --git a/quickjs.c b/quickjs.c
          if (hf->cpool_idx >= 0)
              flags |= DEFINE_GLOBAL_FUNC_VAR;
          dbuf_putc(&bc_out, flags);
-@@ -39525,6 +39536,21 @@ JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
+@@ -40019,6 +40031,21 @@ JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
      return JS_EvalThis2(ctx, ctx->global_obj, input, input_len, &options);
  }
  
@@ -60,10 +61,10 @@ diff --git a/quickjs.c b/quickjs.c
                                     const char *input,
                                     size_t input_len,
 diff --git a/quickjs.h b/quickjs.h
+index ecf300f..13e409e 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1277,7 +1277,12 @@ JS_EXTERN JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);
- JS_EXTERN JSValue v82jsc_eval_no_side_effect(JSContext *ctx,
+@@ -1304,6 +1304,11 @@ JS_EXTERN JSValue v82jsc_eval_no_side_effect(JSContext *ctx,
                                               const char *input,
                                               size_t input_len,
                                               const char *filename);

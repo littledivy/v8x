@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index f8cc386..270f322 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -39877,7 +39877,14 @@
+@@ -40355,7 +40355,14 @@ typedef enum BCTagEnum {
      BC_TAG_SNAPSHOT_INTRINSIC,
  } BCTagEnum;
  
@@ -16,7 +18,7 @@
  
  typedef struct BCWriterState {
      JSContext *ctx;
-@@ -39902,6 +39909,10 @@
+@@ -40380,6 +40387,10 @@ typedef struct BCWriterState {
      JSVarRef **var_ref_tab;
      int var_ref_count;
      int var_ref_size;
@@ -27,7 +29,7 @@
  } BCWriterState;
  
  #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
-@@ -40360,6 +40371,43 @@
+@@ -40838,6 +40849,43 @@ void v82jsc_snapshot_capture_intrinsics(JSContext *ctx, JSValue registry)
      js_object_list_end(ctx, &s.registered);
  }
  
@@ -71,7 +73,7 @@
  static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
  {
      JSFunctionBytecode *b = JS_VALUE_GET_PTR(obj);
-@@ -40443,12 +40491,8 @@
+@@ -40921,12 +40969,8 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
          bc_put_leb128(s, b->col_num);
          bc_put_leb128(s, b->pc2line_len);
          dbuf_put(&s->dbuf, b->pc2line_buf, b->pc2line_len);
@@ -86,7 +88,7 @@
      }
      return 0;
   fail:
-@@ -41631,6 +41675,7 @@
+@@ -42109,6 +42153,7 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
          goto fail;
      js_object_list_end(ctx, &s->object_list);
      js_free(ctx, s->var_ref_tab);
@@ -94,7 +96,7 @@
      js_free(ctx, s->atom_to_idx);
      js_free(ctx, s->idx_to_atom);
      *psize = s->dbuf.size;
-@@ -41648,6 +41693,7 @@
+@@ -42126,6 +42171,7 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
   fail:
      js_object_list_end(ctx, &s->object_list);
      js_free(ctx, s->var_ref_tab);
@@ -102,7 +104,7 @@
      js_free(ctx, s->atom_to_idx);
      js_free(ctx, s->idx_to_atom);
      dbuf_free(&s->dbuf);
-@@ -41683,6 +41729,9 @@
+@@ -42161,6 +42207,9 @@ typedef struct BCReaderState {
      JSVarRef **var_refs;
      int var_refs_count;
      int var_refs_size;
@@ -112,7 +114,7 @@
      /* weak targets retained until the complete object graph is restored */
      JSValue *weak_targets;
      int weak_targets_count;
-@@ -41694,6 +41743,7 @@
+@@ -42172,6 +42221,7 @@ typedef struct BCReaderState {
      /* used for JS_DUMP_READ_OBJECT */
      const uint8_t *ptr_last;
      int level;
@@ -120,7 +122,7 @@
  } BCReaderState;
  
  #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
-@@ -42059,6 +42109,7 @@
+@@ -42537,6 +42587,7 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
      JSValue obj = JS_UNDEFINED;
      uint16_t v16;
      uint8_t v8;
@@ -128,7 +130,7 @@
      int idx, i, local_count, has_debug_info;
      int function_size, cpool_offset, byte_code_offset;
      int closure_var_offset, vardefs_offset;
-@@ -42266,18 +42317,56 @@
+@@ -42743,18 +42794,56 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
          if (bc_get_buf(s, b->pc2line_buf, b->pc2line_len))
              goto fail;
      }
@@ -195,7 +197,7 @@
      }
      bc_read_trace(s, "}\n");
  
-@@ -43629,11 +43718,12 @@
+@@ -44107,11 +44196,12 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
  
      if (bc_get_u8(s, &v8))
          return -1;
@@ -211,7 +213,7 @@
      if (bc_get_u32(s, &h))
          return -1;
      // allow UINT32_MAX as an escape hatch, otherwise updating
-@@ -43703,6 +43793,7 @@
+@@ -44181,6 +44271,7 @@ static void bc_reader_free(BCReaderState *s)
      }
      js_free(s->ctx, s->objects);
      js_free(s->ctx, s->var_refs);

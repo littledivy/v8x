@@ -1,10 +1,11 @@
+diff --git a/quickjs.c b/quickjs.c
+index 6591aa7..12d90c6 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -65572,6 +65572,40 @@
-         csd->filename = JS_NULL;
+@@ -66239,6 +66239,40 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
      }
  }
-+
+ 
 +static void v82jsc_adjust_bytecode_line_number(JSFunctionBytecode *b,
 +                                                int line_delta)
 +{
@@ -38,6 +39,7 @@
 +        v82jsc_adjust_bytecode_line_number(p->u.func.function_bytecode,
 +                                           line_delta);
 +}
- 
++
  static void js_new_callsite_data2(JSContext *ctx, JSCallSiteData *csd, const char *filename, int line_num, int col_num)
  {
+     csd->func = JS_NULL;

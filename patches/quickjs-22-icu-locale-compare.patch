@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 42ed991..be65873 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -49251,10 +49251,13 @@ static int to_utf32_buf(JSContext *ctx, JSString *p, uint32_t **pbuf)
+@@ -49874,10 +49874,13 @@ static int to_utf32_buf(JSContext *ctx, JSString *p, uint32_t **pbuf)
      return j;
  }
  
@@ -16,7 +17,7 @@ diff --git a/quickjs.c b/quickjs.c
      uint32_t *as, *bs, *ts;
      JSValue a, b, ret;
  
-@@ -49294,14 +49297,7 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
+@@ -49917,14 +49920,7 @@ static JSValue js_string_localeCompare(JSContext *ctx, JSValueConst this_val,
      js_free(ctx, bs);
      bs = ts;
  

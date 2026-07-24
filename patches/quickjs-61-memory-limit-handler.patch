@@ -1,23 +1,24 @@
 diff --git a/quickjs.c b/quickjs.c
+index 9a2880a..e848502 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -313,6 +313,8 @@ struct JSRuntime {
+@@ -383,6 +383,9 @@ struct JSRuntime {
+     JSJobContextSet *job_context_set;
+     void *job_context_opaque;
  
-     JSInterruptHandler *interrupt_handler;
-     void *interrupt_opaque;
 +    JSMemoryLimitHandler *memory_limit_handler;
 +    void *memory_limit_opaque;
++
+     JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
+     void *host_promise_rejection_tracker_opaque;
  
-     JSPromiseHook *promise_hook;
-     void *promise_hook_opaque;
-@@ -1700,6 +1702,24 @@ static const JSMallocFunctions def_malloc_funcs = {
-     js__malloc_usable_size
- };
+@@ -2076,6 +2079,23 @@ static void js_arena_free_all(JSRuntime *rt)
+     }
+ }
  
 +static bool js_memory_limit_exceeded(JSRuntime *rt, size_t additional_size)
 +{
 +    JSMallocState *s = &rt->malloc_state;
-+
 +    if (s->malloc_limit == 0)
 +        return false;
 +    if (additional_size >= s->malloc_limit ||
@@ -35,7 +36,8 @@ diff --git a/quickjs.c b/quickjs.c
  void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
  {
      void *ptr;
-@@ -1710,7 +1728,6 @@ void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
+@@ -2089,8 +2109,7 @@ void *js_calloc_rt(JSRuntime *rt, size_t count, size_t size)
+             return NULL;
  
      s = &rt->malloc_state;
 -    /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
@@ -43,8 +45,8 @@ diff --git a/quickjs.c b/quickjs.c
 +    if (unlikely(js_memory_limit_exceeded(rt, count * size)))
          return NULL;
  
-     ptr = rt->mf.js_calloc(s->opaque, count, size);
-@@ -1733,8 +1753,7 @@ void *js_malloc_rt(JSRuntime *rt, size_t size)
+     ptr = js_arena_calloc(rt, count, size);
+@@ -2112,8 +2131,7 @@ void *js_malloc_rt(JSRuntime *rt, size_t size)
          return NULL;
  
      s = &rt->malloc_state;
@@ -53,10 +55,10 @@ diff --git a/quickjs.c b/quickjs.c
 +    if (unlikely(js_memory_limit_exceeded(rt, size)))
          return NULL;
  
-     ptr = rt->mf.js_malloc(s->opaque, size);
-@@ -1780,8 +1799,8 @@ void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size)
+     ptr = js_arena_malloc(rt, size);
+@@ -2159,8 +2177,8 @@ void *js_realloc_rt(JSRuntime *rt, void *ptr, size_t size)
      }
-     old_size = rt->mf.js_malloc_usable_size(ptr);
+     old_size = js_arena_usable_size(rt, ptr);
      s = &rt->malloc_state;
 -    /* When malloc_limit is 0 (unlimited), malloc_limit - 1 will be SIZE_MAX. */
 -    if (s->malloc_size + size - old_size > s->malloc_limit - 1)
@@ -64,8 +66,8 @@ diff --git a/quickjs.c b/quickjs.c
 +        unlikely(js_memory_limit_exceeded(rt, size - old_size)))
          return NULL;
  
-     ptr = rt->mf.js_realloc(s->opaque, ptr, size);
-@@ -2178,6 +2197,13 @@ void JS_SetMemoryLimit(JSRuntime *rt, size_t limit)
+     ptr = js_arena_realloc(rt, ptr, size);
+@@ -2558,6 +2576,13 @@ void JS_SetMemoryLimit(JSRuntime *rt, size_t limit)
      rt->malloc_state.malloc_limit = limit;
  }
  
@@ -80,9 +82,10 @@ diff --git a/quickjs.c b/quickjs.c
  {
  #ifdef ENABLE_DUMPS
 diff --git a/quickjs.h b/quickjs.h
+index f2eaed2..204cb5e 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -483,6 +483,7 @@ enum {
+@@ -503,6 +503,7 @@ typedef struct JSMallocFunctions {
  // Intended for cleanup of associated resources; the runtime itself
  // is no longer usable.
  typedef void JSRuntimeFinalizer(JSRuntime *rt, void *arg);
@@ -90,7 +93,7 @@ diff --git a/quickjs.h b/quickjs.h
  
  typedef struct JSGCObjectHeader JSGCObjectHeader;
  
-@@ -492,6 +493,9 @@ JS_EXTERN JSRuntime *JS_NewRuntime(void);
+@@ -511,6 +512,9 @@ JS_EXTERN JSRuntime *JS_NewRuntime(void);
  JS_EXTERN void JS_SetRuntimeInfo(JSRuntime *rt, const char *info);
  /* use 0 to disable memory limit */
  JS_EXTERN void JS_SetMemoryLimit(JSRuntime *rt, size_t limit);

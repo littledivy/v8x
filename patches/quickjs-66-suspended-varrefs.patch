@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 9ecc241..8dd4b17 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -375,6 +375,7 @@
+@@ -434,6 +434,7 @@ struct JSClass {
  
  typedef struct JSStackFrame {
      struct JSStackFrame *prev_frame; /* NULL if first stack frame */
@@ -9,17 +10,17 @@ diff --git a/quickjs.c b/quickjs.c
      JSValue cur_func; /* current function, JS_UNDEFINED if the frame is detached */
      JSValue this_val; /* borrowed while the frame is active */
      JSValue *arg_buf; /* arguments */
-@@ -424,6 +425,7 @@
-             uint8_t is_const; /* only used with global variables */
-         };
-     };
+@@ -474,6 +475,7 @@ typedef struct JSVarRef {
+     uint8_t is_detached;
+     uint8_t is_lexical; /* only used with global variables */
+     uint8_t is_const; /* only used with global variables */
 +    JSValue gc_owner; /* owner while referencing a suspended stack frame */
      JSValue *pvalue; /* pointer to the value, either on the stack or
                          to 'value' */
      union {
-@@ -6653,12 +6655,19 @@
-         assert(var_ref->header.ref_count > 0);
-         if (--var_ref->header.ref_count == 0) {
+@@ -7067,12 +7069,19 @@ static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref)
+         assert(JS_REF_COUNT(var_ref) > 0);
+         if (--JS_REF_COUNT(var_ref) == 0) {
              if (var_ref->is_detached) {
 +                assert(JS_IsUndefined(var_ref->gc_owner));
                  JS_FreeValueRT(rt, var_ref->value);
@@ -37,7 +38,7 @@ diff --git a/quickjs.c b/quickjs.c
              }
              js_free_rt(rt, var_ref);
          }
-@@ -6757,9 +6766,10 @@
+@@ -7171,9 +7180,10 @@ static void js_bytecode_function_mark(JSRuntime *rt, JSValueConst val,
          if (var_refs) {
              for(i = 0; i < b->closure_var_count; i++) {
                  JSVarRef *var_ref = var_refs[i];
@@ -50,7 +51,7 @@ diff --git a/quickjs.c b/quickjs.c
              }
          }
          /* must mark the function bytecode because template objects may be
-@@ -7082,9 +7092,12 @@
+@@ -7496,9 +7506,12 @@ static void mark_children(JSRuntime *rt, JSGCObjectHeader *gp,
      case JS_GC_OBJ_TYPE_VAR_REF:
          {
              JSVarRef *var_ref = (JSVarRef *)gp;
@@ -66,7 +67,7 @@ diff --git a/quickjs.c b/quickjs.c
          }
          break;
      case JS_GC_OBJ_TYPE_ASYNC_FUNCTION:
-@@ -7237,6 +7250,11 @@
+@@ -7651,6 +7664,11 @@ static void gc_free_cycles(JSRuntime *rt)
  
  void JS_RunGC(JSRuntime *rt)
  {
@@ -78,7 +79,7 @@ diff --git a/quickjs.c b/quickjs.c
      /* decrement the reference of the children of each object. mark =
         1 after this pass. */
      gc_decref(rt);
-@@ -7246,6 +7264,9 @@
+@@ -7660,6 +7678,9 @@ void JS_RunGC(JSRuntime *rt)
  
      /* free the GC objects in a cycle */
      gc_free_cycles(rt);
@@ -88,15 +89,15 @@ diff --git a/quickjs.c b/quickjs.c
  }
  
  /* Return false if not an object or if the object has already been
-@@ -17645,6 +17666,7 @@
+@@ -18060,6 +18081,7 @@ static JSVarRef *js_create_var_ref(JSContext *ctx, bool is_gc_object)
          return NULL;
-     var_ref->header.ref_count = 1;
+     JS_REF_COUNT(var_ref) = 1;
      var_ref->is_detached = true;
 +    var_ref->gc_owner = JS_UNDEFINED;
      var_ref->value = JS_UNDEFINED;
      var_ref->pvalue = &var_ref->value;
      if (is_gc_object)
-@@ -17691,10 +17713,14 @@
+@@ -18106,10 +18128,14 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
          var_ref->is_detached = false;
          var_ref->is_lexical = false;
          var_ref->is_const = false;
@@ -111,15 +112,15 @@ diff --git a/quickjs.c b/quickjs.c
          return var_ref;
      } else {
          /* Variable is not captured (e.g., from eval closures on uncaptured vars).
-@@ -17704,6 +17730,7 @@
+@@ -18119,6 +18145,7 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
              return NULL;
-         var_ref->header.ref_count = 1;
+         JS_REF_COUNT(var_ref) = 1;
          var_ref->is_detached = true;
 +        var_ref->gc_owner = JS_UNDEFINED;
          var_ref->value = js_dup(*pvalue);
          var_ref->pvalue = &var_ref->value;
          add_gc_object(ctx->rt, &var_ref->header, JS_GC_OBJ_TYPE_VAR_REF);
-@@ -17711,6 +17738,23 @@
+@@ -18126,6 +18153,23 @@ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
      }
  }
  
@@ -143,7 +144,7 @@ diff --git a/quickjs.c b/quickjs.c
  static JSValue js_closure2(JSContext *ctx, JSValue func_obj,
                             JSFunctionBytecode *b,
                             JSVarRef **cur_var_refs,
-@@ -17939,11 +17983,18 @@
+@@ -18354,11 +18398,18 @@ static int js_op_define_class(JSContext *ctx, JSValue *sp,
  
  static void close_var_ref(JSRuntime *rt, JSVarRef *var_ref)
  {
@@ -163,7 +164,7 @@ diff --git a/quickjs.c b/quickjs.c
  }
  
  static void close_var_refs(JSRuntime *rt, JSStackFrame *sf)
-@@ -18273,6 +18324,7 @@
+@@ -18688,6 +18739,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  
      sf->is_strict_mode = b->is_strict_mode;
      sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
@@ -171,7 +172,7 @@ diff --git a/quickjs.c b/quickjs.c
      arg_buf = (JSValue *)argv;
      sf->arg_count = argc;
      sf->cur_func = unsafe_unconst(func_obj);
-@@ -21200,7 +21252,8 @@
+@@ -21701,7 +21753,8 @@ static JSValue JS_InvokeFree(JSContext *ctx, JSValue this_val, JSAtom atom,
  static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
                                         JSValueConst func_obj,
                                         JSValueConst this_obj,
@@ -181,7 +182,7 @@ diff --git a/quickjs.c b/quickjs.c
  {
      JSObject *p;
      JSFunctionBytecode *b;
-@@ -21209,6 +21262,7 @@
+@@ -21710,6 +21763,7 @@ static __exception int async_func_init(JSContext *ctx, JSAsyncFunctionState *s,
      size_t alloc_size;
  
      sf = &s->frame;
@@ -189,7 +190,7 @@ diff --git a/quickjs.c b/quickjs.c
      p = JS_VALUE_GET_OBJ(func_obj);
      b = p->u.func.function_bytecode;
      sf->is_strict_mode = b->is_strict_mode;
-@@ -21449,7 +21503,8 @@
+@@ -21950,7 +22004,8 @@ static JSValue js_call_generator_function(JSContext *ctx, JSValueConst func_obj,
      if (!s)
          return JS_EXCEPTION;
      s->state = JS_GENERATOR_STATE_SUSPENDED_START;
@@ -199,7 +200,7 @@ diff --git a/quickjs.c b/quickjs.c
          s->state = JS_GENERATOR_STATE_COMPLETED;
          goto fail;
      }
-@@ -21463,6 +21518,7 @@
+@@ -21964,6 +22019,7 @@ static JSValue js_call_generator_function(JSContext *ctx, JSValueConst func_obj,
      obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_GENERATOR);
      if (JS_IsException(obj))
          goto fail;
@@ -207,7 +208,7 @@ diff --git a/quickjs.c b/quickjs.c
      JS_SetOpaqueInternal(obj, s);
      return obj;
   fail:
-@@ -22284,6 +22340,8 @@
+@@ -22785,6 +22841,8 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
                  JS_FreeValue(ctx, promise);
                  goto fail;
              }
@@ -216,7 +217,7 @@ diff --git a/quickjs.c b/quickjs.c
  
              /* Note: no need to create 'thrownawayCapability' as in
                 the spec */
-@@ -22335,6 +22393,8 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
+@@ -22818,6 +22876,8 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
      bool ok;
      JSValueConst arg;
  
@@ -225,7 +226,7 @@ diff --git a/quickjs.c b/quickjs.c
      if (argc > 0)
          arg = argv[0];
      else
-@@ -22389,7 +22447,8 @@
+@@ -22890,7 +22950,8 @@ static JSValue js_async_function_call_internal(
      if (JS_IsException(promise))
          goto fail;
  
@@ -235,7 +236,7 @@ diff --git a/quickjs.c b/quickjs.c
      fail:
          JS_FreeValue(ctx, promise);
          js_async_function_free(ctx->rt, s);
-@@ -22865,7 +22924,8 @@
+@@ -23366,7 +23427,8 @@ static JSValue js_async_generator_function_call(JSContext *ctx,
          return JS_EXCEPTION;
      s->state = JS_ASYNC_GENERATOR_STATE_SUSPENDED_START;
      init_list_head(&s->queue);
@@ -245,7 +246,7 @@ diff --git a/quickjs.c b/quickjs.c
          s->state = JS_ASYNC_GENERATOR_STATE_COMPLETED;
          goto fail;
      }
-@@ -22880,6 +22940,7 @@
+@@ -23381,6 +23443,7 @@ static JSValue js_async_generator_function_call(JSContext *ctx,
      obj = js_create_from_ctor(ctx, func_obj, JS_CLASS_ASYNC_GENERATOR);
      if (JS_IsException(obj))
          goto fail;
@@ -253,15 +254,15 @@ diff --git a/quickjs.c b/quickjs.c
      s->generator = JS_VALUE_GET_OBJ(obj);
      JS_SetOpaqueInternal(obj, s);
      return obj;
-@@ -32230,6 +32291,7 @@
+@@ -32783,6 +32846,7 @@ static JSVarRef *js_create_module_var(JSContext *ctx, bool is_lexical)
      if (!var_ref)
          return NULL;
-     var_ref->header.ref_count = 1;
+     JS_REF_COUNT(var_ref) = 1;
 +    var_ref->gc_owner = JS_UNDEFINED;
      if (is_lexical)
          var_ref->value = JS_UNINITIALIZED;
      else
-@@ -41922,6 +41984,7 @@
+@@ -42477,6 +42541,7 @@ static JSVarRef *JS_ReadVarRef(BCReaderState *s)
      var_ref->is_detached = true;
      var_ref->is_lexical = flags & 1;
      var_ref->is_const = (flags >> 1) & 1;

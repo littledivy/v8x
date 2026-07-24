@@ -1,17 +1,8 @@
---- a/quickjs.h
-+++ b/quickjs.h
-@@ -929,6 +929,8 @@ JS_EXTERN bool JS_IsRegExp(JSValueConst val);
- JS_EXTERN bool JS_IsMap(JSValueConst val);
- JS_EXTERN bool JS_IsSet(JSValueConst val);
- JS_EXTERN bool JS_IsWeakRef(JSValueConst val);
-+JS_EXTERN JSValue v82jsc_new_weak_ref(JSContext *ctx, JSValueConst target);
-+JS_EXTERN bool v82jsc_weak_ref_is_live(JSValueConst weak_ref);
- JS_EXTERN bool JS_IsWeakSet(JSValueConst val);
- JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
- JS_EXTERN bool JS_IsDataView(JSValueConst val);
+diff --git a/quickjs.c b/quickjs.c
+index 12d90c6..6ec4f36 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -64977,16 +64977,17 @@ void JS_ClearKeptObjects(JSRuntime *rt)
+@@ -65639,16 +65639,17 @@ void JS_ClearKeptObjects(JSRuntime *rt)
      }
  }
  
@@ -36,7 +27,7 @@
      if (JS_IsException(obj))
          return JS_EXCEPTION;
      JSWeakRefData *wrd = js_malloc(ctx, sizeof(*wrd));
-@@ -65001,20 +65002,39 @@ static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
+@@ -65662,20 +65663,39 @@ static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
          js_free(ctx, wrd);
          return JS_EXCEPTION;
      }
@@ -79,3 +70,16 @@
  static JSValue js_weakref_deref(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
  {
      JSWeakRefData *wrd = JS_GetOpaque2(ctx, this_val, JS_CLASS_WEAK_REF);
+diff --git a/quickjs.h b/quickjs.h
+index d76c0f3..f2eaed2 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -953,6 +953,8 @@ JS_EXTERN bool JS_IsRegExp(JSValueConst val);
+ JS_EXTERN bool JS_IsMap(JSValueConst val);
+ JS_EXTERN bool JS_IsSet(JSValueConst val);
+ JS_EXTERN bool JS_IsWeakRef(JSValueConst val);
++JS_EXTERN JSValue v82jsc_new_weak_ref(JSContext *ctx, JSValueConst target);
++JS_EXTERN bool v82jsc_weak_ref_is_live(JSValueConst weak_ref);
+ JS_EXTERN bool JS_IsWeakSet(JSValueConst val);
+ JS_EXTERN bool JS_IsWeakMap(JSValueConst val);
+ JS_EXTERN bool JS_IsDataView(JSValueConst val);

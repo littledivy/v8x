@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 833b327..2d29414 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21957,6 +21957,9 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
+@@ -22456,6 +22456,9 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
           js_v82jsc_has_same_async_site(ctx, error, file, -1, NULL)))
          return;
      error_obj = JS_VALUE_GET_OBJ(error);
@@ -11,8 +12,7 @@ diff --git a/quickjs.c b/quickjs.c
      stack_prop = find_own_property1(error_obj, JS_ATOM_stack);
      if (stack_prop &&
          (stack_prop->flags & JS_PROP_TMASK) == JS_PROP_GETSET &&
-@@ -21968,15 +21971,17 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
-     if (JS_IsException(stack)) {
+@@ -22472,14 +22475,16 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
          JS_FreeValue(ctx, JS_GetException(ctx));
          return;
      }
@@ -36,7 +36,7 @@ diff --git a/quickjs.c b/quickjs.c
      }
      JS_FreeValue(ctx, stack);
      if (func)
-@@ -22070,6 +22075,9 @@ static void js_v82jsc_append_promise_all_frame(JSContext *ctx,
+@@ -22569,6 +22574,9 @@ static void js_v82jsc_append_promise_all_frame(JSContext *ctx,
      if (JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
          return;
      error_obj = JS_VALUE_GET_OBJ(error);
@@ -46,7 +46,7 @@ diff --git a/quickjs.c b/quickjs.c
      stack_prop = find_own_property1(error_obj, JS_ATOM_stack);
      if (stack_prop &&
          (stack_prop->flags & JS_PROP_TMASK) == JS_PROP_GETSET &&
-@@ -22081,15 +22089,17 @@ static void js_v82jsc_append_promise_all_frame(JSContext *ctx,
+@@ -22579,15 +22587,17 @@ static void js_v82jsc_append_promise_all_frame(JSContext *ctx,
          JS_FreeValue(ctx, JS_GetException(ctx));
          return;
      }
@@ -72,7 +72,7 @@ diff --git a/quickjs.c b/quickjs.c
      }
      JS_FreeValue(ctx, stack);
      dbuf_printf(&dbuf, "    at async Promise.all (index %d)", index);
-@@ -45779,7 +45789,9 @@ static JSValue js_error_prepend_stack_header(JSContext *ctx,
+@@ -46306,8 +46316,10 @@ static JSValue js_error_prepend_stack_header(JSContext *ctx,
          dbuf_putstr(&dbuf, ": ");
          dbuf_put(&dbuf, (const uint8_t *)mg, mgl);
      }
@@ -84,7 +84,8 @@ diff --git a/quickjs.c b/quickjs.c
 +    }
      if (dbuf_error(&dbuf))
          res = JS_EXCEPTION;
-@@ -45805,6 +45817,9 @@ static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
+     else
+@@ -46334,6 +46346,9 @@ static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
      p = JS_VALUE_GET_OBJ(this_val);
      if (p->class_id != JS_CLASS_ERROR)
          return JS_UNDEFINED;
@@ -94,7 +95,7 @@ diff --git a/quickjs.c b/quickjs.c
      if (js_error_stack_is_pending(ctx, p->u.object_data)) {
          if (JS_IsFunction(ctx, ctx->error_prepare_stack_callback))
              prepare = js_dup(ctx->error_prepare_stack_callback);
-@@ -45956,6 +45971,7 @@ static JSValue js_aggregate_error_constructor(JSContext *ctx,
+@@ -46484,12 +46499,20 @@ static JSValue js_aggregate_error_constructor(JSContext *ctx,
                                                JSValueConst errors)
  {
      JSValue obj;
@@ -102,7 +103,7 @@ diff --git a/quickjs.c b/quickjs.c
  
      obj = JS_NewObjectProtoClass(ctx,
                                   ctx->native_error_proto[JS_AGGREGATE_ERROR],
-@@ -45964,5 +45980,12 @@ static JSValue js_aggregate_error_constructor(JSContext *ctx,
+                                  JS_CLASS_ERROR);
      if (JS_IsException(obj))
          return obj;
 +    p = JS_VALUE_GET_OBJ(obj);

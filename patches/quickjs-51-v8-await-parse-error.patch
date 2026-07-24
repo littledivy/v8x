@@ -1,7 +1,9 @@
 diff --git a/quickjs.c b/quickjs.c
+index 979b96e..8f7b1fd 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -22920,5 +22920,16 @@ int JS_PRINTF_FORMAT_ATTR(2, 3) js_parse_error(JSParseState *s, JS_PRINTF_FORMAT
+@@ -23415,6 +23415,17 @@ int JS_PRINTF_FORMAT_ATTR(2, 3) js_parse_error(JSParseState *s, JS_PRINTF_FORMAT
+             line_start--;
          err_col_num = (int)(s->token.ptr - line_start) + 1;
      }
 +    /* V8 folds this dynamic-module parse location into the SyntaxError message

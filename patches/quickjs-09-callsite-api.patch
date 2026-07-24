@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 7794820..ae346df 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -369,6 +369,7 @@
+@@ -427,6 +427,7 @@ struct JSClass {
  typedef struct JSStackFrame {
      struct JSStackFrame *prev_frame; /* NULL if first stack frame */
      JSValue cur_func; /* current function, JS_UNDEFINED if the frame is detached */
@@ -8,31 +10,31 @@
      JSValue *arg_buf; /* arguments */
      JSValue *var_buf; /* variables */
      struct JSVarRef **var_refs; /* references to arguments or local variables */
-@@ -1195,6 +1196,7 @@
+@@ -1245,6 +1246,7 @@ typedef struct JSCallSiteData {
      JSValue filename;
      JSValue func;
      JSValue func_name;
 +    JSValue this_val;
      bool native;
+     bool constructor;
      int line_num;
-     int col_num;
-@@ -6329,6 +6331,7 @@
-     // TODO(bnoordhuis) switch realms like js_call_c_function does
+@@ -6696,6 +6698,7 @@ static JSValue js_call_c_function_data(JSContext *ctx, JSValueConst func_obj,
      sf->is_strict_mode = false;
+     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
      sf->cur_func = unsafe_unconst(func_obj);
 +    sf->this_val = unsafe_unconst(this_val);
      sf->arg_count = argc;
      ret = s->func(ctx, this_val, argc, arg_buf, s->magic, vc(s->data));
      rt->current_stack_frame = sf->prev_frame;
-@@ -6454,6 +6457,7 @@
-     // TODO(bnoordhuis) switch realms like js_call_c_function does
+@@ -6822,6 +6825,7 @@ static JSValue js_call_c_closure(JSContext *ctx, JSValueConst func_obj,
      sf->is_strict_mode = false;
+     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
      sf->cur_func = unsafe_unconst(func_obj);
 +    sf->this_val = unsafe_unconst(this_val);
      sf->arg_count = argc;
      ret = s->func(ctx, this_val, argc, arg_buf, s->magic, s->opaque);
      rt->current_stack_frame = sf->prev_frame;
-@@ -8024,6 +8028,7 @@
+@@ -8385,6 +8389,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
              JS_FreeValue(ctx, csd[k].filename);
              JS_FreeValue(ctx, csd[k].func);
              JS_FreeValue(ctx, csd[k].func_name);
@@ -40,15 +42,15 @@
          }
          JSValueConst args[] = {
              error_obj,
-@@ -17511,6 +17516,7 @@
- 
+@@ -17868,6 +17873,7 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
      sf->is_strict_mode = false;
+     sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
      sf->cur_func = unsafe_unconst(func_obj);
 +    sf->this_val = unsafe_unconst(this_obj);
      sf->arg_count = argc;
      arg_buf = argv;
  
-@@ -17731,6 +17737,7 @@
+@@ -18088,6 +18094,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              stack_buf = sf->var_buf + b->var_count;
              sp = sf->cur_sp;
              sf->cur_sp = NULL; /* cur_sp is NULL if the function is running */
@@ -56,7 +58,7 @@
              pc = sf->cur_pc;
              sf->prev_frame = rt->current_stack_frame;
              rt->current_stack_frame = sf;
-@@ -17771,6 +17778,7 @@
+@@ -18129,6 +18136,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      arg_buf = (JSValue *)argv;
      sf->arg_count = argc;
      sf->cur_func = unsafe_unconst(func_obj);
@@ -64,7 +66,7 @@
      var_refs = p->u.func.var_refs;
  
      local_buf = alloca(alloca_size);
-@@ -64483,6 +64491,7 @@
+@@ -62875,6 +62883,7 @@ static void js_callsite_finalizer(JSRuntime *rt, JSValueConst val)
          JS_FreeValueRT(rt, csd->filename);
          JS_FreeValueRT(rt, csd->func);
          JS_FreeValueRT(rt, csd->func_name);
@@ -72,7 +74,7 @@
          js_free_rt(rt, csd);
      }
  }
-@@ -64495,6 +64504,7 @@
+@@ -62887,6 +62896,7 @@ static void js_callsite_mark(JSRuntime *rt, JSValueConst val,
          JS_MarkValue(rt, csd->filename, mark_func);
          JS_MarkValue(rt, csd->func, mark_func);
          JS_MarkValue(rt, csd->func_name, mark_func);
@@ -80,28 +82,26 @@
      }
  }
  
-@@ -64522,6 +64532,7 @@
-     JSObject *p;
+@@ -62915,6 +62925,7 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
  
+     csd->constructor = sf->is_constructor;
      csd->func = js_dup(sf->cur_func);
 +    csd->this_val = js_dup(sf->this_val);
      /* func_name_str is UTF-8 encoded if needed */
      func_name_str = get_func_name(ctx, sf->cur_func);
      if (!func_name_str || func_name_str[0] == '\0')
-@@ -64559,6 +64570,7 @@
+@@ -62952,6 +62963,7 @@ static void js_new_callsite_data2(JSContext *ctx, JSCallSiteData *csd, const cha
  {
      csd->func = JS_NULL;
      csd->func_name = JS_NULL;
 +    csd->this_val = JS_NULL;
      csd->native = false;
+     csd->constructor = false;
      csd->line_num = line_num;
-     csd->col_num = col_num;
-@@ -64594,15 +64606,242 @@
-         return JS_EXCEPTION;
-     int *field = (void *)((char *)csd + magic);
+@@ -62998,14 +63010,240 @@ static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int
      return js_int32(*field);
-+}
-+
+ }
+ 
 +// v82jsc patch: the rest of V8's CallSite API. QuickJS-ng ships only
 +// isNative/getFileName/getFunction/getFunctionName/get{Line,Column}Number, but
 +// many npm packages (depd, stack-trace, source-map-support, ...) call the other
@@ -144,8 +144,8 @@
 +        p = p->shape->proto;
 +    }
 +    return JS_UNDEFINED;
- }
- 
++}
++
 +static JSValue js_callsite_gettypename(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
 +{
 +    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
@@ -245,7 +245,7 @@
 +        JSShape *shape = p->shape;
 +        int i;
 +        for (i = 0; i < shape->prop_count; i++) {
-+            JSShapeProperty *prs = &shape->prop[i];
++            JSShapeProperty *prs = &get_shape_prop(shape)[i];
 +            JSProperty *pr = &p->prop[i];
 +            bool matches = false;
 +
@@ -314,6 +314,7 @@
 +
  static const JSCFunctionListEntry js_callsite_proto_funcs[] = {
      JS_CFUNC_DEF("isNative", 0, js_callsite_isnative),
+     JS_CFUNC_DEF("isConstructor", 0, js_callsite_isconstructor),
      JS_CFUNC_MAGIC_DEF("getFileName", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),
 +    JS_CFUNC_MAGIC_DEF("getScriptNameOrSourceURL", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),
      JS_CFUNC_MAGIC_DEF("getFunction", 0, js_callsite_getfield, offsetof(JSCallSiteData, func)),
@@ -332,7 +333,6 @@
 +    JS_CFUNC_DEF("getEnclosingLineNumber", 0, js_callsite_ret_undefined),
 +    JS_CFUNC_DEF("isEval", 0, js_callsite_ret_false),
 +    JS_CFUNC_DEF("isToplevel", 0, js_callsite_istoplevel),
-+    JS_CFUNC_DEF("isConstructor", 0, js_callsite_ret_false),
 +    JS_CFUNC_DEF("isAsync", 0, js_callsite_ret_false),
 +    JS_CFUNC_DEF("isPromiseAll", 0, js_callsite_ret_false),
 +    JS_CFUNC_DEF("toString", 0, js_callsite_tostring),

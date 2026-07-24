@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index ad575f7..795bf67 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -7857,6 +7857,50 @@ static const char *get_func_name(JSContext *ctx, JSValueConst func)
+@@ -8272,6 +8272,50 @@ static const char *get_func_name(JSContext *ctx, JSValueConst func)
      return JS_ToCString(ctx, val);
  }
  
@@ -51,9 +53,11 @@
  /* Note: it is important that no exception is returned by this function */
  static bool can_add_backtrace(JSValueConst obj)
  {
+diff --git a/quickjs.h b/quickjs.h
+index 2b9fda2..e48d8d1 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1139,6 +1139,11 @@ JS_EXTERN void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRe
+@@ -1163,6 +1163,11 @@ JS_EXTERN void JS_SetHostPromiseRejectionTracker(JSRuntime *rt, JSHostPromiseRej
  /* return != 0 if the JS code needs to be interrupted */
  typedef int JSInterruptHandler(JSRuntime *rt, void *opaque);
  JS_EXTERN void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque);

@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index f899b26..c4a45f9 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21417,12 +21417,6 @@
+@@ -21927,12 +21927,6 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
                  JSFunctionBytecode *b = fp->u.func.function_bytecode;
                  uint32_t pc = s->func_state.frame.cur_pc - b->byte_code_buf - 1;
                  async_line = find_line_num(ctx, b, pc, &async_col);
@@ -12,9 +14,8 @@
 -                    async_col += 1;
                  if (b->filename != JS_ATOM_NULL)
                      async_file = JS_AtomToCString(ctx, b->filename);
-             }
-@@ -27749,8 +27743,12 @@
-         /* v82jsc: capture the await keyword position before next_token advances
+                 if (b->func_name != JS_ATOM_NULL)
+@@ -28272,7 +28266,11 @@ static __exception int js_parse_unary(JSParseState *s, int parse_flags)
             past it, so the OP_await opcode can carry its source loc — v8's
             async-stack frame `at async <file>:<line>:<col>` points at `await`. */
          await_line_num = s->token.line_num;

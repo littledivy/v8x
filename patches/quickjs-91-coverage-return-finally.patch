@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 143ee0d..a559ae7 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -30525,7 +30525,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+@@ -30985,7 +30985,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
  {
      JSContext *ctx = s->ctx;
      JSAtom label_name;
@@ -10,7 +12,7 @@
  
      /* specific label handling */
      /* XXX: support multiple labels on loop statements */
-@@ -30577,6 +30578,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+@@ -31037,6 +31038,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
              goto fail;
          break;
      case TOK_RETURN:
@@ -19,7 +21,7 @@
          if (s->cur_func->is_eval) {
              js_parse_error(s, "Illegal return statement");
              goto fail;
-@@ -30596,6 +30599,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+@@ -31056,6 +31059,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
          }
          if (js_parse_expect_semi(s))
              goto fail;
@@ -27,7 +29,7 @@
          break;
      case TOK_THROW:
          if (next_token(s))
-@@ -31252,6 +31256,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+@@ -31712,6 +31716,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
              }
              emit_label(s, label_finally);
              if (s->token.val == TOK_FINALLY) {
@@ -36,7 +38,7 @@
                  int saved_eval_ret_idx = 0; /* avoid warning */
  
                  if (next_token(s))
-@@ -31276,6 +31282,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+@@ -31736,6 +31742,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
  
                  if (js_parse_block(s))
                      goto fail;

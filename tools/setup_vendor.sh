@@ -9,7 +9,7 @@
 #                       shims (src/jsc/, src/quickjs/) replace its C++ binding.cc
 #                       by defining the same ~570 v8__* C-ABI over JSC / QuickJS.
 #                       2 patches: EscapeSlot (Local==JSValueRef), serializer cap.
-#   vendor/quickjs-ng   quickjs-ng @ v0.15.1            (QuickJS backend)
+#   vendor/quickjs-ng   quickjs-ng @ 034f2ab (master, post-v0.15.1)  (QuickJS backend)
 #   vendor/wamr         wasm-micro-runtime @ 26756a5c   (WebAssembly for QuickJS)
 #
 # Bumping a pin: move the submodule to the new commit, re-run this; if a patch

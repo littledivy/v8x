@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 5125689..c0aaf23 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -8762,6 +8762,22 @@ static int JS_ThrowTypeErrorReadOnly(JSContext *ctx, int flags, JSAtom atom)
+@@ -9134,6 +9134,22 @@ static int JS_ThrowTypeErrorReadOnly(JSContext *ctx, int flags, JSAtom atom)
      }
  }
  
@@ -23,7 +25,7 @@
  static int JS_ThrowTypeErrorNotExtensible(JSContext *ctx, int flags,
                                            JSAtom atom)
  {
-@@ -11038,7 +11052,8 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop,
+@@ -11411,7 +11427,8 @@ retry:
          } else if (!(desc_flags & JS_PROP_WRITABLE) ||
                     p->class_id == JS_CLASS_MODULE_NS) {
          read_only_prop:

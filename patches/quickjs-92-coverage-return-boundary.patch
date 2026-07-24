@@ -1,6 +1,9 @@
+diff --git a/quickjs.c b/quickjs.c
+index a559ae7..3cbbc27 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -30579,7 +30579,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+@@ -31038,7 +31038,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
+             goto fail;
          break;
      case TOK_RETURN:
 -        statement_start = s->token.ptr - s->buf_start;

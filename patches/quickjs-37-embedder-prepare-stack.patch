@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 82dc5ec..ef0ee13 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -516,6 +516,8 @@
+@@ -572,6 +572,8 @@ struct JSContext {
      JSValue error_ctor;
      JSValue error_back_trace;
      JSValue error_prepare_stack;
@@ -9,7 +11,7 @@
      JSValue error_stack_trace_limit;
      JSValue iterator_ctor;
      JSValue iterator_ctor_getset;
-@@ -2630,6 +2632,8 @@
+@@ -3012,6 +3014,8 @@ JSContext *JS_NewContextRaw(JSRuntime *rt)
      ctx->error_ctor = JS_NULL;
      ctx->error_back_trace = JS_UNDEFINED;
      ctx->error_prepare_stack = JS_UNDEFINED;
@@ -17,8 +19,8 @@
 +    ctx->error_stack_pending_marker = JS_UNDEFINED;
      ctx->error_stack_trace_limit = js_int32(10);
      init_list_head(&ctx->loaded_modules);
- 
-@@ -2754,6 +2758,8 @@
+     // TODO(bnoordhuis) use getrandom() etc.
+@@ -3142,6 +3146,8 @@ static void JS_MarkContext(JSRuntime *rt, JSContext *ctx,
      JS_MarkValue(rt, ctx->error_ctor, mark_func);
      JS_MarkValue(rt, ctx->error_back_trace, mark_func);
      JS_MarkValue(rt, ctx->error_prepare_stack, mark_func);
@@ -27,7 +29,7 @@
      JS_MarkValue(rt, ctx->error_stack_trace_limit, mark_func);
      for(i = 0; i < rt->class_count; i++) {
          JS_MarkValue(rt, ctx->class_proto[i], mark_func);
-@@ -2836,6 +2842,8 @@
+@@ -3224,6 +3230,8 @@ void JS_FreeContext(JSContext *ctx)
      JS_FreeValue(ctx, ctx->error_ctor);
      JS_FreeValue(ctx, ctx->error_back_trace);
      JS_FreeValue(ctx, ctx->error_prepare_stack);
@@ -36,12 +38,10 @@
      JS_FreeValue(ctx, ctx->error_stack_trace_limit);
      for(i = 0; i < rt->class_count; i++) {
          JS_FreeValue(ctx, ctx->class_proto[i]);
-@@ -8091,8 +8099,64 @@
-     if (find_own_property1(p, JS_ATOM_stack))
-         return false;
+@@ -8508,6 +8516,62 @@ static bool can_store_error_stack(JSValueConst obj)
      return true;
-+}
-+
+ }
+ 
 +static JSAtom js_error_stack_pending_atom(JSContext *ctx)
 +{
 +    JSAtom descr, atom;
@@ -72,8 +72,8 @@
 +    ret = JS_DefinePropertyValue(ctx, stack, atom, JS_TRUE, 0);
 +    JS_FreeAtom(ctx, atom);
 +    return ret >= 0;
- }
- 
++}
++
 +static bool js_error_stack_is_pending(JSContext *ctx, JSValueConst stack)
 +{
 +    JSAtom atom = js_error_stack_pending_atom(ctx);
@@ -101,7 +101,7 @@
  #define JS_BACKTRACE_FLAG_SKIP_FIRST_LEVEL (1 << 0)
  /* only taken into account if filename is provided */
  #define JS_BACKTRACE_FLAG_SINGLE_LEVEL     (1 << 1)
-@@ -8119,7 +8181,8 @@
+@@ -8534,7 +8598,8 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
      const char *str1;
      JSObject *p;
      JSFunctionBytecode *b;
@@ -111,7 +111,7 @@
      JSRuntime *rt;
      JSCallSiteData csd[64];
      uint32_t i;
-@@ -8165,6 +8228,8 @@
+@@ -8580,6 +8645,8 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
      stack_trace_limit = min_int(stack_trace_limit, countof(csd));
      stack_trace_limit = max_int(stack_trace_limit, 0);
      has_prepare = false;
@@ -120,7 +120,7 @@
      has_filter_func = backtrace_flags & JS_BACKTRACE_FLAG_FILTER_FUNC;
      has_frame_filter = backtrace_flags &
          (JS_BACKTRACE_FLAG_FILTER_FUNC |
-@@ -8172,7 +8237,11 @@
+@@ -8587,7 +8654,11 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
      i = 0;
  
      if (!JS_IsNull(ctx->error_ctor)) {
@@ -133,7 +133,7 @@
          has_prepare = JS_IsFunction(ctx, prepare);
      }
  
-@@ -8291,18 +8360,26 @@
+@@ -8706,18 +8777,26 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
              JS_FreeValue(ctx, csd[k].func_name);
              JS_FreeValue(ctx, csd[k].this_val);
          }
@@ -172,7 +172,7 @@
      } else {
          if (dbuf_error(&dbuf))
              stack = JS_NULL;
-@@ -44796,12 +44873,33 @@
+@@ -45376,12 +45455,33 @@ static JSValue js_error_prepend_stack_header(JSContext *ctx,
  static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
  {
      JSObject *p;
@@ -206,18 +206,16 @@
      return js_error_prepend_stack_header(ctx, this_val,
                                           js_dup(p->u.object_data));
  }
-@@ -44885,8 +44983,19 @@
-     JS_FreeValue(ctx, ctx->error_prepare_stack);
-     ctx->error_prepare_stack = js_dup(value);
+@@ -45467,6 +45567,17 @@ static JSValue js_error_set_prepareStackTrace(JSContext *ctx, JSValueConst this_
      return JS_UNDEFINED;
-+}
-+
+ }
+ 
 +void JS_SetPrepareStackTraceCallback(JSContext *ctx, JSValueConst callback)
 +{
 +    JS_FreeValue(ctx, ctx->error_prepare_stack_callback);
 +    ctx->error_prepare_stack_callback = js_dup(callback);
- }
- 
++}
++
 +JSValue JS_GetPrepareStackTraceCallback(JSContext *ctx)
 +{
 +    return js_dup(ctx->error_prepare_stack_callback);
@@ -226,9 +224,11 @@
  static JSValue js_error_capture_stack_trace(JSContext *ctx, JSValueConst this_val,
                                              int argc, JSValueConst *argv)
  {
+diff --git a/quickjs.h b/quickjs.h
+index b380ac8..26ee41a 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -519,6 +519,8 @@
+@@ -538,6 +538,8 @@ JS_EXTERN JSContext *JS_DupContext(JSContext *ctx);
  JS_EXTERN void *JS_GetContextOpaque(JSContext *ctx);
  JS_EXTERN void JS_SetContextOpaque(JSContext *ctx, void *opaque);
  JS_EXTERN JSRuntime *JS_GetRuntime(JSContext *ctx);

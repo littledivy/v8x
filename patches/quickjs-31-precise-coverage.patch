@@ -1,14 +1,27 @@
+diff --git a/quickjs-opcode.h b/quickjs-opcode.h
+index ec2a5ad..3bb7b4d 100644
+--- a/quickjs-opcode.h
++++ b/quickjs-opcode.h
+@@ -297,6 +297,7 @@ def( set_class_name, 5, 1, 1, u32) /* emitted in phase 1, removed in phase 2 */
+ def( dispose_scope, 3, 0, 0, u16) /* emitted in phase 1, removed in phase 2 */
+ 
+ def(     source_loc, 9, 0, 0, u32x2) /* emitted in phase 1, removed in phase 3 */
++def(       coverage, 9, 0, 0, u32x2) /* emitted in phase 1, lowered to nop in phase 3 */
+ 
+ DEF(    push_minus1, 1, 0, 1, none_int)
+ DEF(         push_0, 1, 0, 1, none_int)
+diff --git a/quickjs.c b/quickjs.c
+index 274113b..987ce2e 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -7783,7 +7783,37 @@
-     *pval = (val >> 1) ^ -(val & 1);
+@@ -8199,6 +8199,36 @@ static int get_sleb128(int32_t *pval, const uint8_t *buf,
      return ret;
  }
-+
+ 
 +static const uint8_t js_coverage_magic[8] = {
 +    'v', '8', 'x', '-', 'c', 'o', 'v', 0
 +};
- 
++
 +static const uint8_t *js_coverage_data(JSFunctionBytecode *b,
 +                                       uint32_t *count)
 +{
@@ -38,7 +51,7 @@
  static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
                           uint32_t pc_value, int *col)
  {
-@@ -7796,6 +7826,12 @@
+@@ -8211,6 +8241,12 @@ static int find_line_num(JSContext *ctx, JSFunctionBytecode *b,
      if (!p)
          goto fail;
      p_end = p + b->pc2line_len;
@@ -51,12 +64,10 @@
      pc = 0;
      line_num = b->line_num;
      col_num = b->col_num;
-@@ -7833,8 +7869,133 @@
- fail:
-     /* should never happen */
+@@ -8250,6 +8286,131 @@ fail:
      return b->line_num;
-+}
-+
+ }
+ 
 +static _Thread_local bool v82jsc_precise_coverage_enabled;
 +
 +extern void v82jsc_coverage_function(const void *key,
@@ -84,8 +95,8 @@
 +void JS_SetPreciseCoverageEnabled(bool enabled)
 +{
 +    v82jsc_precise_coverage_enabled = enabled;
- }
- 
++}
++
 +static void js_coverage_register_function(JSFunctionBytecode *b)
 +{
 +    const uint8_t *p, *p_end;
@@ -185,7 +196,7 @@
  /* in order to avoid executing arbitrary code during the stack trace
     generation, we only look at simple 'name' properties containing a
     string. */
-@@ -17787,7 +17947,7 @@
+@@ -18217,7 +18378,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  #endif
  
  #if !DIRECT_DISPATCH
@@ -194,7 +205,7 @@
  #define CASE(op)        case op
  #define DEFAULT         default
  #define BREAK           break
-@@ -17798,7 +17958,7 @@
+@@ -18228,7 +18389,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  #include "quickjs-opcode.h"
          [ OP_COUNT ... 255 ] = &&case_default
      };
@@ -203,7 +214,7 @@
  #define CASE(op)        case_ ## op
  #define DEFAULT         case_default
  #define BREAK           SWITCH(pc)
-@@ -17825,6 +17986,11 @@
+@@ -18255,6 +18416,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              pc = sf->cur_pc;
              sf->prev_frame = rt->current_stack_frame;
              rt->current_stack_frame = sf;
@@ -215,7 +226,7 @@
              if (s->throw_flag)
                  goto exception;
              else
-@@ -17895,6 +18061,11 @@
+@@ -18325,6 +18491,11 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      sf->prev_frame = rt->current_stack_frame;
      rt->current_stack_frame = sf;
      ctx = b->realm; /* set the current realm */
@@ -227,7 +238,7 @@
  
  #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
      if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_STEP))
-@@ -22195,6 +22357,7 @@
+@@ -22774,6 +22945,7 @@ typedef struct JSFunctionDef {
      int line_num;
      int col_num;
      DynBuf pc2line;
@@ -235,7 +246,7 @@
  
      char *source;  /* raw source, utf-8 encoded */
      int source_len;
-@@ -23872,6 +24035,20 @@
+@@ -24446,6 +24618,20 @@ static void emit_op(JSParseState *s, uint8_t val)
      dbuf_putc(bc, val);
  }
  
@@ -256,7 +267,7 @@
  static void emit_atom(JSParseState *s, JSAtom name)
  {
      DynBuf *bc = &s->cur_func->byte_code;
-@@ -25481,18 +25662,21 @@
+@@ -26055,18 +26241,21 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
                  goto fail;
              if (s->token.val == '{') {
                  ClassFieldsDef *cf = &class_fields[is_static];
@@ -284,7 +295,7 @@
                      goto fail;
                  }
                  // stack is now: fclosure
-@@ -25727,7 +25911,7 @@
+@@ -26301,7 +26490,7 @@ static __exception int js_parse_class(JSParseState *s, bool is_class_expr,
              if (is_private) {
                  class_fields[is_static].need_brand = true;
              }
@@ -293,7 +304,7 @@
                                          start_ptr,
                                          s->token.line_num,
                                          s->token.col_num,
-@@ -28864,7 +29048,7 @@
+@@ -29475,7 +29664,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
      bool has_initializer, is_for_of, has_destructuring;
      int tok, tok1, opcode, scope, block_scope_level;
      int label_next, label_expr, label_cont, label_body, label_break;
@@ -302,7 +313,7 @@
      BlockEnv break_entry;
  
      has_initializer = false;
-@@ -29092,6 +29276,7 @@
+@@ -29704,6 +29893,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
      }
  
      emit_label(s, label_body);
@@ -310,7 +321,7 @@
      {
          bool scope_has_using = fd->scopes[fd->scope_level].has_using;
          int using_scope_level = fd->scope_level;
-@@ -29108,6 +29293,7 @@
+@@ -29720,6 +29910,7 @@ static __exception int js_parse_for_in_of(JSParseState *s, int label_name,
  
          if (js_parse_statement(s))
              return -1;
@@ -318,7 +329,7 @@
  
          if (had_using_be) {
              pop_break_entry(fd);
-@@ -29321,7 +29507,8 @@
+@@ -29933,7 +30124,8 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
          break;
      case TOK_IF:
          {
@@ -328,7 +339,7 @@
              if (next_token(s))
                  goto fail;
              /* create a new scope for `let f;if(1) function f(){}` */
-@@ -29335,19 +29513,26 @@
+@@ -29947,19 +30139,26 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
              else
                  mask = DECL_MASK_FUNC; /* Annex B.3.4 */
  
@@ -355,7 +366,7 @@
              }
              emit_label(s, label1);
              pop_scope(s);
-@@ -32697,6 +32882,7 @@
+@@ -33343,6 +33542,7 @@ static JSFunctionDef *js_new_function_def(JSContext *ctx,
      fd->col_num = col_num;
  
      js_dbuf_init(ctx, &fd->pc2line);
@@ -363,7 +374,7 @@
      //fd->pc2line_last_line_num = line_num;
      //fd->pc2line_last_pc = 0;
  
-@@ -32794,6 +32980,7 @@
+@@ -33440,6 +33640,7 @@ static void js_free_function_def(JSContext *ctx, JSFunctionDef *fd)
  
      JS_FreeAtom(ctx, fd->filename);
      dbuf_free(&fd->pc2line);
@@ -371,7 +382,7 @@
  
      js_free(ctx, fd->source);
  
-@@ -35540,6 +35727,13 @@
+@@ -36186,6 +36387,13 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
              col_num = get_u32(bc_buf + pos + 5);
              break;
  
@@ -385,7 +396,7 @@
          case OP_label:
              {
                  label = get_u32(bc_buf + pos + 1);
-@@ -36295,6 +36489,11 @@
+@@ -36941,6 +37149,11 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
                      if (s->source_loc_slots[j].pc > pos)
                          s->source_loc_slots[j].pc -= delta;
                  }
@@ -397,7 +408,7 @@
                  continue;
              }
              break;
-@@ -36326,6 +36525,13 @@
+@@ -36972,6 +37185,13 @@ static __exception int resolve_labels(JSContext *ctx, JSFunctionDef *s)
      s->label_slots = NULL;
      /* XXX: should delay until copying to runtime bytecode function */
      compute_pc2line_info(s);
@@ -411,7 +422,7 @@
      js_free(ctx, s->source_loc_slots);
      s->source_loc_slots = NULL;
      /* set the new byte code */
-@@ -36815,6 +37025,8 @@
+@@ -37461,6 +37681,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->realm = JS_DupContext(ctx);
  
      add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
@@ -420,9 +431,11 @@
  
  #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_FINAL
      if (check_dump_flag(ctx->rt, JS_DUMP_BYTECODE_FINAL))
+diff --git a/quickjs.h b/quickjs.h
+index e48d8d1..b380ac8 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1144,6 +1144,7 @@
+@@ -1168,6 +1168,7 @@ typedef void JSStackFrameVisitor(void *opaque, const char *function_name,
                                   int column_num);
  JS_EXTERN void JS_VisitStackFrames(JSRuntime *rt, JSStackFrameVisitor *visitor,
                                     void *opaque);
@@ -430,13 +443,3 @@
  /* if can_block is true, Atomics.wait() can be used */
  JS_EXTERN void JS_SetCanBlock(JSRuntime *rt, bool can_block);
  /* set the [IsHTMLDDA] internal slot */
---- a/quickjs-opcode.h
-+++ b/quickjs-opcode.h
-@@ -297,6 +297,7 @@
- def( dispose_scope, 3, 0, 0, u16) /* emitted in phase 1, removed in phase 2 */
- 
- def(     source_loc, 9, 0, 0, u32x2) /* emitted in phase 1, removed in phase 3 */
-+def(       coverage, 9, 0, 0, u32x2) /* emitted in phase 1, lowered to nop in phase 3 */
- 
- DEF(    push_minus1, 1, 0, 1, none_int)
- DEF(         push_0, 1, 0, 1, none_int)

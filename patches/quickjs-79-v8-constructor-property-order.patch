@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 4071932..483758a 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -43857,25 +43857,23 @@
+@@ -44388,25 +44388,23 @@ static JSValue JS_NewCConstructor(JSContext *ctx, int class_id, const char *name
          if (class_id >= 0)
              ctx->class_proto[class_id] = js_dup(proto);
      }
@@ -11,9 +13,9 @@
      ctor = JS_NewCFunction3(ctx, func, name, length, cproto, magic, parent_ctor,
                              n_ctor_fields + 3);
      if (JS_IsException(ctor))
-+        goto fail;
-+    if (JS_SetConstructor2(ctx, ctor, proto, proto_flags, ctor_flags))
          goto fail;
++    if (JS_SetConstructor2(ctx, ctor, proto, proto_flags, ctor_flags))
++        goto fail;
      if (JS_SetPropertyFunctionList(ctx, ctor, ctor_fields, n_ctor_fields))
          goto fail;
 +    if (JS_SetPropertyFunctionList(ctx, proto, proto_fields, n_proto_fields))
@@ -30,7 +32,7 @@
      JS_FreeValue(ctx, proto);
      JS_FreeValue(ctx, parent_proto);
      return ctor;
-@@ -46293,6 +46291,9 @@
+@@ -46824,6 +46822,9 @@ static JSValue JS_ArraySpeciesCreate(JSContext *ctx, JSValueConst obj,
  static const JSCFunctionListEntry js_array_funcs[] = {
      JS_CFUNC_DEF("isArray", 1, js_array_isArray ),
      JS_CFUNC_DEF("from", 1, js_array_from ),
@@ -40,7 +42,7 @@
      JS_CFUNC_DEF("of", 0, js_array_of ),
      JS_CGETSET_DEF("[Symbol.species]", js_get_this, NULL ),
  };
-@@ -49133,44 +49134,44 @@
+@@ -49639,44 +49640,44 @@ static const JSCFunctionListEntry js_array_unscopables_funcs[] = {
  
  static const JSCFunctionListEntry js_array_proto_funcs[] = {
      JS_CFUNC_DEF("at", 1, js_array_at ),
@@ -108,7 +110,7 @@
      JS_OBJECT_DEF("[Symbol.unscopables]", js_array_unscopables_funcs, countof(js_array_unscopables_funcs), JS_PROP_CONFIGURABLE ),
  };
  
-@@ -61785,6 +61786,10 @@
+@@ -62397,6 +62398,10 @@ int JS_AddIntrinsicBaseObjects(JSContext *ctx)
                                JS_AUTOINIT_ID_BYTECODE,
                                (void *)(uintptr_t)JS_BUILTIN_ARRAY_FROMASYNC,
                                JS_PROP_WRITABLE|JS_PROP_CONFIGURABLE);

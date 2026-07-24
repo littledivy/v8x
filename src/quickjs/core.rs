@@ -2632,7 +2632,10 @@ unsafe fn origin_host_defined_options(origin: *const c_void) -> *const Data {
   if origin.is_null() {
     return ptr::null();
   }
-  unsafe { *((origin as *const usize).add(3)) as *const Data }
+  // Layout per RawScriptOrigin in module.rs: resource_name, source_map_url,
+  // {script_id,line}, {column,pad}, host_defined_options — word 4, not 3
+  // (word 3 is the column offset + padding).
+  unsafe { *((origin as *const usize).add(4)) as *const Data }
 }
 
 #[unsafe(no_mangle)]

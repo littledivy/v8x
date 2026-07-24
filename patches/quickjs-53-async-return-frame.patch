@@ -1,13 +1,11 @@
 diff --git a/quickjs.c b/quickjs.c
+index 3bc5ca1..85ca0b6 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21835,7 +21835,157 @@
-             JS_FreeValue(ctx, JS_GetException(ctx));
-         }
-         JS_FreeAtom(ctx, key_atom);
-+    }
-+}
-+
+@@ -22339,6 +22339,156 @@ static void js_v82jsc_append_promise_all_frame(JSContext *ctx,
+     }
+ }
+ 
 +static bool js_v82jsc_has_function_frame(JSContext *ctx, JSValueConst error,
 +                                          const char *file, const char *func)
 +{
@@ -138,7 +136,7 @@ diff --git a/quickjs.c b/quickjs.c
 +        if (func)
 +            JS_FreeCString(ctx, func);
 +        return js_dup(value);
-     }
++    }
 +    data[0] = JS_NewString(ctx, file);
 +    data[1] = js_int32(line);
 +    data[2] = js_int32(col);
@@ -156,10 +154,12 @@ diff --git a/quickjs.c b/quickjs.c
 +    wrapped = JS_Invoke(ctx, value, JS_ATOM_then, 2, then_args);
 +    JS_FreeValue(ctx, reject);
 +    return wrapped;
- }
- 
++}
++
  static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
-@@ -21870,6 +22020,14 @@
+ {
+     bool is_success = true;
+@@ -22371,6 +22521,14 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
          s->func_state.frame.cur_sp[-1] = JS_UNDEFINED;
          if (JS_IsUndefined(func_ret)) {
              /* function returned */

@@ -1,22 +1,23 @@
+diff --git a/quickjs.c b/quickjs.c
+index ae346df..3799d33 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -7843,7 +7843,15 @@
+@@ -8220,6 +8220,14 @@ static bool can_store_error_stack(JSValueConst obj)
  /* only taken into account if filename is provided */
  #define JS_BACKTRACE_FLAG_SINGLE_LEVEL     (1 << 1)
  #define JS_BACKTRACE_FLAG_FILTER_FUNC      (1 << 2)
 +#define JS_BACKTRACE_FLAG_FILTER_CONSTRUCTOR (1 << 3)
- 
++
 +/* v82jsc: defined with js_error_get_stack below; used by build_backtrace to
 +   prepend the v8 `name: message` header to captureStackTrace/DOMException
 +   stacks (which shadow the Error.prototype accessor). */
 +static JSValue js_error_prepend_stack_header(JSContext *ctx,
 +                                             JSValueConst error_obj,
 +                                             JSValue frames_v);
-+
+ 
  /* if filename != NULL, an additional level is added with the filename
     and line number information (used for parse error). */
- static void build_backtrace(JSContext *ctx, JSValueConst error_val,
-@@ -7857,7 +7865,7 @@
+@@ -8234,7 +8242,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
      const char *str1;
      JSObject *p;
      JSFunctionBytecode *b;
@@ -25,7 +26,7 @@
      JSRuntime *rt;
      JSCallSiteData csd[64];
      uint32_t i;
-@@ -7892,6 +7900,9 @@
+@@ -8269,6 +8277,9 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
      stack_trace_limit = max_int(stack_trace_limit, 0);
      has_prepare = false;
      has_filter_func = backtrace_flags & JS_BACKTRACE_FLAG_FILTER_FUNC;
@@ -35,7 +36,7 @@
      i = 0;
  
      if (!JS_IsNull(ctx->error_ctor)) {
-@@ -7925,7 +7936,7 @@
+@@ -8302,7 +8313,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
  
      /* Find the frame we want to start from. Note that when a filter is used the filter
         function will be the first, but we also specify we want to skip the first one. */
@@ -44,7 +45,7 @@
          for (sf = sf_start; sf != NULL && i < stack_trace_limit; sf = sf->prev_frame) {
              if (js_same_value(ctx, sf->cur_func, filter_func)) {
                  sf_start = sf;
-@@ -8038,16 +8049,22 @@
+@@ -8415,16 +8426,22 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
          ctx->error_back_trace = js_dup(stack);
      if (has_filter_func) {
          /* Error.captureStackTrace(target, ...): install an own data property
@@ -70,7 +71,7 @@
          JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack,
                                 JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
      } else {
-@@ -42146,8 +42163,10 @@
+@@ -42706,8 +42723,10 @@ static JSValue js_error_constructor(JSContext *ctx, JSValueConst new_target,
                                 JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
      }
  
@@ -83,7 +84,7 @@
      return obj;
   exception:
      JS_FreeValue(ctx, obj);
-@@ -42183,6 +42202,81 @@
+@@ -42743,6 +42762,81 @@ static JSValue js_error_toString(JSContext *ctx, JSValueConst this_val,
      return JS_ConcatString(ctx, name, msg);
  }
  
@@ -165,7 +166,7 @@
  static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
  {
      JSObject *p;
-@@ -42192,7 +42286,8 @@
+@@ -42752,7 +42846,8 @@ static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
      p = JS_VALUE_GET_OBJ(this_val);
      if (p->class_id != JS_CLASS_ERROR)
          return JS_UNDEFINED;
@@ -175,4 +176,3 @@
  }
  
  static JSValue js_error_set_stack(JSContext *ctx, JSValueConst this_val,
-

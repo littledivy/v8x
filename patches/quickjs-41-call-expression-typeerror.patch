@@ -1,10 +1,11 @@
+diff --git a/quickjs.c b/quickjs.c
+index 26c2218..861df8c 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -8626,7 +8626,46 @@
- {
+@@ -9042,6 +9042,45 @@ static JSValue JS_ThrowTypeErrorNotAFunction(JSContext *ctx)
      return JS_ThrowTypeError(ctx, "not a function");
  }
-+
+ 
 +extern JSValue v82jsc_throw_type_error_not_a_function_at(JSContext *ctx,
 +                                                         const char *filename,
 +                                                         int line,
@@ -19,7 +20,7 @@
 +    JSValue result;
 +    uint32_t pc;
 +    int line, column;
- 
++
 +    if (!sf || !sf->cur_pc || JS_VALUE_GET_TAG(sf->cur_func) != JS_TAG_OBJECT)
 +        return JS_ThrowTypeErrorNotAFunction(ctx);
 +    p = JS_VALUE_GET_OBJ(sf->cur_func);
@@ -47,7 +48,7 @@
  static JSValue JS_ThrowTypeErrorNotAnObject(JSContext *ctx)
  {
      return JS_ThrowTypeError(ctx, "not an object");
-@@ -18107,7 +18146,7 @@
+@@ -18533,7 +18572,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          call_func = rt->class_array[p->class_id].call;
          if (!call_func) {
          not_a_function:

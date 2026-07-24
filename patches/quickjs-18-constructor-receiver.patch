@@ -1,8 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
-index 0000000..0000000 100644
+index 217b3fb..5456338 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -6294,7 +6294,8 @@ static JSValue JS_NewCFunction3(JSContext *ctx, JSCFunction *func,
+@@ -6615,7 +6615,8 @@ JSValue JS_NewCFunction3(JSContext *ctx, JSCFunction *func,
      p->is_constructor = (cproto == JS_CFUNC_constructor ||
                           cproto == JS_CFUNC_constructor_magic ||
                           cproto == JS_CFUNC_constructor_or_func ||
@@ -12,7 +12,7 @@ index 0000000..0000000 100644
      name_atom = JS_ATOM_empty_string;
      if (name && *name) {
          name_atom = JS_NewAtom(ctx, name);
-@@ -12077,6 +12078,12 @@ bool JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, bool val)
+@@ -12071,6 +12072,12 @@ bool JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, bool val)
      return true;
  }
  
@@ -25,7 +25,7 @@ index 0000000..0000000 100644
  bool JS_IsRegExp(JSValueConst val)
  {
      return JS_CLASS_REGEXP == JS_GetClassID(val);
-@@ -17951,6 +17958,10 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
+@@ -17946,6 +17953,10 @@ static JSValue js_call_c_function(JSContext *ctx, JSValueConst func_obj,
          ret_val = func.generic_magic(ctx, this_obj, argc, arg_buf,
                                       p->u.cfunc.magic);
          break;
@@ -37,10 +37,10 @@ index 0000000..0000000 100644
          ret_val = func.getter(ctx, this_obj);
          break;
 diff --git a/quickjs.h b/quickjs.h
-index 0000000..0000000 100644
+index 6763f83..a4a9fe1 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -924,6 +924,7 @@ JS_EXTERN bool JS_IsFunction(JSContext* ctx, JSValueConst val);
+@@ -944,6 +944,7 @@ JS_EXTERN bool JS_IsFunction(JSContext* ctx, JSValueConst val);
  JS_EXTERN bool JS_IsAsyncFunction(JSValueConst val);
  JS_EXTERN bool JS_IsConstructor(JSContext* ctx, JSValueConst val);
  JS_EXTERN bool JS_SetConstructorBit(JSContext *ctx, JSValueConst func_obj, bool val);
@@ -48,7 +48,7 @@ index 0000000..0000000 100644
  
  JS_EXTERN bool JS_IsRegExp(JSValueConst val);
  JS_EXTERN bool JS_IsMap(JSValueConst val);
-@@ -1283,6 +1284,7 @@ typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
+@@ -1285,6 +1286,7 @@ typedef enum JSCFunctionEnum {  /* XXX: should rename for namespace isolation */
      JS_CFUNC_getter_magic,
      JS_CFUNC_setter_magic,
      JS_CFUNC_iterator_next,

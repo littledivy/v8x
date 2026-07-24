@@ -1,19 +1,19 @@
+diff --git a/quickjs.c b/quickjs.c
+index 20edf00..faaec28 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -32378,6 +32378,7 @@
+@@ -32955,6 +32955,7 @@ static int js_execute_sync_module(JSContext *ctx, JSModuleDef *m,
          if (state == JS_PROMISE_FULFILLED) {
              JS_FreeValue(ctx, promise);
          } else if (state == JS_PROMISE_REJECTED) {
 +            JS_PromiseMarkAsHandled(ctx, promise);
              *pvalue = JS_PromiseResult(ctx, promise);
-             JS_FreeValue(ctx, promise);
-             return -1;
-@@ -57353,6 +57354,22 @@
-     if (JS_VALUE_GET_TAG(val) != JS_TAG_OBJECT)
-         return false;
+             // rejection is propagated to module's evaluation promise; mark this internal
+             // promise as handled so it's not also surfaced as an unhandled rejection
+@@ -57971,6 +57972,22 @@ bool JS_IsPromise(JSValueConst val)
      return JS_VALUE_GET_OBJ(val)->class_id == JS_CLASS_PROMISE;
-+}
-+
+ }
+ 
 +void JS_PromiseMarkAsHandled(JSContext *ctx, JSValueConst promise)
 +{
 +    JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
@@ -28,12 +28,16 @@
 +                                               rt->host_promise_rejection_tracker_opaque);
 +    }
 +    s->is_handled = true;
- }
- 
++}
++
  JSValue JS_NewSettledPromise(JSContext *ctx, bool is_reject, JSValueConst value)
+ {
+     return js_promise_resolve(ctx, ctx->promise_ctor, 1, &value, is_reject);
+diff --git a/quickjs.h b/quickjs.h
+index 26ee41a..7075369 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1111,6 +1111,8 @@
+@@ -1135,6 +1135,8 @@ JS_EXTERN JSPromiseStateEnum JS_PromiseState(JSContext *ctx,
                                               JSValueConst promise);
  JS_EXTERN JSValue JS_PromiseResult(JSContext *ctx, JSValueConst promise);
  JS_EXTERN bool JS_IsPromise(JSValueConst val);

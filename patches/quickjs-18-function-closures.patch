@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 5456338..fec4cf0 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -38087,6 +38087,20 @@
+@@ -38707,6 +38707,20 @@ typedef enum BCTagEnum {
      BC_TAG_MAP,
      BC_TAG_SET,
      BC_TAG_SYMBOL,
@@ -20,8 +22,8 @@
 +    BC_TAG_SNAPSHOT_INTRINSIC,
  } BCTagEnum;
  
- #define BC_VERSION 26
-@@ -38110,6 +38124,10 @@
+ #define BC_VERSION 27
+@@ -38730,6 +38744,10 @@ typedef struct BCWriterState {
      int sab_tab_size;
      /* list of referenced objects (used if allow_reference = true) */
      JSObjectList object_list;
@@ -32,7 +34,7 @@
  } BCWriterState;
  
  #ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
-@@ -38138,6 +38156,19 @@
+@@ -38758,6 +38776,19 @@ static const char * const bc_tag_str[] = {
      "Map",
      "Set",
      "Symbol",
@@ -52,7 +54,7 @@
  };
  
  static const char *bc_tag_name(uint8_t tag)
-@@ -38368,6 +38399,158 @@
+@@ -38988,6 +39019,158 @@ static int JS_WriteBigInt(BCWriterState *s, JSValueConst obj)
  
  static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj);
  
@@ -211,13 +213,10 @@
  static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
  {
      JSFunctionBytecode *b = JS_VALUE_GET_PTR(obj);
-@@ -38460,9 +38643,504 @@
-     }
-     return 0;
-  fail:
-+    return -1;
-+}
-+
+@@ -39083,6 +39266,501 @@ static int JS_WriteFunctionTag(BCWriterState *s, JSValueConst obj)
+     return -1;
+ }
+ 
 +static int JS_WriteVarRef(BCWriterState *s, JSVarRef *var_ref)
 +{
 +    int i;
@@ -281,9 +280,9 @@
 +
 + invalid:
 +    JS_ThrowTypeError(s->ctx, "invalid bytecode function object");
-     return -1;
- }
- 
++    return -1;
++}
++
 +/* Returns 1 when the embedder handled the object, 0 when it did not, and -1
 +   on error. */
 +static int JS_WriteHostObject(BCWriterState *s, JSValueConst obj)
@@ -716,7 +715,7 @@
  static int JS_WriteModule(BCWriterState *s, JSValueConst obj)
  {
      JSModuleDef *m = JS_VALUE_GET_PTR(obj);
-@@ -38556,43 +39234,162 @@
+@@ -39176,47 +39854,166 @@ static int JS_WriteArray(BCWriterState *s, JSValueConst obj)
      return -1;
  }
  
@@ -736,6 +735,12 @@
 +    JSAtom skip_atom = JS_ATOM_NULL;
 +    uint32_t len = 0, serialized_len, i;
 +    int extensible, ret = -1;
++
++    proto = JS_GetPrototype(s->ctx, obj);
++    if (JS_IsException(proto) || JS_WriteObjectRec(s, proto))
++        goto fail;
++    JS_FreeValue(s->ctx, proto);
++    proto = JS_UNDEFINED;
  
 -    bc_put_u8(s, BC_TAG_OBJECT);
 -    prop_count = 0;
@@ -743,7 +748,7 @@
 -    for(pass = 0; pass < 2; pass++) {
 -        if (pass == 1)
 -            bc_put_leb128(s, prop_count);
--        for(i = 0, pr = sh->prop; i < sh->prop_count; i++, pr++) {
+-        for(i = 0, pr = get_shape_prop(sh); i < sh->prop_count; i++, pr++) {
 -            atom = pr->atom;
 -            if (atom != JS_ATOM_NULL && (pr->flags & JS_PROP_ENUMERABLE)) {
 -                if (pr->flags & JS_PROP_TMASK) {
@@ -758,12 +763,6 @@
 -                        goto fail;
 -                }
 -            }
-+    proto = JS_GetPrototype(s->ctx, obj);
-+    if (JS_IsException(proto) || JS_WriteObjectRec(s, proto))
-+        goto fail;
-+    JS_FreeValue(s->ctx, proto);
-+    proto = JS_UNDEFINED;
-+
 +    extensible = JS_IsExtensible(s->ctx, obj);
 +    if (extensible < 0)
 +        goto fail;
@@ -815,17 +814,21 @@
 +    JS_FreeValue(s->ctx, desc.value);
 +    JS_FreeValue(s->ctx, desc.getter);
 +    JS_FreeValue(s->ctx, desc.setter);
-+ fail:
+  fail:
+-    return -1;
 +    JS_FreeValue(s->ctx, proto);
 + done:
 +    JS_FreeAtom(s->ctx, skip_atom);
 +    if (props)
 +        js_free_prop_enum(s->ctx, props, len);
 +    return ret;
-+}
-+
+ }
+ 
+-static int JS_WriteTypedArray(BCWriterState *s, JSValueConst obj)
 +static bool JS_IsSnapshotIntrinsicObject(JSContext *ctx, JSValueConst obj)
-+{
+ {
+-    JSObject *p = JS_VALUE_GET_OBJ(obj);
+-    JSTypedArray *ta = p->u.typed_array;
 +    JSObject *target;
 +    JSValue value;
 +    uint32_t i;
@@ -882,11 +885,11 @@
 +        JS_FreeValue(s->ctx, value);
 +    }
 +    JS_ThrowInternalError(s->ctx, "snapshot intrinsic is not registered");
-  fail:
++ fail:
 +    JS_FreeValue(s->ctx, registry);
-     return -1;
- }
- 
++    return -1;
++}
++
 +static int JS_WriteObjectTag(BCWriterState *s, JSValueConst obj)
 +{
 +    bc_put_u8(s, BC_TAG_SNAPSHOT_OBJECT);
@@ -905,10 +908,14 @@
 +    return JS_WriteSnapshotObjectState(s, obj, true);
 +}
 +
- static int JS_WriteTypedArray(BCWriterState *s, JSValueConst obj)
- {
-     JSObject *p = JS_VALUE_GET_OBJ(obj);
-@@ -38650,6 +39447,9 @@
++static int JS_WriteTypedArray(BCWriterState *s, JSValueConst obj)
++{
++    JSObject *p = JS_VALUE_GET_OBJ(obj);
++    JSTypedArray *ta = p->u.typed_array;
+ 
+     bc_put_u8(s, BC_TAG_TYPED_ARRAY);
+     bc_put_u8(s, p->class_id - JS_CLASS_UINT8C_ARRAY);
+@@ -39270,6 +40067,9 @@ static int JS_WriteRegExp(BCWriterState *s, JSRegExp regexp)
  
  static int JS_WriteMap(BCWriterState *s, struct JSMapState *map_state);
  static int JS_WriteSet(BCWriterState *s, struct JSMapState *map_state);
@@ -918,7 +925,7 @@
  
  static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
  {
-@@ -38737,13 +39537,37 @@
+@@ -39357,13 +40157,37 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
                  }
                  p->tmp_mark = 1;
              }
@@ -958,7 +965,7 @@
              case JS_CLASS_ARRAY_BUFFER:
                  ret = JS_WriteArrayBuffer(s, obj);
                  break;
-@@ -38775,12 +39599,41 @@
+@@ -39395,12 +40219,41 @@ static int JS_WriteObjectRec(BCWriterState *s, JSValueConst obj)
                  bc_put_u8(s, BC_TAG_SET);
                  ret = JS_WriteSet(s, p->u.map_state);
                  break;
@@ -1002,7 +1009,7 @@
                  }
                  break;
              }
-@@ -38891,6 +39744,7 @@
+@@ -39511,6 +40364,7 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
      if (JS_WriteObjectAtoms(s))
          goto fail;
      js_object_list_end(ctx, &s->object_list);
@@ -1010,7 +1017,7 @@
      js_free(ctx, s->atom_to_idx);
      js_free(ctx, s->idx_to_atom);
      *psize = s->dbuf.size;
-@@ -38907,6 +39761,7 @@
+@@ -39527,6 +40381,7 @@ uint8_t *JS_WriteObject2(JSContext *ctx, size_t *psize, JSValueConst obj,
      return d->buf;
   fail:
      js_object_list_end(ctx, &s->object_list);
@@ -1018,7 +1025,7 @@
      js_free(ctx, s->atom_to_idx);
      js_free(ctx, s->idx_to_atom);
      dbuf_free(&s->dbuf);
-@@ -38938,6 +39793,14 @@
+@@ -39558,6 +40413,14 @@ typedef struct BCReaderState {
      JSObject **objects;
      int objects_count;
      int objects_size;
@@ -1033,12 +1040,10 @@
      /* SAB references */
      uint8_t **sab_tab;
      int sab_tab_len;
-@@ -39289,6 +40152,16 @@
- static int BC_add_object_ref(BCReaderState *s, JSValue obj)
- {
+@@ -39911,6 +40774,16 @@ static int BC_add_object_ref(BCReaderState *s, JSValue obj)
      return BC_add_object_ref1(s, JS_VALUE_GET_OBJ(obj));
-+}
-+
+ }
+ 
 +static int BC_keep_weak_target(BCReaderState *s, JSValueConst target)
 +{
 +    if (js_resize_array(s->ctx, (void **)&s->weak_targets,
@@ -1047,13 +1052,64 @@
 +        return -1;
 +    s->weak_targets[s->weak_targets_count++] = js_dup(target);
 +    return 0;
- }
- 
++}
++
  static JSValue JS_ReadFunctionTag(BCReaderState *s)
-@@ -39526,10 +40399,585 @@
+ {
+     JSContext *ctx = s->ctx;
+@@ -40099,53 +40972,628 @@ static JSValue JS_ReadFunctionTag(BCReaderState *s)
+     if (!has_debug_info)
+         goto nodebug;
  
-  fail:
-     JS_FreeAtom(ctx, bc.func_name);
+-    /* read optional debug information */
+-    bc_read_trace(s, "debug {\n");
+-    if (bc_get_atom(s, &b->filename))
++    /* read optional debug information */
++    bc_read_trace(s, "debug {\n");
++    if (bc_get_atom(s, &b->filename))
++        goto fail;
++    if (bc_get_leb128_int(s, &b->line_num))
++        goto fail;
++    if (bc_get_leb128_int(s, &b->col_num))
++        goto fail;
++#ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
++    if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
++        bc_read_trace(s, "filename: ");
++        print_atom(s->ctx, b->filename);
++        printf(", line: %d, column: %d\n", b->line_num, b->col_num);
++    }
++#endif
++    if (bc_get_leb128_int(s, &b->pc2line_len))
++        goto fail;
++    if (b->pc2line_len) {
++        bc_read_trace(s, "positions: %d bytes\n", b->pc2line_len);
++        b->pc2line_buf = js_mallocz(ctx, b->pc2line_len);
++        if (!b->pc2line_buf)
++            goto fail;
++        if (bc_get_buf(s, b->pc2line_buf, b->pc2line_len))
++            goto fail;
++    }
++    if (bc_get_leb128_int(s, &b->source_len))
++        goto fail;
++    if (b->source_len) {
++        bc_read_trace(s, "source: %d bytes\n", b->source_len);
++        if (s->ptr_last)
++            s->ptr_last += b->source_len;  // omit source code hex dump
++        /* b->source is a UTF-8 encoded null terminated C string */
++        b->source = js_mallocz(ctx, b->source_len + 1);
++        if (!b->source)
++            goto fail;
++        if (bc_get_buf(s, b->source, b->source_len))
++            goto fail;
++    }
++    bc_read_trace(s, "}\n");
++
++ nodebug:
++    b->realm = JS_DupContext(ctx);
++    return obj;
++
++ fail:
++    JS_FreeAtom(ctx, bc.func_name);
 +    JS_FreeValue(ctx, obj);
 +    return JS_EXCEPTION;
 +}
@@ -1076,7 +1132,7 @@
 +            return NULL;
 +        }
 +        var_ref = s->var_refs[index];
-+        var_ref->header.ref_count++;
++        JS_REF_COUNT(var_ref)++;
 +        return var_ref;
 +    }
 +    if (tag != 1 || bc_get_u8(s, &flags)) {
@@ -1088,7 +1144,7 @@
 +    if (!var_ref)
 +        return NULL;
 +    memset(var_ref, 0, sizeof(*var_ref));
-+    var_ref->header.ref_count = 1;
++    JS_REF_COUNT(var_ref) = 1;
 +    var_ref->is_detached = true;
 +    var_ref->is_lexical = flags & 1;
 +    var_ref->is_const = (flags >> 1) & 1;
@@ -1492,15 +1548,24 @@
 +
 +    target = JS_ReadObjectRec(s);
 +    if (JS_IsException(target))
-+        goto fail;
+         goto fail;
+-    if (bc_get_leb128_int(s, &b->line_num))
 +    handler = JS_ReadObjectRec(s);
 +    if (JS_IsException(handler))
-+        goto fail;
+         goto fail;
+-    if (bc_get_leb128_int(s, &b->col_num))
 +    if (JS_VALUE_GET_TAG(target) != JS_TAG_OBJECT ||
 +        JS_VALUE_GET_TAG(handler) != JS_TAG_OBJECT) {
 +        JS_ThrowSyntaxError(ctx, "invalid proxy target or handler");
-+        goto fail;
-+    }
+         goto fail;
+-#ifdef ENABLE_DUMPS // JS_DUMP_READ_OBJECT
+-    if (check_dump_flag(s->ctx->rt, JS_DUMP_READ_OBJECT)) {
+-        bc_read_trace(s, "filename: ");
+-        print_atom(s->ctx, b->filename);
+-        printf(", line: %d, column: %d\n", b->line_num, b->col_num);
+     }
+-#endif
+-    if (bc_get_leb128_int(s, &b->pc2line_len))
 +    proxy = JS_VALUE_GET_OBJ(obj)->u.proxy_data;
 +    proxy->target = target;
 +    proxy->handler = handler;
@@ -1532,14 +1597,20 @@
 +
 +    obj = JS_NewObjectClass(ctx, JS_CLASS_MODULE_NS);
 +    if (JS_IsException(obj) || BC_add_object_ref(s, obj))
-+        goto fail;
+         goto fail;
+-    if (b->pc2line_len) {
+-        bc_read_trace(s, "positions: %d bytes\n", b->pc2line_len);
+-        b->pc2line_buf = js_mallocz(ctx, b->pc2line_len);
+-        if (!b->pc2line_buf)
+-            goto fail;
+-        if (bc_get_buf(s, b->pc2line_buf, b->pc2line_len))
 +    p = JS_VALUE_GET_OBJ(obj);
 +    if (bc_get_leb128(s, &count) || count > 1000 * 1000)
 +        goto fail;
 +    for (i = 0; i < count; i++) {
 +        if (bc_get_atom(s, &atom) || bc_get_u8(s, &flags) ||
 +            (flags & ~JS_PROP_C_W_E) || bc_get_u8(s, &kind) || kind > 2)
-+            goto fail;
+             goto fail;
 +        if (kind == 1) {
 +            var_ref = JS_ReadVarRef(s);
 +            if (!var_ref)
@@ -1581,7 +1652,8 @@
 +        }
 +        JS_FreeAtom(ctx, atom);
 +        atom = JS_ATOM_NULL;
-+    }
+     }
+-    if (bc_get_leb128_int(s, &b->source_len))
 +    p->extensible = false;
 +    return obj;
 +
@@ -1592,10 +1664,10 @@
 +    JS_FreeValue(ctx, value);
 +    JS_FreeValue(ctx, getter);
 +    JS_FreeValue(ctx, setter);
-     JS_FreeValue(ctx, obj);
-     return JS_EXCEPTION;
- }
- 
++    JS_FreeValue(ctx, obj);
++    return JS_EXCEPTION;
++}
++
 +static JSValue JS_ReadHostObject(BCReaderState *s)
 +{
 +    JSValue obj = JS_UNDEFINED, prototype = JS_UNDEFINED;
@@ -1612,36 +1684,45 @@
 +        return JS_ThrowSyntaxError(s->ctx, "invalid host object");
 +    s->ptr += size;
 +    if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT || BC_add_object_ref(s, obj))
-+        goto fail;
+         goto fail;
+-    if (b->source_len) {
+-        bc_read_trace(s, "source: %d bytes\n", b->source_len);
+-        if (s->ptr_last)
+-            s->ptr_last += b->source_len;  // omit source code hex dump
+-        /* b->source is a UTF-8 encoded null terminated C string */
+-        b->source = js_mallocz(ctx, b->source_len + 1);
+-        if (!b->source)
 +    if (bc_get_u8(s, &has_prototype) || has_prototype > 1)
 +        goto fail;
 +    if (has_prototype) {
 +        prototype = JS_ReadObjectRec(s);
 +        if (JS_IsException(prototype))
-+            goto fail;
+             goto fail;
+-        if (bc_get_buf(s, b->source, b->source_len))
 +        if (JS_DefinePropertyValue(s->ctx, obj, JS_ATOM_prototype,
 +                                   prototype,
 +                                   JS_PROP_CONFIGURABLE | JS_PROP_WRITABLE) < 0)
-+            goto fail;
+             goto fail;
 +        prototype = JS_UNDEFINED;
-+    }
-+    return obj;
-+
-+ fail:
+     }
+-    bc_read_trace(s, "}\n");
+-
+- nodebug:
+-    b->realm = JS_DupContext(ctx);
+     return obj;
+ 
+  fail:
+-    JS_FreeAtom(ctx, bc.func_name);
+-    JS_FreeValue(ctx, obj);
 +    JS_FreeValue(s->ctx, prototype);
 +    JS_FreeValue(s->ctx, obj);
-+    return JS_EXCEPTION;
-+}
-+
- static JSValue JS_ReadModule(BCReaderState *s)
- {
-     JSContext *ctx = s->ctx;
-@@ -39692,6 +41140,135 @@
-  fail:
-     JS_FreeValue(ctx, obj);
      return JS_EXCEPTION;
-+}
-+
+ }
+ 
+@@ -40313,6 +41761,135 @@ static JSValue JS_ReadObjectTag(BCReaderState *s)
+     return JS_EXCEPTION;
+ }
+ 
 +static int JS_ReadSnapshotObjectState(BCReaderState *s, JSValueConst obj)
 +{
 +    JSContext *ctx = s->ctx;
@@ -1769,10 +1850,12 @@
 +        return JS_EXCEPTION;
 +    }
 +    return obj;
- }
- 
++}
++
  static JSValue JS_ReadArray(BCReaderState *s, int tag)
-@@ -39873,6 +41450,7 @@
+ {
+     JSContext *ctx = s->ctx;
+@@ -40492,6 +42069,7 @@ static JSValue JS_ReadRegExp(BCReaderState *s)
      JSContext *ctx = s->ctx;
      JSString *pattern;
      JSString *bc;
@@ -1780,7 +1863,7 @@
  
      pattern = JS_ReadString(s);
      if (!pattern)
-@@ -39890,9 +41468,16 @@
+@@ -40510,9 +42088,16 @@ static JSValue JS_ReadRegExp(BCReaderState *s)
          return JS_ThrowInternalError(ctx, "bad regexp bytecode");
      }
  
@@ -1800,7 +1883,7 @@
  }
  
  static JSValue JS_ReadDate(BCReaderState *s)
-@@ -39944,6 +41529,9 @@
+@@ -40564,6 +42149,9 @@ static JSValue JS_ReadObjectValue(BCReaderState *s)
  
  static JSValue JS_ReadMap(BCReaderState *s);
  static JSValue JS_ReadSet(BCReaderState *s);
@@ -1810,11 +1893,10 @@
  
  static JSValue JS_ReadObjectRec(BCReaderState *s)
  {
-@@ -40001,7 +41589,32 @@
-         if (!s->allow_bytecode)
+@@ -40622,6 +42210,31 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
              goto no_allow_bytecode;
          obj = JS_ReadFunctionTag(s);
-+        break;
+         break;
 +    case BC_TAG_BYTECODE_FUNCTION_OBJECT:
 +        if (!s->allow_bytecode)
 +            goto no_allow_bytecode;
@@ -1824,7 +1906,7 @@
 +        if (!s->allow_bytecode)
 +            goto no_allow_bytecode;
 +        obj = JS_ReadCFunctionObject(s);
-         break;
++        break;
 +    case BC_TAG_C_FUNCTION_DATA_OBJECT:
 +        if (!s->allow_bytecode)
 +            goto no_allow_bytecode;
@@ -1843,11 +1925,10 @@
      case BC_TAG_MODULE:
          if (!s->allow_bytecode) {
          no_allow_bytecode:
-@@ -40011,6 +41624,20 @@
-         break;
+@@ -40632,6 +42245,20 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
      case BC_TAG_OBJECT:
          obj = JS_ReadObjectTag(s);
-+        break;
+         break;
 +    case BC_TAG_SNAPSHOT_OBJECT:
 +        obj = JS_ReadSnapshotObjectTag(s);
 +        break;
@@ -1861,14 +1942,14 @@
 +        if (!s->allow_bytecode)
 +            goto no_allow_bytecode;
 +        obj = JS_ReadSnapshotIntrinsic(s);
-         break;
++        break;
      case BC_TAG_ARRAY:
      case BC_TAG_TEMPLATE_OBJECT:
-@@ -40059,18 +41686,28 @@
-         break;
+         obj = JS_ReadArray(s, tag);
+@@ -40680,17 +42307,27 @@ static JSValue JS_ReadObjectRec(BCReaderState *s)
      case BC_TAG_SET:
          obj = JS_ReadSet(s);
-+        break;
+         break;
 +    case BC_TAG_WEAK_MAP:
 +        obj = JS_ReadWeakMap(s);
 +        break;
@@ -1883,7 +1964,7 @@
 +        break;
 +    case BC_TAG_MODULE_NAMESPACE:
 +        obj = JS_ReadModuleNamespace(s);
-         break;
++        break;
      case BC_TAG_SYMBOL:
          {
              JSAtom atom;
@@ -1899,7 +1980,7 @@
          }
          break;
      default:
-@@ -40160,6 +41797,10 @@
+@@ -40780,6 +42417,10 @@ static void bc_reader_free(BCReaderState *s)
          js_free(s->ctx, s->idx_to_atom);
      }
      js_free(s->ctx, s->objects);
@@ -1910,7 +1991,7 @@
  }
  
  JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_len,
-@@ -53457,6 +55098,10 @@
+@@ -54087,6 +55728,10 @@ static JSValue js_map_read(BCReaderState *s, int magic)
          rv = js_map_set(ctx, obj, countof(argv), vc(argv), magic);
          if (JS_IsException(rv))
              goto fail;
@@ -1921,7 +2002,7 @@
          JS_FreeValue(ctx, rv);
          JS_FreeValue(ctx, argv[0]);
          JS_FreeValue(ctx, argv[1]);
-@@ -53481,6 +55126,8 @@
+@@ -54111,6 +55756,8 @@ static int js_map_write(BCWriterState *s, struct JSMapState *map_state,
      if (map_state) {
          list_for_each(el, &map_state->records) {
              mr = list_entry(el, JSMapRecord, link);
@@ -1930,12 +2011,10 @@
              if (JS_WriteObjectRec(s, mr->key))
                  return -1;
              // mr->value is always JS_UNDEFINED for sets
-@@ -53501,6 +55148,16 @@
- static JSValue JS_ReadSet(BCReaderState *s)
- {
+@@ -54133,6 +55780,16 @@ static JSValue JS_ReadSet(BCReaderState *s)
      return js_map_read(s, MAGIC_SET);
-+}
-+
+ }
+ 
 +static JSValue JS_ReadWeakMap(BCReaderState *s)
 +{
 +    return js_map_read(s, MAGIC_WEAK);
@@ -1944,10 +2023,12 @@
 +static JSValue JS_ReadWeakSet(BCReaderState *s)
 +{
 +    return js_map_read(s, MAGIC_SET | MAGIC_WEAK);
- }
- 
++}
++
  static int JS_WriteMap(BCWriterState *s, struct JSMapState *map_state)
-@@ -53513,6 +55170,16 @@
+ {
+     return js_map_write(s, map_state, 0);
+@@ -54143,6 +55800,16 @@ static int JS_WriteSet(BCWriterState *s, struct JSMapState *map_state)
      return js_map_write(s, map_state, MAGIC_SET);
  }
  
@@ -1964,11 +2045,10 @@
  static int js_setlike_get_props(JSContext *ctx, JSValueConst setlike,
                                  uint64_t *psize, JSValue *phas, JSValue *pkeys)
  {
-@@ -62364,7 +64031,126 @@
-     JSContext *ctx;
+@@ -63072,6 +64739,125 @@ typedef struct JSFinalizationRegistryData {
      JSValue cb;
  } JSFinalizationRegistryData;
-+
+ 
 +static bool is_valid_weakref_target(JSValueConst val);
 +
 +static int JS_WriteFinalizationRegistry(BCWriterState *s, JSValueConst obj)
@@ -1978,7 +2058,7 @@
 +    struct list_head *el;
 +    JSFinRecEntry *fre;
 +    uint32_t count = 0;
- 
++
 +    if (!frd) {
 +        JS_ThrowTypeError(s->ctx, "invalid FinalizationRegistry");
 +        return -1;
@@ -2091,4 +2171,3 @@
  static void delete_finrec_weakref(JSRuntime *rt, JSFinRecEntry *fre)
  {
      JSWeakRefRecord **pwr, *wr;
-

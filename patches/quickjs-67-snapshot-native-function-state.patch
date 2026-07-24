@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 8dd4b17..6297518 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -40448,7 +40448,7 @@
+@@ -41006,7 +41006,7 @@ static int JS_WriteCFunctionObject(BCWriterState *s, JSValueConst obj)
      bc_put_u8(s, path.found_exact);
      JS_FreeIntrinsicFunctionPath(&path);
      if (path.found_exact)
@@ -10,7 +11,7 @@ diff --git a/quickjs.c b/quickjs.c
  
      bc_put_u8(s, p->u.cfunc.length);
      bc_put_u8(s, p->u.cfunc.cproto);
-@@ -42173,7 +42173,8 @@
+@@ -42730,7 +42730,8 @@ static JSValue JS_ReadCFunctionObject(BCReaderState *s)
      if (bc_get_u8(s, &is_exact) || is_exact > 1)
          goto fail;
      if (is_exact) {

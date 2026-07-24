@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 8b704c2..ee36220 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -8756,6 +8756,19 @@ static int JS_ThrowTypeErrorReadOnly(JSContext *ctx, int flags, JSAtom atom)
+@@ -9129,6 +9129,19 @@ static int JS_ThrowTypeErrorReadOnly(JSContext *ctx, int flags, JSAtom atom)
      }
  }
  
@@ -20,8 +21,8 @@ diff --git a/quickjs.c b/quickjs.c
 +
  JSValue JS_ThrowOutOfMemory(JSContext *ctx)
  {
-     if (!ctx->rt->in_out_of_memory) {
-@@ -10984,7 +10996,7 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop,
+     JSRuntime *rt = ctx->rt;
+@@ -11357,7 +11370,7 @@ retry:
  
      if (p == JS_VALUE_GET_OBJ(obj)) {
          if (unlikely(!p->extensible)) {
@@ -30,9 +31,7 @@ diff --git a/quickjs.c b/quickjs.c
              goto done;
          }
          if (p->is_exotic) {
-@@ -11028,9 +11040,9 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop,
-         ret = JS_DefineProperty(ctx, this_obj, prop, val,
-                                 JS_UNDEFINED, JS_UNDEFINED,
+@@ -11401,7 +11414,7 @@ retry:
                                  JS_PROP_HAS_VALUE);
      } else {
          if (unlikely(!p->extensible)) {

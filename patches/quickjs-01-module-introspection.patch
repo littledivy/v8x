@@ -1,8 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
-index 11caae0..a5d29c7 100644
+index 2f74ad4..db307b0 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -988,6 +988,67 @@ struct JSModuleDef {
+@@ -1043,6 +1043,67 @@ struct JSModuleDef {
      JSValue private_value; /* private value for C modules */
  };
  
