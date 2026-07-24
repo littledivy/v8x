@@ -605,6 +605,7 @@ fn register_dispatch(
 }
 
 fn lookup_dispatch(
+  ctx: *mut JSContext,
   idx: c_int,
 ) -> Option<(
   FunctionCallback,
@@ -615,9 +616,22 @@ fn lookup_dispatch(
 )> {
   DISPATCH.with(|t| {
     t.borrow().entries.get(idx as usize).map(|e| {
+      // The dispatch table is process-global and outlives any single runtime;
+      // reusable entries (undefined/External data) are shared across runtimes,
+      // including by snapshot-restored functions. The stored JSValue may
+      // therefore belong to a dead runtime — materialize the callback data in
+      // the calling context instead of handing out the stored value. The
+      // returned value is OWNED by the caller (free after dispatch).
+      let data = if e.data_is_undefined {
+        jsv_undefined()
+      } else if let Some(ptr) = e.data_external {
+        make_external_jsvalue(super::core::current_iso(), ctx, ptr)
+      } else {
+        unsafe { JS_DupValue(ctx, e.data) }
+      };
       (
         e.callback,
-        e.data,
+        data,
         e.instance,
         e.signature,
         e.fast_overloads.clone(),
@@ -2756,19 +2770,21 @@ unsafe extern "C" fn fn_trampoline(
   magic: c_int,
 ) -> JSValue {
   let Some((callback, data, _instance, signature, fast_overloads)) =
-    lookup_dispatch(magic)
+    lookup_dispatch(ctx, magic)
   else {
     return jsv_undefined();
   };
   if !receiver_matches_signature(ctx, this_val, signature) {
+    unsafe { JS_FreeValue(ctx, data) };
     return unsafe { JS_ThrowTypeError(ctx, c"Illegal invocation".as_ptr()) };
   }
   if let Some(result) = unsafe {
     try_fast_dispatch(ctx, &fast_overloads, data, this_val, argc, argv)
   } {
+    unsafe { JS_FreeValue(ctx, data) };
     return result;
   }
-  unsafe {
+  let r = unsafe {
     dispatch(
       ctx,
       callback,
@@ -2779,7 +2795,9 @@ unsafe extern "C" fn fn_trampoline(
       argc,
       argv,
     )
-  }
+  };
+  unsafe { JS_FreeValue(ctx, data) };
+  r
 }
 
 unsafe extern "C" fn fn_construct_trampoline(
@@ -2790,13 +2808,13 @@ unsafe extern "C" fn fn_construct_trampoline(
   magic: c_int,
 ) -> JSValue {
   let Some((callback, data, instance, _signature, _fast_overloads)) =
-    lookup_dispatch(magic)
+    lookup_dispatch(ctx, magic)
   else {
     return unsafe { JS_NewObject(ctx) };
   };
 
   if !unsafe { v82jsc_is_constructor_call(ctx) } {
-    return unsafe {
+    let r = unsafe {
       dispatch(
         ctx,
         callback,
@@ -2808,6 +2826,8 @@ unsafe extern "C" fn fn_construct_trampoline(
         argv,
       )
     };
+    unsafe { JS_FreeValue(ctx, data) };
+    return r;
   }
   let new_target = this_or_new_target;
 
@@ -2818,6 +2838,7 @@ unsafe extern "C" fn fn_construct_trampoline(
     unsafe { JS_NewObject(ctx) }
   };
   if jsv_is_exception(&this) {
+    unsafe { JS_FreeValue(ctx, data) };
     return this;
   }
   unsafe {
@@ -2858,6 +2879,7 @@ unsafe extern "C" fn fn_construct_trampoline(
   let r = unsafe {
     dispatch(ctx, callback, data, this, new_target, true, argc, argv)
   };
+  unsafe { JS_FreeValue(ctx, data) };
   if jsv_is_exception(&r) {
     unsafe { JS_FreeValue(ctx, this) };
     return r;
