@@ -1,11 +1,11 @@
 diff --git a/quickjs.c b/quickjs.c
+index 3799d33..8f56b6a 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -53048,7 +53048,126 @@
-         }
+@@ -53640,6 +53640,125 @@ static JSValue js_map_iterator_next(JSContext *ctx, JSValueConst this_val,
      }
  }
-+
+ 
 +/* v82jsc: peek the remaining entries of a Map/Set iterator WITHOUT consuming it
 +   (v8's Object::PreviewEntries / `Deno.core.previewEntries`, used by console to
 +   render `[Set Iterator] { 1, 2, 3 }`). Walks the record list from the
@@ -46,7 +46,7 @@ diff --git a/quickjs.c b/quickjs.c
 +    JSValue arr;
 +    uint32_t idx;
 +    int magic;
- 
++
 +    if (pis_key_value)
 +        *pis_key_value = 0;
 +    if (JS_VALUE_GET_TAG(iter) != JS_TAG_OBJECT)
@@ -128,7 +128,7 @@ diff --git a/quickjs.c b/quickjs.c
  static JSValue js_map_read(BCReaderState *s, int magic)
  {
      JSContext *ctx = s->ctx;
-@@ -55328,6 +55447,12 @@
+@@ -55942,6 +56061,12 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
                  error = js_aggregate_error_constructor(ctx, values);
                  if (JS_IsException(error))
                      goto fail_reject;

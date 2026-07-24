@@ -1,16 +1,8 @@
---- a/quickjs.h
-+++ b/quickjs.h
-@@ -540,6 +540,7 @@
- JS_EXTERN int JS_AddIntrinsicPromise(JSContext *ctx);
- JS_EXTERN int JS_AddIntrinsicBigInt(JSContext *ctx);
- JS_EXTERN int JS_AddIntrinsicWeakRef(JSContext *ctx);
-+JS_EXTERN void JS_ClearKeptObjects(JSRuntime *rt);
- JS_EXTERN int JS_AddPerformance(JSContext *ctx);
- JS_EXTERN int JS_AddIntrinsicDOMException(JSContext *ctx);
- JS_EXTERN int JS_AddIntrinsicAToB(JSContext *ctx);
+diff --git a/quickjs.c b/quickjs.c
+index d52fd4e..10f4eca 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -323,6 +323,7 @@
+@@ -377,6 +377,7 @@ struct JSRuntime {
      // for smuggling the parent promise from js_promise_then
      // to js_promise_constructor
      JSValueLink *parent_promise;
@@ -18,7 +10,7 @@
  
      JSJobContextCapture *job_context_capture;
      JSJobContextSet *job_context_set;
-@@ -2414,6 +2415,7 @@
+@@ -2791,6 +2792,7 @@ void JS_FreeRuntime(JSRuntime *rt)
  
      rt->in_free = true;
      JS_FreeValueRT(rt, rt->current_exception);
@@ -26,7 +18,7 @@
  
      list_for_each_safe(el, el1, &rt->job_list) {
          JSJobEntry *e = list_entry(el, JSJobEntry, link);
-@@ -64861,6 +64863,29 @@
+@@ -65525,6 +65527,29 @@ static void js_weakref_finalizer(JSRuntime *rt, JSValueConst val)
      js_free_rt(rt, wr);
  }
  
@@ -56,7 +48,7 @@
  static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
                                        int argc, JSValueConst *argv)
  {
-@@ -64889,6 +64914,10 @@
+@@ -65555,6 +65580,10 @@ static JSValue js_weakref_constructor(JSContext *ctx, JSValueConst new_target,
      insert_weakref_record(arg, wr);
  
      JS_SetOpaqueInternal(obj, wrd);
@@ -67,7 +59,7 @@
      return obj;
  }
  
-@@ -64900,6 +64929,8 @@
+@@ -65565,6 +65594,8 @@ static JSValue js_weakref_deref(JSContext *ctx, JSValueConst this_val, int argc,
          return JS_EXCEPTION;
      if (wrd == &js_weakref_sentinel)
          return JS_UNDEFINED;
@@ -75,4 +67,16 @@
 +        return JS_EXCEPTION;
      return js_dup(wrd->target);
  }
-
+ 
+diff --git a/quickjs.h b/quickjs.h
+index 1a55a6f..d76c0f3 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -559,6 +559,7 @@ JS_EXTERN int JS_AddIntrinsicTypedArrays(JSContext *ctx);
+ JS_EXTERN int JS_AddIntrinsicPromise(JSContext *ctx);
+ JS_EXTERN int JS_AddIntrinsicBigInt(JSContext *ctx);
+ JS_EXTERN int JS_AddIntrinsicWeakRef(JSContext *ctx);
++JS_EXTERN void JS_ClearKeptObjects(JSRuntime *rt);
+ JS_EXTERN int JS_AddPerformance(JSContext *ctx);
+ JS_EXTERN int JS_AddIntrinsicDOMException(JSContext *ctx);
+ JS_EXTERN int JS_AddIntrinsicAToB(JSContext *ctx);

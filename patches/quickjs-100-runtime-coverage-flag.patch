@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 5dabd5a..f8cc386 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -308,6 +308,7 @@ struct JSRuntime {
+@@ -366,6 +366,7 @@ struct JSRuntime {
      bool in_build_stack_trace;
      /* true if inside JS_FreeRuntime */
      bool in_free;
@@ -8,7 +10,7 @@
  
      struct JSStackFrame *current_stack_frame;
  
-@@ -7998,8 +7999,6 @@ fail:
+@@ -8371,8 +8372,6 @@ fail:
      return b->line_num;
  }
  
@@ -17,7 +19,7 @@
  extern void v82jsc_coverage_function(const void *key,
                                       const char *function_name,
                                       const char *filename,
-@@ -8023,9 +8022,9 @@ extern void v82jsc_coverage_range_hit(const void *key,
+@@ -8396,9 +8395,9 @@ extern void v82jsc_coverage_range_hit(const void *key,
  extern void v82jsc_coverage_function_hit(const void *key);
  extern void v82jsc_debugger_statement(void);
  
@@ -29,7 +31,7 @@
  }
  
  static void js_coverage_register_function(JSFunctionBytecode *b)
-@@ -18372,6 +18371,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -18747,6 +18746,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      JSValue *local_buf, *stack_buf, *var_buf, *arg_buf, *sp, ret_val, *pval;
      JSVarRef **var_refs;
      size_t alloca_size;
@@ -39,7 +41,7 @@
  
  #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_STEP
  #define DUMP_BYTECODE_OR_DONT(pc) \
-@@ -18382,7 +18384,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -18756,7 +18758,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  #endif
  
  #if !DIRECT_DISPATCH
@@ -48,7 +50,7 @@
  #define CASE(op)        case op
  #define DEFAULT         default
  #define BREAK           break
-@@ -18393,8 +18395,19 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -18767,10 +18769,21 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  #include "quickjs-opcode.h"
          [ OP_COUNT ... 255 ] = &&case_default
      };
@@ -69,7 +71,9 @@
 +    __extension__ ({ goto *dispatch_table[opcode]; });
 +coverage_dispatch_done:
  #endif
-@@ -18420,7 +18419,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+ 
+     if (js_poll_interrupts(caller_ctx))
+@@ -18794,7 +18807,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              pc = sf->cur_pc;
              sf->prev_frame = rt->current_stack_frame;
              rt->current_stack_frame = sf;
@@ -78,7 +82,7 @@
                  pc == b->byte_code_buf) {
                  js_coverage_register_function(b);
                  v82jsc_coverage_function_hit(b);
-@@ -18504,7 +18503,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -18878,7 +18891,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
      sf->prev_frame = rt->current_stack_frame;
      rt->current_stack_frame = sf;
      ctx = b->realm; /* set the current realm */
@@ -87,7 +91,7 @@
      {
          js_coverage_register_function(b);
          v82jsc_coverage_function_hit(b);
-@@ -38366,7 +38365,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
+@@ -38851,7 +38864,7 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
      b->realm = JS_DupContext(ctx);
  
      add_gc_object(ctx->rt, &b->header, JS_GC_OBJ_TYPE_FUNCTION_BYTECODE);
@@ -96,9 +100,11 @@
          js_coverage_register_function(b);
  
  #ifdef ENABLE_DUMPS // JS_DUMP_BYTECODE_FINAL
+diff --git a/quickjs.h b/quickjs.h
+index 13e409e..9d34c8f 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1161,7 +1161,7 @@ typedef void JSStackFrameVisitor(void *opaque, const char *function_name,
+@@ -1184,7 +1184,7 @@ typedef void JSStackFrameVisitor(void *opaque, const char *function_name,
                                   int column_num);
  JS_EXTERN void JS_VisitStackFrames(JSRuntime *rt, JSStackFrameVisitor *visitor,
                                     void *opaque);

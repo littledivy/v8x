@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 531a774..c777e54 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1490,7 +1490,8 @@
+@@ -1541,7 +1541,8 @@ static JSValue js_new_promise_capability(JSContext *ctx,
  static __exception int perform_promise_then(JSContext *ctx,
                                              JSValueConst promise,
                                              JSValueConst *resolve_reject,
@@ -10,7 +12,7 @@
  static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv, int magic);
  static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
-@@ -22327,6 +22328,7 @@
+@@ -22828,6 +22829,7 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
              goto resolved;
          } else {
              JSValue promise, resolving_funcs[2], resolving_funcs1[2];
@@ -18,7 +20,7 @@
              int i, res;
  
              /* await */
-@@ -22343,16 +22345,30 @@
+@@ -22844,16 +22846,30 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
              set_stack_frame_gc_owner(ctx->rt, &s->func_state.frame,
                                       resolving_funcs[0]);
  
@@ -52,7 +54,7 @@
              if (res)
                  goto fail;
          }
-@@ -22613,6 +22629,7 @@
+@@ -23116,6 +23132,7 @@ static int js_async_generator_await(JSContext *ctx,
                                      JSValue value)
  {
      JSValue promise, resolving_funcs[2], resolving_funcs1[2];
@@ -60,7 +62,7 @@
      int i, res;
  
      promise = js_promise_resolve(ctx, ctx->promise_ctor,
-@@ -22626,16 +22643,30 @@
+@@ -23129,16 +23146,30 @@ static int js_async_generator_await(JSContext *ctx,
          goto fail;
      }
  
@@ -94,7 +96,7 @@
      if (res)
          goto fail;
      return 0;
-@@ -22722,7 +22753,7 @@
+@@ -23225,7 +23256,7 @@ static int js_async_generator_completed_return(JSContext *ctx,
      resolving_funcs[1] = JS_UNDEFINED;
      res = perform_promise_then(ctx, promise,
                                 vc(resolving_funcs1),
@@ -103,7 +105,7 @@
      JS_FreeValue(ctx, resolving_funcs1[0]);
      JS_FreeValue(ctx, resolving_funcs1[1]);
      JS_FreeValue(ctx, promise);
-@@ -58240,6 +58271,7 @@
+@@ -58786,6 +58817,7 @@ typedef struct JSPromiseReactionData {
      JSValue resolving_funcs[2];
      JSValue handler;
      JSValue job_context;
@@ -111,7 +113,7 @@
  } JSPromiseReactionData;
  
  JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValueConst promise)
-@@ -58296,6 +58328,7 @@
+@@ -58865,6 +58897,7 @@ static void promise_reaction_data_free(JSRuntime *rt,
      JS_FreeValueRT(rt, rd->resolving_funcs[1]);
      JS_FreeValueRT(rt, rd->handler);
      JS_FreeValueRT(rt, rd->job_context);
@@ -119,7 +121,7 @@
      js_free_rt(rt, rd);
  }
  
-@@ -58315,6 +58348,8 @@
+@@ -58884,6 +58917,8 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
      JSValueConst handler, func;
      JSValue res, res2;
      JSValueConst arg;
@@ -128,7 +130,7 @@
      bool is_reject;
  
      assert(argc == 6);
-@@ -58324,9 +58359,13 @@
+@@ -58893,9 +58928,13 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
  
      promise_trace(ctx, "promise_reaction_job: is_reject=%d\n", is_reject);
  
@@ -145,7 +147,7 @@
      }
      if (JS_IsUndefined(handler)) {
          if (is_reject) {
-@@ -58337,14 +58376,15 @@
+@@ -58906,14 +58945,15 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
      } else {
          res = JS_Call(ctx, handler, JS_UNDEFINED, 1, &arg);
      }
@@ -166,7 +168,7 @@
          res = JS_GetException(ctx);
      }
      func = argv[is_reject];
-@@ -58358,6 +58398,11 @@
+@@ -58927,6 +58967,11 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
      }
      JS_FreeValue(ctx, res);
  
@@ -178,7 +180,7 @@
      return res2;
  }
  
-@@ -58390,7 +58435,7 @@
+@@ -58959,7 +59004,7 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
  
      promise_trace(ctx, "fulfill_or_reject_promise: is_reject=%d\n", is_reject);
  
@@ -187,7 +189,7 @@
          JSRuntime *rt = ctx->rt;
          if (rt->promise_hook) {
              rt->promise_hook(ctx, JS_PROMISE_HOOK_RESOLVE, promise,
-@@ -58412,7 +58457,7 @@
+@@ -58976,7 +59021,7 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
          args[2] = rd->handler;
          args[3] = js_bool(is_reject);
          args[4] = value;
@@ -196,7 +198,7 @@
          js_enqueue_job(ctx, promise_reaction_job, 6, args,
                         &rd->job_context);
          list_del(&rd->link);
-@@ -58623,6 +58668,7 @@
+@@ -59187,6 +59232,7 @@ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
              JS_MarkValue(rt, rd->resolving_funcs[1], mark_func);
              JS_MarkValue(rt, rd->handler, mark_func);
              JS_MarkValue(rt, rd->job_context, mark_func);
@@ -204,7 +206,7 @@
          }
      }
      JS_MarkValue(rt, s->promise_result, mark_func);
-@@ -58788,7 +58834,8 @@
+@@ -59352,7 +59398,8 @@ JSValue JS_PromiseThen(JSContext *ctx, JSValueConst promise,
      if (JS_IsException(result_promise))
          return result_promise;
  
@@ -214,7 +216,7 @@
      for (i = 0; i < 2; i++)
          JS_FreeValue(ctx, resolving_funcs[i]);
      if (ret) {
-@@ -59232,7 +59279,8 @@
+@@ -59796,7 +59843,8 @@ static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
  static __exception int perform_promise_then(JSContext *ctx,
                                              JSValueConst promise,
                                              JSValueConst *resolve_reject,
@@ -224,7 +226,7 @@
  {
      JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
      JSPromiseReactionData *rd_array[2], *rd;
-@@ -59260,6 +59308,7 @@
+@@ -59824,6 +59872,7 @@ static __exception int perform_promise_then(JSContext *ctx,
          } else {
              rd->job_context = JS_UNDEFINED;
          }
@@ -232,7 +234,7 @@
          rd_array[i] = rd;
      }
  
-@@ -59281,7 +59330,7 @@
+@@ -59840,7 +59889,7 @@ static __exception int perform_promise_then(JSContext *ctx,
          args[2] = rd->handler;
          args[3] = js_bool(i);
          args[4] = s->promise_result;
@@ -241,7 +243,7 @@
          js_enqueue_job(ctx, promise_reaction_job, 6, args,
                         &rd->job_context);
          for(i = 0; i < 2; i++)
-@@ -59321,7 +59370,8 @@
+@@ -59880,7 +59929,8 @@ static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
      JS_FreeValue(ctx, ctor);
      if (JS_IsException(result_promise))
          return result_promise;
@@ -251,7 +253,7 @@
      for(i = 0; i < 2; i++)
          JS_FreeValue(ctx, resolving_funcs[i]);
      if (ret) {
-@@ -59616,7 +59666,7 @@
+@@ -60175,7 +60225,7 @@ static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst thi
  
          res = perform_promise_then(ctx, value_wrapper_promise,
                                     vc(resolve_reject),
@@ -260,9 +262,11 @@
          JS_FreeValue(ctx, resolve_reject[0]);
          JS_FreeValue(ctx, value_wrapper_promise);
          JS_FreeValue(ctx, resolving_funcs[0]);
+diff --git a/quickjs.h b/quickjs.h
+index 5c6b532..3a40553 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1132,7 +1132,7 @@
+@@ -1156,7 +1156,7 @@ typedef enum JSPromiseHookType {
      JS_PROMISE_HOOK_INIT,     // emitted when a new promise is created
      JS_PROMISE_HOOK_BEFORE,   // runs right before promise.then is invoked
      JS_PROMISE_HOOK_AFTER,    // runs right after promise.then is invoked

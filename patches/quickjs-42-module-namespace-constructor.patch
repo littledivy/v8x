@@ -1,25 +1,16 @@
---- a/quickjs.h
-+++ b/quickjs.h
-@@ -1199,6 +1199,9 @@
- JS_EXTERN JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);
- JS_EXTERN JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m);
- JS_EXTERN JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m);
-+JS_EXTERN JSValue v82jsc_new_module_namespace(JSContext *ctx);
-+JS_EXTERN int v82jsc_module_namespace_set(JSContext *ctx, JSValueConst obj,
-+                                          const char *name, JSValue value);
- 
- /* associate a JSValue to a C module */
- JS_EXTERN int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val);
+diff --git a/quickjs.c b/quickjs.c
+index 861df8c..d52fd4e 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1458,5 +1458,6 @@
+@@ -1508,6 +1508,7 @@ static JSValue JS_ThrowTypeErrorArrayBufferOOB(JSContext *ctx);
+ static JSVarRef *get_var_ref(JSContext *ctx, JSStackFrame *sf, int var_idx,
                               bool is_arg);
  static JSVarRef *js_create_var_ref(JSContext *ctx, bool is_gc_object);
 +static JSVarRef *js_create_module_var(JSContext *ctx, bool is_lexical);
  static JSValue js_call_generator_function(JSContext *ctx, JSValueConst func_obj,
                                            JSValueConst this_obj,
                                            int argc, JSValueConst *argv,
-@@ -31463,6 +31463,62 @@
+@@ -32044,6 +32045,62 @@ static JSValue js_build_module_ns(JSContext *ctx, JSModuleDef *m)
      return JS_EXCEPTION;
  }
  
@@ -82,3 +73,17 @@
  JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m)
  {
      if (JS_IsUndefined(m->module_ns)) {
+diff --git a/quickjs.h b/quickjs.h
+index 7075369..1a55a6f 100644
+--- a/quickjs.h
++++ b/quickjs.h
+@@ -1223,6 +1223,9 @@ JS_EXTERN void JS_SetModuleNormalizeFunc2(JSRuntime *rt,
+ JS_EXTERN JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);
+ JS_EXTERN JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m);
+ JS_EXTERN JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m);
++JS_EXTERN JSValue v82jsc_new_module_namespace(JSContext *ctx);
++JS_EXTERN int v82jsc_module_namespace_set(JSContext *ctx, JSValueConst obj,
++                                          const char *name, JSValue value);
+ 
+ /* associate a JSValue to a C module */
+ JS_EXTERN int JS_SetModulePrivateValue(JSContext *ctx, JSModuleDef *m, JSValue val);

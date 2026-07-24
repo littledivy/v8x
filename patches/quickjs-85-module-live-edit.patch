@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 0553cd5..954957f 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -68308,6 +68308,184 @@ void v82jsc_ensure_error_backtrace(JSContext *ctx, JSValueConst error)
+@@ -68922,6 +68922,184 @@ void v82jsc_ensure_error_backtrace(JSContext *ctx, JSValueConst error)
      build_backtrace(ctx, error, JS_UNDEFINED, NULL, 0, 0, 0);
  }
  
@@ -142,7 +143,7 @@ diff --git a/quickjs.c b/quickjs.c
 +
 +    list_for_each(el, &ctx->rt->gc_obj_list) {
 +        JSGCObjectHeader *header = list_entry(el, JSGCObjectHeader, link);
-+        if (header->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
++        if (JS_GC_TYPE(header) != JS_GC_OBJ_TYPE_JS_OBJECT)
 +            continue;
 +        object = (JSObject *)header;
 +        if (!js_class_has_bytecode(object->class_id) ||
@@ -161,7 +162,7 @@ diff --git a/quickjs.c b/quickjs.c
 +
 +    list_for_each(el, &ctx->rt->gc_obj_list) {
 +        JSGCObjectHeader *header = list_entry(el, JSGCObjectHeader, link);
-+        if (header->gc_obj_type != JS_GC_OBJ_TYPE_JS_OBJECT)
++        if (JS_GC_TYPE(header) != JS_GC_OBJ_TYPE_JS_OBJECT)
 +            continue;
 +        object = (JSObject *)header;
 +        if (!js_class_has_bytecode(object->class_id) ||
@@ -172,7 +173,7 @@ diff --git a/quickjs.c b/quickjs.c
 +        if (!replacement)
 +            continue;
 +        old_bytecodes[closure_index++] = object->u.func.function_bytecode;
-+        replacement->header.ref_count++;
++        JS_REF_COUNT(replacement)++;
 +        object->u.func.function_bytecode = replacement;
 +    }
 +    for (closure_index = 0; closure_index < closure_count; closure_index++) {
@@ -187,9 +188,10 @@ diff --git a/quickjs.c b/quickjs.c
  #undef free
  #undef realloc
 diff --git a/quickjs.h b/quickjs.h
+index 1e2d80b..ecf300f 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1278,6 +1278,8 @@ JS_EXTERN JSValue v82jsc_eval_no_side_effect(JSContext *ctx,
+@@ -1304,6 +1304,8 @@ JS_EXTERN JSValue v82jsc_eval_no_side_effect(JSContext *ctx,
                                               const char *input,
                                               size_t input_len,
                                               const char *filename);

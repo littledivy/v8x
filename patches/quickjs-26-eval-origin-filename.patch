@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index c4a45f9..f5fe870 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -37918,7 +37918,9 @@
+@@ -38564,7 +38564,9 @@ static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
                               JSValueConst val, int flags, int scope_idx)
  {
      JSValue ret;
@@ -11,7 +13,7 @@
      size_t len;
  
      if (!JS_IsString(val))
-@@ -37926,7 +37928,28 @@
+@@ -38572,7 +38574,28 @@ static JSValue JS_EvalObject(JSContext *ctx, JSValueConst this_obj,
      str = JS_ToCStringLen(ctx, &len, val);
      if (!str)
          return JS_EXCEPTION;

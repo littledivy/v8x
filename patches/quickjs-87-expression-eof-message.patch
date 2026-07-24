@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 4c4860c..8b704c2 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -28436,6 +28436,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
+@@ -28896,6 +28896,8 @@ static __exception int js_parse_postfix_expr(JSParseState *s, int parse_flags)
          }
          break;
      default:

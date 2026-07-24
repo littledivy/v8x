@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 6ec4f36..c91df73 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -7408,7 +7408,17 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
+@@ -7821,7 +7821,17 @@ void JS_ComputeMemoryUsage(JSRuntime *rt, JSMemoryUsage *s)
          case JS_CLASS_ARGUMENTS:         /* u.array | length */
              s->array_count++;
              if (p->fast_array) {

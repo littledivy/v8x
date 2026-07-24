@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index c17e92d..04b8491 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -2242,6 +2242,11 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
+@@ -2623,6 +2623,11 @@ void JS_SetInterruptHandler(JSRuntime *rt, JSInterruptHandler *cb, void *opaque)
      rt->interrupt_opaque = opaque;
  }
  

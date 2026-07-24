@@ -1,8 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
-index 11caae0..11caae0 100644
+index fec4cf0..6c11c74 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1678,6 +1678,47 @@ JSValue v82jsc_global_var_obj(JSContext *ctx) {
+@@ -1719,6 +1719,47 @@ JSValue v82jsc_global_var_obj(JSContext *ctx) {
      return js_dup(ctx->global_var_obj);
  }
  
@@ -21,7 +21,7 @@ index 11caae0..11caae0 100644
 +    *count = 0;
 +    list_for_each(el, &ctx->rt->gc_obj_list) {
 +        JSGCObjectHeader *header = list_entry(el, JSGCObjectHeader, link);
-+        if (header->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT)
++        if (JS_GC_TYPE(header) == JS_GC_OBJ_TYPE_JS_OBJECT)
 +            capacity++;
 +    }
 +    if (capacity == 0)
@@ -31,7 +31,7 @@ index 11caae0..11caae0 100644
 +        return NULL;
 +    list_for_each(el, &ctx->rt->gc_obj_list) {
 +        JSGCObjectHeader *header = list_entry(el, JSGCObjectHeader, link);
-+        if (header->gc_obj_type == JS_GC_OBJ_TYPE_JS_OBJECT) {
++        if (JS_GC_TYPE(header) == JS_GC_OBJ_TYPE_JS_OBJECT) {
 +            JSObject *object = (JSObject *)header;
 +            objects[index++] = js_dup(JS_MKPTR(JS_TAG_OBJECT, object));
 +        }

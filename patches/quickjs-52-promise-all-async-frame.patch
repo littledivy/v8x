@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 8f7b1fd..3bc5ca1 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21464,35 +21464,38 @@
+@@ -21965,35 +21965,38 @@ static int js_async_function_resolve_create(JSContext *ctx,
     self-contained object; the embedder reads file/line/col via methods. */
  static JSValue js_v82jsc_make_async_callsite(JSContext *ctx, const char *file,
                                               int line, int col,
@@ -48,7 +49,7 @@ diff --git a/quickjs.c b/quickjs.c
      JS_FreeValue(ctx, factory);
      JS_FreeValue(ctx, argv[0]);
      JS_FreeValue(ctx, argv[3]);
-@@ -21737,7 +21740,7 @@
+@@ -22238,7 +22241,7 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
              }
          }
          JSValue cs_obj = js_v82jsc_make_async_callsite(ctx, file, line, col,
@@ -57,11 +58,10 @@ diff --git a/quickjs.c b/quickjs.c
          if (!JS_IsNull(cs_obj)) {
              JS_DefinePropertyValueUint32(ctx, arr, next_idx, cs_obj,
                                           JS_PROP_C_W_E);
-@@ -21750,7 +21753,91 @@
-         JS_FreeAtom(ctx, key_atom);
+@@ -22252,6 +22255,90 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
      }
  }
-+
+ 
 +static void js_v82jsc_append_promise_all_frame(JSContext *ctx,
 +                                                JSValueConst error,
 +                                                int index)
@@ -72,7 +72,7 @@ diff --git a/quickjs.c b/quickjs.c
 +    DynBuf dbuf;
 +    const char *cs;
 +    size_t len;
- 
++
 +    if (JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
 +        return;
 +    error_obj = JS_VALUE_GET_OBJ(error);
@@ -149,12 +149,10 @@ diff --git a/quickjs.c b/quickjs.c
  static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
  {
      bool is_success = true;
-@@ -58275,6 +58362,21 @@
-         JS_FreeValue(ctx, ret);
-     }
+@@ -58874,6 +58961,21 @@ static JSValue js_promise_all_resolve_element(JSContext *ctx,
      return JS_UNDEFINED;
-+}
-+
+ }
+ 
 +static JSValue js_v82jsc_promise_all_reject_element(
 +    JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv,
 +    int magic, JSValueConst *func_data)
@@ -168,10 +166,12 @@ diff --git a/quickjs.c b/quickjs.c
 +        return JS_EXCEPTION;
 +    js_v82jsc_append_promise_all_frame(ctx, error, index);
 +    return JS_Call(ctx, func_data[1], JS_UNDEFINED, 1, &error);
- }
- 
++}
++
  /* magic = 0: Promise.all 1: Promise.allSettled */
-@@ -58368,7 +58470,16 @@
+ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
+                               int argc, JSValueConst *argv, int magic)
+@@ -58965,7 +59067,16 @@ static JSValue js_promise_all(JSContext *ctx, JSValueConst this_val,
                  reject_element = resolve_element;
                  resolve_element = js_dup(resolving_funcs[0]);
              } else {

@@ -1,13 +1,16 @@
+diff --git a/quickjs.c b/quickjs.c
+index 04ea95b..3f913d7 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21599,12 +21599,22 @@ void v82jsc_mark_skip_next_async_frame(JSContext *ctx, JSValueConst error,
+@@ -22099,6 +22099,7 @@ void v82jsc_mark_skip_next_async_frame(JSContext *ctx, JSValueConst error,
+                                        JSValueConst filename)
  {
      JSAtom atom;
 +    JSValue marker;
  
      if (JS_VALUE_GET_TAG(error) != JS_TAG_OBJECT)
          return;
-     atom = js_v82jsc_private_atom(ctx,
+@@ -22106,33 +22107,64 @@ void v82jsc_mark_skip_next_async_frame(JSContext *ctx, JSValueConst error,
          "v82jsc_private:skip_next_async_frame");
      if (atom == JS_ATOM_NULL)
          return;
@@ -23,7 +26,6 @@
      if (JS_DefinePropertyValue(ctx, error, atom, js_dup(filename),
                                 JS_PROP_CONFIGURABLE) < 0)
          JS_FreeValue(ctx, JS_GetException(ctx));
-@@ -21611,27 +21611,49 @@ void v82jsc_mark_skip_next_async_frame(JSContext *ctx, JSValueConst error,
      JS_FreeAtom(ctx, atom);
  }
  
@@ -80,7 +82,7 @@
      if (marked_file)
          JS_FreeCString(ctx, marked_file);
      JS_FreeValue(ctx, marker);
-@@ -21707,13 +21729,14 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
+@@ -22207,13 +22239,14 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
      DynBuf dbuf;
      const char *cs;
      size_t len;
@@ -91,14 +93,14 @@
          return;
      skip_marked = js_v82jsc_take_skip_next_async_frame(ctx, error, file);
 -    if (skip_marked &&
+-        js_v82jsc_has_same_async_site(ctx, error, file, -1))
 +    if (skip_marked == 2 ||
 +        (skip_marked == 1 &&
--        js_v82jsc_has_same_async_site(ctx, error, file, -1))
 +         js_v82jsc_has_same_async_site(ctx, error, file, -1)))
          return;
      error_obj = JS_VALUE_GET_OBJ(error);
      stack_prop = find_own_property1(error_obj, JS_ATOM_stack);
-@@ -21734,8 +21752,7 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
+@@ -22233,8 +22266,7 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
          cs = JS_ToCStringLen(ctx, &len, stack);
          if (cs) {
              dbuf_put(&dbuf, (const uint8_t *)cs, len);
@@ -108,7 +110,7 @@
              JS_FreeCString(ctx, cs);
          }
      }
-@@ -32827,6 +32844,7 @@ static JSValue js_async_module_execution_rejected(JSContext *ctx, JSValueConst t
+@@ -33382,6 +33414,7 @@ static JSValue js_async_module_execution_rejected(JSContext *ctx, JSValueConst t
      module->async_func_state = NULL;
      module->eval_has_exception = true;
      module->eval_exception = js_dup(error);
@@ -116,7 +118,7 @@
      module->status = JS_MODULE_STATUS_EVALUATED;
  
      for(i = 0; i < module->async_parent_modules_count; i++) {
-@@ -33104,6 +33122,7 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
+@@ -33662,6 +33695,7 @@ static JSValue js_evaluate_module(JSContext *ctx, JSModuleDef *m)
              m1->status = JS_MODULE_STATUS_EVALUATED;
              m1->eval_has_exception = true;
              m1->eval_exception = js_dup(result);

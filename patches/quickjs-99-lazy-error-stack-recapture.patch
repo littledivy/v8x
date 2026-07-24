@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index d0aac4a..5dabd5a 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -8386,6 +8386,15 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+@@ -8759,6 +8759,15 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
      }
      rt->in_build_stack_trace = true;
      error_obj = js_dup(error_val);
@@ -16,7 +18,7 @@
  
      // Save exception because conversion to double may fail.
      saved_exception = JS_GetException(ctx);
-@@ -8570,7 +8580,14 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+@@ -8943,7 +8952,14 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
  
      if (JS_IsUndefined(ctx->error_back_trace))
          ctx->error_back_trace = js_dup(stack);
@@ -32,7 +34,7 @@
          /* Error.captureStackTrace(target, ...): install an own data property
             on the (possibly non-Error) target, shadowing the accessor. Because
             it shadows js_error_get_stack, prepend the v8 `name: message` header
-@@ -8578,13 +8595,6 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
+@@ -8951,13 +8967,6 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
          stack = js_error_prepend_stack_header(ctx, error_obj, stack);
          JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack,
                                 JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);

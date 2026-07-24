@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 7acd6ab..0553cd5 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -504,6 +504,8 @@
+@@ -561,6 +561,8 @@ struct JSContext {
         - the prototype of Object.prototype is null (always true as it is immutable)
      */
      uint8_t std_array_prototype : 1;
@@ -9,7 +11,7 @@
  
      JSShape *array_shape;   /* initial shape for Array objects */
      JSShape *arguments_shape;  /* shape for arguments objects */
-@@ -8666,6 +8668,7 @@
+@@ -9039,6 +9041,7 @@ JS_ThrowError(JSContext *ctx, JSErrorEnum error_num,
  }
  
  #define JS_ERROR_MAP(X)     \
@@ -17,7 +19,7 @@
      X(Internal, INTERNAL)   \
      X(Plain, PLAIN)         \
      X(Range, RANGE)         \
-@@ -10801,6 +10804,12 @@
+@@ -11174,6 +11177,12 @@ static int JS_SetPropertyInternal2(JSContext *ctx, JSValueConst obj, JSAtom prop
      int desc_flags;
      int ret;
  
@@ -30,7 +32,7 @@
      switch(JS_VALUE_GET_TAG(this_obj)) {
      case JS_TAG_NULL:
          JS_ThrowTypeErrorAtom(ctx, "Cannot set properties of null (setting '%s')", prop);
-@@ -12092,6 +12101,12 @@
+@@ -12465,6 +12474,12 @@ static inline int JS_SetGlobalVar(JSContext *ctx, JSAtom prop, JSValue val,
      JSProperty *pr;
      int ret;
  
@@ -43,19 +45,19 @@
      /* no exotic behavior is possible in global_var_obj */
      p = JS_VALUE_GET_OBJ(ctx->global_var_obj);
      prs = find_own_property(&pr, p, prop);
-@@ -12168,6 +12183,11 @@
-     JSValue obj1;
+@@ -12542,6 +12557,11 @@ int JS_DeleteProperty(JSContext *ctx, JSValueConst obj, JSAtom prop, int flags)
      JSObject *p;
      int res;
-+
+ 
 +    if (unlikely(ctx->v82jsc_throw_on_side_effect)) {
 +        JS_ThrowEvalError(ctx, "Possible side-effect in debug-evaluate");
 +        return -1;
 +    }
- 
++
      obj1 = JS_ToObject(ctx, obj);
      if (JS_IsException(obj1))
-@@ -18361,6 +18381,14 @@
+         return -1;
+@@ -18735,6 +18755,14 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          }
      }
      p = JS_VALUE_GET_OBJ(func_obj);
@@ -70,7 +72,7 @@
      if (unlikely(p->class_id != JS_CLASS_BYTECODE_FUNCTION)) {
          JSClassCall *call_func;
          call_func = rt->class_array[p->class_id].call;
-@@ -19924,6 +19952,10 @@
+@@ -20298,6 +20326,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                  atom = get_u32(pc);
                  pc += 4;
  
@@ -81,7 +83,7 @@
                  obj = sp[-2];
                  if (likely(JS_VALUE_GET_TAG(obj) == JS_TAG_OBJECT)) {
                      p = JS_VALUE_GET_OBJ(obj);
-@@ -20205,6 +20237,10 @@
+@@ -20614,6 +20646,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                  JSObject *p;
  
                  val = sp[-1];
@@ -92,12 +94,10 @@
                  if (likely(JS_VALUE_GET_TAG(sp[-2]) == JS_TAG_INT)) {
                      idx = JS_VALUE_GET_INT(sp[-2]);
                      if (likely(JS_VALUE_GET_TAG(sp[-3]) == JS_TAG_OBJECT)) {
-@@ -39491,6 +39527,39 @@
-         .eval_flags = eval_flags
-     };
+@@ -39983,6 +40019,39 @@ JSValue JS_Eval(JSContext *ctx, const char *input, size_t input_len,
      return JS_EvalThis2(ctx, ctx->global_obj, input, input_len, &options);
-+}
-+
+ }
+ 
 +JSValue v82jsc_eval_no_side_effect(JSContext *ctx,
 +                                   const char *input,
 +                                   size_t input_len,
@@ -129,12 +129,16 @@
 +    ctx->v82jsc_side_effect_root = NULL;
 +    ctx->v82jsc_throw_on_side_effect = false;
 +    return result;
- }
- 
++}
++
  JSValue JS_Eval2(JSContext *ctx, const char *input, size_t input_len, JSEvalOptions *options)
+ {
+     return JS_EvalThis2(ctx, ctx->global_obj, input, input_len, options);
+diff --git a/quickjs.h b/quickjs.h
+index cbfc4e8..1e2d80b 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1277,6 +1277,10 @@
+@@ -1300,6 +1300,10 @@ JS_EXTERN JSValue JS_ReadObject2(JSContext *ctx, const uint8_t *buf, size_t buf_
  /* instantiate and evaluate a bytecode function. Only used when
     reading a script or module with JS_ReadObject() */
  JS_EXTERN JSValue JS_EvalFunction(JSContext *ctx, JSValue fun_obj);

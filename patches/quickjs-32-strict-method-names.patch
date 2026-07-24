@@ -1,8 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
-index 11caae0..11caae0 100644
+index 987ce2e..935bc1f 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -37210,7 +37210,10 @@ static int js_parse_function_check_names(JSParseState *s, JSFunctionDef *fd,
+@@ -37856,7 +37856,10 @@ static int js_parse_function_check_names(JSParseState *s, JSFunctionDef *fd,
          if (!fd->has_simple_parameter_list && fd->has_use_strict) {
              return js_parse_error(s, "\"use strict\" not allowed in function with default or destructuring parameter");
          }

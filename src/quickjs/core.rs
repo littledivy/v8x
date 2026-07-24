@@ -2632,7 +2632,10 @@ unsafe fn origin_host_defined_options(origin: *const c_void) -> *const Data {
   if origin.is_null() {
     return ptr::null();
   }
-  unsafe { *((origin as *const usize).add(3)) as *const Data }
+  // Layout per RawScriptOrigin in module.rs: resource_name, source_map_url,
+  // {script_id,line}, {column,pad}, host_defined_options — word 4, not 3
+  // (word 3 is the column offset + padding).
+  unsafe { *((origin as *const usize).add(4)) as *const Data }
 }
 
 #[unsafe(no_mangle)]
@@ -2867,10 +2870,14 @@ pub extern "C" fn v8__Script__Run(
     push_current_host_defined_options(host_defined_options);
   super::inspector::maybe_pause_on_next_statement();
   // Capture the source under its eval filename for the stack-trace shim.
-  if let Some(name) = fname_owned.as_ref()
-    && let Ok(fname) = name.to_str()
+  // Anonymous scripts register under the engine-visible "<eval>" name so the
+  // inspector still emits Debugger.scriptParsed for them (V8 does, with "").
   {
     let bytes = unsafe { std::slice::from_raw_parts(cstr as *const u8, len) };
+    let fname = fname_owned
+      .as_ref()
+      .and_then(|name| name.to_str().ok())
+      .unwrap_or("<eval>");
     register_script_source(fname, &String::from_utf8_lossy(bytes));
   }
   // Script bytecode cache: parse once per (source, flags), then boot from

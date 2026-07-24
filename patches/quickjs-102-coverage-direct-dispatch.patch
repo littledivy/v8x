@@ -1,8 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
-index 241c217..e04f6bb 100644
+index 9c1a171..95a8c3f 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -18400,7 +18400,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -18774,7 +18774,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          [ OP_COUNT ... 255 ] = &&case_default
      };
      __extension__ static const void * const coverage_dispatch_table[256] = {
@@ -14,7 +14,7 @@ index 241c217..e04f6bb 100644
      };
      active_dispatch_table = rt->v82jsc_precise_coverage_enabled
                                  ? coverage_dispatch_table
-@@ -18410,9 +18413,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -18784,9 +18787,9 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
  #define DEFAULT         case_default
  #define BREAK           SWITCH(pc)
      goto coverage_dispatch_done;

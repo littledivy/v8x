@@ -1,11 +1,11 @@
 diff --git a/quickjs.c b/quickjs.c
+index dc9aa54..cadd824 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21699,14 +21699,81 @@
-     JS_FreeAtom(ctx, atom);
+@@ -22201,13 +22201,80 @@ static int js_v82jsc_take_skip_next_async_frame(JSContext *ctx,
      return skip;
  }
-+
+ 
 +static bool js_v82jsc_text_stack_has_same_async_site(JSContext *ctx,
 +                                                      JSValueConst stack,
 +                                                      const char *file,
@@ -17,7 +17,7 @@ diff --git a/quickjs.c b/quickjs.c
 +    size_t len, file_len, func_len;
 +    int site_line;
 +    bool same = false;
- 
++
 +    if (!JS_IsString(stack) || line < 0)
 +        return false;
 +    text = JS_ToCStringLen(ctx, &len, stack);
@@ -86,7 +86,7 @@ diff --git a/quickjs.c b/quickjs.c
      int32_t site_line = 0;
      bool same = false;
  
-@@ -21718,7 +21785,13 @@
+@@ -22219,7 +22286,13 @@ static bool js_v82jsc_has_same_async_site(JSContext *ctx,
      JS_FreeAtom(ctx, key_atom);
      if (!JS_IsArray(existing)) {
          JS_FreeValue(ctx, existing);
@@ -101,16 +101,14 @@ diff --git a/quickjs.c b/quickjs.c
      }
      site = JS_GetPropertyUint32(ctx, existing, 0);
      JS_FreeValue(ctx, existing);
-@@ -21732,16 +21805,25 @@
-     JS_FreeValue(ctx, method);
-     method = JS_GetPropertyStr(ctx, site, "getLineNumber");
+@@ -22235,14 +22308,23 @@ static bool js_v82jsc_has_same_async_site(JSContext *ctx,
      line_value = JS_IsFunction(ctx, method)
-+        ? JS_Call(ctx, method, site, 0, NULL) : JS_UNDEFINED;
-+    JS_FreeValue(ctx, method);
-+    method = JS_GetPropertyStr(ctx, site, "getFunctionName");
-+    func_value = JS_IsFunction(ctx, method)
          ? JS_Call(ctx, method, site, 0, NULL) : JS_UNDEFINED;
      JS_FreeValue(ctx, method);
++    method = JS_GetPropertyStr(ctx, site, "getFunctionName");
++    func_value = JS_IsFunction(ctx, method)
++        ? JS_Call(ctx, method, site, 0, NULL) : JS_UNDEFINED;
++    JS_FreeValue(ctx, method);
      JS_FreeValue(ctx, site);
      site_file = JS_ToCString(ctx, file_value);
 +    site_func = JS_IsString(func_value) ? JS_ToCString(ctx, func_value) : NULL;
@@ -128,7 +126,7 @@ diff --git a/quickjs.c b/quickjs.c
      if (JS_HasException(ctx))
          JS_FreeValue(ctx, JS_GetException(ctx));
      return same;
-@@ -21772,7 +21854,7 @@
+@@ -22273,7 +22355,7 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
      skip_marked = js_v82jsc_take_skip_next_async_frame(ctx, error, file);
      if (skip_marked == 2 ||
          (skip_marked == 1 &&
@@ -137,7 +135,7 @@ diff --git a/quickjs.c b/quickjs.c
          return;
      error_obj = JS_VALUE_GET_OBJ(error);
      stack_prop = find_own_property1(error_obj, JS_ATOM_stack);
-@@ -21780,7 +21862,7 @@
+@@ -22281,7 +22363,7 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
          (stack_prop->flags & JS_PROP_TMASK) == JS_PROP_GETSET &&
          !js_error_has_native_stack_accessor(ctx, error_obj))
          return;

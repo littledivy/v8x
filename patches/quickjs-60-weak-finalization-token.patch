@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 3f913d7..9a2880a 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -560,6 +560,7 @@ typedef enum {
+@@ -617,6 +617,7 @@ typedef enum {
      JS_WEAK_REF_KIND_MAP,
      JS_WEAK_REF_KIND_WEAK_REF,
      JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY,
@@ -9,7 +10,7 @@ diff --git a/quickjs.c b/quickjs.c
  } JSWeakRefKindEnum;
  
  typedef struct JSWeakRefRecord {
-@@ -65546,9 +65547,11 @@ typedef struct JSFinRecEntry {
+@@ -66188,9 +66189,11 @@ typedef struct JSFinRecEntry {
      struct list_head link;
      JSValueConst target;
      JSValue held_val;
@@ -22,7 +23,7 @@ diff --git a/quickjs.c b/quickjs.c
  } JSFinRecEntry;
  
  typedef struct JSFinalizationRegistryData {
-@@ -65597,7 +65600,7 @@ static JSValue JS_ReadFinalizationRegistry(BCReaderState *s)
+@@ -66239,7 +66242,7 @@ static JSValue JS_ReadFinalizationRegistry(BCReaderState *s)
      JSContext *ctx = s->ctx;
      JSFinalizationRegistryData *frd;
      JSFinRecEntry *fre;
@@ -31,7 +32,7 @@ diff --git a/quickjs.c b/quickjs.c
      JSValue obj = JS_UNDEFINED, cb = JS_UNDEFINED;
      JSValue target = JS_UNDEFINED, held_val = JS_UNDEFINED;
      JSValue token = JS_UNDEFINED;
-@@ -65643,6 +65646,10 @@ static JSValue JS_ReadFinalizationRegistry(BCReaderState *s)
+@@ -66285,6 +66288,10 @@ static JSValue JS_ReadFinalizationRegistry(BCReaderState *s)
          }
          if (BC_keep_weak_target(s, target))
              goto fail;
@@ -42,7 +43,7 @@ diff --git a/quickjs.c b/quickjs.c
          fre = js_malloc(ctx, sizeof(*fre));
          if (!fre)
              goto fail;
-@@ -65651,19 +65658,36 @@ static JSValue JS_ReadFinalizationRegistry(BCReaderState *s)
+@@ -66293,19 +66300,36 @@ static JSValue JS_ReadFinalizationRegistry(BCReaderState *s)
              js_free(ctx, fre);
              goto fail;
          }
@@ -80,7 +81,7 @@ diff --git a/quickjs.c b/quickjs.c
      }
      return obj;
  
-@@ -65676,26 +65700,27 @@ static JSValue JS_ReadFinalizationRegistry(BCReaderState *s)
+@@ -66318,26 +66342,27 @@ static JSValue JS_ReadFinalizationRegistry(BCReaderState *s)
      return JS_EXCEPTION;
  }
  
@@ -117,7 +118,7 @@ diff --git a/quickjs.c b/quickjs.c
      JS_FreeValueRT(rt, fre->cb);
      JS_FreeContext(fre->ctx);
      js_free_rt(rt, fre);
-@@ -65710,7 +65735,8 @@ static void js_finrec_finalizer(JSRuntime *rt, JSValueConst val)
+@@ -66352,7 +66377,8 @@ static void js_finrec_finalizer(JSRuntime *rt, JSValueConst val)
             by freeing a token / held value. */
          list_for_each_safe(el, el1, &frd->entries) {
              JSFinRecEntry *fre = list_entry(el, JSFinRecEntry, link);
@@ -127,7 +128,7 @@ diff --git a/quickjs.c b/quickjs.c
          }
          /* second pass to actually free all objects. */
          list_for_each_safe(el, el1, &frd->entries) {
-@@ -65733,7 +65759,6 @@ static void js_finrec_mark(JSRuntime *rt, JSValueConst val,
+@@ -66375,7 +66401,6 @@ static void js_finrec_mark(JSRuntime *rt, JSValueConst val,
          list_for_each(el, &frd->entries) {
              JSFinRecEntry *fre = list_entry(el, JSFinRecEntry, link);
              JS_MarkValue(rt, fre->held_val, mark_func);
@@ -135,7 +136,7 @@ diff --git a/quickjs.c b/quickjs.c
              JS_MarkValue(rt, fre->cb, mark_func);
              mark_func(rt, &fre->ctx->header);
          }
-@@ -65792,15 +65817,31 @@ static JSValue js_finrec_register(JSContext *ctx, JSValueConst this_val,
+@@ -66434,15 +66459,31 @@ static JSValue js_finrec_register(JSContext *ctx, JSValueConst this_val,
          js_free(ctx, fre);
          return JS_EXCEPTION;
      }
@@ -168,7 +169,7 @@ diff --git a/quickjs.c b/quickjs.c
  
      return JS_UNDEFINED;
  }
-@@ -65821,7 +65862,10 @@ static JSValue js_finrec_unregister(JSContext *ctx, JSValueConst this_val, int a
+@@ -66463,7 +66504,10 @@ static JSValue js_finrec_unregister(JSContext *ctx, JSValueConst this_val, int a
          JSFinRecEntry *fre = list_entry(el, JSFinRecEntry, link);
          if (js_same_value(ctx, fre->token, token)) {
              list_del(&fre->link);
@@ -180,21 +181,22 @@ diff --git a/quickjs.c b/quickjs.c
              js_finrec_free(ctx->rt, fre);
              removed = true;
          }
-@@ -65911,7 +65955,13 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
+@@ -66553,8 +66597,14 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
              break;
          case JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY:
              fre = wr->u.fin_rec_entry;
 +            fre->target_weak_ref = NULL;
              list_del(&fre->link);
-+            break;
+             break;
 +        case JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_TOKEN:
 +            fre = wr->u.fin_rec_entry;
 +            fre->token = JS_UNDEFINED;
 +            fre->token_weak_ref = NULL;
-             break;
++            break;
          default:
              abort();
-@@ -65935,6 +65985,7 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
+         }
+@@ -66577,6 +66627,7 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
              break;
          case JS_WEAK_REF_KIND_FINALIZATION_REGISTRY_ENTRY: {
              fre = wr->u.fin_rec_entry;
@@ -202,7 +204,7 @@ diff --git a/quickjs.c b/quickjs.c
              /**
               * During the GC sweep phase the held object might be
               * collected first (free_mark set). Also skip if the
-@@ -65962,6 +66013,8 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
+@@ -66604,6 +66655,8 @@ static void reset_weak_ref(JSRuntime *rt, JSWeakRefRecord **first_weak_ref)
              js_finrec_free(rt, fre);
              break;
          }

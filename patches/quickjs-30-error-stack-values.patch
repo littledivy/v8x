@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 3f7f33f..274113b 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -44384,10 +44384,12 @@
+@@ -45032,10 +45032,12 @@ static JSValue js_error_set_stack(JSContext *ctx, JSValueConst this_val,
  
      if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
          return JS_ThrowTypeErrorNotAnObject(ctx);

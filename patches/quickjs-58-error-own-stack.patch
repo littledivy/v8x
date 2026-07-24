@@ -1,11 +1,11 @@
+diff --git a/quickjs.c b/quickjs.c
+index 3b55b18..04ea95b 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -8103,10 +8103,62 @@
-     if (find_own_property1(p, JS_ATOM_stack))
-         return false;
+@@ -8519,8 +8519,60 @@ static bool can_add_backtrace(JSValueConst obj)
      return true;
-+}
-+
+ }
+ 
 +static bool js_error_has_native_stack_accessor(JSContext *ctx, JSObject *p)
 +{
 +    JSObject *proto;
@@ -56,15 +56,15 @@
 +                 : JS_UNDEFINED;
 +    return JS_DefinePropertyGetSet(ctx, obj, JS_ATOM_stack, getter, setter,
 +                                   JS_PROP_CONFIGURABLE);
- }
- 
++}
++
  /* Note: it is important that no exception is returned by this function */
 -static bool can_store_error_stack(JSValueConst obj)
 +static bool can_store_error_stack(JSContext *ctx, JSValueConst obj)
  {
      JSObject *p;
      if (JS_VALUE_GET_TAG(obj) != JS_TAG_OBJECT)
-@@ -8116,7 +8168,8 @@
+@@ -8530,7 +8582,8 @@ static bool can_store_error_stack(JSValueConst obj)
          return false;
      if (!JS_IsUndefined(p->u.object_data))
          return false;
@@ -74,7 +74,7 @@
          return false;
      return true;
  }
-@@ -8219,7 +8272,8 @@
+@@ -8633,7 +8686,8 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
          if (p->class_id == JS_CLASS_ERROR &&
              !(backtrace_flags & JS_BACKTRACE_FLAG_FILTER_FUNC) &&
              (!JS_IsUndefined(p->u.object_data) ||
@@ -84,7 +84,7 @@
              if (JS_IsUndefined(ctx->error_back_trace) &&
                  !JS_IsUndefined(p->u.object_data))
                  ctx->error_back_trace = js_dup(p->u.object_data);
-@@ -8383,7 +8437,7 @@
+@@ -8797,7 +8851,7 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
              JS_FreeValue(ctx, csd[k].this_val);
          }
          defer_prepare = has_embedder_prepare &&
@@ -93,7 +93,7 @@
                          js_mark_error_stack_pending(ctx, stack);
          if (defer_prepare) {
              JS_FreeValue(ctx, prepare);
-@@ -8420,12 +8474,13 @@
+@@ -8834,12 +8888,13 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
          stack = js_error_prepend_stack_header(ctx, error_obj, stack);
          JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack,
                                 JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
@@ -108,7 +108,7 @@
      } else if (can_add_backtrace(error_obj)) {
          /* DOMException and the like keep an own "stack" data property (no
             Error.prototype accessor), so prepend the header here (v82jsc). */
-@@ -18084,9 +18139,9 @@
+@@ -18499,9 +18554,9 @@ static void dump_single_byte_code(JSContext *ctx, const uint8_t *pc,
  static void print_func_name(JSFunctionBytecode *b);
  #endif
  
@@ -120,7 +120,7 @@
  }
  
  /* argv[] is modified if (flags & JS_CALL_FLAG_COPY_ARGV) = 0. */
-@@ -20887,7 +20942,7 @@
+@@ -21388,7 +21443,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
          }
      }
   exception:
@@ -129,7 +129,7 @@
      || JS_IsUndefined(ctx->error_back_trace)) {
          sf->cur_pc = pc;
          build_backtrace(ctx, rt->current_exception, JS_UNDEFINED,
-@@ -21662,7 +21717,8 @@
+@@ -22163,7 +22218,8 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
      error_obj = JS_VALUE_GET_OBJ(error);
      stack_prop = find_own_property1(error_obj, JS_ATOM_stack);
      if (stack_prop &&
@@ -139,7 +139,7 @@
          return;
      if (js_v82jsc_has_same_async_site(ctx, error, file, line))
          return;
-@@ -21703,7 +21759,8 @@
+@@ -22204,7 +22260,8 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
          JS_FreeValue(ctx, JS_GetException(ctx));
          return;
      }
@@ -149,7 +149,7 @@
          /* Preserve the prototype accessor and its lazily generated header. */
          JS_FreeValue(ctx, error_obj->u.object_data);
          error_obj->u.object_data = new_stack;
-@@ -21769,7 +21826,9 @@
+@@ -22270,7 +22327,9 @@ static void js_v82jsc_append_promise_all_frame(JSContext *ctx,
          return;
      error_obj = JS_VALUE_GET_OBJ(error);
      stack_prop = find_own_property1(error_obj, JS_ATOM_stack);
@@ -160,7 +160,7 @@
          return;
      stack = JS_GetProperty(ctx, error, JS_ATOM_stack);
      if (JS_IsException(stack)) {
-@@ -21798,7 +21857,8 @@
+@@ -22299,7 +22358,8 @@ static void js_v82jsc_append_promise_all_frame(JSContext *ctx,
          JS_FreeValue(ctx, JS_GetException(ctx));
          return;
      }
@@ -170,7 +170,7 @@
          JS_FreeValue(ctx, error_obj->u.object_data);
          error_obj->u.object_data = new_stack;
      } else if (JS_DefinePropertyValue(ctx, error, JS_ATOM_stack, new_stack,
-@@ -45427,6 +45487,7 @@
+@@ -45984,6 +46044,7 @@ static JSValue js_error_get_stack(JSContext *ctx, JSValueConst this_val)
  static JSValue js_error_set_stack(JSContext *ctx, JSValueConst this_val,
                                    JSValueConst value)
  {
@@ -178,19 +178,19 @@
      int ret, flags;
  
      if (JS_VALUE_GET_TAG(this_val) != JS_TAG_OBJECT)
-@@ -45434,6 +45495,15 @@
-     if (js_same_value(ctx, this_val, ctx->class_proto[JS_CLASS_ERROR])) {
-         if (JS_DefinePropertyValue(ctx, this_val, JS_ATOM_stack, js_dup(value),
-                                    JS_PROP_C_W_E | JS_PROP_THROW) < 0)
-+            return JS_EXCEPTION;
-+        return JS_UNDEFINED;
-+    }
+@@ -45994,6 +46055,15 @@ static JSValue js_error_set_stack(JSContext *ctx, JSValueConst this_val,
+             return JS_EXCEPTION;
+         return JS_UNDEFINED;
+     }
 +    p = JS_VALUE_GET_OBJ(this_val);
 +    if (p->class_id == JS_CLASS_ERROR &&
 +        js_error_has_native_stack_accessor(ctx, p)) {
 +        if (JS_DefinePropertyValue(ctx, this_val, JS_ATOM_stack, js_dup(value),
 +                                   JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE |
 +                                   JS_PROP_THROW) < 0)
-             return JS_EXCEPTION;
-         return JS_UNDEFINED;
-     }
++            return JS_EXCEPTION;
++        return JS_UNDEFINED;
++    }
+     ret = JS_GetOwnPropertyFlagsInternal(ctx, &flags, JS_VALUE_GET_OBJ(this_val),
+                                          JS_ATOM_stack);
+     if (ret < 0)

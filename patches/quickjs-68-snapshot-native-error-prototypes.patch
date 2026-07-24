@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 6297518..03d5c77 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -40030,6 +40030,8 @@
+@@ -40588,6 +40588,8 @@ void v82jsc_snapshot_capture_intrinsics(JSContext *ctx, JSValue registry)
  
      for (i = 0; i < ctx->rt->class_count; i++)
          JS_RegisterSnapshotIntrinsic(&s, ctx->class_proto[i]);
@@ -9,16 +11,16 @@
      JS_RegisterSnapshotIntrinsic(&s, ctx->function_proto);
      JS_RegisterSnapshotIntrinsic(&s, ctx->iterator_proto);
      JS_RegisterSnapshotIntrinsic(&s, ctx->async_iterator_proto);
-@@ -40835,6 +40837,12 @@
-     target = JS_VALUE_GET_OBJ(obj);
-     for (i = 0; i < ctx->rt->class_count; i++) {
-         value = ctx->class_proto[i];
+@@ -41397,6 +41399,12 @@ static bool JS_IsSnapshotIntrinsicObject(JSContext *ctx, JSValueConst obj)
+             JS_VALUE_GET_OBJ(value) == target)
+             return true;
+     }
++    for (i = 0; i < JS_NATIVE_ERROR_COUNT; i++) {
++        value = ctx->native_error_proto[i];
 +        if (JS_VALUE_GET_TAG(value) == JS_TAG_OBJECT &&
 +            JS_VALUE_GET_OBJ(value) == target)
 +            return true;
 +    }
-+    for (i = 0; i < JS_NATIVE_ERROR_COUNT; i++) {
-+        value = ctx->native_error_proto[i];
-         if (JS_VALUE_GET_TAG(value) == JS_TAG_OBJECT &&
-             JS_VALUE_GET_OBJ(value) == target)
-             return true;
+     value = ctx->function_proto;
+     if (JS_VALUE_GET_TAG(value) == JS_TAG_OBJECT &&
+         JS_VALUE_GET_OBJ(value) == target)

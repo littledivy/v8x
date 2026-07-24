@@ -1,92 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 02f234e..52a35d1 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -378,6 +378,7 @@
-     uint16_t var_ref_count; /* number of var refs */
-     uint16_t arg_count;
-     bool is_strict_mode;
-+    bool is_constructor;
-     /* only used in generators. Current stack pointer value. NULL if
-        the function is running. */
-     JSValue *cur_sp;
-@@ -1198,6 +1199,7 @@
-     JSValue func_name;
-     JSValue this_val;
-     bool native;
-+    bool constructor;
-     int line_num;
-     int col_num;
- } JSCallSiteData;
-@@ -6330,6 +6332,7 @@
-     rt->current_stack_frame = sf;
-     // TODO(bnoordhuis) switch realms like js_call_c_function does
-     sf->is_strict_mode = false;
-+    sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
-     sf->cur_func = unsafe_unconst(func_obj);
-     sf->this_val = unsafe_unconst(this_val);
-     sf->arg_count = argc;
-@@ -6456,6 +6459,7 @@
-     rt->current_stack_frame = sf;
-     // TODO(bnoordhuis) switch realms like js_call_c_function does
-     sf->is_strict_mode = false;
-+    sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
-     sf->cur_func = unsafe_unconst(func_obj);
-     sf->this_val = unsafe_unconst(this_val);
-     sf->arg_count = argc;
-@@ -17515,6 +17519,7 @@
-     ctx = p->u.cfunc.realm; /* change the current realm */
- 
-     sf->is_strict_mode = false;
-+    sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
-     sf->cur_func = unsafe_unconst(func_obj);
-     sf->this_val = unsafe_unconst(this_obj);
-     sf->arg_count = argc;
-@@ -17775,6 +17780,7 @@
-         return JS_ThrowStackOverflow(caller_ctx);
- 
-     sf->is_strict_mode = b->is_strict_mode;
-+    sf->is_constructor = (flags & JS_CALL_FLAG_CONSTRUCTOR) != 0;
-     arg_buf = (JSValue *)argv;
-     sf->arg_count = argc;
-     sf->cur_func = unsafe_unconst(func_obj);
-@@ -20709,6 +20715,7 @@
-     p = JS_VALUE_GET_OBJ(func_obj);
-     b = p->u.func.function_bytecode;
-     sf->is_strict_mode = b->is_strict_mode;
-+    sf->is_constructor = false;
-     sf->cur_pc = b->byte_code_buf;
-     arg_buf_len = max_int(b->arg_count, argc);
-     local_count = arg_buf_len + b->var_count + b->stack_size;
-@@ -64533,6 +64540,7 @@
- 
-     csd->func = js_dup(sf->cur_func);
-     csd->this_val = js_dup(sf->this_val);
-+    csd->constructor = sf->is_constructor;
-     /* func_name_str is UTF-8 encoded if needed */
-     func_name_str = get_func_name(ctx, sf->cur_func);
-     if (!func_name_str || func_name_str[0] == '\0')
-@@ -64572,6 +64580,7 @@
-     csd->func_name = JS_NULL;
-     csd->this_val = JS_NULL;
-     csd->native = false;
-+    csd->constructor = false;
-     csd->line_num = line_num;
-     csd->col_num = col_num;
-     /* filename is UTF-8 encoded if needed (original argument to __JS_EvalInternal()) */
-@@ -64599,12 +64608,22 @@
-     return js_bool(csd->native);
- }
- 
-+static JSValue js_callsite_isconstructor(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
-+{
-+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
-+    if (!csd)
-+        return JS_EXCEPTION;
-+    return js_bool(csd->constructor);
-+}
-+
- static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic)
- {
-     JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+@@ -65355,6 +65355,8 @@ static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int
      if (!csd)
          return JS_EXCEPTION;
      int *field = (void *)((char *)csd + magic);
@@ -95,12 +11,3 @@
      return js_int32(*field);
  }
  
-@@ -64824,7 +64843,7 @@
-     JS_CFUNC_DEF("getEnclosingLineNumber", 0, js_callsite_ret_undefined),
-     JS_CFUNC_DEF("isEval", 0, js_callsite_ret_false),
-     JS_CFUNC_DEF("isToplevel", 0, js_callsite_istoplevel),
--    JS_CFUNC_DEF("isConstructor", 0, js_callsite_ret_false),
-+    JS_CFUNC_DEF("isConstructor", 0, js_callsite_isconstructor),
-     JS_CFUNC_DEF("isAsync", 0, js_callsite_ret_false),
-     JS_CFUNC_DEF("isPromiseAll", 0, js_callsite_ret_false),
-     JS_CFUNC_DEF("toString", 0, js_callsite_tostring),

@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 7d6fc67..dc9aa54 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -998,6 +998,7 @@ struct JSModuleDef {
+@@ -1053,6 +1053,7 @@ struct JSModuleDef {
      bool eval_has_exception;
      JSValue eval_exception;
      JSValue meta_obj; /* for import.meta */
@@ -9,7 +10,7 @@ diff --git a/quickjs.c b/quickjs.c
      JSValue private_value; /* private value for C modules */
  };
  
-@@ -32490,6 +32491,18 @@ JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m)
+@@ -33041,6 +33042,18 @@ JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m)
      return JS_DupAtom(ctx, m->module_name);
  }
  
@@ -28,7 +29,7 @@ diff --git a/quickjs.c b/quickjs.c
  JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m)
  {
      JSValue obj;
-@@ -32506,6 +32518,7 @@ JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m)
+@@ -33058,6 +33071,7 @@ JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m)
  static JSValue js_import_meta(JSContext *ctx)
  {
      JSAtom filename;
@@ -36,7 +37,7 @@ diff --git a/quickjs.c b/quickjs.c
      JSModuleDef *m;
  
      filename = JS_GetScriptOrModuleName(ctx, 0);
-@@ -32521,7 +32534,18 @@ static JSValue js_import_meta(JSContext *ctx)
+@@ -33073,7 +33087,18 @@ static JSValue js_import_meta(JSContext *ctx)
          JS_ThrowTypeError(ctx, "import.meta not supported in this context");
          return JS_EXCEPTION;
      }
@@ -57,9 +58,10 @@ diff --git a/quickjs.c b/quickjs.c
  
  static JSValue JS_NewModuleValue(JSContext *ctx, JSModuleDef *m)
 diff --git a/quickjs.h b/quickjs.h
+index 3aea836..40abd4b 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1197,6 +1197,11 @@ JS_EXTERN JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -1231,6 +1231,11 @@ JS_EXTERN void JS_SetModuleNormalizeFunc2(JSRuntime *rt,
  JS_EXTERN JSValue JS_GetImportMeta(JSContext *ctx, JSModuleDef *m);
  JS_EXTERN JSAtom JS_GetModuleName(JSContext *ctx, JSModuleDef *m);
  JS_EXTERN JSValue JS_GetModuleNamespace(JSContext *ctx, JSModuleDef *m);

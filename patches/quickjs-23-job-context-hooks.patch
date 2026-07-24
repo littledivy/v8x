@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index be65873..397eb84 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -320,6 +320,10 @@
+@@ -378,6 +378,10 @@ struct JSRuntime {
      // to js_promise_constructor
      JSValueLink *parent_promise;
  
@@ -11,7 +13,7 @@
      JSHostPromiseRejectionTracker *host_promise_rejection_tracker;
      void *host_promise_rejection_tracker_opaque;
  
-@@ -1055,6 +1059,7 @@
+@@ -1109,6 +1113,7 @@ typedef struct JSJobEntry {
      struct list_head link;
      JSContext *ctx;
      JSJobFunc *job_func;
@@ -19,7 +21,7 @@
      int argc;
      JSValue argv[];
  } JSJobEntry;
-@@ -2209,8 +2214,17 @@
+@@ -2589,8 +2594,17 @@ void JS_SetSharedArrayBufferFunctions(JSRuntime *rt,
  }
  
  /* return 0 if OK, < 0 if exception */
@@ -39,7 +41,7 @@
  {
      JSRuntime *rt = ctx->rt;
      JSJobEntry *e;
-@@ -2223,6 +2237,13 @@
+@@ -2603,6 +2617,13 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
          return -1;
      e->ctx = ctx;
      e->job_func = job_func;
@@ -53,7 +55,7 @@
      e->argc = argc;
      for(i = 0; i < argc; i++) {
          e->argv[i] = js_dup(argv[i]);
-@@ -2231,6 +2252,12 @@
+@@ -2611,6 +2632,12 @@ int JS_EnqueueJob(JSContext *ctx, JSJobFunc *job_func,
      return 0;
  }
  
@@ -66,7 +68,7 @@
  bool JS_IsJobPending(JSRuntime *rt)
  {
      return !list_empty(&rt->job_list);
-@@ -2262,9 +2289,16 @@
+@@ -2642,9 +2669,16 @@ int JS_ExecutePendingJob(JSRuntime *rt, JSContext **pctx)
      e = list_entry(rt->job_list.next, JSJobEntry, link);
      list_del(&e->link);
      ctx = e->ctx;
@@ -83,7 +85,7 @@
      if (JS_IsException(res))
          ret = -1;
      else
-@@ -2372,6 +2406,7 @@
+@@ -2752,6 +2786,7 @@ void JS_FreeRuntime(JSRuntime *rt)
          JSJobEntry *e = list_entry(el, JSJobEntry, link);
          for(i = 0; i < e->argc; i++)
              JS_FreeValueRT(rt, e->argv[i]);
@@ -91,7 +93,7 @@
          js_free_rt(rt, e);
      }
      init_list_head(&rt->job_list);
-@@ -56612,6 +56647,7 @@
+@@ -57273,6 +57308,7 @@ typedef struct JSPromiseReactionData {
      struct list_head link; /* not used in promise_reaction_job */
      JSValue resolving_funcs[2];
      JSValue handler;
@@ -99,7 +101,7 @@
  } JSPromiseReactionData;
  
  JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValueConst promise)
-@@ -56651,6 +56687,7 @@
+@@ -57335,6 +57371,7 @@ static void promise_reaction_data_free(JSRuntime *rt,
      JS_FreeValueRT(rt, rd->resolving_funcs[0]);
      JS_FreeValueRT(rt, rd->resolving_funcs[1]);
      JS_FreeValueRT(rt, rd->handler);
@@ -107,7 +109,7 @@
      js_free_rt(rt, rd);
  }
  
-@@ -56672,13 +56709,17 @@
+@@ -57356,13 +57393,17 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
      JSValueConst arg;
      bool is_reject;
  
@@ -126,7 +128,7 @@
      if (JS_IsUndefined(handler)) {
          if (is_reject) {
              res = JS_Throw(ctx, js_dup(arg));
-@@ -56688,6 +56729,10 @@
+@@ -57372,6 +57413,10 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
      } else {
          res = JS_Call(ctx, handler, JS_UNDEFINED, 1, &arg);
      }
@@ -137,7 +139,7 @@
      is_reject = JS_IsException(res);
      if (is_reject) {
          if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception)))
-@@ -56728,7 +56773,7 @@
+@@ -57412,7 +57457,7 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
      JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
      struct list_head *el, *el1;
      JSPromiseReactionData *rd;
@@ -146,7 +148,7 @@
  
      if (!s || s->promise_state != JS_PROMISE_PENDING)
          return; /* should never happen */
-@@ -56759,7 +56804,9 @@
+@@ -57438,7 +57483,9 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
          args[2] = rd->handler;
          args[3] = js_bool(is_reject);
          args[4] = value;
@@ -157,7 +159,7 @@
          list_del(&rd->link);
          promise_reaction_data_free(ctx->rt, rd);
      }
-@@ -56967,6 +57014,7 @@
+@@ -57646,6 +57693,7 @@ static void js_promise_mark(JSRuntime *rt, JSValueConst val,
              JS_MarkValue(rt, rd->resolving_funcs[0], mark_func);
              JS_MarkValue(rt, rd->resolving_funcs[1], mark_func);
              JS_MarkValue(rt, rd->handler, mark_func);
@@ -165,7 +167,7 @@
          }
      }
      JS_MarkValue(rt, s->promise_result, mark_func);
-@@ -57537,6 +57585,12 @@
+@@ -58216,6 +58264,12 @@ static __exception int perform_promise_then(JSContext *ctx,
          if (!JS_IsFunction(ctx, handler))
              handler = JS_UNDEFINED;
          rd->handler = js_dup(handler);
@@ -178,16 +180,16 @@
          rd_array[i] = rd;
      }
  
-@@ -57544,7 +57598,7 @@
+@@ -58223,7 +58277,7 @@ static __exception int perform_promise_then(JSContext *ctx,
          for(i = 0; i < 2; i++)
              list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
      } else {
 -        JSValueConst args[5];
 +        JSValueConst args[6];
-         if (s->promise_state == JS_PROMISE_REJECTED && !s->is_handled) {
-             JSRuntime *rt = ctx->rt;
-             if (rt->host_promise_rejection_tracker)
-@@ -57558,7 +57612,9 @@
+         call_promise_rejection_tracker(ctx, promise, true);
+         i = s->promise_state - JS_PROMISE_FULFILLED;
+         rd = rd_array[i];
+@@ -58232,7 +58286,9 @@ static __exception int perform_promise_then(JSContext *ctx,
          args[2] = rd->handler;
          args[3] = js_bool(i);
          args[4] = s->promise_result;
@@ -198,9 +200,11 @@
          for(i = 0; i < 2; i++)
              promise_reaction_data_free(ctx->rt, rd_array[i]);
      }
+diff --git a/quickjs.h b/quickjs.h
+index a4a9fe1..2b9fda2 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1197,6 +1197,15 @@
+@@ -1221,6 +1221,15 @@ JS_EXTERN JSValue JS_GetModulePrivateValue(JSContext *ctx, JSModuleDef *m);
  /* JS Job support */
  
  typedef JSValue JSJobFunc(JSContext *ctx, int argc, JSValueConst *argv);

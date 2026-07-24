@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 11c78e9..c73c0a3 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -51433,6 +51433,38 @@ static int getTimezoneOffset(int64_t time) {
+@@ -51955,6 +51955,38 @@ static int getTimezoneOffset(int64_t time) {
  #endif
  }
  
@@ -39,7 +41,7 @@
  /* RegExp */
  
  static void js_regexp_finalizer(JSRuntime *rt, JSValueConst val)
-@@ -59877,7 +59909,7 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
+@@ -60459,7 +60491,7 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
                                 int argc, JSValueConst *argv, int magic)
  {
      // _string(obj, fmt, part)
@@ -48,7 +50,7 @@
      double fields[9];
      int res, fmt, part, pos;
      int y, mon, d, h, m, s, ms, wd, tz;
-@@ -59964,7 +59996,24 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
+@@ -60545,7 +60577,24 @@ static JSValue get_date_string(JSContext *ctx, JSValueConst this_val,
              /* tz is >= 0, can use % */
              pos += snprintf(buf + pos, sizeof(buf) - pos,
                              "%02d%02d", tz / 60, tz % 60);

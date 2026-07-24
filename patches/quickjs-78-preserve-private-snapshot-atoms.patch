@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index 2d29414..4071932 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -41326,8 +41326,9 @@ static int JS_WriteObjectAtoms(BCWriterState *s)
+@@ -41856,8 +41856,9 @@ static int JS_WriteObjectAtoms(BCWriterState *s)
              bc_put_u32(s, atom);
          } else {
              JSAtomStruct *p = rt->atom_array[atom];
@@ -13,7 +14,7 @@ diff --git a/quickjs.c b/quickjs.c
              bc_put_u8(s, type);
              JS_WriteString(s, p);
          }
-@@ -43414,7 +43415,7 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
+@@ -43945,7 +43946,7 @@ static int JS_ReadObjectAtoms(BCReaderState *s)
                  return -1;
              }
          } else {

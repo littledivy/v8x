@@ -1,9 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
-index 11caae0..11caae0 100644
+index 363d639..217b3fb 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1637,7 +1637,16 @@ JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
- {
+@@ -1710,6 +1710,15 @@ JSValue JS_DupValueRT(JSRuntime *rt, JSValueConst v)
      return js_dup(v);
  }
  

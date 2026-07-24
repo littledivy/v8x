@@ -1,25 +1,25 @@
 diff --git a/quickjs.c b/quickjs.c
-index 8b89ee4..c36f8cb 100644
+index c0aaf23..d0aac4a 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -41999,6 +41999,8 @@ static int BC_add_object_ref1(BCReaderState *s, JSObject *p)
+@@ -42487,6 +42487,8 @@ static int BC_add_object_ref1(BCReaderState *s, JSObject *p)
                              &s->objects_size, s->objects_count + 1))
              return -1;
          s->objects[s->objects_count++] = p;
 +        if (p)
-+            p->header.ref_count++;
++            JS_REF_COUNT(p)++;
      }
      return 0;
  }
-@@ -43222,6 +43224,7 @@ static JSValue JS_ReadTypedArray(BCReaderState *s)
+@@ -43706,6 +43708,7 @@ static JSValue JS_ReadTypedArray(BCReaderState *s)
          goto fail;
      if (s->allow_reference) {
          s->objects[idx] = JS_VALUE_GET_OBJ(obj);
-+        JS_VALUE_GET_OBJ(obj)->header.ref_count++;
++        JS_REF_COUNT(JS_VALUE_GET_OBJ(obj))++;
      }
      JS_FreeValue(ctx, array_buffer);
      return obj;
-@@ -43664,6 +43667,11 @@ static void bc_reader_free(BCReaderState *s)
+@@ -44149,6 +44152,11 @@ static void bc_reader_free(BCReaderState *s)
          }
          js_free(s->ctx, s->idx_to_atom);
      }

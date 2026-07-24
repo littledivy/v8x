@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 52a35d1..42ed991 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -38690,7 +38690,9 @@
+@@ -39336,7 +39336,9 @@ static int JS_WriteVarRef(BCWriterState *s, JSVarRef *var_ref)
  }
  
  static int JS_WriteSnapshotObjectState(BCWriterState *s, JSValueConst obj,
@@ -11,7 +13,7 @@
  
  static int JS_WriteBytecodeFunctionObject(BCWriterState *s,
                                            JSValueConst obj)
-@@ -38720,7 +38722,7 @@
+@@ -39366,7 +39368,7 @@ static int JS_WriteBytecodeFunctionObject(BCWriterState *s,
          bc_put_u8(s, 0);
      }
      bc_put_u8(s, p->is_constructor);
@@ -20,7 +22,7 @@
  
   invalid:
      JS_ThrowTypeError(s->ctx, "invalid bytecode function object");
-@@ -38765,7 +38767,7 @@
+@@ -39411,7 +39413,7 @@ static int JS_WriteHostObject(BCWriterState *s, JSValueConst obj)
          if (ret)
              return -1;
      }
@@ -29,7 +31,7 @@
  }
  
  #define JS_INTRINSIC_PATH_MAX 64
-@@ -39250,7 +39252,9 @@
+@@ -39896,7 +39898,9 @@ static int JS_WriteArray(BCWriterState *s, JSValueConst obj)
  }
  
  static int JS_WriteSnapshotObjectState(BCWriterState *s, JSValueConst obj,
@@ -40,7 +42,7 @@
  {
      JSPropertyDescriptor desc;
      JSPropertyEnum *props = NULL;
-@@ -39259,11 +39263,13 @@
+@@ -39905,11 +39909,13 @@ static int JS_WriteSnapshotObjectState(BCWriterState *s, JSValueConst obj,
      uint32_t len = 0, serialized_len, i;
      int extensible, ret = -1;
  
@@ -59,7 +61,7 @@
  
      extensible = JS_IsExtensible(s->ctx, obj);
      if (extensible < 0)
-@@ -39272,7 +39278,8 @@
+@@ -39918,7 +39924,8 @@ static int JS_WriteSnapshotObjectState(BCWriterState *s, JSValueConst obj,
  
      if (JS_GetOwnPropertyNames(s->ctx, &props, &len, obj,
                                 JS_GPN_STRING_MASK | JS_GPN_SYMBOL_MASK |
@@ -69,7 +71,7 @@
          goto fail;
      serialized_len = len;
      if (skip_intrinsic_registry) {
-@@ -39284,9 +39291,23 @@
+@@ -39930,9 +39937,23 @@ static int JS_WriteSnapshotObjectState(BCWriterState *s, JSValueConst obj,
                  serialized_len--;
          }
      }
@@ -94,7 +96,7 @@
              continue;
          memset(&desc, 0, sizeof(desc));
          desc.value = JS_UNDEFINED;
-@@ -39390,19 +39411,19 @@
+@@ -40036,19 +40057,19 @@ static int JS_WriteSnapshotIntrinsic(BCWriterState *s, JSValueConst obj)
  static int JS_WriteObjectTag(BCWriterState *s, JSValueConst obj)
  {
      bc_put_u8(s, BC_TAG_SNAPSHOT_OBJECT);
@@ -117,7 +119,7 @@
  }
  
  static int JS_WriteTypedArray(BCWriterState *s, JSValueConst obj)
-@@ -40473,7 +40494,8 @@
+@@ -41118,7 +41139,8 @@ static JSVarRef *JS_ReadVarRef(BCReaderState *s)
      return var_ref;
  }
  
@@ -127,7 +129,7 @@
  
  static JSValue JS_ReadBytecodeFunctionObject(BCReaderState *s)
  {
-@@ -40550,7 +40572,7 @@
+@@ -41195,7 +41217,7 @@ static JSValue JS_ReadBytecodeFunctionObject(BCReaderState *s)
      if (bc_get_u8(s, &is_constructor) || is_constructor > 1)
          goto fail;
      JS_SetConstructorBit(ctx, obj, is_constructor);
@@ -136,7 +138,7 @@
          goto fail;
      return obj;
  
-@@ -40985,6 +41007,8 @@
+@@ -41630,6 +41652,8 @@ static JSValue JS_ReadHostObject(BCReaderState *s)
              goto fail;
          prototype = JS_UNDEFINED;
      }
@@ -145,7 +147,7 @@
      return obj;
  
   fail:
-@@ -41157,7 +41181,8 @@
+@@ -41802,7 +41826,8 @@ static JSValue JS_ReadObjectTag(BCReaderState *s)
      return JS_EXCEPTION;
  }
  
@@ -155,7 +157,7 @@
  {
      JSContext *ctx = s->ctx;
      JSValue proto = JS_UNDEFINED;
-@@ -41168,11 +41193,13 @@
+@@ -41813,11 +41838,13 @@ static int JS_ReadSnapshotObjectState(BCReaderState *s, JSValueConst obj)
      uint8_t extensible;
      int define_flags, ret;
  
@@ -174,7 +176,7 @@
  
      if (bc_get_u8(s, &extensible) || extensible > 1 ||
          bc_get_leb128(s, &prop_count))
-@@ -41255,7 +41282,7 @@
+@@ -41900,7 +41927,7 @@ static JSValue JS_ReadSnapshotObjectTag(BCReaderState *s)
      JSValue obj = JS_NewObject(s->ctx);
  
      if (JS_IsException(obj) || BC_add_object_ref(s, obj) ||
@@ -183,7 +185,7 @@
          JS_FreeValue(s->ctx, obj);
          return JS_EXCEPTION;
      }
-@@ -41267,7 +41294,7 @@
+@@ -41912,7 +41939,7 @@ static JSValue JS_ReadSnapshotArrayTag(BCReaderState *s)
      JSValue obj = JS_NewArray(s->ctx);
  
      if (JS_IsException(obj) || BC_add_object_ref(s, obj) ||
@@ -192,7 +194,7 @@
          JS_FreeValue(s->ctx, obj);
          return JS_EXCEPTION;
      }
-@@ -41279,7 +41306,7 @@
+@@ -41924,7 +41951,7 @@ static JSValue JS_ReadContextGlobal(BCReaderState *s)
      JSValue obj = JS_GetGlobalObject(s->ctx);
  
      if (JS_IsException(obj) || BC_add_object_ref(s, obj) ||

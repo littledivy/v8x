@@ -1,8 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
-index 11caae0..a5d29c7 100644
+index 615034f..7794820 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -1476,8 +1476,8 @@ static JSValue JS_EvalInternal(JSContext *ctx, JSValueConst this_obj,
+@@ -1507,8 +1507,8 @@ static void js_free_module_def(JSContext *ctx, JSModuleDef *m);
  static void js_mark_module_def(JSRuntime *rt, JSModuleDef *m,
                                 JS_MarkFunc *mark_func);
  static JSValue js_import_meta(JSContext *ctx);
@@ -13,7 +13,7 @@ index 11caae0..a5d29c7 100644
  static void free_var_ref(JSRuntime *rt, JSVarRef *var_ref);
  static JSValue js_new_promise_capability(JSContext *ctx,
                                           JSValue *resolving_funcs,
-@@ -18793,7 +18793,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
+@@ -18806,7 +18806,7 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
              {
                  JSValue val;
                  sf->cur_pc = pc;
@@ -22,7 +22,7 @@ index 11caae0..a5d29c7 100644
                  if (JS_IsException(val))
                      goto exception;
                  JS_FreeValue(ctx, sp[-2]);
-@@ -31057,6 +31197,19 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
+@@ -31761,6 +31761,19 @@ JSValue JS_LoadModule(JSContext *ctx, const char *basename,
      return promise;
  }
  
@@ -42,7 +42,8 @@ index 11caae0..a5d29c7 100644
  static JSValue js_dynamic_import_job(JSContext *ctx,
                                       int argc, JSValueConst *argv)
  {
-@@ -31101,7 +31242,7 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+@@ -31796,8 +31809,8 @@ static JSValue js_dynamic_import_job(JSContext *ctx,
+     return JS_UNDEFINED;
  }
  
 -static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
@@ -52,7 +53,7 @@ index 11caae0..a5d29c7 100644
  {
      JSAtom basename;
      JSValue promise, resolving_funcs[2], basename_val, err, ret;
-@@ -31177,9 +31329,18 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst function,
+@@ -31881,9 +31894,18 @@ static JSValue js_dynamic_import(JSContext *ctx, JSValueConst specifier,
      args[3] = specifier_str;
      args[4] = attributes;
  

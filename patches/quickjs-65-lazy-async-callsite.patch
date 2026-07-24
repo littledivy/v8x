@@ -1,11 +1,11 @@
+diff --git a/quickjs.c b/quickjs.c
+index cadd824..9ecc241 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21586,6 +21586,38 @@
-         return JS_NULL;
-     }
+@@ -22089,6 +22089,38 @@ static JSValue js_v82jsc_make_async_callsite(JSContext *ctx, const char *file,
      return cs;
-+}
-+
+ }
+ 
 +/* Keep async frames structured while an embedder prepare-stack callback is
 +   pending. This lets the embedder process the complete frame list (including
 +   source mapping) when Error.stack is eventually read. */
@@ -36,17 +36,19 @@
 +        return false;
 +    }
 +    return true;
- }
- 
++}
++
  /* v82jsc: look up (or create) the embedder's private-symbol key for the
-@@ -21863,6 +21895,10 @@
-         !js_error_has_native_stack_accessor(ctx, error_obj))
+    structured-frames array. deno uses `Symbol.for("v82jsc_private:<name>")`
+    via the shim's v8__Private__ForApi; we mirror that here so the same atom
+@@ -22365,6 +22397,10 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
          return;
      if (js_v82jsc_has_same_async_site(ctx, error, file, line, func))
-+        return;
+         return;
 +    if (error_obj->class_id == JS_CLASS_ERROR &&
 +        js_v82jsc_append_pending_async_callsite(
 +            ctx, error_obj->u.object_data, file, line, col, func))
-         return;
++        return;
      stack = JS_GetProperty(ctx, error, JS_ATOM_stack);
      if (JS_IsException(stack)) {
+         JS_FreeValue(ctx, JS_GetException(ctx));

@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 3d0a855..7acd6ab 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -62764,7 +62764,7 @@ static JSValue js_typed_array_get_length(JSContext *ctx, JSValueConst this_val)
+@@ -63339,7 +63339,7 @@ static JSValue js_typed_array_get_length(JSContext *ctx, JSValueConst this_val)
      p = get_typed_array(ctx, this_val);
      if (!p)
          return JS_EXCEPTION;

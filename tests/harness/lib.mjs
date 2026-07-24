@@ -180,6 +180,7 @@ export function parseNextestJson(output) {
   const pass = new Set();
   const fail = new Set();
   const skip = new Set();
+  const failOutput = new Map();
   for (const line of output.split("\n")) {
     if (!line.startsWith("{")) continue;
     let event;
@@ -195,11 +196,13 @@ export function parseNextestJson(output) {
       fail.delete(name);
     } else if (event.event === "failed" || event.event === "timeout") {
       if (!pass.has(name)) fail.add(name);
+      if (typeof event.stdout === "string" && event.stdout.length)
+        failOutput.set(name, event.stdout);
     } else if (event.event === "ignored") {
       skip.add(name);
     }
   }
-  return { pass, fail, skip };
+  return { pass, fail, skip, failOutput };
 }
 
 // --- JUnit XML parser (deno test --junit-path) ------------------------------

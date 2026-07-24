@@ -1,7 +1,8 @@
 diff --git a/quickjs.c b/quickjs.c
+index f5fe870..ad575f7 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -38507,6 +38507,34 @@ static void JS_RegisterSnapshotIntrinsic(JSSnapshotIntrinsicCollector *s,
+@@ -39149,6 +39149,34 @@ static void JS_RegisterSnapshotIntrinsic(JSSnapshotIntrinsicCollector *s,
      }
  }
  
@@ -36,7 +37,7 @@ diff --git a/quickjs.c b/quickjs.c
  static void JS_CollectSnapshotIntrinsics(JSSnapshotIntrinsicCollector *s,
                                           JSValueConst value, int depth)
  {
-@@ -38612,6 +38640,11 @@ void v82jsc_snapshot_capture_intrinsics(JSContext *ctx, JSValue registry)
+@@ -39258,6 +39286,11 @@ void v82jsc_snapshot_capture_intrinsics(JSContext *ctx, JSValue registry)
      JS_RegisterSnapshotIntrinsic(&s, ctx->function_proto);
      JS_RegisterSnapshotIntrinsic(&s, ctx->iterator_proto);
      JS_RegisterSnapshotIntrinsic(&s, ctx->async_iterator_proto);

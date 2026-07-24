@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 03d5c77..531a774 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -58762,6 +58762,43 @@
+@@ -59325,6 +59325,43 @@ JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs)
      return js_new_promise_capability(ctx, resolving_funcs, JS_UNDEFINED);
  }
  
@@ -44,9 +46,11 @@
  static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                    int argc, JSValueConst *argv, int magic)
  {
+diff --git a/quickjs.h b/quickjs.h
+index 40abd4b..5c6b532 100644
 --- a/quickjs.h
 +++ b/quickjs.h
-@@ -1115,6 +1115,9 @@
+@@ -1139,6 +1139,9 @@ typedef enum JSPromiseStateEnum {
  } JSPromiseStateEnum;
  
  JS_EXTERN JSValue JS_NewPromiseCapability(JSContext *ctx, JSValue *resolving_funcs);

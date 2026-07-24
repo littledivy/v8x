@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index ef0ee13..20edf00 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21527,12 +21527,19 @@
+@@ -22039,12 +22039,19 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
                                           const char *func)
  {
      JSValue stack, new_stack;
@@ -20,7 +22,7 @@
      if (js_v82jsc_has_same_async_site(ctx, error, file, line))
          return;
      stack = JS_GetProperty(ctx, error, JS_ATOM_stack);
-@@ -21572,12 +21579,15 @@
+@@ -22084,12 +22091,15 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
          JS_FreeValue(ctx, JS_GetException(ctx));
          return;
      }

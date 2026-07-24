@@ -1,11 +1,11 @@
+diff --git a/quickjs.c b/quickjs.c
+index 8f56b6a..363d639 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21025,8 +21025,239 @@
-         p->u.async_function_data = s;
-     }
+@@ -21498,6 +21498,237 @@ static int js_async_function_resolve_create(JSContext *ctx,
      return 0;
-+}
-+
+ }
+ 
 +/* v82jsc: build a CallSite-shaped JS object for an injected async frame.
 +   Used to satisfy embedders (e.g. deno's `has_call_site`) that gate stack
 +   preservation on a populated `#callSiteEvals` private. Returns a fresh,
@@ -82,8 +82,8 @@
 +    JSAtom atom = JS_ValueToAtom(ctx, sym);
 +    JS_FreeValue(ctx, sym);
 +    return atom;
- }
- 
++}
++
 +static bool js_v82jsc_has_same_async_site(JSContext *ctx,
 +                                           JSValueConst error,
 +                                           const char *file, int line)
@@ -240,7 +240,7 @@
  static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
  {
      bool is_success = true;
-@@ -21105,6 +21336,10 @@
+@@ -21576,6 +21807,10 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
      JSObject *p = JS_VALUE_GET_OBJ(func_obj);
      JSAsyncFunctionData *s = p->u.async_function_data;
      bool is_reject = p->class_id - JS_CLASS_ASYNC_FUNCTION_RESOLVE;
@@ -251,7 +251,7 @@
      JSValueConst arg;
  
      if (argc > 0)
-@@ -21112,13 +21347,51 @@
+@@ -21583,13 +21818,51 @@ static JSValue js_async_function_resolve_call(JSContext *ctx,
      else
          arg = JS_UNDEFINED;
      s->func_state.throw_flag = is_reject;
@@ -304,7 +304,7 @@
          return JS_EXCEPTION;
      return JS_UNDEFINED;
  }
-@@ -27412,19 +27685,27 @@
+@@ -27893,19 +28166,27 @@ static __exception int js_parse_unary(JSParseState *s, int parse_flags)
              return -1;
          parse_flags = 0;
          break;
@@ -333,4 +333,3 @@
      default:
          if (js_parse_postfix_expr(s, PF_POSTFIX_CALL))
              return -1;
-

@@ -17,8 +17,18 @@ PATCHES_ONLY=0
 
 # Fetch WebKit at the pinned submodule commit.
 if [ ! -d "$WK/Source/JavaScriptCore" ]; then
+  # CI restores the WebKitBuild cache into $WK before the submodule exists,
+  # and git refuses to clone into a non-empty directory. Move the build tree
+  # aside for the clone and put it back after.
+  if [ -d "$WK/WebKitBuild" ] && [ ! -e "$WK/.git" ]; then
+    mv "$WK/WebKitBuild" "$WK.WebKitBuild.cached"
+    rmdir "$WK" 2>/dev/null || true
+  fi
   git -c submodule.vendor/webkit.update=checkout \
     submodule update --init --depth 1 "$WK"
+  if [ -d "$WK.WebKitBuild.cached" ]; then
+    mv "$WK.WebKitBuild.cached" "$WK/WebKitBuild"
+  fi
 fi
 
 # Apply our WebKit patches (idempotent — skip if already applied). Patch paths

@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 10f4eca..f19cd35 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -21538,6 +21538,53 @@ static JSAtom js_v82jsc_private_atom(JSContext *ctx, const char *name)
+@@ -22027,6 +22027,53 @@ static JSAtom js_v82jsc_private_atom(JSContext *ctx, const char *name)
      return atom;
  }
  
@@ -54,7 +56,7 @@
  static bool js_v82jsc_has_same_async_site(JSContext *ctx,
                                             JSValueConst error,
                                             const char *file, int line)
-@@ -21577,7 +21624,7 @@ static bool js_v82jsc_has_same_async_site(JSContext *ctx,
+@@ -22064,7 +22111,7 @@ static bool js_v82jsc_has_same_async_site(JSContext *ctx,
      JS_FreeValue(ctx, site);
      site_file = JS_ToCString(ctx, file_value);
      if (site_file && JS_ToInt32(ctx, &site_line, line_value) == 0)
@@ -63,7 +65,7 @@
      if (site_file)
          JS_FreeCString(ctx, site_file);
      JS_FreeValue(ctx, file_value);
-@@ -21605,9 +21652,14 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
+@@ -22092,9 +22139,14 @@ static void js_v82jsc_append_async_frame(JSContext *ctx, JSValueConst error,
      DynBuf dbuf;
      const char *cs;
      size_t len;
@@ -78,7 +80,7 @@
      error_obj = JS_VALUE_GET_OBJ(error);
      stack_prop = find_own_property1(error_obj, JS_ATOM_stack);
      if (stack_prop &&
-@@ -25589,6 +25591,8 @@ static __exception int js_parse_object_literal(JSParseState *s)
+@@ -26097,6 +26149,8 @@ static __exception int js_parse_object_literal(JSParseState *s)
          } else {
              if (js_parse_expect(s, ':'))
                  goto fail;
@@ -87,7 +89,7 @@
              if (js_parse_assign_expr(s))
                  goto fail;
              if (name == JS_ATOM_NULL) {
-@@ -66734,6 +66735,11 @@ void v82jsc_clear_error_backtrace(JSContext *ctx, JSValueConst error)
+@@ -67766,6 +67820,11 @@ void v82jsc_clear_error_backtrace(JSContext *ctx, JSValueConst error)
      ctx->error_back_trace = JS_UNDEFINED;
  }
  

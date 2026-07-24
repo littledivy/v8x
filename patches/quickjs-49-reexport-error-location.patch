@@ -1,7 +1,11 @@
 diff --git a/quickjs.c b/quickjs.c
+index c91df73..7b2f99e 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -31322,37 +31322,47 @@
+@@ -31871,10 +31871,11 @@ static void js_resolve_export_throw_error(JSContext *ctx,
+     }
+ }
+ 
 -static void js_resolve_import_throw_error(JSContext *ctx,
 -                                          JSResolveResultEnum res,
 -                                          JSModuleDef *importer,
@@ -14,7 +18,7 @@ diff --git a/quickjs.c b/quickjs.c
  {
      const char *specifier;
      const char *export_name;
-     JSValue exception;
+@@ -31882,14 +31883,14 @@ static void js_resolve_import_throw_error(JSContext *ctx,
  
      if (res != JS_RESOLVE_RES_NOT_FOUND) {
          JSModuleDef *target =
@@ -33,19 +37,10 @@ diff --git a/quickjs.c b/quickjs.c
      if (specifier && export_name) {
          JS_ThrowSyntaxError(
              ctx,
-             "The requested module '%s' does not provide an export named '%s'",
-             specifier, export_name);
-         exception = JS_GetException(ctx);
-         JS_SetPropertyStr(ctx, exception, "fileName",
-                           JS_AtomToString(ctx, importer->module_name));
-         JS_Throw(ctx, exception);
-     }
-     if (specifier)
-         JS_FreeCString(ctx, specifier);
-     if (export_name)
+@@ -31906,6 +31907,15 @@ static void js_resolve_import_throw_error(JSContext *ctx,
          JS_FreeCString(ctx, export_name);
  }
-+
+ 
 +static void js_resolve_import_throw_error(JSContext *ctx,
 +                                          JSResolveResultEnum res,
 +                                          JSModuleDef *importer,
@@ -54,14 +49,18 @@ diff --git a/quickjs.c b/quickjs.c
 +    js_resolve_requested_module_throw_error(
 +        ctx, res, importer, mi->req_module_idx, mi->import_name);
 +}
- 
++
  
  typedef enum {
-@@ -31877,7 +31887,8 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
+     EXPORTED_NAME_AMBIGUOUS,
+@@ -32439,10 +32449,8 @@ static int js_inner_module_linking(JSContext *ctx, JSModuleDef *m,
              m1 = m->req_module_entries[me->u.req_module_idx].module;
              ret = js_resolve_export(ctx, &res_m, &res_me, m1, me->local_name);
              if (ret != JS_RESOLVE_RES_FOUND) {
--                js_resolve_export_throw_error(ctx, ret, m, me->export_name);
+-                /* the binding is missing from the re-exported module m1, not
+-                   from the re-exporting module m; report m1 and the name being
+-                   looked up there, matching the direct-import diagnostic */
+-                js_resolve_export_throw_error(ctx, ret, m1, me->local_name);
 +                js_resolve_requested_module_throw_error(
 +                    ctx, ret, m, me->u.req_module_idx, me->local_name);
                  goto fail;

@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 3cbbc27..5745ba9 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -29905,7 +29905,7 @@
+@@ -30365,7 +30365,7 @@ static __exception int js_parse_statement(JSParseState *s)
      return js_parse_statement_or_decl(s, 0);
  }
  
@@ -9,7 +11,7 @@
  {
      JSFunctionDef *fd = s->cur_func;
  
-@@ -29956,6 +29956,8 @@
+@@ -30416,6 +30416,8 @@ static __exception int js_parse_block(JSParseState *s)
          }
          pop_scope(s);
      }
@@ -18,7 +20,7 @@
      if (next_token(s))
          return -1;
      return 0;
-@@ -30574,7 +30576,7 @@
+@@ -31034,7 +31036,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
  
      switch(tok = s->token.val) {
      case '{':
@@ -27,7 +29,7 @@
              goto fail;
          break;
      case TOK_RETURN:
-@@ -31158,7 +31160,7 @@
+@@ -31618,7 +31620,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                               JS_ATOM_NULL, -1, -1, 1);
              block_env.label_finally = label_finally;
  
@@ -36,7 +38,7 @@
                  goto fail;
  
              pop_break_entry(s->cur_func);
-@@ -31180,6 +31182,7 @@
+@@ -31640,6 +31642,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
  
                  push_scope(s);  /* catch variable */
                  emit_label(s, label_catch);
@@ -44,7 +46,7 @@
  
                  if (s->token.val == '{') {
                      /* support optional-catch-binding feature */
-@@ -31219,8 +31222,10 @@
+@@ -31679,8 +31682,10 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                                   -1, -1, 1);
                  block_env.label_finally = label_finally;
  
@@ -56,7 +58,7 @@
  
                  pop_break_entry(s->cur_func);
                  pop_scope(s);  /* catch block */
-@@ -31280,7 +31285,7 @@
+@@ -31740,7 +31745,7 @@ static __exception int js_parse_statement_or_decl(JSParseState *s,
                      set_eval_ret_undefined(s);
                  }
  

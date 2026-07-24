@@ -1,6 +1,8 @@
+diff --git a/quickjs.c b/quickjs.c
+index 795bf67..3f7f33f 100644
 --- a/quickjs.c
 +++ b/quickjs.c
-@@ -39604,8 +39604,40 @@
+@@ -40184,8 +40184,40 @@ static int JS_WriteSnapshotIntrinsic(BCWriterState *s, JSValueConst obj)
      return -1;
  }
  
