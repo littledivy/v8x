@@ -436,6 +436,13 @@ async function runCargoDeno() {
   if (r.code !== 0 && parsed.pass.size + parsed.fail.size + parsed.skip.size === 0) {
     process.stderr.write(r.out);
   }
+  // nextest's libtest-json events don't carry test output; keep the human
+  // stderr (--failure-output final) so the ratchet report can show why a
+  // baselined test failed.
+  parsed.rawText = r.out
+    .split("\n")
+    .filter((l) => !l.startsWith("{"))
+    .join("\n");
   return finalize(parsed);
 }
 
@@ -638,6 +645,17 @@ function report(res) {
       const clipped = out.length > 8000 ? out.slice(-8000) : out;
       console.error(`\n--- output: ${name} ---\n${clipped}\n--- end ---`);
     }
+  }
+  if (
+    r.regressions.length &&
+    !(_sets.failOutput && r.regressions.some((n) => _sets.failOutput.has(n))) &&
+    _sets.rawText &&
+    _sets.rawText.trim()
+  ) {
+    const raw = _sets.rawText.length > 16000
+      ? _sets.rawText.slice(-16000)
+      : _sets.rawText;
+    console.error(`\n--- runner output (failures) ---\n${raw}\n--- end ---`);
   }
   if (r.missing.length)
     console.error(`\nMISSING — baselined but not seen (${r.missing.length}):\n  ${r.missing.join("\n  ")}`);

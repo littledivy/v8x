@@ -395,7 +395,6 @@ deno_core::uv_compat::tests::timer_get_set_repeat
 deno_core::uv_compat::tests::timer_init_sets_fields
 deno_core::uv_compat::tests::timer_repeat
 deno_core::uv_compat::tests::timer_stop_prevents_firing
-deno_core::uv_compat::tests::timer_wakes_event_loop_at_deadline
 deno_core::uv_compat::tests::try_write_no_stream_returns_ebadf
 deno_core::uv_compat::tests::tty_close_fires_callback
 deno_core::uv_compat::tests::tty_get_winsize
