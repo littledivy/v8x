@@ -1326,8 +1326,8 @@ pub extern "C" fn v8_inspector__V8Inspector__contextDestroyed(
   // V8 only emits Runtime.executionContextDestroyed to sessions that enabled
   // the Runtime domain; an unenabled session gets no event (and may not even
   // be re-entrant, e.g. a test holding a borrow across contextDestroyed).
-  let runtime_active = ACTIVE_RUNTIME_CHANNEL
-    .with(|slot| *slot.borrow() == Some(state.channel));
+  let runtime_active =
+    ACTIVE_RUNTIME_CHANNEL.with(|slot| *slot.borrow() == Some(state.channel));
   if !state.channel.is_null() && runtime_active {
     send_channel_notification(
       state.channel,
