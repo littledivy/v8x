@@ -24,7 +24,5 @@ with a different engine underneath. One page per obligation:
 + #link("snapshots")[Snapshots]: booting from state no engine can
   serialize alone
 + #link("wasm")[WebAssembly]: a second runtime behind the same object API
-+ #link("gaps")[Closing gaps]: what gets forwarded, emulated, patched, or
-  refused
 
 The pages read best in order. Each one links to the next.

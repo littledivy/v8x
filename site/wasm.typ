@@ -27,4 +27,4 @@ ownership boundary, and three rules keep it sound:
   to the new memory; reference values crossing tables and globals keep
   their QuickJS ownership count
 
-#next("gaps", [Closing gaps: forward, adapt, normalize, patch])
+#next("./", [The hill climb: how progress is measured])

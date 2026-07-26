@@ -81,7 +81,7 @@
 #let crumb(n, title) = html.elem(
   "p",
   attrs: (class: "crumb"),
-  [#html.elem("a", attrs: (href: "internals"), [internals]) · #n of 7 · #title],
+  [#html.elem("a", attrs: (href: "internals"), [internals]) · #n of 6 · #title],
 )
 
 /// "Next:" pointer at the bottom of a sub-page.
