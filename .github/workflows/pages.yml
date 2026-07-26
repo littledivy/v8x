@@ -1,13 +1,16 @@
 name: Pages
 
-# Publish the hill-climb dashboard to GitHub Pages on dashboard (docs/) changes
-# or manual dispatch. NOTE: routine data updates are deployed by the ci.yml
-# `report` job itself (its [skip ci] commit can't trigger this workflow).
+# Publish the docs site (typst-built, site/) + hill-climb dashboard (/status/)
+# to GitHub Pages on site/dashboard changes or manual dispatch. NOTE: routine
+# data updates are deployed by the ci.yml `report` job itself (its [skip ci]
+# commit can't trigger this workflow). Both call tools/build-site.sh.
 on:
   push:
     branches: [main]
     paths:
       - "docs/**"
+      - "site/**"
+      - "tools/build-site.sh"
   workflow_dispatch:
 
 permissions:
@@ -28,13 +31,12 @@ jobs:
       url: ${{ steps.deploy.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
-      - name: Assemble site (dashboard + data)
+      - name: Install typst
         run: |
-          mkdir -p _site
-          cp docs/index.html _site/
-          cp tests/status/report.json _site/report.json
-          # history.jsonl may not exist on the very first deploy.
-          cp tests/status/history.jsonl _site/history.jsonl 2>/dev/null || : > _site/history.jsonl
+          curl -fsSL https://github.com/typst/typst/releases/download/v0.15.0/typst-x86_64-unknown-linux-musl.tar.xz | tar -xJ -C /tmp
+          echo "/tmp/typst-x86_64-unknown-linux-musl" >> "$GITHUB_PATH"
+      - name: Assemble site (docs + dashboard + data)
+        run: tools/build-site.sh _site
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site

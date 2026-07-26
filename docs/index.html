@@ -1,174 +1,87 @@
 <!doctype html>
+<!-- The hill-climb dashboard, served at /status/ on Pages. Styled to match
+     the typst docs site (../main.css, ../chart.js, always deployed together
+     by tools/build-site.sh). Data (report.json, history.jsonl) is CI-written
+     next to this file. -->
 <html lang="en">
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>v8x test suite</title>
-    <link rel="preconnect" href="https://rsms.me/" />
-    <link rel="stylesheet" href="https://rsms.me/inter/inter.css" />
-    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <title>dashboard · v8x</title>
+    <link rel="stylesheet" href="../main.css" />
+    <script src="../chart.js"></script>
     <style>
-      :root {
-        --bg: #0a0c10; --fg: #e8ecf1; --dim: #6b7480; --line: #1a1f29;
-        --card: #0e1117; --green: #3fb950; --green-soft: #2ea04333;
-      }
-      * { box-sizing: border-box; }
-      html { -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility; }
-      body {
-        margin: 0; background: var(--bg); color: var(--fg);
-        font-family: "Inter", -apple-system, system-ui, sans-serif;
-        font-feature-settings: "cv05", "ss01", "tnum";
-        max-width: 920px; margin: 0 auto; padding: 56px 28px 80px;
-      }
-      header { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-      h1 { font-size: 19px; font-weight: 600; margin: 0; letter-spacing: -0.02em; }
-      h1 .mono { color: var(--dim); font-weight: 500; }
-      .meta { color: var(--dim); font-size: 12.5px; font-variant-numeric: tabular-nums; }
-      .mono { font-family: "Inter", ui-monospace, monospace; }
-
-      .hero { display: flex; align-items: flex-end; gap: 10px; margin: 36px 0 4px; }
-      .hero .num { font-size: 56px; font-weight: 680; letter-spacing: -0.04em; line-height: 0.9; }
-      .hero .of { color: var(--dim); font-size: 18px; font-weight: 500; padding-bottom: 6px; }
-      .hero .pct { margin-left: auto; color: var(--green); font-size: 15px; font-weight: 600;
-                   padding-bottom: 8px; font-variant-numeric: tabular-nums; }
-      .caption { color: var(--dim); font-size: 12.5px; letter-spacing: 0.01em; }
-
-      #chart { height: 220px; margin: 18px 0 8px; }
-
-      table { width: 100%; border-collapse: collapse; margin-top: 40px; font-variant-numeric: tabular-nums; }
-      caption { text-align: left; color: var(--dim); font-size: 11px; font-weight: 600;
-                text-transform: uppercase; letter-spacing: 0.1em; padding-bottom: 14px; }
-      th { font-weight: 500; color: var(--dim); font-size: 12px; text-align: right; padding: 0 0 12px; }
-      th:first-child { text-align: left; }
-      td { padding: 13px 0; border-top: 1px solid var(--line); text-align: right; vertical-align: middle; }
-      td:first-child { text-align: left; font-weight: 500; }
-      .cellnum b { font-weight: 600; }
-      .cellnum span { color: var(--dim); font-size: 12px; }
-      .track { height: 3px; background: var(--line); border-radius: 2px; margin-top: 7px; overflow: hidden; }
-      .track > i { display: block; height: 100%; background: var(--green); border-radius: 2px; }
-      .z { color: var(--dim); }
-      footer { margin-top: 48px; color: var(--dim); font-size: 12px; }
-      footer a { color: var(--dim); }
+      .hero { font-size: 2.4em; margin: 0.3em 0 0.1em; }
+      .hero .of { color: #666; font-size: 0.5em; }
+      .meta { color: #666; }
+      td.num { font-variant-numeric: tabular-nums; }
+      td.num span { color: #666; font-size: 0.9em; }
     </style>
   </head>
   <body>
-    <header>
-      <h1>v8x <span class="mono">test suite</span></h1>
-      <div class="meta" id="meta">loading…</div>
-    </header>
+    <nav>
+      <a href="../">v8x</a><span style="white-space: pre-wrap">     </span
+      ><a href="../getting-started">getting started</a><span style="white-space: pre-wrap">     </span
+      ><a href="../internals">internals</a><span style="white-space: pre-wrap">     </span
+      ><a href="./">dashboard</a><span style="white-space: pre-wrap">     </span
+      ><a href="https://github.com/littledivy/v8x">github</a>
+    </nav>
 
-    <div class="hero">
-      <div class="num" id="pass">—</div>
-      <div class="of" id="known"></div>
-      <div class="pct" id="pct"></div>
-    </div>
-    <div class="caption">tests passing across the matrix</div>
+    <h2>Test dashboard</h2>
+    <p class="hero" id="hero">—</p>
+    <p class="meta" id="meta">loading…</p>
 
     <div id="chart"></div>
 
-    <table id="matrix"></table>
+    <table id="matrix" hidden></table>
 
-    <footer id="foot"></footer>
+    <footer id="foot"><a href="https://github.com/littledivy/v8x">github.com/littledivy/v8x</a></footer>
 
-    <script type="module">
-      const GREEN = "#3fb950", DIM = "#6b7480", LINE = "#1a1f29";
-
-      const report = await fetch("report.json").then((r) => r.json()).catch(() => null);
-      const history = await fetch("history.jsonl").then((r) => r.text()).then(parseJsonl).catch(() => []);
-      if (!report) document.getElementById("meta").textContent = "no data yet";
-      else render(report, history);
-
-      function parseJsonl(t) {
-        return t.split("\n").filter(Boolean).map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
-      }
-
-      function render(report, history) {
+    <script>
+      (async () => {
+        const report = await fetch("report.json").then((r) => r.json()).catch(() => null);
+        if (!report) {
+          document.getElementById("meta").textContent = "no data yet";
+          return;
+        }
         const { backends, suites, cells } = report;
         let pass = 0, known = 0;
         for (const b of backends) for (const s of suites) {
-          const c = cells[b.id][s.id]; pass += c.pass; known += c.total || 0;
+          const c = cells[b.id][s.id];
+          pass += c.pass;
+          known += c.total || 0;
         }
+        document.getElementById("hero").innerHTML =
+          `${pass.toLocaleString()} <span class="of">/ ${known.toLocaleString()} tests passing` +
+          (known ? ` (${Math.round((pass / known) * 100)}%)` : "") + `</span>`;
         document.getElementById("meta").innerHTML =
-          `<span class="mono">${report.commit.slice(0, 7)}</span> · ${timeago(report.generated)}`;
-        document.getElementById("pass").textContent = pass.toLocaleString();
-        document.getElementById("known").textContent = known ? `/ ${known.toLocaleString()}` : "";
-        document.getElementById("pct").textContent = known ? `${Math.round((pass / known) * 100)}% pass` : "";
+          `across the engine × suite matrix · <code>${report.commit.slice(0, 7)}</code> · ${timeago(report.generated)}`;
 
-        drawChart(history);
-        drawMatrix(report);
+        v8xChart(document.getElementById("chart"), "");
 
-        document.getElementById("foot").innerHTML =
-          `${backends.length} engines · ${suites.length} suites · ` +
-          `<a href="https://github.com/littledivy/v8x">littledivy/v8x</a>`;
-      }
-
-      function drawChart(history) {
-        const el = document.getElementById("chart");
-        if (history.length < 2) {
-          el.style.height = "auto";
-          el.innerHTML = `<div class="caption">progress chart appears after a few CI runs</div>`;
-          return;
-        }
-        const data = history.map((s) => [s.ts, s.totalPass]);
-        const chart = echarts.init(el, null, { renderer: "svg" });
-        chart.setOption({
-          grid: { left: 0, right: 0, top: 12, bottom: 20, containLabel: true },
-          tooltip: {
-            trigger: "axis", backgroundColor: "#0e1117", borderColor: LINE,
-            textStyle: { color: "#e8ecf1", fontSize: 12 },
-            formatter: (p) => `${new Date(p[0].value[0]).toLocaleDateString()} · <b>${p[0].value[1]}</b> passing`,
-          },
-          xAxis: {
-            type: "time", boundaryGap: false,
-            axisLine: { lineStyle: { color: LINE } }, axisTick: { show: false },
-            axisLabel: { color: DIM, fontSize: 11, hideOverlap: true },
-            splitLine: { show: false },
-          },
-          yAxis: {
-            type: "value", minInterval: 1,
-            axisLabel: { color: DIM, fontSize: 11 },
-            splitLine: { lineStyle: { color: LINE } }, axisLine: { show: false }, axisTick: { show: false },
-          },
-          series: [{
-            type: "line", data, smooth: 0.4, showSymbol: false,
-            lineStyle: { color: GREEN, width: 2 },
-            areaStyle: {
-              color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                { offset: 0, color: "#2ea04355" }, { offset: 1, color: "#2ea04300" },
-              ]),
-            },
-          }],
-        });
-        addEventListener("resize", () => chart.resize());
-      }
-
-      function drawMatrix(report) {
-        const { backends, suites, cells } = report;
         const t = document.getElementById("matrix");
-        let h = `<caption>passing per engine × suite</caption><tr><th>engine</th>`;
+        let h = `<tr><th>engine</th>`;
         for (const s of suites) h += `<th>${s.label}</th>`;
         h += `</tr>`;
         for (const b of backends) {
           h += `<tr><td>${b.label}</td>`;
           for (const s of suites) {
             const c = cells[b.id][s.id];
-            const tot = c.total, w = tot ? (c.pass / tot) * 100 : 0;
-            const zero = !c.pass;
-            h += `<td><div class="cellnum ${zero ? "z" : ""}"><b>${c.pass}</b>${tot != null ? ` <span>/ ${tot}</span>` : ""}</div>
-                  <div class="track"><i style="width:${w}%"></i></div></td>`;
+            h += `<td class="num"><b>${c.pass}</b>${c.total != null ? ` <span>/ ${c.total}</span>` : ""}</td>`;
           }
           h += `</tr>`;
         }
         t.innerHTML = h;
-      }
+        t.hidden = false;
 
-      function timeago(iso) {
-        const s = (Date.now() - new Date(iso)) / 1000;
-        if (s < 90) return "just now";
-        if (s < 5400) return `${Math.round(s / 60)}m ago`;
-        if (s < 129600) return `${Math.round(s / 3600)}h ago`;
-        return `${Math.round(s / 86400)}d ago`;
-      }
+        function timeago(iso) {
+          const s = (Date.now() - new Date(iso)) / 1000;
+          if (s < 90) return "just now";
+          if (s < 5400) return `${Math.round(s / 60)}m ago`;
+          if (s < 129600) return `${Math.round(s / 3600)}h ago`;
+          return `${Math.round(s / 86400)}d ago`;
+        }
+      })();
     </script>
   </body>
 </html>

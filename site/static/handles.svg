@@ -1,0 +1,55 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 780 205" font-family="Helvetica, Arial, sans-serif">
+  <!-- Recreated from the vmil-2026 paper, fig:handles (TikZ in submission/main.tex) -->
+  <defs>
+    <marker id="harr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#2c4f7c"/>
+    </marker>
+    <marker id="farr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#555"/>
+    </marker>
+  </defs>
+
+  <!-- JavaScriptCore lane -->
+  <text x="118" y="52" text-anchor="end" font-size="12" font-weight="bold">JavaScriptCore</text>
+
+  <rect x="132" y="28" width="100" height="40" fill="#e9eef6" stroke="#555" stroke-width="1"/>
+  <text x="182" y="45" text-anchor="middle" font-size="11" font-family="Menlo, monospace">Local&lt;T&gt;</text>
+  <text x="182" y="60" text-anchor="middle" font-size="10" fill="#444">one pointer</text>
+
+  <line x1="232" y1="48" x2="306" y2="48" stroke="#2c4f7c" stroke-width="1" marker-end="url(#harr)"/>
+  <text x="270" y="40" text-anchor="middle" font-size="10" fill="#444">direct</text>
+
+  <rect x="310" y="28" width="150" height="40" fill="#fbf3d8" stroke="#555" stroke-width="1"/>
+  <text x="385" y="45" text-anchor="middle" font-size="11" font-family="Menlo, monospace">JSValueRef</text>
+  <text x="385" y="60" text-anchor="middle" font-size="10" fill="#444">engine cell</text>
+
+  <text x="478" y="44" font-size="10.5" fill="#333"><tspan font-family="Menlo, monospace">JSValueProtect</tspan> on entry</text>
+  <text x="478" y="60" font-size="10.5" fill="#333"><tspan font-family="Menlo, monospace">JSValueUnprotect</tspan> at watermark</text>
+
+  <line x1="20" y1="102" x2="760" y2="102" stroke="#ccc" stroke-width="1"/>
+
+  <!-- QuickJS lane -->
+  <text x="118" y="160" text-anchor="end" font-size="12" font-weight="bold">QuickJS</text>
+
+  <rect x="132" y="136" width="100" height="40" fill="#e9eef6" stroke="#555" stroke-width="1"/>
+  <text x="182" y="153" text-anchor="middle" font-size="11" font-family="Menlo, monospace">Local&lt;T&gt;</text>
+  <text x="182" y="168" text-anchor="middle" font-size="10" fill="#444">one pointer</text>
+
+  <line x1="232" y1="156" x2="296" y2="156" stroke="#2c4f7c" stroke-width="1" marker-end="url(#harr)"/>
+  <text x="265" y="148" text-anchor="middle" font-size="10" fill="#444">slot ptr</text>
+
+  <rect x="300" y="136" width="95" height="40" fill="#e0f0f2" stroke="#555" stroke-width="1"/>
+  <text x="347" y="160" text-anchor="middle" font-size="11">arena slot</text>
+
+  <line x1="395" y1="156" x2="459" y2="156" stroke="#2c4f7c" stroke-width="1" marker-end="url(#harr)"/>
+  <text x="428" y="148" text-anchor="middle" font-size="10" fill="#444">+1 ref</text>
+
+  <rect x="463" y="136" width="135" height="40" fill="#fbf3d8" stroke="#555" stroke-width="1"/>
+  <text x="530" y="153" text-anchor="middle" font-size="10.5">tag&#160;&#160;&#160;payload</text>
+  <text x="530" y="168" text-anchor="middle" font-size="10">16-byte <tspan font-family="Menlo, monospace">JSValue</tspan></text>
+
+  <line x1="598" y1="156" x2="668" y2="156" stroke="#555" stroke-width="1" stroke-dasharray="4 3" marker-end="url(#farr)"/>
+  <text x="633" y="148" text-anchor="middle" font-size="10" fill="#444">scope exit</text>
+  <text x="674" y="153" font-size="10.5" font-family="Menlo, monospace" fill="#333">JS_FreeValue</text>
+  <text x="674" y="168" font-size="10" fill="#444">free slot</text>
+</svg>

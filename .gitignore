@@ -15,3 +15,6 @@ vendor/rusty_v8/third_party/icu/common/icudtl.dat
 DEMO.md
 SNAPSHOT_NOTES.md
 __cmake_systeminformation/
+
+# typst docs site build output (tools/build-site.sh)
+/_site/
