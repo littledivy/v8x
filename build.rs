@@ -219,10 +219,23 @@ fn apply_patch_series(root: &Path, sub: &str, prefix: &str) {
   let sub_dir = root.join(sub);
   if !sub_dir.join(".git").exists() {
     let update_cfg = format!("submodule.{sub}.update=checkout");
+    // core.autocrlf=false: the patches are made against LF trees; a Windows
+    // clone with the Git for Windows default (autocrlf=true) would otherwise
+    // check the submodule out with CRLF and every patch context would miss.
+    // (-c propagates to the spawned clone/checkout via GIT_CONFIG_PARAMETERS.)
     assert!(
       run_git(
         root,
-        &["-c", &update_cfg, "submodule", "update", "--init", sub]
+        &[
+          "-c",
+          "core.autocrlf=false",
+          "-c",
+          &update_cfg,
+          "submodule",
+          "update",
+          "--init",
+          sub
+        ]
       ),
       "git submodule update --init {sub} failed"
     );
@@ -303,9 +316,19 @@ fn posix_cksum(bytes: &[u8]) -> u32 {
 }
 
 /// `git apply` rejected the patch; retry with patch(1), which fuzzes offsets,
-/// and treat "previously applied" as success. Unix-only fallback — patch(1)
-/// does not exist on Windows, where this just returns false.
+/// and treat "previously applied" as success. Not used for git binary deltas:
+/// GNU patch doesn't understand them and *silently skips* those sections while
+/// exiting 0 on the text hunks — a half-applied patch with a written stamp.
 fn patch_fallback(root: &Path, sub: &str, patch: &Path) -> bool {
+  if std::fs::read(patch)
+    .map(|c| {
+      c.windows(b"GIT binary patch".len())
+        .any(|w| w == b"GIT binary patch")
+    })
+    .unwrap_or(true)
+  {
+    return false;
+  }
   let run = |extra: &[&str]| {
     std::process::Command::new("patch")
       .args(["--batch", "--forward", "-p1", "-d", sub])

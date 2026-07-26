@@ -1,0 +1,8 @@
+# Patch files must reach the working tree byte-exact: two of the quickjs
+# patches are git binary deltas ("GIT binary patch"), which core.autocrlf=true
+# (the Git for Windows default) corrupts at checkout — git apply then fails
+# with "git diff header lacks filename information". Text patches also only
+# apply cleanly against the LF submodule trees when kept LF themselves.
+*.patch -text
+# Shell scripts break under bash if CRLF-converted.
+*.sh text eol=lf

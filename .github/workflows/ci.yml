@@ -122,6 +122,12 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 60
     steps:
+      # Git for Windows defaults to core.autocrlf=true, which corrupts the
+      # git-binary-delta patches at checkout and CRLFs the submodule trees the
+      # text patches context-match against. .gitattributes pins *.patch, but
+      # the submodule checkouts below have no such attributes — force LF.
+      - name: Force LF checkouts
+        run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
         with:
           submodules: false

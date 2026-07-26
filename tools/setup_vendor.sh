@@ -54,6 +54,11 @@ apply_series() {
     fi
     if ! git -C "$sub" apply --reverse --check "../../$p" 2>/dev/null; then
       if ! git -C "$sub" apply "../../$p"; then
+        # patch(1) silently SKIPS git binary deltas while exiting 0 on the
+        # text hunks — never fall back to it for those (half-applied patch).
+        if grep -q "GIT binary patch" "$p"; then
+          return 1
+        fi
         if patch --batch --dry-run --forward -p1 -d "$sub" < "$p" \
              >/dev/null 2>&1; then
           patch --batch --forward -p1 -d "$sub" < "$p"
