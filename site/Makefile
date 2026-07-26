@@ -6,8 +6,8 @@ help:
 all: ## Build the full site into ../_site (docs + dashboard)
 	TYPST=$(TYPST) ../tools/build-site.sh
 
-serve: all ## Build and serve locally on :8000
-	python3 -m http.server -d ../_site 8000
+serve: all ## Build and serve locally on :8000 (resolves clean URLs like Pages)
+	npx -y serve ../_site -l 8000
 
 fmt: ## Format typst sources
 	typstyle -i *.typ shim/*.typ
