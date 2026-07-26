@@ -112,6 +112,18 @@ blockquote {
   margin: 1.5em 0;
 }
 
+figure {
+  margin: 1.5em 0;
+}
+
+.crumb {
+  color: #666;
+}
+
+.next {
+  margin-top: 2.5em;
+}
+
 #chart svg {
   display: block;
   height: auto;

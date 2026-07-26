@@ -69,6 +69,30 @@
 /// An aside worth flagging. Usage: `#note[...]`
 #let note(body) = html.elem("aside", attrs: (class: "note-card"), body)
 
+/// A figure reused from the paper. `#fig("static/handles.svg", "alt", width: "420")`
+#let fig(src, alt, width: none) = html.elem(
+  "figure",
+  html.elem(
+    "img",
+    attrs: (src: src, alt: alt, loading: "lazy")
+      + (if width != none { (width: width) } else { (:) }),
+  ),
+)
+
+/// Breadcrumb + position marker for the internals sub-pages.
+#let crumb(n, title) = html.elem(
+  "p",
+  attrs: (class: "crumb"),
+  [#html.elem("a", attrs: (href: "internals"), [internals]) · #n of 7 · #title],
+)
+
+/// "Next:" pointer at the bottom of a sub-page.
+#let next(href, title) = html.elem(
+  "p",
+  attrs: (class: "next"),
+  [Next: #html.elem("a", attrs: (href: href), title)],
+)
+
 #let html-shim(doc) = context {
   default-html(get-document-info())(nav-bar() + doc + site-footer())
 }

@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE svg
+  PUBLIC '-//W3C//DTD SVG 1.0//EN'
+  'http://www.w3.org/TR/2001/REC-SVG-20010904/DTD/svg10.dtd'>
+<svg width="236" height="196" preserveAspectRatio="xMinYMin meet" viewBox="0 0 236 196" xmlns="http://www.w3.org/2000/svg" version="1.0" fill-rule="evenodd" xmlns:xlink="http://www.w3.org/1999/xlink">
+	<title>...</title>
+	<desc>...</desc>
+	<clipPath id="clip">
+		<rect x="0" y="0" width="236" height="196"/>
+	</clipPath>
+	<g id="group" transform="scale(1,-1) translate(0,-196)" style="clip-path: url(#clip)">
+		<g transform="">
+			<text x="24.470249999999993" y="184" style="font-family: Helvetica-Bold; font-size: 8.5px;fill: rgb(8%,8%,8%); stroke:none;" transform="translate(0,368) scale(1,-1)">one Local&lt;Value&gt;, two ownership translations</text>
+			<text x="30.49" y="165" style="font-family: Helvetica-Bold; font-size: 7.5px;fill: rgb(8%,8%,8%); stroke:none;" transform="translate(0,330) scale(1,-1)">JavaScriptCore</text>
+			<text x="162.9925" y="165" style="font-family: Helvetica-Bold; font-size: 7.5px;fill: rgb(8%,8%,8%); stroke:none;" transform="translate(0,330) scale(1,-1)">QuickJS</text>
+			<rect x="8" y="132" width="100" height="23" rx="4" ry="4" style="stroke: rgb(78%,78%,75%); stroke-linecap: butt; stroke-width: 1.2; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<text x="35.4418" y="145.8" style="font-family: Helvetica-Bold; font-size: 8.2px;fill: rgb(8%,8%,8%); stroke:none;" transform="translate(0,291) scale(1,-1)">JSValueRef</text>
+			<text x="39.289" y="138.67" style="font-family: Helvetica; font-size: 6.6px;fill: rgb(40%,40%,40%); stroke:none;" transform="translate(0,277) scale(1,-1)">engine value</text>
+			<path d="M 58,132 L 58,119 Z" style="stroke: rgb(78%,78%,75%); stroke-linecap: butt; stroke-width: 1;"/>
+			<rect x="8" y="96" width="100" height="23" rx="4" ry="4" style="stroke: rgb(78%,78%,75%); stroke-linecap: butt; stroke-width: 1.2; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<text x="27.9224" y="109.8" style="font-family: Helvetica-Bold; font-size: 8.2px;fill: rgb(8%,8%,8%); stroke:none;" transform="translate(0,219) scale(1,-1)">JSValueProtect</text>
+			<path d="M 58,96 L 58,83 Z" style="stroke: rgb(78%,78%,75%); stroke-linecap: butt; stroke-width: 1;"/>
+			<rect x="8" y="60" width="100" height="23" rx="4" ry="4" style="stroke: rgb(78%,78%,75%); stroke-linecap: butt; stroke-width: 1.2; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<text x="20.403000000000006" y="73.8" style="font-family: Helvetica-Bold; font-size: 8.2px;fill: rgb(8%,8%,8%); stroke:none;" transform="translate(0,147) scale(1,-1)">Local&lt;T&gt; is pointer</text>
+			<path d="M 58,60 L 58,47 Z" style="stroke: rgb(78%,78%,75%); stroke-linecap: butt; stroke-width: 1;"/>
+			<rect x="8" y="24" width="100" height="23" rx="4" ry="4" style="stroke: rgb(78%,78%,75%); stroke-linecap: butt; stroke-width: 1.2; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<text x="22.686700000000002" y="37.8" style="font-family: Helvetica-Bold; font-size: 8.2px;fill: rgb(8%,8%,8%); stroke:none;" transform="translate(0,75) scale(1,-1)">JSValueUnprotect</text>
+			<rect x="128" y="132" width="100" height="23" rx="4" ry="4" style="stroke: rgb(78%,78%,75%); stroke-linecap: butt; stroke-width: 1.2; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<text x="146.553" y="145.8" style="font-family: Helvetica-Bold; font-size: 8.2px;fill: rgb(8%,8%,8%); stroke:none;" transform="translate(0,291) scale(1,-1)">16-byte JSValue</text>
+			<text x="159.289" y="138.67" style="font-family: Helvetica; font-size: 6.6px;fill: rgb(40%,40%,40%); stroke:none;" transform="translate(0,277) scale(1,-1)">engine value</text>
+			<path d="M 178,132 L 178,119 Z" style="stroke: rgb(19%,41%,38%); stroke-linecap: butt; stroke-width: 1;"/>
+			<rect x="128" y="96" width="100" height="23" rx="4" ry="4" style="stroke: rgb(19%,41%,38%); stroke-linecap: butt; stroke-width: 1.2; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<text x="153.8469" y="109.8" style="font-family: Helvetica-Bold; font-size: 8.2px;fill: rgb(8%,8%,8%); stroke:none;" transform="translate(0,219) scale(1,-1)">box in arena</text>
+			<path d="M 178,96 L 178,83 Z" style="stroke: rgb(19%,41%,38%); stroke-linecap: butt; stroke-width: 1;"/>
+			<rect x="128" y="60" width="100" height="23" rx="4" ry="4" style="stroke: rgb(78%,78%,75%); stroke-linecap: butt; stroke-width: 1.2; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<text x="130.1448" y="73.8" style="font-family: Helvetica-Bold; font-size: 8.2px;fill: rgb(8%,8%,8%); stroke:none;" transform="translate(0,147) scale(1,-1)">Local&lt;T&gt; is slot address</text>
+			<path d="M 178,60 L 178,47 Z" style="stroke: rgb(19%,41%,38%); stroke-linecap: butt; stroke-width: 1;"/>
+			<rect x="128" y="24" width="100" height="23" rx="4" ry="4" style="stroke: rgb(78%,78%,75%); stroke-linecap: butt; stroke-width: 1.2; fill: rgb(100%,100%,100%); fill-rule: evenodd;"/>
+			<text x="137.779" y="37.8" style="font-family: Helvetica-Bold; font-size: 8.2px;fill: rgb(8%,8%,8%); stroke:none;" transform="translate(0,75) scale(1,-1)">FreeValue + free box</text>
+			<text x="38.90969999999999" y="3" style="font-family: Helvetica-Oblique; font-size: 6.2px;fill: rgb(40%,40%,40%); stroke:none;" transform="translate(0,6) scale(1,-1)">scope exit releases all values after the saved arena depth</text>
+		</g>
+	</g>
+</svg>
