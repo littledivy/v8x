@@ -14,7 +14,7 @@
 Both backends expose the same pointer-shaped `Local<T>`. They keep that
 promise in very different ways.
 
-#fig("static/handles.svg", "one Local<Value>, two ownership translations: JSC protects a JSValueRef pointer and unprotects at scope pop; QuickJS boxes a 16-byte JSValue into an owned slot and frees it at scope pop", width: "440")
+#fig("static/handles.svg", "two lanes: in JavaScriptCore a Local<T> points directly at a JSValueRef engine cell, protected on entry and unprotected at the watermark; in QuickJS it points at an arena slot that owns one reference to a 16-byte JSValue, freed at scope exit", width: "680")
 
 == JSC: the value is the handle
 

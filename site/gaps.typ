@@ -2,7 +2,7 @@
 
 #set document(
   title: "closing gaps · v8x",
-  description: "The escalation ladder for V8 semantics an engine doesn't expose: forward, adapt, normalize, or patch the engine.",
+  description: "Every v8__* symbol is classified: forwarded, emulated, normalized, patched, restricted, or unsupported.",
 )
 
 #show: html-shim
@@ -11,16 +11,28 @@
 
 = Closing gaps
 
-When a `v8__*` symbol needs behavior the engine does not expose, there are
-four moves, tried in order:
+Not every V8 behavior has an engine equivalent. Every `v8__*` symbol ends
+up in one of six classes:
 
-#fig("static/gaps.svg", "how v8x closes a semantic gap: 1 forward to an equivalent public API; 2 rebuild in adapter state; 3 normalize the source or observable result; 4 patch the engine to expose hidden state", width: "440")
+#table(
+  columns: 2,
+  [*class*], [*meaning*],
+  [forwarded], [the engine has an equivalent public API; the symbol calls it],
+  [emulated], [rebuilt in adapter side state: handles, contexts, templates,
+    module maps],
+  [normalized], [the source or the observable result is adjusted to match V8],
+  [patched], [the engine is patched to expose state its public API hides],
+  [restricted], [supported under a stated limit, like system JSC's
+    closed-graph #link("modules")[module loading]],
+  [unsupported], [declared unavailable, like #link("snapshots")[snapshots]
+    on system JSC],
+)
 
-+ forward: the engine has an equivalent public API, so call it
-+ adapter state: rebuild the behavior in v8x's own records (handles,
-  contexts, templates, module maps)
-+ normalize: adjust the source or the observable result to match V8
-+ patch: expose what the public API hides
+The first four are an escalation order: forward when the API exists,
+emulate when it doesn't, normalize when behavior differs, and patch only
+when required state is otherwise unreachable.
+
+== The patches
 
 Patches live in `patches/` and are applied to the submodules at build time:
 

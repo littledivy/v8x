@@ -14,7 +14,9 @@
 QuickJS can serialize objects and bytecode, but not Rust callbacks,
 template metadata, or embedder slots. Those are exactly what a `deno_core`
 snapshot needs, so a v8x snapshot is one serialized global graph plus a
-replay log for the native side:
+replay log for the native side.
+
+#fig("static/snapshot.svg", "the QuickJS object graph and a HOSTDATA replay log both feed one snapshot container; restore runs a five-step timeline: disable GC, decode graph, replay HOSTDATA, reconnect slots, enable GC, with GC disabled through the middle", width: "680")
 
 ```text
 context record = global object graph      # one graph, identity preserved

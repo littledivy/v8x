@@ -14,7 +14,7 @@
 rusty_v8 is a Rust API on top of \~570 `extern "C"` symbols. v8x keeps the
 Rust layer and reimplements the symbols on a different engine.
 
-#fig("static/architecture.svg", "stock runtime vs v8x runtime: same deno_core and rusty_v8 Rust API; the v8__* native ABI is implemented by V8 on the left, by v8x (JavaScriptCore / QuickJS) on the right", width: "640")
+#fig("static/architecture.svg", "layered diagram: host runtime and the rusty_v8 Rust API sit above the generated native ABI line; each build selects one v8x adapter below it, JavaScriptCore (tracing GC, protected pointers) or QuickJS (reference counts, tagged values)", width: "680")
 
 A call to `v8::String::new` still reaches `v8__String__NewFromUtf8`. The
 symbol is the same; the implementation behind it is new.

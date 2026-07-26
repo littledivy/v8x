@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 760 220" font-family="Helvetica, Arial, sans-serif">
+  <!-- Recreated from the vmil-2026 paper, fig:snapshot (TikZ in submission/main.tex) -->
+  <defs>
+    <marker id="sarr" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+      <path d="M0,0 L6,3 L0,6 z" fill="#333"/>
+    </marker>
+  </defs>
+
+  <!-- inputs -->
+  <rect x="16" y="26" width="200" height="44" fill="#e9eef6" stroke="#555" stroke-width="1"/>
+  <text x="116" y="44" text-anchor="middle" font-size="11.5" font-weight="bold">QuickJS object graph</text>
+  <text x="116" y="60" text-anchor="middle" font-size="10" fill="#444">objects, bytecode, identity</text>
+
+  <rect x="16" y="118" width="200" height="44" fill="#fbf3d8" stroke="#555" stroke-width="1"/>
+  <text x="116" y="136" text-anchor="middle" font-size="11.5"><tspan font-family="Menlo, monospace" font-weight="bold" font-size="11">HOSTDATA</tspan> replay log</text>
+  <text x="116" y="152" text-anchor="middle" font-size="10" fill="#444">callbacks, templates, slots</text>
+
+  <!-- container -->
+  <rect x="262" y="48" width="92" height="94" fill="#f5f5f5" stroke="#555" stroke-width="1"/>
+  <text x="308" y="90" text-anchor="middle" font-size="11">snapshot</text>
+  <text x="308" y="105" text-anchor="middle" font-size="11">container</text>
+
+  <line x1="216" y1="48" x2="256" y2="72" stroke="#333" stroke-width="0.9" marker-end="url(#sarr)"/>
+  <line x1="216" y1="140" x2="256" y2="118" stroke="#333" stroke-width="0.9" marker-end="url(#sarr)"/>
+
+  <!-- restore timeline -->
+  <line x1="354" y1="95" x2="392" y2="95" stroke="#333" stroke-width="0.9" marker-end="url(#sarr)"/>
+
+  <text x="540" y="52" text-anchor="middle" font-size="10" fill="#666">GC disabled</text>
+  <rect x="400" y="85" width="256" height="20" fill="#ececec"/>
+  <line x1="396" y1="95" x2="736" y2="95" stroke="#555" stroke-width="1"/>
+
+  <g font-size="10.5">
+    <circle cx="410" cy="95" r="11" fill="#fff" stroke="#555"/>
+    <text x="410" y="99" text-anchor="middle" font-weight="bold">1</text>
+    <text x="410" y="126" text-anchor="middle">disable</text>
+    <text x="410" y="139" text-anchor="middle">GC</text>
+
+    <circle cx="482" cy="95" r="11" fill="#fff" stroke="#555"/>
+    <text x="482" y="99" text-anchor="middle" font-weight="bold">2</text>
+    <text x="482" y="126" text-anchor="middle">decode</text>
+    <text x="482" y="139" text-anchor="middle">graph</text>
+
+    <circle cx="554" cy="95" r="11" fill="#fff" stroke="#555"/>
+    <text x="554" y="99" text-anchor="middle" font-weight="bold">3</text>
+    <text x="554" y="126" text-anchor="middle">replay</text>
+    <text x="554" y="139" text-anchor="middle" font-family="Menlo, monospace" font-size="9.5">HOSTDATA</text>
+
+    <circle cx="626" cy="95" r="11" fill="#fff" stroke="#555"/>
+    <text x="626" y="99" text-anchor="middle" font-weight="bold">4</text>
+    <text x="626" y="126" text-anchor="middle">reconnect</text>
+    <text x="626" y="139" text-anchor="middle">slots</text>
+
+    <circle cx="698" cy="95" r="11" fill="#fff" stroke="#555"/>
+    <text x="698" y="99" text-anchor="middle" font-weight="bold">5</text>
+    <text x="698" y="126" text-anchor="middle">enable</text>
+    <text x="698" y="139" text-anchor="middle">GC</text>
+  </g>
+</svg>
