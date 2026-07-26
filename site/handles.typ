@@ -1,7 +1,7 @@
 #import "./shim/html.typ": *
 
 #set document(
-  title: "handles — v8x",
+  title: "handles · v8x",
   description: "One pointer-shaped Local<T>, two ownership models: JSC protected pointers vs QuickJS one-refcount arena slots.",
 )
 
@@ -11,15 +11,15 @@
 
 = Handles
 
-Same public `Local<T>`, two engine representations. The figure is the whole
-story; the code below is how each side keeps its promise.
+Both backends expose the same pointer-shaped `Local<T>`. They keep that
+promise in very different ways.
 
 #fig("static/handles.svg", "one Local<Value>, two ownership translations: JSC protects a JSValueRef pointer and unprotects at scope pop; QuickJS boxes a 16-byte JSValue into an owned slot and frees it at scope pop", width: "440")
 
 == JSC: the value is the handle
 
-`JSValueRef` is already a pointer. Protect it, remember it, unprotect at
-scope exit:
+`JSValueRef` is already a pointer, so it is used directly. Protect the
+value, remember it, unprotect at scope exit:
 
 ```rust
 // intern
@@ -27,7 +27,7 @@ JSValueProtect(ctx, v);
 iso.locals.push((v, ctx));
 return v as *const T;
 
-// HandleScope::drop — pop to the watermark saved at scope entry
+// HandleScope::drop: pop to the watermark saved at scope entry
 while iso.locals.len() > scope.watermark {
     let (v, ctx) = iso.locals.pop();
     JSValueUnprotect(ctx, v);
@@ -36,9 +36,9 @@ while iso.locals.len() > scope.watermark {
 
 == QuickJS: the slot is the handle
 
-A `JSValue` is 16 bytes of payload + tag — those bits can't be a pointer.
-Box it; the slot address is the handle. *Each slot owns exactly one
-refcount:*
+A `JSValue` is 16 bytes of payload and tag, so the bits cannot themselves
+be a pointer. Each value moves into a boxed arena slot and the slot address
+becomes the handle. Every slot owns exactly one reference count:
 
 ```rust
 // fresh engine result: move it into the slot
@@ -52,8 +52,9 @@ while arena.len() > scope.watermark {
 }
 ```
 
-Break the rule either way and you lose: dup a fresh value → leak one count;
-move a borrowed one → free somebody else's value.
+Duplicating a fresh value would leak a reference. Moving a borrowed one
+would free a value some other owner still holds. The one-count-per-slot
+rule prevents both.
 
 == Globals
 
@@ -68,13 +69,14 @@ struct PersistentCell { value: JSValue, ctx: *mut JSContext, iso: *mut IsoState 
 
 == Weak handles
 
-- QuickJS: native `WeakRef` beside the cell; sweep after `JS_RunGC`, fire
-  the Rust callback for dead targets
-- JSC: no per-object weak reference in the public C API — callbacks drain
-  after an explicit GC request
+QuickJS keeps a native `WeakRef` next to the persistent cell, sweeps after
+`JS_RunGC`, and fires the Rust callback for dead targets. JSC's public C
+API has no per-object weak reference, so that backend records callbacks and
+drains them after an explicit collection request.
 
-Handle *validity* is exact on both. Collection *timing* is a backend
-property: refcount-zero ≠ cycle pass ≠ tracing ≠ V8 major GC. Code that
-depends on finalizer order stays engine-sensitive.
+Handle validity is exact on both backends. Collection timing is not: a
+reference count reaching zero, a cycle pass, a tracing collection, and a V8
+major GC are four different events, and v8x does not pretend otherwise.
+Code that depends on finalizer order stays engine-sensitive.
 
-#next("callbacks", [Callbacks & exceptions — trampolines and side state])
+#next("callbacks", [Callbacks and exceptions: trampolines and side state])
