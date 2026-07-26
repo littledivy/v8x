@@ -42,39 +42,12 @@ One engine is active at a time. The usual reason to swap is binary size:
   [quickjs-ng], [56.1 MB], [\~1 MB static],
 )
 
-== What runs today
+== Progress
 
-- `deno_core` compiles and runs unchanged on all backends.
-- Next.js 14 with full SSR runs on QuickJS and on vendored JSC, native
-  `@next/swc` addon included.
-- Express, Hono, and `deno repl` run on QuickJS. The repl talks to a real
-  V8-inspector/CDP implementation.
-
-== The hill climb
-
-Compatibility is measured, not claimed. Two suites run unmodified against
-every backend: the rusty_v8 integration tests, and `deno_core`'s own test
+Two suites run unmodified against every backend: the rusty_v8 integration tests, and `deno_core`'s own test
 suite under nextest. When a test fails, the backend gets fixed, not the
 test.
 
 #html.elem("div", attrs: (id: "chart", class: "chart"), "")
 #html.elem("script", attrs: (src: "chart.js"), "")
 #html.elem("script", "v8xChart(document.getElementById('chart'), 'status/')")
-
-Progress is ratcheted. Each backend and suite pair has a checked-in
-baseline listing every test known to pass, and CI fails on a regression or
-on unrecorded progress. The passing count can only move up. Live numbers
-are on the #link("status/")[dashboard].
-
-Contributing follows one loop: make a test pass, re-run the cell with
-`--update` to record the new baseline, commit both, open a PR. The playbook
-is in the repo's
-#link("https://github.com/littledivy/v8x/blob/main/CLAUDE.md")[CLAUDE.md].
-
-== Design
-
-The work is not calling a different engine's API. It is preserving V8's
-host semantics on engines that were never built for them: value ownership
-across two garbage-collection models, module identity, exception state,
-startup snapshots, WebAssembly. The #link("internals")[internals] pages
-walk through each one.
