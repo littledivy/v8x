@@ -50,7 +50,7 @@ pub const v8_String_WriteFlags_kNullTerminate:
   v8_String_WriteFlags__bindgen_ty_1 = 1;
 pub const v8_String_WriteFlags_kReplaceInvalidUtf8:
   v8_String_WriteFlags__bindgen_ty_1 = 2;
-pub type v8_String_WriteFlags__bindgen_ty_1 = ::std::os::raw::c_uint;
+pub type v8_String_WriteFlags__bindgen_ty_1 = ::std::os::raw::c_int;
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
   ["Size of v8_String_WriteFlags"]
@@ -89,7 +89,7 @@ const _: () = {
     - 8usize];
 };
 unsafe extern "C" {
-  #[link_name = "\u{1}__ZN2v86String26ExternalStringResourceBase22kDefaultMemoryEstimateE"]
+  #[link_name = "\u{1}?kDefaultMemoryEstimate@ExternalStringResourceBase@String@v8@@2_KB"]
   pub static v8_String_ExternalStringResourceBase_kDefaultMemoryEstimate: usize;
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
@@ -123,7 +123,7 @@ const _: () = {
 };
 unsafe extern "C" {
   #[doc = " Update {cached_data_} with the data from the underlying buffer. This can\n be called only for cacheable resources."]
-  #[link_name = "\u{1}__ZN2v86String29ExternalOneByteStringResource15UpdateDataCacheEv"]
+  #[link_name = "\u{1}?UpdateDataCache@ExternalOneByteStringResource@String@v8@@QEAAXXZ"]
   pub fn v8_String_ExternalOneByteStringResource_UpdateDataCache(
     this: *mut v8_String_ExternalOneByteStringResource,
   );
@@ -175,7 +175,7 @@ pub const v8_CTypeInfo_Flags_kIsRestrictedBit: v8_CTypeInfo_Flags = 8;
 pub type v8_CTypeInfo_Flags = u8;
 pub type v8_CTypeInfo_Identifier = u32;
 unsafe extern "C" {
-  #[link_name = "\u{1}__ZN2v89CTypeInfo20kCallbackOptionsTypeE"]
+  #[link_name = "\u{1}?kCallbackOptionsType@CTypeInfo@v8@@2W4Type@12@B"]
   pub static v8_CTypeInfo_kCallbackOptionsType: v8_CTypeInfo_Type;
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
@@ -234,14 +234,14 @@ const _: () = {
     [::std::mem::offset_of!(v8_CFunctionInfo, arg_info_) - 8usize];
 };
 unsafe extern "C" {
-  #[link_name = "\u{1}__ZNK2v813CFunctionInfo12ArgumentInfoEj"]
+  #[link_name = "\u{1}?ArgumentInfo@CFunctionInfo@v8@@QEBAAEBVCTypeInfo@2@I@Z"]
   pub fn v8_CFunctionInfo_ArgumentInfo(
     this: *const v8_CFunctionInfo,
     index: ::std::os::raw::c_uint,
   ) -> *const v8_CTypeInfo;
 }
 unsafe extern "C" {
-  #[link_name = "\u{1}__ZN2v813CFunctionInfoC1ERKNS_9CTypeInfoEjPS2_NS0_19Int64RepresentationE"]
+  #[link_name = "\u{1}??0CFunctionInfo@v8@@QEAA@AEBVCTypeInfo@1@IPEBV21@W4Int64Representation@01@@Z"]
   pub fn v8_CFunctionInfo_CFunctionInfo(
     this: *mut v8_CFunctionInfo,
     return_info: *const v8_CTypeInfo,
@@ -305,7 +305,7 @@ const _: () = {
     [::std::mem::offset_of!(v8_CFunction, type_info_) - 8usize];
 };
 unsafe extern "C" {
-  #[link_name = "\u{1}__ZN2v89CFunctionC1EPKvPKNS_13CFunctionInfoE"]
+  #[link_name = "\u{1}??0CFunction@v8@@QEAA@PEBXPEBVCFunctionInfo@1@@Z"]
   pub fn v8_CFunction_CFunction(
     this: *mut v8_CFunction,
     address: *const ::std::os::raw::c_void,
@@ -360,7 +360,7 @@ impl ::std::ops::BitAndAssign for v8_GCType {
 #[repr(transparent)]
 #[doc = " Applications can register callback functions which will be called before and\n after certain garbage collection operations.  Allocations are not allowed in\n the callback functions, you therefore cannot manipulate objects (set or\n delete properties for example) since it is possible such operations will\n result in the allocation of objects.\n TODO(v8:12612): Deprecate kGCTypeMinorMarkSweep after updating blink."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
-pub struct v8_GCType(pub ::std::os::raw::c_uint);
+pub struct v8_GCType(pub ::std::os::raw::c_int);
 impl v8_GCCallbackFlags {
   pub const kNoGCCallbackFlags: v8_GCCallbackFlags = v8_GCCallbackFlags(0);
   pub const kGCCallbackFlagConstructRetainedObjectInfos: v8_GCCallbackFlags =
@@ -406,7 +406,7 @@ impl ::std::ops::BitAndAssign for v8_GCCallbackFlags {
 #[repr(transparent)]
 #[doc = " GCCallbackFlags is used to notify additional information about the GC\n callback.\n   - kGCCallbackFlagConstructRetainedObjectInfos: The GC callback is for\n     constructing retained object infos.\n   - kGCCallbackFlagForced: The GC callback is for a forced GC for testing.\n   - kGCCallbackFlagSynchronousPhantomCallbackProcessing: The GC callback\n     is called synchronously without getting posted to an idle task.\n   - kGCCallbackFlagCollectAllAvailableGarbage: The GC callback is called\n     in a phase where V8 is trying to collect all available garbage\n     (e.g., handling a low memory notification).\n   - kGCCallbackScheduleIdleGarbageCollection: The GC callback is called to\n     trigger an idle garbage collection."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
-pub struct v8_GCCallbackFlags(pub ::std::os::raw::c_uint);
+pub struct v8_GCCallbackFlags(pub ::std::os::raw::c_int);
 #[repr(i32)]
 #[doc = " Import phases in import requests."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -494,7 +494,7 @@ const _: () = {
   ) - 112usize];
 };
 unsafe extern "C" {
-  #[link_name = "\u{1}__ZN2v814HeapStatisticsC1Ev"]
+  #[link_name = "\u{1}??0HeapStatistics@v8@@QEAA@XZ"]
   pub fn v8_HeapStatistics_HeapStatistics(this: *mut v8_HeapStatistics);
 }
 impl v8_HeapStatistics {
@@ -540,7 +540,7 @@ const _: () = {
     - 32usize];
 };
 unsafe extern "C" {
-  #[link_name = "\u{1}__ZN2v819HeapSpaceStatisticsC1Ev"]
+  #[link_name = "\u{1}??0HeapSpaceStatistics@v8@@QEAA@XZ"]
   pub fn v8_HeapSpaceStatistics_HeapSpaceStatistics(
     this: *mut v8_HeapSpaceStatistics,
   );
@@ -589,7 +589,7 @@ const _: () = {
     - 24usize];
 };
 unsafe extern "C" {
-  #[link_name = "\u{1}__ZN2v818HeapCodeStatisticsC1Ev"]
+  #[link_name = "\u{1}??0HeapCodeStatistics@v8@@QEAA@XZ"]
   pub fn v8_HeapCodeStatistics_HeapCodeStatistics(
     this: *mut v8_HeapCodeStatistics,
   );
@@ -602,7 +602,7 @@ impl v8_HeapCodeStatistics {
     __bindgen_tmp.assume_init()
   }
 }
-#[repr(u32)]
+#[repr(i32)]
 #[doc = " Features reported via the SetUseCounterCallback callback. Do not change\n assigned numbers of existing items; add new features to the end of this\n list.\n Dead features can be marked `V8_DEPRECATE_SOON`, then `V8_DEPRECATED`, and\n then finally be renamed to `kOBSOLETE_...` to stop embedders from using\n them."]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub enum v8_Isolate_UseCounterFeature {
@@ -845,11 +845,11 @@ const _: () = {
   ["Alignment of RustObj"][::std::mem::align_of::<RustObj>() - 8usize];
 };
 unsafe extern "C" {
-  #[link_name = "\u{1}__ZN7RustObjD1Ev"]
+  #[link_name = "\u{1}??1RustObj@@UEAA@XZ"]
   pub fn RustObj_RustObj_destructor(this: *mut RustObj);
 }
 unsafe extern "C" {
-  #[link_name = "\u{1}__ZNK7RustObj20GetHumanReadableNameEv"]
+  #[link_name = "\u{1}?GetHumanReadableName@RustObj@@UEBAPEBDXZ"]
   pub fn RustObj_GetHumanReadableName(
     this: *mut ::std::os::raw::c_void,
   ) -> *const ::std::os::raw::c_char;

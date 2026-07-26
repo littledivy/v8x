@@ -25,7 +25,6 @@ fn emit_bc_embed() {
 }
 
 fn emit_vendor_rerun_inputs(manifest_dir: &Path) {
-  println!("cargo:rerun-if-changed=tools/setup_vendor.sh");
   let patches_dir = manifest_dir.join("patches");
   println!("cargo:rerun-if-changed={}", patches_dir.display());
   let Ok(entries) = std::fs::read_dir(&patches_dir) else {
@@ -84,12 +83,27 @@ fn main() {
   // `include!(env!("RUSTY_V8_SRC_BINDING_PATH"))` to pull in the bindgen
   // output (extern decls + SIZE consts). We point it at the pre-generated
   // bindings for this target. The C ABI symbols are *defined* by our own
-  // JSC-backed shim (linked below); only the declarations come from here.
-  let simdutf = env::var("CARGO_FEATURE_SIMDUTF").is_ok();
-  let gen_file = if simdutf {
-    "gen/src_binding_simdutf_debug_aarch64-apple-darwin.rs"
-  } else {
+  // engine shim (linked below); only the declarations come from here.
+  //
+  // The files in gen/ are unmodified upstream rusty_v8 v149.4.0 release
+  // assets. Their content varies only by OS family — the per-arch and
+  // debug/release/simdutf variants upstream publishes are byte-identical
+  // within one OS (verified; see gen/README.md) — so one file per OS family
+  // covers every target: mangled C++ `link_name`s (Itanium `_Z..` with a
+  // leading underscore on Apple, MSVC `?..` on Windows) and enum repr types
+  // (c_int on MSVC, c_uint elsewhere).
+  let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+  let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+  let gen_file = if env::var("CARGO_CFG_TARGET_VENDOR").as_deref()
+    == Ok("apple")
+  {
     "gen/src_binding_debug_aarch64-apple-darwin.rs"
+  } else if target_os == "windows" && target_env == "msvc" {
+    "gen/src_binding_release_x86_64-pc-windows-msvc.rs"
+  } else {
+    // Itanium mangling without the Apple underscore: linux-gnu/musl, the BSDs,
+    // android, windows-gnu.
+    "gen/src_binding_debug_x86_64-unknown-linux-gnu.rs"
   };
   let binding_path = manifest_dir.join(gen_file);
   println!(
@@ -103,6 +117,14 @@ fn main() {
   // --- JSC backend: generate full FFI bindings from the SDK header. ---
   // `src/jsc_sys.rs` `include!`s the output, so the complete JavaScriptCore
   // C API is available without hand-written externs.
+  if env::var_os("CARGO_FEATURE_ENGINE_JSC").is_some() && target_os != "macos"
+  {
+    panic!(
+      "the JSC backends (features `jsc`/`engine_jsc`/`system_jsc`) are \
+       macOS-only; build with `--no-default-features --features quickjs` \
+       on {target_os}"
+    );
+  }
   if env::var_os("CARGO_FEATURE_ENGINE_JSC").is_some() {
     generate_jsc_bindings();
   }
@@ -158,22 +180,177 @@ fn main() {
   }
 }
 
-/// Init the pinned quickjs-ng + WAMR submodules and apply our patch files on top
-/// (see tools/setup_vendor.sh). Idempotent; runs before either engine compiles so
-/// a fresh checkout builds without a manual submodule dance.
-fn setup_vendor(manifest_dir: &std::path::Path, mode: &str) {
-  let status = std::process::Command::new("bash")
-    .arg(manifest_dir.join("tools/setup_vendor.sh"))
-    .arg(mode)
-    .current_dir(manifest_dir)
-    .status();
-  match status {
-    Ok(s) if s.success() => {}
-    other => panic!(
-      "tools/setup_vendor.sh (submodule init + patches) failed: {other:?}"
-    ),
+/// Init the pinned vendor submodules and apply our patch files on top.
+/// Pure-Rust port of tools/setup_vendor.sh (kept for manual use — change both
+/// together) so a fresh checkout builds without bash, notably on Windows.
+/// Idempotent: `.v8x-patches/` stamp files skip patches whose checksum hasn't
+/// changed, and an applied patch is detected via `git apply --reverse --check`.
+fn setup_vendor(manifest_dir: &Path, mode: &str) {
+  apply_patch_series(manifest_dir, "vendor/rusty_v8", "rusty_v8");
+  ensure_rusty_v8_icu(manifest_dir);
+  if mode == "quickjs" {
+    apply_patch_series(manifest_dir, "vendor/quickjs-ng", "quickjs");
+    apply_patch_series(manifest_dir, "vendor/wamr", "wamr");
+    // WAMR's CMake driver has no upstream counterpart; copy it in.
+    let dst_dir = manifest_dir.join("vendor/wamr/v82jsc");
+    std::fs::create_dir_all(&dst_dir).unwrap();
+    std::fs::copy(
+      manifest_dir.join("patches/wamr-v82jsc-CMakeLists.txt"),
+      dst_dir.join("CMakeLists.txt"),
+    )
+    .expect("failed to copy WAMR CMakeLists driver");
   }
   emit_vendor_rerun_inputs(manifest_dir);
+}
+
+fn run_git(cwd: &Path, args: &[&str]) -> bool {
+  std::process::Command::new("git")
+    .args(args)
+    .current_dir(cwd)
+    .status()
+    .map(|s| s.success())
+    .unwrap_or(false)
+}
+
+/// Apply every patches/<prefix>-NN-*.patch onto a submodule, ordered like
+/// `sort -V` (numerically by NN, then by name). Initializes the submodule
+/// first if its working tree is absent.
+fn apply_patch_series(root: &Path, sub: &str, prefix: &str) {
+  let sub_dir = root.join(sub);
+  if !sub_dir.join(".git").exists() {
+    let update_cfg = format!("submodule.{sub}.update=checkout");
+    assert!(
+      run_git(
+        root,
+        &["-c", &update_cfg, "submodule", "update", "--init", sub]
+      ),
+      "git submodule update --init {sub} failed"
+    );
+  }
+  let stamp_dir = sub_dir.join(".v8x-patches");
+  std::fs::create_dir_all(&stamp_dir).unwrap();
+
+  let mut patches: Vec<(u64, String, PathBuf)> = Vec::new();
+  for entry in std::fs::read_dir(root.join("patches")).unwrap().flatten() {
+    let name = entry.file_name().to_string_lossy().into_owned();
+    let Some(rest) = name.strip_prefix(&format!("{prefix}-")) else {
+      continue;
+    };
+    if !name.ends_with(".patch")
+      || !rest.starts_with(|c: char| c.is_ascii_digit())
+    {
+      continue;
+    }
+    let num: u64 = rest
+      .chars()
+      .take_while(char::is_ascii_digit)
+      .collect::<String>()
+      .parse()
+      .unwrap();
+    patches.push((num, name, entry.path()));
+  }
+  patches.sort();
+
+  for (_, name, patch) in patches {
+    let contents = std::fs::read(&patch).unwrap();
+    // Same format tools/setup_vendor.sh writes (`cksum < patch`), so stamps
+    // written by either implementation are honored by the other. That matters:
+    // patches applied long ago may no longer probe as applied (later patches
+    // shift their context past what `git apply --reverse --check` tolerates),
+    // so invalidating existing stamps would fail such trees spuriously.
+    let checksum = format!("{} {}", posix_cksum(&contents), contents.len());
+    let stamp = stamp_dir.join(&name);
+    if std::fs::read_to_string(&stamp)
+      .map(|s| s.trim_end() == checksum)
+      .unwrap_or(false)
+    {
+      continue;
+    }
+    // Already absolute (root is CARGO_MANIFEST_DIR). Deliberately NOT
+    // canonicalize(): on Windows that yields a \\?\-prefixed path git rejects.
+    let patch_str = patch.to_str().unwrap();
+    let applied = run_git(
+      &sub_dir,
+      &["apply", "--reverse", "--check", patch_str],
+    ) || run_git(&sub_dir, &["apply", patch_str])
+      || patch_fallback(root, sub, &patch);
+    assert!(applied, "failed to apply patches/{name} onto {sub}");
+    std::fs::write(&stamp, format!("{checksum}\n")).unwrap();
+  }
+}
+
+/// POSIX cksum(1): CRC-32 (poly 0x04C11DB7, MSB-first, init 0) over the data
+/// followed by the length as minimal little-endian bytes, complemented.
+fn posix_cksum(bytes: &[u8]) -> u32 {
+  fn step(mut crc: u32, b: u8) -> u32 {
+    crc ^= u32::from(b) << 24;
+    for _ in 0..8 {
+      crc = if crc & 0x8000_0000 != 0 {
+        (crc << 1) ^ 0x04C1_1DB7
+      } else {
+        crc << 1
+      };
+    }
+    crc
+  }
+  let mut crc = bytes.iter().fold(0u32, |c, &b| step(c, b));
+  let mut len = bytes.len() as u64;
+  while len != 0 {
+    crc = step(crc, (len & 0xff) as u8);
+    len >>= 8;
+  }
+  !crc
+}
+
+/// `git apply` rejected the patch; retry with patch(1), which fuzzes offsets,
+/// and treat "previously applied" as success. Unix-only fallback — patch(1)
+/// does not exist on Windows, where this just returns false.
+fn patch_fallback(root: &Path, sub: &str, patch: &Path) -> bool {
+  let run = |extra: &[&str]| {
+    std::process::Command::new("patch")
+      .args(["--batch", "--forward", "-p1", "-d", sub])
+      .args(extra)
+      .arg("-i")
+      .arg(patch)
+      .current_dir(root)
+      .output()
+  };
+  let Ok(dry) = run(&["--dry-run"]) else {
+    return false; // no patch(1) on this system
+  };
+  if dry.status.success() {
+    return run(&[]).map(|o| o.status.success()).unwrap_or(false);
+  }
+  let out = String::from_utf8_lossy(&dry.stdout).into_owned()
+    + &String::from_utf8_lossy(&dry.stderr);
+  if out.contains("previously applied") {
+    println!(
+      "cargo:warning={} may already be applied",
+      patch.display()
+    );
+    return true;
+  }
+  false
+}
+
+/// rusty_v8's tests embed third_party/icu/common/icudtl.dat at compile time.
+/// Keep the real pinned Chromium ICU data available; the 10 MiB blob is not
+/// committed here, so init the nested submodule when the file is missing or
+/// truncated.
+fn ensure_rusty_v8_icu(root: &Path) {
+  let rusty_v8 = root.join("vendor/rusty_v8");
+  let dat = rusty_v8.join("third_party/icu/common/icudtl.dat");
+  let size = std::fs::metadata(&dat).map(|m| m.len()).unwrap_or(0);
+  if size < 1_048_576 {
+    let _ = std::fs::remove_dir_all(rusty_v8.join("third_party/icu"));
+    assert!(
+      run_git(
+        &rusty_v8,
+        &["submodule", "update", "--init", "third_party/icu"]
+      ),
+      "git submodule update --init third_party/icu failed in vendor/rusty_v8"
+    );
+  }
 }
 
 /// Build the vendored wasm-micro-runtime (WAMR) as an interpreter-only static
@@ -210,9 +387,21 @@ fn build_wamr(manifest_dir: &std::path::Path) {
     "-DWAMR_DISABLE_STACK_HW_BOUND_CHECK=1",
     src.to_str().unwrap(),
   ]);
-  cmake(&["--build", ".", "-j", "4"]);
+  // `--config` matters only for multi-config generators (the Visual Studio
+  // default on Windows, which emits into a Release/ subdir); single-config
+  // generators ignore it.
+  cmake(&["--build", ".", "--config", "Release", "-j", "4"]);
   println!("cargo:rustc-link-search=native={}", out.display());
+  println!(
+    "cargo:rustc-link-search=native={}",
+    out.join("Release").display()
+  );
   println!("cargo:rustc-link-lib=static=vmlib");
+  if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+    // win_socket.c / win_thread.c pull in winsock; the #pragma comment(lib)
+    // in the objects covers MSVC link.exe, but be explicit for lld-link.
+    println!("cargo:rustc-link-lib=ws2_32");
+  }
   println!("cargo:rerun-if-changed={}", src.display());
 }
 
@@ -531,7 +720,18 @@ fn build_quickjs(manifest_dir: &std::path::Path) {
     .flag_if_supported("-Wno-unused-but-set-variable")
     .flag_if_supported("-Wno-unused-variable")
     // Match quickjs-ng's CMake Release configuration.
-    .opt_level(3)
-    .compile("quickjs");
+    .opt_level(3);
+  // Mirror upstream quickjs-ng's Windows/MSVC CMake configuration: C11 with
+  // the (still "experimental") MSVC C11 atomics, and lean windows.h.
+  if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+    build
+      .define("WIN32_LEAN_AND_MEAN", None)
+      .define("_WIN32_WINNT", "0x0601")
+      .define("_CRT_SECURE_NO_WARNINGS", None)
+      .define("_CRT_NONSTDC_NO_DEPRECATE", None)
+      .flag_if_supported("/std:c11")
+      .flag_if_supported("/experimental:c11atomics");
+  }
+  build.compile("quickjs");
   println!("cargo:rerun-if-changed={}", qjs.display());
 }

@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# NOTE: build.rs carries a pure-Rust port of this script (fn setup_vendor and
+# friends) so `cargo build` works without bash, notably on Windows. This script
+# stays for manual/CI use — keep the two in sync when changing patch semantics.
+#
 # Init the pinned vendor submodules and apply our patches on top. Every vendored
 # dependency lives in vendor/<name> at an exact upstream commit (see .gitmodules /
 # the gitlinks); our edits ship as patches/<name>-NN-*.patch applied to the

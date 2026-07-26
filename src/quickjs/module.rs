@@ -1058,7 +1058,15 @@ unsafe fn dynamic_phase_import_js_cb(
     };
   };
 
+  // Windows ABI: leading return-slot out-param (see run_synthetic_eval_steps).
+  #[cfg(not(target_os = "windows"))]
   let promise_ptr = unsafe { cb(ctx_l, ho_l, ref_l, spec_l, phase, attr_l) };
+  #[cfg(target_os = "windows")]
+  let promise_ptr = unsafe {
+    let mut ret = ptr::null_mut();
+    cb(&mut ret, ctx_l, ho_l, ref_l, spec_l, phase, attr_l);
+    ret
+  };
   if promise_ptr.is_null() {
     if unsafe { JS_HasException(ctx) } {
       return jsv_exception();
@@ -1338,7 +1346,15 @@ unsafe extern "C" fn dynamic_import_hook(
     return;
   };
 
+  // Windows ABI: leading return-slot out-param (see run_synthetic_eval_steps).
+  #[cfg(not(target_os = "windows"))]
   let promise_ptr = unsafe { cb(ctx_l, ho_l, ref_l, spec_l, attr_l) };
+  #[cfg(target_os = "windows")]
+  let promise_ptr = unsafe {
+    let mut ret = ptr::null_mut();
+    cb(&mut ret, ctx_l, ho_l, ref_l, spec_l, attr_l);
+    ret
+  };
   if promise_ptr.is_null() {
     if unsafe { JS_HasException(ctx) } {
       let mut a = [unsafe { JS_GetException(ctx) }];
@@ -3253,7 +3269,15 @@ unsafe fn resolve_module_import(
   ) else {
     return None;
   };
+  // Windows ABI: leading return-slot out-param (see run_synthetic_eval_steps).
+  #[cfg(not(target_os = "windows"))]
   let resolved = unsafe { cb(context, specifier, attributes, referrer) };
+  #[cfg(target_os = "windows")]
+  let resolved = unsafe {
+    let mut ret = ptr::null();
+    cb(&mut ret, context, specifier, attributes, referrer);
+    ret
+  };
   if unsafe { JS_HasException(ctx) } {
     return None;
   }
@@ -3337,7 +3361,15 @@ unsafe fn resolve_source_import(
   ) else {
     return;
   };
+  // Windows ABI: leading return-slot out-param (see run_synthetic_eval_steps).
+  #[cfg(not(target_os = "windows"))]
   let ret = unsafe { scb(ctx_local, spec_local, attrs_local, ref_local) };
+  #[cfg(target_os = "windows")]
+  let ret = unsafe {
+    let mut ret = ptr::null();
+    scb(&mut ret, ctx_local, spec_local, attrs_local, ref_local);
+    ret
+  };
 
   let obj: *const Object = unsafe { std::mem::transmute(ret) };
   if obj.is_null() {
