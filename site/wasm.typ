@@ -16,20 +16,15 @@ constructors and accessors for modules, instances, memories, tables, and
 globals. quickjs-ng has no WebAssembly surface, so the QuickJS backend
 embeds #link("https://github.com/bytecodealliance/wasm-micro-runtime")[WAMR]
 and wraps its native objects in JavaScript objects. This is a second
-ownership boundary:
+ownership boundary, and three rules keep it sound:
 
-```text
-JS wrapper ──retains──▶ native WAMR object     (until engine collects wrapper)
-wasm import call ──▶ QuickJS callback ──▶ same Rust trampoline as JS fns
-memory.grow ──▶ JS ArrayBuffer view re-synced to new linear memory
-```
-
-Three rules keep it sound:
-
-+ a wrapper must outlive its native object, never the reverse
-+ imported functions reuse the #link("callbacks")[callback trampoline], so
-  host calls behave the same from JavaScript and from Wasm
-+ reference values crossing tables and globals keep their QuickJS
-  ownership count
++ a JavaScript wrapper retains its native WAMR object until the engine
+  collects the wrapper, never the reverse
++ imported functions cross from Wasm into a QuickJS callback and then the
+  same #link("callbacks")[trampoline] as ordinary functions, so host calls
+  behave the same from JavaScript and from Wasm
++ when linear memory grows, the JavaScript `ArrayBuffer` view is re-synced
+  to the new memory; reference values crossing tables and globals keep
+  their QuickJS ownership count
 
 #next("gaps", [Closing gaps: forward, adapt, normalize, patch])

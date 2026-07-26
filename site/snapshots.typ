@@ -18,14 +18,16 @@ replay log for the native side.
 
 #fig("static/snapshot.svg", "the QuickJS object graph and a HOSTDATA replay log both feed one snapshot container; restore runs a five-step timeline: disable GC, decode graph, replay HOSTDATA, reconnect slots, enable GC, with GC disabled through the middle", width: "680")
 
-```text
-context record = global object graph      # one graph, identity preserved
-               + template descriptions
-               + lexical globals
-               + embedder/context slots
-               + rooted-in-graph bitmap
-host function  = HOSTDATA { index into rusty_v8 external-ref table }
-```
+#table(
+  columns: 2,
+  [*record*], [*contents*],
+  [context record], [the global object graph, serialized as one graph so
+    repeated references keep their identity; template descriptions; lexical
+    globals; embedder and context slots; a bitmap of values already rooted
+    in the graph],
+  [host function], [a `HOSTDATA` entry holding the function's index in the
+    rusty_v8 external-reference table],
+)
 
 Restore order matters:
 

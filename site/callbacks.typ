@@ -14,14 +14,13 @@
 Every native callback crosses an engine C frame before it reaches Rust.
 The trampoline does five things, in order:
 
-```text
-engine calls C trampoline
-  1. restore thread-local (isolate, context)    # many ABI fns get only a value ptr
-  2. intern receiver + args                     # quickjs: arena slots
-  3. build the FunctionCallbackInfo pointer layout rusty_v8 expects
-  4. call the Rust callback                     # panics caught at this boundary
-  5. translate the return-value slot back to an engine value
-```
++ restore the thread-local isolate and context; many ABI functions receive
+  only a value pointer, so this state must already be in place
++ intern the receiver and arguments, which on QuickJS allocates arena slots
++ build the exact `FunctionCallbackInfo` pointer layout rusty_v8 expects
++ call the Rust callback, catching panics so they never unwind through
+  engine frames
++ translate the return-value slot back into an engine value
 
 == Exceptions live in side state
 
