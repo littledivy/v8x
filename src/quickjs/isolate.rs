@@ -752,6 +752,22 @@ unsafe extern "C" fn promise_hook_trampoline(
   PROMISE_HOOK_BUSY.with(|b| b.set(false));
 }
 
+/// Free any dup'd JS promise-hook functions before their `JSContext` dies.
+/// Called from `v8__Isolate__Dispose`. `PROMISE_HOOKS` is thread-local, not
+/// per-context: left in place, the next runtime created on this thread would
+/// free the stale values into *its* context on the next `SetPromiseHooks`
+/// call — a use-after-free that intermittently segfaults (the JSValues point
+/// into the dead runtime's freed-and-reused heap).
+pub(crate) fn release_promise_hooks(ctx: *mut JSContext) {
+  let old = PROMISE_HOOKS.with(|h| h.replace([jsv_undefined(); 4]));
+  for v in old {
+    if !jsv_is_undefined(&v) {
+      unsafe { JS_FreeValue(ctx, v) };
+    }
+  }
+  PROMISE_HOOK_CB.with(|h| h.set(None));
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__SetPromiseHooks(
   _this: *const Context,
