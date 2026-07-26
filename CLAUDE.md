@@ -120,6 +120,27 @@ On macOS (`jsc`/`sys-jsc`) the runner auto-codesigns test binaries with
 - Don't lower a baseline to dodge a regression — fix the regression.
 - Don't enable a backend's feature alongside another (they collide at link).
 
+## Docs (`site/`) — keep them true
+
+The public docs (`site/*.typ`, published to Pages) describe the state of the
+backends. **Any PR that changes what's true must update the docs in the same
+PR**: a new feature flag, a platform gained or lost, a subsystem landing
+(inspector, snapshots, wasm…), size numbers, or workflow changes
+(harness commands, ratchet rules). If your change makes a sentence on the
+site wrong, fix the sentence. Rebuild locally with `make -C site all` to
+check the pages compile.
+
+Style rules (Divy's, non-negotiable):
+
+- No em dashes anywhere. Plain, calm, declarative sentences; no punchy
+  fragments, rhetorical questions, or cutesy section names.
+- Code blocks contain real code only. Mappings go in tables, sequences in
+  numbered lists, diagrams in SVG (`site/static/`, drawn to match the
+  paper's figures). Never ASCII pseudo-diagrams with aligned columns/arrows.
+- Lead with semantics (ownership, identity, state), not C-ABI/symbol-count
+  mechanics. Short prose; figure or code first.
+- Only document what works today. No aspirational platforms or features.
+
 ## Reference
 
 - Harness internals: `tests/harness/lib.mjs`, `run.mjs`, `aggregate.mjs`.
