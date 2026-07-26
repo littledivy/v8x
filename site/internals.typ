@@ -13,8 +13,8 @@ The idea is small: keep rusty_v8's Rust layer and reimplement its \~570
 `v8__*` C symbols on each engine. Everything else follows from what those
 symbols promise the caller. One page per subsystem:
 
-+ #link("abi")[The ABI cut]: where the seam is, and why the linker is the
-  todo list
++ #link("architecture")[Architecture]: the boundary, and why missing
+  symbols are link errors
 + #link("handles")[Handles]: one `Local<T>`, two ownership models
 + #link("callbacks")[Callbacks and exceptions]: trampolines, side state,
   templates
