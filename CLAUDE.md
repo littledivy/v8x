@@ -123,7 +123,12 @@ On macOS (`jsc`/`sys-jsc`) the runner auto-codesigns test binaries with
 ## Reference
 
 - Harness internals: `tests/harness/lib.mjs`, `run.mjs`, `aggregate.mjs`.
-- Dashboard: `docs/index.html` (GitHub Pages). Reads `report.json` + history.
+- Dashboard: `docs/index.html` (GitHub Pages, served at `/status/`). Reads
+  `report.json` + history.
+- Public docs site: `site/*.typ` (Typst → HTML, littledivy.com-style shim in
+  `site/shim/html.typ`). `tools/build-site.sh` assembles docs + dashboard into
+  `_site/`; both `pages.yml` and ci.yml's `report` job call it. Local preview:
+  `make -C site serve`.
 - CI: `.github/workflows/ci.yml` (`check` = rusty_v8, `deno_core` = deno_core
   suite, `report` = single-writer aggregator on main), `pages.yml` (dashboard).
 - Deno pin + integration patch: `tools/deno/DENO_REF`,

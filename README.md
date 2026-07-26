@@ -1,5 +1,7 @@
 `v8x` makes rusty_v8 engine agnostic.
 
+Docs: https://littledivy.github.io/v8x · Test dashboard: https://littledivy.github.io/v8x/status/
+
 ```diff
 -v8 = "0.155.0"
 +v8 = { package = "v8x", version = "0.155.0", features = ["jsc"] }
