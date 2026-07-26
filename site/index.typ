@@ -2,7 +2,7 @@
 
 #set document(
   title: "v8x",
-  description: "v8x makes rusty_v8 engine agnostic: a drop-in v8 ABI compatibility layer over JavaScriptCore and QuickJS.",
+  description: "v8x makes rusty_v8 engine agnostic: run deno_core and Deno unchanged on JavaScriptCore or QuickJS.",
 )
 
 #show: html-shim
@@ -10,8 +10,8 @@
 = v8x
 
 `v8x` makes rusty_v8 engine agnostic. It is a drop-in replacement for the
-`v8` crate that implements the same Rust API on top of a pluggable JavaScript
-engine:
+`v8` crate that keeps the same Rust API and runs it on a different
+JavaScript engine:
 
 ```diff
 -v8 = "149.4.0"
@@ -21,7 +21,7 @@ engine:
 Anything built on rusty_v8, including `deno_core` and Deno itself, compiles
 unchanged and runs on the engine you picked.
 
-== Supported engines
+== Engines
 
 #table(
   columns: 3,
@@ -50,18 +50,31 @@ One engine is active at a time. The usual reason to swap is binary size:
 - Express, Hono, and `deno repl` run on QuickJS. The repl talks to a real
   V8-inspector/CDP implementation.
 
-Progress is tracked test by test on the #link("status/")[dashboard]. The
-vendored rusty_v8 suite and the `deno_core` suite run unmodified against
-each backend, and CI ratchets the passing set so it only grows. See
-#link("hill-climb")[how the hill climb works].
+== The hill climb
+
+Compatibility is measured, not claimed. Two suites run unmodified against
+every backend: the rusty_v8 integration tests, and `deno_core`'s own test
+suite under nextest. When a test fails, the backend gets fixed, not the
+test.
 
 #html.elem("div", attrs: (id: "chart", class: "chart"), "")
 #html.elem("script", attrs: (src: "chart.js"), "")
 #html.elem("script", "v8xChart(document.getElementById('chart'), 'status/')")
 
-== How it's a drop-in
+Progress is ratcheted. Each backend and suite pair has a checked-in
+baseline listing every test known to pass, and CI fails on a regression or
+on unrecorded progress. The passing count can only move up. Live numbers
+are on the #link("status/")[dashboard].
 
-`v8x` vendors the real `v8` crate's Rust source verbatim and implements the
-\~570 `v8__*` C ABI symbols its bindings call, on JSC or QuickJS instead of
-V8. The Rust surface is exactly the crates.io API, so nothing downstream
-has to change. #link("internals")[Read the internals.]
+Contributing follows one loop: make a test pass, re-run the cell with
+`--update` to record the new baseline, commit both, open a PR. The playbook
+is in the repo's
+#link("https://github.com/littledivy/v8x/blob/main/CLAUDE.md")[CLAUDE.md].
+
+== Design
+
+The work is not calling a different engine's API. It is preserving V8's
+host semantics on engines that were never built for them: value ownership
+across two garbage-collection models, module identity, exception state,
+startup snapshots, WebAssembly. The #link("internals")[internals] pages
+walk through each one.

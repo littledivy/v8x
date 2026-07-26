@@ -54,8 +54,6 @@
     #text("   ")
     #html.elem("a", attrs: (href: "internals"), [internals])
     #text("   ")
-    #html.elem("a", attrs: (href: "hill-climb"), [hill climb])
-    #text("   ")
     #html.elem("a", attrs: (href: "status/"), [dashboard])
     #text("   ")
     #html.elem("a", attrs: (href: "https://github.com/littledivy/v8x"), [github])

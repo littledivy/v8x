@@ -2,7 +2,7 @@
 
 #set document(
   title: "architecture · v8x",
-  description: "v8x swaps the implementation behind rusty_v8's ~570 generated C symbols. Same Rust API, different engine.",
+  description: "The rusty_v8 binding is the portability boundary: everything above it is unchanged, everything below it is per-engine.",
 )
 
 #show: html-shim
@@ -11,33 +11,34 @@
 
 = Architecture
 
-rusty_v8 is a Rust API on top of \~570 `extern "C"` symbols. v8x keeps the
-Rust layer and reimplements the symbols on a different engine.
+An engine executes JavaScript. A runtime needs much more than that: it
+owns values across garbage collection, calls native code from JavaScript,
+resolves modules, boots from snapshots. rusty_v8 encodes those needs as a
+Rust API over a generated native boundary, and V8 has always been the only
+thing on the other side.
+
+v8x treats that boundary as a portability layer:
 
 #fig("static/architecture.svg", "layered diagram: host runtime and the rusty_v8 Rust API sit above the generated native ABI line; each build selects one v8x adapter below it, JavaScriptCore (tracing GC, protected pointers) or QuickJS (reference counts, tagged values)", width: "680")
 
-A call to `v8::String::new` still reaches `v8__String__NewFromUtf8`. The
-symbol is the same; the implementation behind it is new.
+Above the line nothing changes: the same crate, types, and lifetimes, so
+`deno_core` compiles as-is. Below the line each build pairs one engine with
+an adapter. The engine executes JavaScript; the adapter supplies what the
+engine does not have, which is V8's model of ownership, context, identity,
+and startup state.
 
-These symbols promise more than their signatures:
+The two backends make the split concrete. JavaScriptCore brings a tracing
+collector, so the adapter roots values by protecting pointers. QuickJS
+brings reference counting and tagged values, so the adapter owns counts in
+slots it controls. Same API above, two disciplines below. The rest of the
+series is about keeping V8's promises on top of each.
 
-+ `Local<T>` is pointer-shaped and dies with its handle scope
-+ `Global<T>` outlives scopes and can go weak, which means GC roots
-+ callbacks expect the current isolate and context to be restored
-+ modules keep their identity across compile, instantiate, and evaluate
-+ snapshots mix JavaScript graphs with native callbacks
+== Missing pieces surface at link time
 
-ECMAScript specifies none of this. Each item is a page in this series.
+The boundary has a useful mechanical property: a workload that needs an
+unimplemented piece fails to link, naming exactly what is missing. Deno or
+a test suite becomes a completeness probe. A stub is a fine first
+implementation, because it converts "won't build" into a failing test that
+the #link("./")[hill climb] can count.
 
-== Missing symbols are link errors
-
-A workload that uses an unimplemented `v8__*` symbol fails to link, so the
-linker doubles as a completeness checker:
-
-+ point a real workload (Deno, a test suite) at a backend
-+ collect the undefined symbols from the link error
-+ define them; a stub is a fine first move
-+ the stub turns "won't link" into "test fails", which the
-  #link("hill-climb")[hill climb] can measure
-
-#next("handles", [Handles: one `Local<T>`, two ownership models])
+#next("handles", [Handles: value ownership across two garbage collectors])

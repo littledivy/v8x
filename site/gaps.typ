@@ -51,4 +51,4 @@ can be sent upstream; several are landed or open against quickjs-ng. When
 an engine grows an equivalent public hook, the patch is deleted. The stack
 shrinks over time.
 
-#next("hill-climb", [The hill climb: how progress is measured])
+#next("./", [The hill climb: how progress is measured])
