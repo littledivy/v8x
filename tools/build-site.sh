@@ -18,7 +18,7 @@ for f in site/*.typ; do
   echo "typst: $f -> $OUT/$name.html"
   "$TYPST" compile --root site --features html "$f" "$OUT/$name.html"
 done
-cp site/main.css "$OUT/"
+cp site/main.css site/chart.js "$OUT/"
 
 cp docs/index.html "$OUT/status/index.html"
 cp tests/status/report.json "$OUT/status/report.json"

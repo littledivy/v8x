@@ -55,6 +55,10 @@ the vendored rusty_v8 test suite and `deno_core`'s test suite run as-is
 against each backend, and CI ratchets the set of passing tests so it only
 ever grows. #link("hill-climb")[How the hill climb works.]
 
+#html.elem("div", attrs: (id: "chart", class: "chart"), "")
+#html.elem("script", attrs: (src: "chart.js"), "")
+#html.elem("script", "v8xChart(document.getElementById('chart'), 'status/')")
+
 == How it's a drop-in
 
 `v8x` vendors the real `v8` crate's Rust source verbatim and implements the

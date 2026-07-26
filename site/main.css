@@ -107,6 +107,17 @@ blockquote {
   margin-left: 2em;
 }
 
+#chart {
+  color: #666;
+  margin: 1.5em 0;
+}
+
+#chart svg {
+  display: block;
+  height: auto;
+  width: 100%;
+}
+
 .note-card {
   border-left: 3px solid #777;
   margin: 1em 0;
