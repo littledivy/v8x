@@ -11,7 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
-- [x] *** Hermes passes 58/267 rusty_v8 tests (real V8 suite; use --rescue) ***
+- [x] *** Hermes passes 61/267 rusty_v8 tests; runs functions/callbacks/exceptions (use --rescue) ***
 - [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities
@@ -39,6 +39,24 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle C10 - native function callbacks, ratchet 58 -> 61 (agent: c10, opus) DONE
+A Rust/C v8 FunctionCallback is invoked when JS calls the fn: reads args/this/data, sets return value,
+value flows back to JS (smoke test hermes_native_callback + 3 rusty_v8: function_builder_raw,
+function_callback_info_parts, return_value). --check --rescue holds.
+Impl: Function::New, FunctionTemplate::New + GetFunction (template = deferred Function::New); the
+FunctionCallbackInfo bridge (JSI createFromHostFunction host lambda marshals this/data/args into
+handle slots -> v8x_hermes_dispatch_callback builds a Rust CbInfo, invokes the callback ptr, returns
+the ReturnValue slot; C++ copies result before truncating the per-callback scope; data held in
+shared_ptr<jsi::Value> to survive scope truncation). All v8__FunctionCallbackInfo__* + ReturnValue__*
+accessors matching the vendored layout; predicates IsInt32/Uint32/Null/True/False + Number/Int32Value.
+Callback-throw routes Isolate::ThrowException -> per-isolate pending_exception -> jsi::JSError ->
+surfaces via C9 TryCatch, never aborts. 13/13 smoke, quickjs clean, generator idempotent.
+KNOWN (pre-existing, not C10): stub-only `--features hermes` build blocked by misc.rs:100 c_void error
+(confirmed on HEAD). The real link_hermes backend the ratchet uses builds+links clean. FIX pending.
+NEXT: ObjectTemplate + template instantiation (object_template*, internal fields, signatures) - reachable
+on this cycle's template machinery; then property accessors (reuse callback bridge via PropertyCallbackInfo);
+BackingStore/shared_ptr subsystem kills the last 3 cppgc_ crashers.
 
 ### Cycle C9 - TryCatch + exception surfacing, ratchet 33 -> 58 (agent: c9) DONE
 throw/catch works: TryCatch has_caught/exception/message(synthesizes "Uncaught Error: foo")/stack_trace/
