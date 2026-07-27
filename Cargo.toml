@@ -3,10 +3,58 @@
 # can run unmodified. Downstream crates should depend on this package under an
 # explicit alias when both rusty_v8 and v8x are available.
 name = "v8x"
-version = "149.4.0"
+version = "149.4.0-rc.1"
 edition = "2024"
-description = "rusty_v8 API surface backed by a pluggable JS engine (JSC / QuickJS)"
+authors = ["Divy Srivastava <me@littledivy.com>"]
+description = "Engine agnostic JavaScript"
 build = "build.rs"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/littledivy/v8x"
+homepage = "https://github.com/littledivy/v8x"
+readme = "README.md"
+keywords = ["v8", "javascript", "quickjs", "javascriptcore", "engine"]
+categories = ["api-bindings", "development-tools"]
+
+# crates.io ships a self-contained tarball: only the sources the QuickJS build
+# actually compiles, with our patches already baked into the vendored trees (see
+# the `.git`-absent guard in build.rs `setup_vendor`). This excludes the 8.9 GB
+# vendor/webkit tree (JSC backend, macOS-only, built from a git checkout) and the
+# 232 MB vendor/rusty_v8/third_party V8 sources we never build.
+include = [
+  "/build.rs",
+  "/Cargo.toml",
+  "/README.md",
+  "/LICENSE-MIT",
+  "/LICENSE-APACHE",
+  "/src/**/*",
+  "/gen/**/*",
+  # rusty_v8 Rust API surface: src/lib.rs `#[path]`-includes these modules, and
+  # binding.rs `include!`s the pre-generated bindings from gen/. The tests dir is
+  # shipped only so the [[test]] target paths below resolve; it is not compiled
+  # for downstream builds.
+  "/vendor/rusty_v8/src/**/*",
+  "/vendor/rusty_v8/tests/**/*",
+  "/vendor/rusty_v8/LICENSE",
+  # QuickJS-ng: the flat C sources + headers cc compiles (quickjs.c and friends).
+  "/vendor/quickjs-ng/*.c",
+  "/vendor/quickjs-ng/*.h",
+  "/vendor/quickjs-ng/LICENSE",
+  # Temporal polyfill JS `include_bytes!`'d by src/quickjs/temporal.rs.
+  "/vendor/temporal-polyfill/**/*",
+  # WAMR (WebAssembly): CMake builds the interpreter-only static lib from core/
+  # + build-scripts/; v82jsc/ carries our CMake driver.
+  "/vendor/wamr/core/**/*",
+  "/vendor/wamr/build-scripts/**/*",
+  "/vendor/wamr/v82jsc/**/*",
+  "/vendor/wamr/LICENSE",
+]
+
+# docs.rs can't build the default JSC/WebKit backend (macOS-only, needs a
+# vendored WebKit tree that is not shipped in the crate). Document the portable
+# QuickJS backend instead.
+[package.metadata.docs.rs]
+no-default-features = true
+features = ["quickjs"]
 
 [lib]
 name = "v8"

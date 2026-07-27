@@ -186,6 +186,14 @@ fn main() {
 /// Idempotent: `.v8x-patches/` stamp files skip patches whose checksum hasn't
 /// changed, and an applied patch is detected via `git apply --reverse --check`.
 fn setup_vendor(manifest_dir: &Path, mode: &str) {
+  // A published crates.io package ships the vendored sources already
+  // materialized and patched (see the `include` list in Cargo.toml), with no
+  // git metadata to init submodules or apply patches against. Detect that and
+  // skip the whole dance: a git checkout has a `.git` entry, an extracted
+  // `.crate` tarball does not.
+  if !manifest_dir.join(".git").exists() {
+    return;
+  }
   apply_patch_series(manifest_dir, "vendor/rusty_v8", "rusty_v8");
   ensure_rusty_v8_icu(manifest_dir);
   if mode == "quickjs" {
