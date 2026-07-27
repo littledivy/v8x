@@ -44,3 +44,10 @@ find the creative path around it and TEST it. Autonomous until morning; user is 
       data structures as raw data (partial heap capture of the static parts), AOT-run only the
       dynamic init. Measure vs full snapshot. Novel middle path.
 Rule: prefer a working prototype + measured number over a paragraph. Record failures honestly too.
+
+## [DONE 01:21] TOP DELIVERABLE: working QuickJS Deno binary
+Built deno release --no-default-features --features quickjs (v8x 149.4.0-rc.1 from crates.io) in
+~/gh/deno-v8x-rebase (branch v8x-rebase-rc). 68M binary. VERIFIED fully working, fails=0:
+JS builtins, async+setTimeout, Deno.readTextFile, TypeScript, Deno.serve+fetch (200 OK), npm import
+(change-case downloaded+ran). Delivered to ~/deno-quickjs/deno + README.md. NO further work needed.
+(This is the mature QuickJS backend; Hermes backend remains the spike.)

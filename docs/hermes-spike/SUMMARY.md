@@ -34,12 +34,12 @@ C-ABI as the JSC and QuickJS backends. Progression in one night:
 | C4 identity | object identity solved (`strictEquals` + hidden-symbol-id `GetIdentityHash`) |
 | C5 AOT | precompiled Hermes bytecode (HBC) runs parse-free, 21x faster boot |
 | C6 surface | objects / arrays / numbers / functions run through the backend (12/12 smoke tests) |
-| C7-C10 ratchet | 0 -> 10 -> 33 -> 58 -> 61 real rusty_v8 tests passing |
+| C7-C11 ratchet | 0 -> 10 -> 33 -> 58 -> 61 -> 76 real rusty_v8 tests passing |
 
 What works through the Hermes backend today: isolates, contexts, handle scopes, strings, numbers,
 booleans, objects, arrays, typed arrays, function calls, native function callbacks
-(`Function::New`/`FunctionTemplate` + the full `FunctionCallbackInfo` bridge), TryCatch and thrown
-exceptions, and correct object identity.
+(`Function::New`/`FunctionTemplate` + the full `FunctionCallbackInfo` bridge), ObjectTemplate with
+internal fields, native property accessors, TryCatch and thrown exceptions, and correct object identity.
 
 Build + test it (macOS; the prebuilt `hermes.framework` is vendored):
 
@@ -75,13 +75,12 @@ Delivered and solid: the QuickJS Deno binary; a Hermes backend that runs real JS
 V8 tests with identity, exceptions, and callbacks; the AOT measurements.
 
 Not done (this was a spike, not a product):
-- Hermes is nowhere near running Deno yet. 61/267 rusty_v8 tests; then comes the whole deno_core suite
+- Hermes is nowhere near running Deno yet. 76/267 rusty_v8 tests; then comes the whole deno_core suite
   (modules, async, ops, microtasks), then the runtime. That is a large, multi-week road, not a night.
 - Known gaps: `SameValue` is not yet exact for NaN/+-0; weak handles over-retain (no GC weak-callback);
-  3 `cppgc_*` tests crash (need the BackingStore/shared_ptr subsystem); ObjectTemplate/accessors,
-  modules, async/microtask pump, and Promises are unimplemented.
+  4 tests crash (need the BackingStore/shared_ptr subsystem); property interceptors, modules,
+  async/microtask pump, and Promises are unimplemented.
 
-Prioritized next targets: ObjectTemplate + property accessors (reuse the C10 callback bridge) ->
-BackingStore/shared_ptr (also kills the last crashers) -> Promises/microtask queue -> ES modules ->
+Prioritized next targets: named/indexed property interceptors -> BackingStore/shared_ptr (also kills the last crashers) -> Promises/microtask queue -> ES modules ->
 start the deno_core hill-climb. Separately, wire an HBC path into `deno compile` to cash in the 21x
 startup win on real Deno bootstrap.

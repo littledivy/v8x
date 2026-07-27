@@ -11,7 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
-- [x] *** Hermes passes 61/267 rusty_v8 tests; runs functions/callbacks/exceptions (use --rescue) ***
+- [x] *** Hermes passes 76/267 rusty_v8 tests; objects/arrays/functions/callbacks/exceptions/templates/accessors (use --rescue) ***
 - [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities
@@ -39,6 +39,25 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle C11 - ObjectTemplate + property accessors, ratchet 61 -> 76 (agent: c11) DONE
+ObjectTemplate, object internal fields, and native property accessors all work. +15 tests, --check
+--rescue holds x2. Clusters: object_template (internal fields, PropertyAttribute, templated fn prop),
+object_template_from_function_template (SetClassName + constructor.name), instance_template_with_
+internal_field (new Ctor()), object_template_set_accessor (all 4 incl set_accessor_property),
+object_set_accessor{,_with_setter,_with_setter_with_property,_with_data}, context_from_object_template,
++ 3 escapable_handle_scope* bonus.
+~28 new v8__*. Templates = #[repr(C)] structs with a TemplateHeader{kind} tag; Data::Is*Template via
+raw-ptr-vs-tagged-Local lowbit. Internal fields = hidden Symbol-keyed JS Array on the object (reuses
+C4 identity), aligned-ptr fields via C7 External. Attributes via real Object.defineProperty. Native
+accessors reuse C10 host-fn bridge + new PropertyCallbackInfo/PropCbInfo trampolines, exceptions via
+C10 pending-exception path.
+FIXED the C3 EscapableHandleScope::escape compromise: was string-only/lossy and reclaimed by child
+scope truncate. Now reserves a parent slot at construction + overwrites on escape. This was the actual
+blocker for the whole template cluster (vendored eval helper escapes its result) + unlocked 3 escapable
+tests. Only the 4 pre-existing C8 crashers remain.
+NEXT (C12): named/indexed property interceptors (JSI Proxy/HostObject + Intercepted enum);
+function_template_signature; BackingStore/shared_ptr (last non-cppgc crasher).
 
 ### Cycle C10 - native function callbacks, ratchet 58 -> 61 (agent: c10, opus) DONE
 A Rust/C v8 FunctionCallback is invoked when JS calls the fn: reads args/this/data, sets return value,
