@@ -394,4 +394,97 @@ int64_t v8x_hermes_get_identity_hash(void *rtw, v8x_hermes_slot slot) {
   }
 }
 
+// ---- C5: parse-free AOT execution (source OR precompiled HBC) ------------
+//
+// HermesRuntime::evaluateJavaScript already sniffs its input: the first 8
+// bytes are checked against the Hermes Bytecode (HBC) magic
+// (HermesRuntime::isHermesBytecode), and if they match, Hermes runs the
+// buffer directly as bytecode, skipping the parser/compiler entirely. If they
+// don't match, it is treated as UTF-8 JS source and parsed+compiled as usual.
+// This entry point hands Hermes a raw byte buffer (owned by Rust, copied
+// here) instead of assuming it is a `std::string` of source text, so the
+// SAME function runs plain JS source or a hermesc-compiled .hbc file
+// transparently. See docs/hermes-spike/experiments/C5-hermes-hbc-aot.md.
+
+namespace {
+
+// A jsi::Buffer over an owned byte copy (the Rust slice may not outlive the
+// call, and HermesRuntime keeps referencing the Buffer while a
+// PreparedJavaScript derived from it is alive).
+//
+// LOAD-BEARING: one extra NUL byte is always appended after the payload
+// (not counted in size()). Hermes' JS lexer (like most hand-rolled C++
+// lexers, e.g. V8's own ScannerStream) reads a one-byte lookahead past the
+// last real character and expects a NUL sentinel there instead of relying on
+// size()/bounds-checking every single access; jsi::StringBuffer gets this
+// for free because std::string::data() has been guaranteed NUL-terminated
+// since C++11. A raw std::vector<uint8_t> built from (data, data+len) has NO
+// such guarantee, so the byte after the last real one is uninitialized
+// heap - reading it is technically fine (it is still one past a valid
+// std::vector allocation's used range only if capacity > size; otherwise it
+// is a real out-of-bounds read). Empirically this crashed (SIGSEGV inside
+// the Hermes lexer/parser) on a ~340KB source buffer but not smaller ones,
+// consistent with an out-of-bounds read that only sometimes lands on an
+// unmapped page depending on heap layout. Confirmed fixed by reserving one
+// extra byte and zeroing it. HBC buffers do not need this (bytecode has a
+// fixed-size header/footer, no lexer lookahead), but appending it
+// unconditionally is harmless there too.
+class OwnedBuffer : public jsi::Buffer {
+public:
+  OwnedBuffer(const uint8_t *data, size_t len) : bytes_(len + 1) {
+    std::memcpy(bytes_.data(), data, len);
+    bytes_[len] = 0;
+  }
+  size_t size() const override { return bytes_.size() - 1; }
+  const uint8_t *data() const override { return bytes_.data(); }
+
+private:
+  std::vector<uint8_t> bytes_;
+};
+
+} // namespace
+
+// Is `data[0..len)` recognized as Hermes bytecode (checks the 8-byte HBC
+// magic + header)? Returns 1/0. Static on HermesRuntime, needs no runtime
+// instance.
+int v8x_hermes_is_hbc(const uint8_t *data, size_t len) {
+  if (data == nullptr) {
+    return 0;
+  }
+  return facebook::hermes::HermesRuntime::isHermesBytecode(data, len) ? 1 : 0;
+}
+
+// Evaluate a raw byte buffer that is EITHER JS source OR Hermes bytecode
+// (HBC): Hermes itself sniffs which one it is (see isHermesBytecode above)
+// and skips parsing/compiling for HBC. Returns a slot with the result Value,
+// or the null slot on any error (JSI throws JSIException/JSError for bad
+// input on either path). *ok is set to 1 on success, 0 otherwise, mirroring
+// v8x_hermes_run's contract.
+v8x_hermes_slot v8x_hermes_eval_buffer(void *rtw, const uint8_t *data,
+                                       size_t len, const char *source_url,
+                                       int *ok) {
+  if (ok != nullptr) {
+    *ok = 0;
+  }
+  if (rtw == nullptr || data == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    auto buffer = std::make_shared<OwnedBuffer>(data, len);
+    std::string url = source_url != nullptr ? source_url : "v8x-buffer.js";
+    jsi::Value result = w->runtime().evaluateJavaScript(buffer, url);
+    v8x_hermes_slot out = w->push(std::move(result));
+    if (ok != nullptr) {
+      *ok = 1;
+    }
+    return out;
+  } catch (const jsi::JSError &) {
+    // Destroyed here, while `w->rt` is still alive (the C2 lifetime rule).
+    return V8X_HERMES_NULL_SLOT;
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
 } // extern "C"

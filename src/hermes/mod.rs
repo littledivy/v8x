@@ -50,6 +50,101 @@ mod smoke {
 #[cfg(feature = "link_hermes")]
 pub use smoke::smoke_eval;
 
+// C5: parse-free AOT execution. HermesRuntime::evaluateJavaScript already
+// sniffs its input buffer for the 8-byte HBC magic (isHermesBytecode) and
+// skips parsing/compiling entirely when it matches; otherwise the buffer is
+// treated as UTF-8 JS source and parsed+compiled as usual. This module is a
+// minimal, standalone harness (one HermesRuntime per call, like `smoke`
+// above) that proves the SAME entry point runs plain source or a
+// hermesc-compiled `.hbc` buffer, and lets a caller measure the parse+compile
+// cost recovered by feeding precompiled HBC instead of source. See
+// docs/hermes-spike/experiments/C5-hermes-hbc-aot.md.
+#[cfg(feature = "link_hermes")]
+pub mod aot {
+  use std::ffi::CString;
+  use std::os::raw::{c_char, c_int, c_void};
+
+  unsafe extern "C" {
+    fn v8x_hermes_runtime_new() -> *mut c_void;
+    fn v8x_hermes_runtime_free(rtw: *mut c_void);
+    fn v8x_hermes_is_hbc(data: *const u8, len: usize) -> c_int;
+    fn v8x_hermes_eval_buffer(
+      rtw: *mut c_void,
+      data: *const u8,
+      len: usize,
+      source_url: *const c_char,
+      ok: *mut c_int,
+    ) -> i64;
+    fn v8x_hermes_value_to_utf8(
+      rtw: *mut c_void,
+      slot: i64,
+      out: *mut c_char,
+      cap: usize,
+    ) -> usize;
+  }
+
+  /// A single-runtime handle for the AOT proof/bench. Frees the underlying
+  /// HermesRuntime on drop.
+  pub struct Rt(*mut c_void);
+
+  impl Rt {
+    /// Create a fresh HermesRuntime. Panics if construction throws in the
+    /// shim (mirrors the `assert!` in `core.rs`'s `v8__Isolate__New`).
+    pub fn new() -> Self {
+      let rtw = unsafe { v8x_hermes_runtime_new() };
+      assert!(!rtw.is_null(), "v8x_hermes_runtime_new failed");
+      Rt(rtw)
+    }
+
+    /// Evaluate a raw byte buffer (JS source OR Hermes bytecode; Hermes
+    /// sniffs which). Returns the result coerced to a Rust `String` via
+    /// `Value::toString`, or `None` on any error (bad input on either path,
+    /// or a thrown JS error).
+    pub fn eval_buffer(&self, buf: &[u8], source_url: &str) -> Option<String> {
+      let url = CString::new(source_url).unwrap();
+      let mut ok: c_int = 0;
+      let slot = unsafe {
+        v8x_hermes_eval_buffer(
+          self.0,
+          buf.as_ptr(),
+          buf.len(),
+          url.as_ptr(),
+          &mut ok,
+        )
+      };
+      if ok == 0 || slot < 0 {
+        return None;
+      }
+      // Two-pass: ask for the length (cap=0), then copy.
+      let need = unsafe { v8x_hermes_value_to_utf8(self.0, slot, std::ptr::null_mut(), 0) };
+      if need == usize::MAX {
+        return None;
+      }
+      let mut out = vec![0u8; need];
+      let n = unsafe {
+        v8x_hermes_value_to_utf8(self.0, slot, out.as_mut_ptr() as *mut c_char, need)
+      };
+      if n == usize::MAX {
+        return None;
+      }
+      out.truncate(n.min(need));
+      Some(String::from_utf8_lossy(&out).into_owned())
+    }
+  }
+
+  impl Drop for Rt {
+    fn drop(&mut self) {
+      unsafe { v8x_hermes_runtime_free(self.0) };
+    }
+  }
+
+  /// `HermesRuntime::isHermesBytecode`: does `data` start with the HBC magic
+  /// + a well-formed header? Static check, needs no runtime instance.
+  pub fn is_hermes_bytecode(data: &[u8]) -> bool {
+    unsafe { v8x_hermes_is_hbc(data.as_ptr(), data.len()) != 0 }
+  }
+}
+
 // Shared, PROCESS-WIDE V8 platform/init guard for every test module below.
 // `v8::V8::initialize_platform`/`initialize` gate a single global state
 // machine (Uninitialized -> PlatformInitialized -> Initialized) shared across
@@ -271,6 +366,227 @@ mod hermes_identity {
        reroute through JSI object identity, not slot identity; hidden id \
        invisible to Object.keys/JSON.stringify/for-in and non-enumerable"
     );
+  }
+}
+
+// C5: parse-free AOT execution proof + measured win. Compiles JS source to
+// Hermes Bytecode (HBC) ahead of time with `hermesc` (the Hermes AOT
+// compiler, extracted from the `hermes-engine` npm package, see
+// docs/hermes-spike/experiments/C5-hermes-hbc-aot.md), then runs the SAME
+// buffer entry point (`aot::Rt::eval_buffer`) on either the JS source or the
+// precompiled HBC bytes and shows they produce identical results, while
+// `isHermesBytecode` correctly distinguishes the two. A second test measures
+// the parse+compile time recovered by feeding HBC instead of source on a
+// bootstrap-shaped chunk of JS.
+#[cfg(all(test, feature = "link_hermes"))]
+mod hermes_hbc {
+  use super::aot::{is_hermes_bytecode, Rt};
+  use std::io::Write;
+  use std::process::Command;
+  use std::time::{Duration, Instant};
+
+  /// Path to the `hermesc` AOT compiler binary vendored for this spike.
+  /// Extracted from the `hermes-engine` npm package (osx-bin/hermesc), which
+  /// ships the SAME Hermes release (v0.11.0, HBC bytecode version 84) as the
+  /// vendored `hermes.framework` runtime, so the bytecode it emits is exactly
+  /// what our linked libhermes expects. See C5 doc for provenance.
+  fn hermesc_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/hermes/bin/hermesc")
+  }
+
+  /// Compile `source` to Hermes Bytecode with `hermesc -emit-binary`
+  /// (optionally `-O` for the optimizing pipeline) and return the raw HBC
+  /// bytes. Panics with hermesc's stderr on a compile error (a compile
+  /// failure here is a test-authoring bug, not a thing under test).
+  fn compile_to_hbc(source: &str, optimize: bool) -> Vec<u8> {
+    let dir = std::env::temp_dir().join(format!(
+      "v8x-hermes-hbc-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src_path = dir.join("in.js");
+    let hbc_path = dir.join("out.hbc");
+    std::fs::File::create(&src_path)
+      .unwrap()
+      .write_all(source.as_bytes())
+      .unwrap();
+
+    let mut cmd = Command::new(hermesc_path());
+    cmd.arg("-emit-binary");
+    if optimize {
+      cmd.arg("-O");
+    }
+    cmd.arg("-out").arg(&hbc_path).arg(&src_path);
+    let out = cmd.output().expect("failed to spawn hermesc");
+    assert!(
+      out.status.success(),
+      "hermesc failed: {}",
+      String::from_utf8_lossy(&out.stderr)
+    );
+    let hbc = std::fs::read(&hbc_path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    hbc
+  }
+
+  #[test]
+  fn hermes_hbc_runs_through_backend() {
+    let source = "(function(){ return 40 + 2; })()";
+    let hbc = compile_to_hbc(source, /* optimize */ true);
+
+    // Step 3's proof, point A: isHermesBytecode must correctly classify both
+    // buffers (this is exactly the sniff evaluateJavaScript relies on).
+    assert!(
+      is_hermes_bytecode(&hbc),
+      "hermesc output must be recognized as Hermes bytecode"
+    );
+    assert!(
+      !is_hermes_bytecode(source.as_bytes()),
+      "plain JS source must NOT be recognized as Hermes bytecode"
+    );
+    println!(
+      "hermes_hbc: isHermesBytecode(source)=false isHermesBytecode(hbc)=true \
+       (source {} bytes, hbc {} bytes)",
+      source.len(),
+      hbc.len()
+    );
+
+    // Step 3's proof, point B: the SAME buffer-eval entry point, fed source
+    // vs fed HBC, produces the SAME result. Two fresh runtimes: each must be
+    // used cold, since evaluateJavaScript is a one-shot top-level eval.
+    let rt_source = Rt::new();
+    let from_source = rt_source
+      .eval_buffer(source.as_bytes(), "source.js")
+      .expect("eval of JS source should succeed");
+
+    let rt_hbc = Rt::new();
+    let from_hbc = rt_hbc
+      .eval_buffer(&hbc, "hbc.js")
+      .expect("eval of precompiled HBC should succeed");
+
+    println!(
+      "hermes_hbc: eval(source) = {from_source:?}, eval(hbc) = {from_hbc:?}"
+    );
+    assert_eq!(
+      from_source, from_hbc,
+      "running precompiled HBC must produce the identical result to running \
+       the JS source it was compiled from"
+    );
+    assert_eq!(from_source, "42");
+  }
+
+  /// Generate a bootstrap-shaped chunk of JS: many small function and object
+  /// definitions, mimicking a runtime bootstrap module (a few thousand tiny
+  /// bindings, not one big computation), so parsing/compiling it is nontrivial
+  /// work but running it is cheap. Returns the source and the number of
+  /// top-level definitions generated.
+  fn generate_bootstrap_shaped_js(n_defs: usize) -> String {
+    let mut s = String::with_capacity(n_defs * 120);
+    s.push_str("'use strict';\nvar __v8x_ns = {};\n");
+    for i in 0..n_defs {
+      // A small function + a small object literal + a prototype method per
+      // iteration: shaped like the many tiny builtin bindings a JS runtime
+      // bootstrap module defines (ops wrappers, constants, helper classes).
+      s.push_str(&format!(
+        "function __v8x_fn_{i}(a, b) {{ return a + b + {i}; }}\n\
+         __v8x_ns.f{i} = __v8x_fn_{i};\n\
+         function __v8x_Ctor_{i}(x) {{ this.x = x; this.tag = {i}; }}\n\
+         __v8x_Ctor_{i}.prototype.get = function() {{ return this.x + this.tag; }};\n\
+         __v8x_ns.obj{i} = {{ id: {i}, name: 'item_{i}', nested: {{ a: {i}, b: {i} * 2 }} }};\n",
+      ));
+    }
+    s.push_str("var __v8x_total = 0;\n");
+    for i in 0..n_defs {
+      s.push_str(&format!(
+        "__v8x_total += new __v8x_Ctor_{i}({i}).get();\n"
+      ));
+    }
+    s.push_str("String(__v8x_total);\n");
+    s
+  }
+
+  fn median(mut xs: Vec<Duration>) -> Duration {
+    xs.sort();
+    xs[xs.len() / 2]
+  }
+
+  #[test]
+  fn hermes_hbc_parse_free_win() {
+    // A few thousand tiny function/object definitions: hundreds of KB of
+    // source, shaped like a runtime bootstrap module (many small bindings),
+    // per the C5 mission.
+    const N_DEFS: usize = 4000;
+    let source = generate_bootstrap_shaped_js(N_DEFS);
+    println!(
+      "hermes_hbc bench: generated bootstrap-shaped JS, {} defs, {} bytes source",
+      N_DEFS,
+      source.len()
+    );
+
+    let hbc = compile_to_hbc(&source, /* optimize */ true);
+    println!("hermes_hbc bench: hbc size = {} bytes", hbc.len());
+
+    assert!(is_hermes_bytecode(&hbc));
+    assert!(!is_hermes_bytecode(source.as_bytes()));
+
+    const ITERS: usize = 7;
+    let mut source_times = Vec::with_capacity(ITERS);
+    let mut hbc_times = Vec::with_capacity(ITERS);
+    let mut last_source_result = String::new();
+    let mut last_hbc_result = String::new();
+
+    for _ in 0..ITERS {
+      // Cold, fresh runtime each iteration: evaluateJavaScript is a one-shot
+      // top-level eval and we want the FULL parse+compile+run cost every
+      // time, not amortized JIT/cache warmup across iterations.
+      let rt = Rt::new();
+      let t0 = Instant::now();
+      last_source_result = rt
+        .eval_buffer(source.as_bytes(), "bootstrap-source.js")
+        .expect("source eval should succeed");
+      source_times.push(t0.elapsed());
+      drop(rt);
+
+      let rt = Rt::new();
+      let t0 = Instant::now();
+      last_hbc_result = rt
+        .eval_buffer(&hbc, "bootstrap-hbc.js")
+        .expect("hbc eval should succeed");
+      hbc_times.push(t0.elapsed());
+      drop(rt);
+    }
+
+    assert_eq!(
+      last_source_result, last_hbc_result,
+      "source-run and hbc-run must compute the identical bootstrap result"
+    );
+
+    let median_source = median(source_times.clone());
+    let median_hbc = median(hbc_times.clone());
+    let delta = median_source.checked_sub(median_hbc).unwrap_or_default();
+    let speedup = median_source.as_secs_f64() / median_hbc.as_secs_f64().max(1e-9);
+
+    println!(
+      "hermes_hbc bench [{ITERS} iters, cold runtime each]: \
+       source-run median = {median_source:?}, hbc-run (parse-free) median = {median_hbc:?}, \
+       delta (parse+compile recovered) = {delta:?}, speedup = {speedup:.2}x"
+    );
+    println!(
+      "hermes_hbc bench sizes: source = {} bytes, hbc = {} bytes ({:.2}x)",
+      source.len(),
+      hbc.len(),
+      hbc.len() as f64 / source.len() as f64
+    );
+    println!(
+      "hermes_hbc bench raw source times: {:?}",
+      source_times
+    );
+    println!("hermes_hbc bench raw hbc times: {:?}", hbc_times);
+
+    assert_eq!(last_source_result, last_hbc_result);
   }
 }
 
