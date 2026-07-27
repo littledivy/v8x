@@ -31,6 +31,26 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 ## Cycle log
 (newest first)
 
+### Cycle C2 - Hermes FFI PROOF (agent: c2, opus) DONE => GO CONFIRMED (breakthrough)
+Rust -> extern "C" C++ shim -> real libhermes JSI evaluateJavaScript("40 + 2") -> asNumber -> 42
+back in Rust. The C++-only-JSI blocker from C0 is BEATEN: author v8__* in C++ against JSI, export
+extern "C", catch jsi::JSError at the boundary. Test asserts 42; a thrown JS error maps to a sentinel.
+- libhermes: PREBUILT facebook/hermes v0.11.0 release asset hermes-runtime-darwin (universal
+  hermes.framework + JSI/hermes headers), 4.5MB into vendor/hermes/. NO source/CMake/LLVM build, no
+  disk risk. (npm hermes-engine is the WRONG artifact: hermesc + android .so only, no macOS host lib.)
+- build.rs build_hermes: cc::Build cpp(true) std=c++17 compiles src/hermes/hermes_eval_shim.cpp,
+  includes vendor/hermes/include, links framework=hermes + c++ + rpath; gated on link_hermes; honors
+  HERMES_LIB_DIR/HERMES_INCLUDE_DIR. Run: cargo test --no-default-features --features hermes,link_hermes --lib hermes_smoke.
+- Real JSI rules learned (carry into every impl): (1) the Runtime must OUTLIVE any caught jsi::JSError
+  (its embedded Value dtor calls back into the Runtime) - declare rt in outer scope. (2) one
+  HermesRuntime per thread. (3) link_hermes surfaced 14 more scope/platform stub symbols (added to
+  shims.rs); quickjs + stub-hermes builds still clean, no regressions.
+Deepest remaining risk unchanged: object IDENTITY (JSI hands out no raw ptr) - de-risk right after the
+hello-world path.
+Next C3: real backend = clone src/quickjs/ arena-handle shape (JSI Value is NaN-boxed struct like qjs
+JSValue). Implement the 9-symbol hello-world path (Isolate/Context/HandleScope/String/Script) in C++
+against JSI + expand the extern-C shim, so a v8x smoke test runs a real script THROUGH the hermes backend.
+
 ### DELIVERABLE - working QuickJS deno binary (01:21) SHIPPED
 Built deno release --no-default-features --features quickjs on v8x 149.4.0-rc.1 (crates.io) in
 ~/gh/deno-v8x-rebase. 68M. VERIFIED fully working: JS builtins, async+setTimeout, Deno.readTextFile,
