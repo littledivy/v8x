@@ -11,7 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
-- [x] *** Hermes passes 33 rusty_v8 tests, all 16 files link (real V8 suite, on the ratchet) ***
+- [x] *** Hermes passes 58/267 rusty_v8 tests (real V8 suite; use --rescue) ***
 - [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities
@@ -39,6 +39,23 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle C9 - TryCatch + exception surfacing, ratchet 33 -> 58 (agent: c9) DONE
+throw/catch works: TryCatch has_caught/exception/message(synthesizes "Uncaught Error: foo")/stack_trace/
+rethrow/reset (incl the V8 quirk that reset() after rethrow() keeps has_caught true); Isolate.
+ThrowException; Exception::{Error,TypeError,RangeError,ReferenceError,SyntaxError}; Message::Get.
+=> 58/267 rusty_v8 tests pass on hermes (was 33). Baseline --updated; --check --rescue holds x3.
+Impl: per-runtime tc_stack of TryCatchFrame + capture_exception() sink wired into run/eval_buffer/
+function_call; 12 v8__TryCatch__* + ThrowException + Exception ctors in core.rs/hermes_shim.cpp.
+CRASH LANDMINES fixed: (1) latent Isolate Enter/Exit needed REAL nesting (ISO_STACK Vec push/pop) -
+flat set/clear double-panic-SIGABRT'd on teardown when Exception::type_error's internal enter/exit
+nested. (2) use-after-realloc in throw_exception (read slot before handles.push_back that can realloc).
+(3) PRE-EXISTING vendored-infra artifact: shared PROCESS_LOCK RwLock poisons when an earlier test
+panics mid-scope, cascading PoisonError onto ~200 later tests -> use run.mjs --rescue (already exists
+for quickjs's identical issue). Any hermes CI wiring MUST pass --rescue; plain --check falsely reports
+a regression against this baseline.
+NEXT: native Function::new callbacks (unlocks microtask/accessor clusters), then BackingStore/shared_ptr
+(kills the last known crasher array_buffer_with_shared_backing_store).
 
 ### Cycle C8 - unlock test_api, ratchet 10 -> 33 (agent: c8, opus) DONE
 rv8_test_api (248 cases) + rv8_test_cppgc now LINK -> all 16/16 files link (was 14). 33 baselined (was
