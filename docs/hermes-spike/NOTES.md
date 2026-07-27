@@ -24,7 +24,7 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
       hermes backend: v8x Rust surface (Isolate/HandleScope/Context/String/
       Script) -> our v8__* -> libhermes evaluateJavaScript -> "hello world" back
       in Rust (docs/hermes-spike/experiments/C3-hermes-helloworld.md).
-- [ ] C4 test: rusty_v8 harness on hermes, hill-climb
+- [ ] C4 de-risk OBJECT IDENTITY (deepest blocker) -> then hill-climb rusty_v8
 - [ ] C5 AOT E5: QuickJS bytecode-boot vs source (parse-cost)
 - [x] C6 AOT E6: REAL QuickJS heap snapshot WORKS (but no startup speedup - see log)
 - [ ] C7 AOT E7: Static Hermes native AOT on real bootstrap chunk (push past 'untyped=no win')
@@ -33,6 +33,28 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle C3 - Hermes backend runs hello world through v8 C-ABI (agent: c3, opus) DONE (headline)
+A v8x smoke test drives the VENDORED rusty_v8 Rust surface: Isolate -> scope! -> Context -> String ->
+Script::compile -> Script::run -> to_rust_string_lossy => "hello world", executed on real libhermes.
+Source is compiled+run by OUR v8__Script__Compile/Run and read via the same String/Value path real V8
+strings use (not the C2 standalone eval). 3 tests pass (C3 + both C2 smokes). No regressions on stub-
+hermes or quickjs.
+- Design: arena lives C++-SIDE (jsi::Value is move-only + Runtime-bound, cannot sit in a Rust arena
+  like qjs). RuntimeWrapper owns unique_ptr<jsi::Runtime> rt (first-declared, last-destroyed per C2
+  rule) + vector<jsi::Value> handle table. Local = table index handed to Rust as tagged ptr ((i<<1)|1).
+  HandleScope = watermark; DESTRUCT truncates. Thread-local current iso/ctx; one ctx per runtime.
+- ~30 v8__* made REAL in src/hermes/core.rs (Isolate lifecycle, HandleScope CONSTRUCT/DESTRUCT +
+  EscapeSlot, Context, String NewFromUtf8/OneByte/Length/Utf8Length/WriteUtf8 + the ValueView quintet
+  fast-path read, Script Compile/Run, Value ToString). Their stubs gated cfg(not(link_hermes)) so no
+  dup symbols; stub build unchanged. C++ bridge: src/hermes/hermes_shim.cpp.
+- Test cmd: cargo test --no-default-features --features hermes,link_hermes --lib hermes:: -- --nocapture
+  (scope to hermes:: - bare run also builds vendored rv8_test_api = hundreds of stubbed syms, won't link).
+- Known compromise: EscapeSlot__escape re-materializes the escaping value as a STRING (exact for the
+  hello-world string, lossy for non-string Values). Clean fix = a handles_dup(rtw, slot) shim entry.
+NEXT C4: de-risk OBJECT IDENTITY (the deepest C0 risk) - JSI hands out no raw ptr so two Locals to one
+object differ. Intern same object twice, show tagged ptrs differ, wire jsi::Runtime::strictEquals,
+demo a Set with one logical member. Gate before broad surface / rusty_v8 hill-climb.
 
 ### Cycle C3 - Hermes backend runs hello world (agent: executor, opus) DONE => script runs THROUGH the backend
 A real script runs end to end through engine_hermes via the v8 C-ABI: a v8x smoke test drives the
