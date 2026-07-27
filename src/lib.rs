@@ -113,6 +113,9 @@ mod jsc;
 #[cfg(feature = "engine_quickjs")]
 mod quickjs;
 
+#[cfg(feature = "engine_hermes")]
+mod hermes;
+
 // Pure-Rust implementation of the `crdtp__*` inspector-protocol C-ABI surface
 // (engine-independent), so `test_api.rs` and friends link and run. See the
 // module docs for the simplified "CBOR == JSON bytes" encoding rationale.
@@ -287,6 +290,8 @@ pub const TYPED_ARRAY_MAX_SIZE_IN_HEAP: usize =
 /// The engine backend this build of the shim runs on.
 pub const V8X_ENGINE: &str = if cfg!(feature = "engine_quickjs") {
   "quickjs"
+} else if cfg!(feature = "engine_hermes") {
+  "hermes"
 } else if cfg!(feature = "vendor_jsc") {
   "jsc"
 } else {

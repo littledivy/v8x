@@ -68,6 +68,13 @@ path = "src/lib.rs"
 default = ["engine_jsc", "vendor_jsc"]
 engine_jsc = []
 engine_quickjs = []
+# Hermes backend spike: scaffold only. `engine_hermes` builds a pure-Rust
+# stub backend (every v8__*/cppgc__* symbol defined as an unimplemented!()
+# stub) so the crate compiles and links with zero Hermes dependency. Linking
+# the real Hermes static library is a separate, later feature (`link_hermes`,
+# not yet wired into build.rs).
+engine_hermes = []
+link_hermes = []
 # Short aliases (README-facing).
 jsc = ["engine_jsc", "vendor_jsc"]
 # System JavaScriptCore.framework (tiny binary, no vendored WebKit). Apple's
@@ -76,6 +83,9 @@ jsc = ["engine_jsc", "vendor_jsc"]
 # module shim and targets BUNDLED apps (deno compile / desktop), where the user
 # graph is flattened and the rewriter's unbundled-ESM gaps never bite.
 system_jsc = ["engine_jsc"]
+# Hermes stub backend (scaffold cycle). Deliberately does NOT pull in
+# link_hermes: no native Hermes library is built or linked yet.
+hermes = ["engine_hermes"]
 quickjs = [
   "engine_quickjs",
   "link_quickjs",

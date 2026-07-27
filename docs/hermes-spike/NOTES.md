@@ -1,5 +1,9 @@
 # Hermes backend spike (overnight autonomous run)
 
+**Directive (user): explore frontiers, truly innovate, do not accept limitations. AOT can make
+this wonderful. Bias to BUILD + MEASURE real prototypes/experiments, chase the AOT-native-Deno
+vision (tiny instant-start binary). Fully autonomous overnight.**
+
 Goal: prototype a static **Hermes** backend for v8x (`engine_hermes`) that can run
 Deno, and test whether AOT-compiling JS (Hermes bytecode / static-hermes /
 Porffor) can replace the V8 startup snapshot.
@@ -14,7 +18,11 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 - [ ] C2 build: vendor + build static Hermes, link stubs
 - [ ] C3 implement: core v8__* (isolate/context/primitives/strings)
 - [ ] C4 test: rusty_v8 harness on hermes, hill-climb
-- [ ] C5 AOT experiment: precompile demo JS, boot without parser
+- [ ] C5 AOT E5: QuickJS bytecode-boot vs source (parse-cost)
+- [ ] C6 AOT E6: REAL QuickJS heap snapshot via JS_WriteObject (dissolve 'AOT!=state')
+- [ ] C7 AOT E7: Static Hermes native AOT on real bootstrap chunk (push past 'untyped=no win')
+- [ ] C8 AOT E8: AOT-native Deno north star - tiny native binary running a Deno program
+- [ ] C9 AOT E9: hybrid AOT-bytecode + build-time-precomputed constant data (partial heap)
 
 ## Cycle log
 (newest first)
