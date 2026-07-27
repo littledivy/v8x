@@ -9,7 +9,7 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 ## Status board (updated each cycle)
 - [ ] C0 research: Hermes embedding API + AOT capabilities
 - [x] C0 research: v8x integration surface (how to add engine_hermes)
-- [ ] C0 research: AOT-solves-snapshot feasibility (HBC / static-hermes / Porffor)
+- [x] C0 research: AOT-solves-snapshot feasibility (HBC / static-hermes / Porffor)
 - [ ] C1 scaffold: engine_hermes feature + src/hermes/ skeleton + build.rs
 - [ ] C2 build: vendor + build static Hermes, link stubs
 - [ ] C3 implement: core v8__* (isolate/context/primitives/strings)
@@ -18,6 +18,29 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle 0 - AOT vs snapshot (agent: aot-snapshot) DONE
+CRUX: "AOT solves snapshot" is FALSE as stated. V8 snapshot = serialized INITIALIZED HEAP
+STATE (deserialize -> skip running bootstrap, ~2ms restore). AOT/HBC = CODE only (still RUNS
+bootstrap each boot, just no parse). They capture different things.
+Defensible reframing that DOES hold: native builtins (Hermes/QuickJS both init builtins in C/C++,
+not JS) + AOT-compiled runtime bootstrap can make snapshotting UNNECESSARY *iff* parse-free
+bootstrap EXECUTION fits the startup budget. So the real question is empirical: how much of Deno's
+snapshot win is parse (recoverable by AOT) vs heap-construction execution (not).
+- Static Hermes (shermes, native via LLVM): WIP; needs static types for native speed; on UNTYPED
+  Deno internals it falls back to dynamic path (no speedup) + typed-mode feature gaps. Not viable
+  for compiling the bootstrap.
+- Porffor: pre-alpha, ~50% Test262, no eval, cannot run Deno-sized JS. Research reference only,
+  NOT a v8x backend.
+High-value experiments (prioritized):
+  E5 (IN-REPO, do first): QuickJS bytecode-boot - run Deno bootstrap from precompiled qjs bytecode
+     vs source vs the abandoned snapshot-tape. If bytecode-boot ~ snapshot-restore, validates
+     dropping the tape hacks. Uses existing engine, no Hermes needed. Directly actionable.
+  E2: decompose Deno startup (snapshot on vs off) into parse vs execute fractions.
+  E1: HBC boot-cost microbenchmark (needs hermesc).
+Takeaway: Hermes is the credible AOT/mobile path but CHANGES architecture from "restore state"
+to "re-run bootstrap cheaply". The snapshot pain reframes as "make bootstrap exec cheap", which
+E5 can test in-repo tonight regardless of Hermes feasibility.
 
 ### Cycle 0 - integration surface (agent: v8x-integration) DONE
 Plan to add `engine_hermes` is clear and mirrors quickjs:
