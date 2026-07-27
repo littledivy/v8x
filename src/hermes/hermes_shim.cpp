@@ -61,6 +61,21 @@ struct RuntimeWrapper {
   }
 };
 
+// A v8 `External` wraps an opaque embedder `void*` in a JS heap value. JSI has
+// no native "external"/"foreign pointer" value, so we model it as a JSI
+// HostObject that carries the pointer. Each External is a distinct JS object,
+// so two Externals compare unequal by object identity (what the vendored
+// `External` PartialEq via strictEquals/Data__EQ expects) and reading the
+// pointer back is exact.
+class ExternalHost : public jsi::HostObject {
+public:
+  explicit ExternalHost(void *ptr) : ptr_(ptr) {}
+  void *ptr() const { return ptr_; }
+
+private:
+  void *ptr_;
+};
+
 } // namespace
 
 extern "C" {
@@ -900,6 +915,97 @@ int v8x_hermes_value_is_boolean(void *rtw, v8x_hermes_slot slot) {
   auto *w = static_cast<RuntimeWrapper *>(rtw);
   const jsi::Value *v = slot_ref(w, slot);
   return (v != nullptr && v->isBool()) ? 1 : 0;
+}
+
+// ---- External (v8::External): opaque embedder void* as a JS value ----------
+
+// jsi::Object::createFromHostObject wrapping an ExternalHost that carries
+// `ptr`. Returns a slot, or the null slot on error.
+v8x_hermes_slot v8x_hermes_external_new(void *rtw, void *ptr) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    jsi::Object obj = jsi::Object::createFromHostObject(
+        w->runtime(), std::make_shared<ExternalHost>(ptr));
+    return w->push(jsi::Value(w->runtime(), obj));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// Read the embedder void* back out of an External's ExternalHost. `found` (if
+// non-null) is set to 1 when the slot really held an ExternalHost, 0 otherwise
+// (so a genuine null pointer is distinguishable from a wrong-type slot).
+void *v8x_hermes_external_value(void *rtw, v8x_hermes_slot slot, int *found) {
+  if (found != nullptr) {
+    *found = 0;
+  }
+  if (rtw == nullptr) {
+    return nullptr;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return nullptr;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    if (!obj.isHostObject(w->runtime())) {
+      return nullptr;
+    }
+    auto host = obj.getHostObject<ExternalHost>(w->runtime());
+    if (host == nullptr) {
+      return nullptr;
+    }
+    if (found != nullptr) {
+      *found = 1;
+    }
+    return host->ptr();
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+// Is the Value in `slot` an External (a JSI HostObject carrying a pointer)?
+int v8x_hermes_value_is_external(void *rtw, v8x_hermes_slot slot) {
+  int found = 0;
+  (void)v8x_hermes_external_value(rtw, slot, &found);
+  return found;
+}
+
+// Is the Value in `slot` `undefined`?
+int v8x_hermes_value_is_undefined(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  return (v != nullptr && v->isUndefined()) ? 1 : 0;
+}
+
+// Uint32 coercion (v8's Value::Uint32Value). JSI has no ToUint32; a Number
+// value is truncated to a uint32 the way ECMAScript ToUint32 does for finite
+// numbers. Writes the result into *out; returns 1 on success, 0 on error
+// (not a number, or a bad slot).
+int v8x_hermes_uint32_value(void *rtw, v8x_hermes_slot slot, uint32_t *out) {
+  if (rtw == nullptr || out == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isNumber()) {
+    return 0;
+  }
+  try {
+    double d = v->getNumber();
+    // ECMAScript ToUint32: wrap into the 2^32 ring for finite numbers.
+    *out = static_cast<uint32_t>(static_cast<int64_t>(d));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
 }
 
 } // extern "C"

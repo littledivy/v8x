@@ -36,9 +36,9 @@
 
 use crate::support::{MaybeBool, SharedPtrBase};
 use crate::{
-  Allocator, Array, Boolean, Context, Data, Function, Integer, Number,
-  Object, Platform, Primitive, RealIsolate, Script, String as V8String,
-  UniquePtr, Value,
+  Allocator, Array, Boolean, Context, Data, External, Function, Integer,
+  Number, Object, Platform, Primitive, RealIsolate, Script,
+  String as V8String, UniquePtr, Value,
 };
 use std::cell::Cell;
 use std::os::raw::{c_char, c_int, c_void};
@@ -110,6 +110,21 @@ unsafe extern "C" {
   fn v8x_hermes_value_is_boolean(rtw: *mut c_void, slot: i64) -> c_int;
   fn v8x_hermes_undefined(rtw: *mut c_void) -> i64;
   fn v8x_hermes_null(rtw: *mut c_void) -> i64;
+
+  // C7: External (opaque embedder void*), a few more Value predicates/coercions.
+  fn v8x_hermes_external_new(rtw: *mut c_void, ptr: *mut c_void) -> i64;
+  fn v8x_hermes_external_value(
+    rtw: *mut c_void,
+    slot: i64,
+    found: *mut c_int,
+  ) -> *mut c_void;
+  fn v8x_hermes_value_is_external(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_value_is_undefined(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_uint32_value(
+    rtw: *mut c_void,
+    slot: i64,
+    out: *mut u32,
+  ) -> c_int;
 }
 
 /// The C++ null-slot sentinel (must match `V8X_HERMES_NULL_SLOT` in the shim).
@@ -124,6 +139,11 @@ pub(crate) struct IsoState {
   /// Embedder data slots (v8__Isolate__Get/SetData). The vendored surface uses
   /// slot 0 for its `IsolateAnnex`; four is plenty for the hello-world path.
   pub data_slots: [*mut c_void; 4],
+  /// Context aligned-pointer embedder-data fields
+  /// (v8__Context__Get/SetAlignedPointerInEmbedderData). There is one context
+  /// per Hermes isolate (its handle IS the isolate pointer), so these live on
+  /// the isolate. Grows on demand; used by `Context::set_slot`'s annex.
+  pub ctx_embedder_data: Vec<*mut c_void>,
 }
 
 thread_local! {
@@ -185,6 +205,7 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
   let st = Box::new(IsoState {
     rtw,
     data_slots: [ptr::null_mut(); 4],
+    ctx_embedder_data: Vec::new(),
   });
   Box::into_raw(st) as *mut RealIsolate
 }
@@ -261,6 +282,45 @@ pub extern "C" fn v8__Isolate__GetCurrentContext(
 ) -> *const Context {
   isolate as *const Context
 }
+
+// ---- Global / Weak (persistent handles) ------------------------------------
+//
+// A v8 `Global<T>` is a persistent handle that survives handle scopes. Our
+// handle table entries already survive until the runtime is torn down (a
+// HandleScope only truncates its own watermark on exit, and `Global::new`
+// copies the data pointer out of any enclosing scope), so a `Global` is
+// modeled as the same handle-table slot pointer carried unchanged. This keeps
+// the value reachable for the life of the isolate, which is correct for the
+// context-slot and kept-context tests (they never rely on GC reclaiming a
+// Global).
+//
+// `NewWeak` installs a would-be weak handle + finalizer. Hermes exposes no
+// embedder weak-callback hook through JSI, so this returns the same data
+// pointer as a non-firing weak: the value stays strongly reachable and the
+// finalizer never runs. That is a conservative over-retention (a leak, not a
+// use-after-free), acceptable for the current test surface; a real weak/GC
+// integration is a later cycle. `Reset` is a safe no-op for the same reason.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Global__New(
+  _isolate: *mut RealIsolate,
+  data: *const Data,
+) -> *const Data {
+  data
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Global__NewWeak(
+  _isolate: *mut RealIsolate,
+  data: *const Data,
+  _parameter: *const c_void,
+  _callback: unsafe extern "C" fn(*const c_void),
+) -> *const Data {
+  data
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Global__Reset(_data: *const Data) {}
 
 // ---- HandleScope -----------------------------------------------------------
 
@@ -395,6 +455,56 @@ pub extern "C" fn v8__Context__Global(this: *const Context) -> *const Object {
   let st = iso_state(this as *mut RealIsolate);
   let slot = unsafe { v8x_hermes_global(st.rtw) };
   slot_ptr::<Object>(slot)
+}
+
+// ---- Context embedder data (aligned-pointer fields) -----------------------
+//
+// `Context::set_slot`/`get_slot` store an annex pointer in embedder-data field
+// 0 of the context, growing the field vector as needed. Our Context IS the
+// isolate (one context per Hermes runtime), so those fields live on the
+// `IsoState`. Only the aligned-pointer variants are needed by the context-slot
+// tests; the `Value`-typed `Get/SetEmbedderData` pair is not on this surface.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__GetNumberOfEmbedderDataFields(
+  this: *const Context,
+) -> u32 {
+  if this.is_null() {
+    return 0;
+  }
+  iso_state(this as *mut RealIsolate).ctx_embedder_data.len() as u32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__GetAlignedPointerFromEmbedderData(
+  this: *const Context,
+  index: c_int,
+) -> *mut c_void {
+  if this.is_null() || index < 0 {
+    return ptr::null_mut();
+  }
+  let st = iso_state(this as *mut RealIsolate);
+  st.ctx_embedder_data
+    .get(index as usize)
+    .copied()
+    .unwrap_or(ptr::null_mut())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__SetAlignedPointerInEmbedderData(
+  this: *const Context,
+  index: c_int,
+  value: *mut c_void,
+) {
+  if this.is_null() || index < 0 {
+    return;
+  }
+  let st = iso_state(this as *mut RealIsolate);
+  let idx = index as usize;
+  if idx >= st.ctx_embedder_data.len() {
+    st.ctx_embedder_data.resize(idx + 1, ptr::null_mut());
+  }
+  st.ctx_embedder_data[idx] = value;
 }
 
 // ---- String ----------------------------------------------------------------
@@ -555,7 +665,20 @@ pub extern "C" fn v8__Script__Compile(
   if context.is_null() || source.is_null() {
     return ptr::null();
   }
-  // The source string is already a slot; carry it as the Script handle.
+  // Under `--use_strict` (V8 makes every top-level script strict), prepend a
+  // `"use strict";` directive by re-interning the source. Otherwise the source
+  // string is already a slot, carried directly as the Script handle.
+  if USE_STRICT.load(Ordering::Relaxed) {
+    let isolate = context as *mut RealIsolate;
+    let rtw = iso_state(isolate).rtw;
+    if let Some(src) = read_string(rtw, slot_of(source)) {
+      let strict = format!("\"use strict\";\n{src}");
+      let new_src = intern_string_utf8(isolate, strict.as_bytes());
+      if !new_src.is_null() {
+        return new_src as *const Script;
+      }
+    }
+  }
   source as *const Script
 }
 
@@ -1109,6 +1232,117 @@ pub extern "C" fn v8__Value__IsString(this: *const Value) -> bool {
   unsafe { v8x_hermes_value_is_string(rtw, slot_of(this)) != 0 }
 }
 
+/// `Value::IsUndefined`: routes to `jsi::Value::isUndefined`. Needed by tests
+/// that assert a script result is `undefined` (e.g. a `--use_strict` body).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsUndefined(this: *const Value) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_value_is_undefined(rtw, slot_of(this)) != 0 }
+}
+
+/// `Value::IsExternal`: true when the handle holds a v8 `External` (modeled as
+/// a JSI HostObject carrying an opaque pointer, see `v8__External__New`).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsExternal(this: *const Value) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_value_is_external(rtw, slot_of(this)) != 0 }
+}
+
+/// `Value::Uint32Value`: ECMAScript ToUint32 of a numeric value, written into
+/// the out-param `Maybe<u32>`. `has_value=false` for non-numbers or errors,
+/// matching v8's `Maybe` contract on a failed coercion.
+#[repr(C)]
+struct MaybeU32 {
+  has_value: bool,
+  value: u32,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__Uint32Value(
+  this: *const Value,
+  context: *const Context,
+  out: *mut crate::support::Maybe<u32>,
+) {
+  let out = out as *mut MaybeU32;
+  if out.is_null() {
+    return;
+  }
+  let write = |has_value: bool, value: u32| unsafe {
+    ptr::write(out, MaybeU32 { has_value, value });
+  };
+  if this.is_null() || context.is_null() {
+    write(false, 0);
+    return;
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let mut v: u32 = 0;
+  let ok = unsafe { v8x_hermes_uint32_value(rtw, slot_of(this), &mut v) };
+  if ok != 0 {
+    write(true, v);
+  } else {
+    write(false, 0);
+  }
+}
+
+// ---- External (v8::External): opaque embedder void* ------------------------
+//
+// A v8 `External` wraps an opaque embedder `void*` in a JS heap value. Hermes
+// (JSI) has no native external value, so the C++ shim models it as a JSI
+// HostObject carrying the pointer (see `v8x_hermes_external_new`). Each
+// External is a distinct JS object, so two different externals compare unequal
+// by JSI object identity (which `v8__Data__EQ` routes through), and reading
+// the pointer back is exact.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__External__New(
+  isolate: *mut RealIsolate,
+  value: *mut c_void,
+) -> *const External {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  let slot = unsafe { v8x_hermes_external_new(rtw, value) };
+  slot_ptr::<External>(slot)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__External__Value(this: *const External) -> *mut c_void {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return ptr::null_mut();
+  }
+  let mut found: c_int = 0;
+  unsafe { v8x_hermes_external_value(rtw, slot_of(this), &mut found) }
+}
+
+/// `Data::EQ`: equality of two `Data` handles by JSI identity. The vendored
+/// `External`/`Context`/etc. `PartialEq` route here (`use identity`). Two
+/// handles to the same JS object/value compare equal; different objects do
+/// not. Uses the same `jsi::Value::strictEquals` as `v8__Value__StrictEquals`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Data__EQ(
+  this: *const Data,
+  other: *const Data,
+) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() {
+    return this == other;
+  }
+  let a = slot_of(this);
+  let b = slot_of(other);
+  if a < 0 || b < 0 {
+    return this == other;
+  }
+  unsafe { v8x_hermes_strict_equals(rtw, a, b) == 1 }
+}
+
 /// `Function::Call`: JSI's `Function::call`/`callWithThis`. `recv` may be
 /// null (v8 passes a null receiver for `undefined`), in which case the shim
 /// uses the undefined-`this` call path. Returns the null handle on any error
@@ -1184,11 +1418,75 @@ pub extern "C" fn v8__Platform__NewDefaultPlatform(
   new_platform()
 }
 
+/// `new_unprotected_default_platform`: Hermes has no V8 platform, so the
+/// "unprotected" distinction (a V8 code-space memory-protection setting) is
+/// meaningless here; it returns the same inert marker as the default platform.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Platform__NewUnprotectedDefaultPlatform(
+  _thread_pool_size: c_int,
+  _idle_task_support: bool,
+) -> *mut Platform {
+  new_platform()
+}
+
+/// `new_single_threaded_default_platform`: same inert marker (Hermes runs
+/// single-threaded through JSI regardless).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Platform__NewSingleThreadedDefaultPlatform(
+  _idle_task_support: bool,
+) -> *mut Platform {
+  new_platform()
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__InitializePlatform(_platform: *mut Platform) {}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__Initialize() {}
+
+/// Process-global "run every script in strict mode" flag, set by
+/// `--use_strict`. V8 applies `--use_strict` by making every top-level script
+/// strict; Hermes has no such flag, so `Script::Compile` prepends a
+/// `"use strict";` directive when this is set. Each rusty_v8 test target is its
+/// own process, so this global is per-target (only the api_flags target sets
+/// it).
+static USE_STRICT: std::sync::atomic::AtomicBool =
+  std::sync::atomic::AtomicBool::new(false);
+
+/// `V8::set_flags_from_string`: V8 command-line flags do not apply to Hermes,
+/// which has its own runtime configuration. Most flags the tests pass
+/// (`--expose_gc`, `--allow-natives-syntax`, etc.) either match Hermes's own
+/// defaults or exercise machinery those tests only reach through other
+/// symbols, so they are accepted and ignored. `--use_strict` is the one flag
+/// with observable top-level semantics (it makes scripts strict), so it is
+/// honored via the `USE_STRICT` flag above.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__V8__SetFlagsFromString(
+  flags: *const u8,
+  length: usize,
+) {
+  if flags.is_null() {
+    return;
+  }
+  let bytes = unsafe { std::slice::from_raw_parts(flags, length) };
+  if let Ok(s) = std::str::from_utf8(bytes) {
+    if s.split_whitespace().any(|f| f == "--use_strict") {
+      USE_STRICT.store(true, Ordering::Relaxed);
+    }
+  }
+}
+
+/// `Isolate::perform_microtask_checkpoint`: drain the JS microtask queue.
+/// Hermes runs microtasks (promise jobs) as part of `evaluateJavaScript` and
+/// exposes no separate embedder drain entry point through JSI, so for the
+/// current surface this is a no-op: the tests that call it (the `slots`
+/// layer1/layer2 Deno-pattern tests) only use it to prove `Isolate` methods
+/// are reachable via `Deref`, not to observe queued microtasks.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(
+  _isolate: *mut RealIsolate,
+) {
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__Dispose() -> bool {

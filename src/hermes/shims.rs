@@ -106,8 +106,6 @@ pub extern "C" fn v8__Context__AllowCodeGenerationFromStrings() { unimplemented!
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__FromSnapshot() { unimplemented!("v8__Context__FromSnapshot") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Context__GetAlignedPointerFromEmbedderData() { unimplemented!("v8__Context__GetAlignedPointerFromEmbedderData") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetContinuationPreservedEmbedderData() { unimplemented!("v8__Context__GetContinuationPreservedEmbedderData") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetDataFromSnapshotOnce() { unimplemented!("v8__Context__GetDataFromSnapshotOnce") }
@@ -118,11 +116,7 @@ pub extern "C" fn v8__Context__GetExtrasBindingObject() { unimplemented!("v8__Co
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetMicrotaskQueue() { unimplemented!("v8__Context__GetMicrotaskQueue") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Context__GetNumberOfEmbedderDataFields() { unimplemented!("v8__Context__GetNumberOfEmbedderDataFields") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetSecurityToken() { unimplemented!("v8__Context__GetSecurityToken") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Context__SetAlignedPointerInEmbedderData() { unimplemented!("v8__Context__SetAlignedPointerInEmbedderData") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__SetContinuationPreservedEmbedderData() { unimplemented!("v8__Context__SetContinuationPreservedEmbedderData") }
 #[unsafe(no_mangle)]
@@ -147,8 +141,6 @@ pub extern "C" fn v8__CppHeap__Terminate() { unimplemented!("v8__CppHeap__Termin
 pub extern "C" fn v8__CpuProfiler__CollectSample() { unimplemented!("v8__CpuProfiler__CollectSample") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__CpuProfiler__UseDetailedSourcePositionsForProfiling() { unimplemented!("v8__CpuProfiler__UseDetailedSourcePositionsForProfiling") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Data__EQ() { unimplemented!("v8__Data__EQ") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Data__IsBigInt() { unimplemented!("v8__Data__IsBigInt") }
 #[unsafe(no_mangle)]
@@ -220,10 +212,6 @@ pub extern "C" fn v8__Exception__SyntaxError() { unimplemented!("v8__Exception__
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Exception__TypeError() { unimplemented!("v8__Exception__TypeError") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__External__New() { unimplemented!("v8__External__New") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__External__Value() { unimplemented!("v8__External__Value") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__ExternalOneByteStringResource__data() { unimplemented!("v8__ExternalOneByteStringResource__data") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ExternalOneByteStringResource__length() { unimplemented!("v8__ExternalOneByteStringResource__length") }
@@ -292,12 +280,6 @@ pub extern "C" fn v8__GCCallbackFlags() { unimplemented!("v8__GCCallbackFlags") 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__GCType() { unimplemented!("v8__GCType") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Global__New() { unimplemented!("v8__Global__New") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Global__NewWeak() { unimplemented!("v8__Global__NewWeak") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Global__Reset() { unimplemented!("v8__Global__Reset") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__HeapCodeStatistics() { unimplemented!("v8__HeapCodeStatistics") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__HeapProfiler__TakeHeapSnapshot() { unimplemented!("v8__HeapProfiler__TakeHeapSnapshot") }
@@ -359,8 +341,6 @@ pub extern "C" fn v8__Isolate__LowMemoryNotification() { unimplemented!("v8__Iso
 pub extern "C" fn v8__Isolate__MemoryPressureNotification() { unimplemented!("v8__Isolate__MemoryPressureNotification") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__NumberOfHeapSpaces() { unimplemented!("v8__Isolate__NumberOfHeapSpaces") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint() { unimplemented!("v8__Isolate__PerformMicrotaskCheckpoint") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__RemoveGCEpilogueCallback() { unimplemented!("v8__Isolate__RemoveGCEpilogueCallback") }
 #[unsafe(no_mangle)]
@@ -627,10 +607,6 @@ pub extern "C" fn v8__PATCH_LEVEL() { unimplemented!("v8__PATCH_LEVEL") }
 pub extern "C" fn v8__Platform__DELETE() { unimplemented!("v8__Platform__DELETE") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__NewCustomPlatform() { unimplemented!("v8__Platform__NewCustomPlatform") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__NewSingleThreadedDefaultPlatform() { unimplemented!("v8__Platform__NewSingleThreadedDefaultPlatform") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__NewUnprotectedDefaultPlatform() { unimplemented!("v8__Platform__NewUnprotectedDefaultPlatform") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__PumpMessageLoop() { unimplemented!("v8__Platform__PumpMessageLoop") }
 #[unsafe(no_mangle)]
@@ -1050,8 +1026,6 @@ pub extern "C" fn v8__V8__SetFatalErrorHandler() { unimplemented!("v8__V8__SetFa
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__SetFlagsFromCommandLine() { unimplemented!("v8__V8__SetFlagsFromCommandLine") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__V8__SetFlagsFromString() { unimplemented!("v8__V8__SetFlagsFromString") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__GetHash() { unimplemented!("v8__Value__GetHash") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__InstanceOf() { unimplemented!("v8__Value__InstanceOf") }
@@ -1081,8 +1055,6 @@ pub extern "C" fn v8__Value__IsBooleanObject() { unimplemented!("v8__Value__IsBo
 pub extern "C" fn v8__Value__IsDataView() { unimplemented!("v8__Value__IsDataView") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsDate() { unimplemented!("v8__Value__IsDate") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsExternal() { unimplemented!("v8__Value__IsExternal") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsFalse() { unimplemented!("v8__Value__IsFalse") }
 #[unsafe(no_mangle)]
@@ -1154,8 +1126,6 @@ pub extern "C" fn v8__Value__IsUint8Array() { unimplemented!("v8__Value__IsUint8
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsUint8ClampedArray() { unimplemented!("v8__Value__IsUint8ClampedArray") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsUndefined() { unimplemented!("v8__Value__IsUndefined") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsWasmMemoryObject() { unimplemented!("v8__Value__IsWasmMemoryObject") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsWasmModuleObject() { unimplemented!("v8__Value__IsWasmModuleObject") }
@@ -1181,8 +1151,6 @@ pub extern "C" fn v8__Value__ToNumber() { unimplemented!("v8__Value__ToNumber") 
 pub extern "C" fn v8__Value__ToUint32() { unimplemented!("v8__Value__ToUint32") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__TypeOf() { unimplemented!("v8__Value__TypeOf") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__Uint32Value() { unimplemented!("v8__Value__Uint32Value") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ValueDeserializer__CONSTRUCT() { unimplemented!("v8__ValueDeserializer__CONSTRUCT") }
 #[unsafe(no_mangle)]
