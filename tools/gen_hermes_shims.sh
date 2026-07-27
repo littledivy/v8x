@@ -123,7 +123,19 @@ sort -u /tmp/hermes_implemented.txt -o /tmp/hermes_implemented.txt
         echo "#[cfg(not(feature = \"link_hermes\"))]"
       fi
       echo "#[unsafe(no_mangle)]"
-      echo "pub extern \"C\" fn ${sym}() { unimplemented!(\"${sym}\") }"
+      # Null-returning stub (NOT unimplemented!()): a panic in an extern "C" fn
+      # cannot unwind and aborts the WHOLE test process, masking every other
+      # pass in that binary (rusty_v8 runs a file's hundreds of tests in one
+      # process). Returning a null pointer instead means: void-returning setup
+      # symbols (SetFatalErrorHandler, AddMessageListener, ...) become true
+      # no-ops (the extra x0=null is ignored), and value-returning ones hand
+      # back a NULL handle the many `if this.is_null()` guards in core.rs
+      # short-circuit gracefully - so an unimplemented path fails ONE test
+      # instead of aborting the binary. Linking is name-only (the vendored
+      # extern decl's real signature is never type-checked against this stub),
+      # so a single null-pointer return satisfies every declared shape. Promote
+      # hot stubs to real bodies in core.rs.
+      echo "pub extern \"C\" fn ${sym}() -> *const ::std::ffi::c_void { ::std::ptr::null() }"
     done
 } > "$OUT"
 

@@ -1008,4 +1008,133 @@ int v8x_hermes_uint32_value(void *rtw, v8x_hermes_slot slot, uint32_t *out) {
   }
 }
 
+// ---- ArrayBuffer + TypedArray (C8) ----------------------------------------
+//
+// JSI exposes jsi::ArrayBuffer (a data() + size() view over a backing buffer)
+// but only lets an embedder READ an existing one; it has no C++ factory to
+// allocate a fresh ArrayBuffer of a given byte length. So a new ArrayBuffer is
+// created by calling the JS `ArrayBuffer` constructor on the global with the
+// byte length, then the backing bytes are reached through
+// jsi::ArrayBuffer::data(). Typed arrays are likewise built by calling the JS
+// `Uint8Array`/etc constructor with (arraybuffer, byteOffset, length). Every
+// entry point keeps the C2 catch-all.
+
+// new ArrayBuffer(byte_length). Returns a slot, or the null slot on error.
+v8x_hermes_slot v8x_hermes_array_buffer_new(void *rtw, size_t byte_length) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    jsi::Function ctor = w->runtime()
+                             .global()
+                             .getPropertyAsFunction(w->runtime(), "ArrayBuffer");
+    jsi::Value ab = ctor.callAsConstructor(
+        w->runtime(),
+        jsi::Value(static_cast<double>(byte_length)));
+    return w->push(std::move(ab));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// ArrayBuffer.prototype.byteLength as a size_t. Returns SIZE_MAX on error so a
+// genuine 0-length buffer is distinguishable from a bad slot.
+size_t v8x_hermes_array_buffer_byte_length(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return SIZE_MAX;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return SIZE_MAX;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    if (!obj.isArrayBuffer(w->runtime())) {
+      return SIZE_MAX;
+    }
+    return obj.getArrayBuffer(w->runtime()).size(w->runtime());
+  } catch (...) {
+    return SIZE_MAX;
+  }
+}
+
+// Pointer to an ArrayBuffer's backing bytes (jsi::ArrayBuffer::data). Returns
+// nullptr on error or for a non-ArrayBuffer slot.
+void *v8x_hermes_array_buffer_data(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return nullptr;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return nullptr;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    if (!obj.isArrayBuffer(w->runtime())) {
+      return nullptr;
+    }
+    return obj.getArrayBuffer(w->runtime()).data(w->runtime());
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+// new <ctor_name>(arraybuffer, byte_offset, length). `ctor_name` is a NUL-
+// terminated JS global constructor name (e.g. "Uint8Array"). Returns a slot
+// with the constructed typed array, or the null slot on error (bad slot, the
+// buffer slot is not an ArrayBuffer, or the JS constructor threw).
+v8x_hermes_slot v8x_hermes_typed_array_new(void *rtw, const char *ctor_name,
+                                           v8x_hermes_slot buf_slot,
+                                           size_t byte_offset, size_t length) {
+  if (rtw == nullptr || ctor_name == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *bv = slot_ref(w, buf_slot);
+  if (bv == nullptr || !bv->isObject()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    jsi::Object buf = bv->getObject(w->runtime());
+    if (!buf.isArrayBuffer(w->runtime())) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Function ctor =
+        w->runtime().global().getPropertyAsFunction(w->runtime(), ctor_name);
+    jsi::Value ta = ctor.callAsConstructor(
+        w->runtime(), jsi::Value(w->runtime(), buf),
+        jsi::Value(static_cast<double>(byte_offset)),
+        jsi::Value(static_cast<double>(length)));
+    return w->push(std::move(ta));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// TypedArray.prototype.length. Returns SIZE_MAX on error so a genuine 0-length
+// typed array is distinguishable from a bad slot / non-object.
+size_t v8x_hermes_typed_array_length(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return SIZE_MAX;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return SIZE_MAX;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    jsi::Value len = obj.getProperty(w->runtime(), "length");
+    if (!len.isNumber()) {
+      return SIZE_MAX;
+    }
+    return static_cast<size_t>(len.getNumber());
+  } catch (...) {
+    return SIZE_MAX;
+  }
+}
+
 } // extern "C"

@@ -36,8 +36,8 @@
 
 use crate::support::{MaybeBool, SharedPtrBase};
 use crate::{
-  Allocator, Array, Boolean, Context, Data, External, Function, Integer,
-  Number, Object, Platform, Primitive, RealIsolate, Script,
+  Allocator, Array, ArrayBuffer, Boolean, Context, Data, External, Function,
+  Integer, Number, Object, Platform, Primitive, RealIsolate, Script,
   String as V8String, UniquePtr, Value,
 };
 use std::cell::Cell;
@@ -125,6 +125,20 @@ unsafe extern "C" {
     slot: i64,
     out: *mut u32,
   ) -> c_int;
+
+  // C8: ArrayBuffer + TypedArray. See
+  // docs/hermes-spike/experiments/C8-hermes-testapi.md.
+  fn v8x_hermes_array_buffer_new(rtw: *mut c_void, byte_length: usize) -> i64;
+  fn v8x_hermes_array_buffer_byte_length(rtw: *mut c_void, slot: i64) -> usize;
+  fn v8x_hermes_array_buffer_data(rtw: *mut c_void, slot: i64) -> *mut c_void;
+  fn v8x_hermes_typed_array_new(
+    rtw: *mut c_void,
+    ctor_name: *const c_char,
+    buf_slot: i64,
+    byte_offset: usize,
+    length: usize,
+  ) -> i64;
+  fn v8x_hermes_typed_array_length(rtw: *mut c_void, slot: i64) -> usize;
 }
 
 /// The C++ null-slot sentinel (must match `V8X_HERMES_NULL_SLOT` in the shim).
@@ -144,6 +158,14 @@ pub(crate) struct IsoState {
   /// per Hermes isolate (its handle IS the isolate pointer), so these live on
   /// the isolate. Grows on demand; used by `Context::set_slot`'s annex.
   pub ctx_embedder_data: Vec<*mut c_void>,
+  /// The context's MicrotaskQueue pointer (C8). Hermes drains promise jobs
+  /// inside evaluateJavaScript and exposes no embedder MicrotaskQueue, so this
+  /// is an inert non-null marker: `GetMicrotaskQueue` must not return null
+  /// (the vendored `&*ptr` deref would SEGV and abort the whole test binary),
+  /// and `SetMicrotaskQueue`/`GetMicrotaskQueue` round-trip the same pointer so
+  /// the identity check in `microtask_queue_new` holds. Defaults to a stable
+  /// per-isolate marker (the field's own address is used).
+  pub microtask_queue: *mut c_void,
 }
 
 thread_local! {
@@ -202,11 +224,15 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     !rtw.is_null(),
     "v8x_hermes_runtime_new failed (makeHermesRuntime threw)"
   );
-  let st = Box::new(IsoState {
+  let mut st = Box::new(IsoState {
     rtw,
     data_slots: [ptr::null_mut(); 4],
     ctx_embedder_data: Vec::new(),
+    microtask_queue: ptr::null_mut(),
   });
+  // A stable non-null default marker: the box's own state address. Overwritten
+  // by any later SetMicrotaskQueue.
+  st.microtask_queue = (&*st as *const IsoState) as *mut c_void;
   Box::into_raw(st) as *mut RealIsolate
 }
 
@@ -455,6 +481,35 @@ pub extern "C" fn v8__Context__Global(this: *const Context) -> *const Object {
   let st = iso_state(this as *mut RealIsolate);
   let slot = unsafe { v8x_hermes_global(st.rtw) };
   slot_ptr::<Object>(slot)
+}
+
+/// `Context::get_microtask_queue`. Returns the per-isolate marker pointer (see
+/// `IsoState::microtask_queue`). Never null: the vendored getter deref's the
+/// result, so a null would SEGV and abort the whole test binary. Hermes has no
+/// real embedder MicrotaskQueue; the marker only satisfies the pointer-identity
+/// and non-null contracts, not microtask enqueue/flush semantics.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__GetMicrotaskQueue(
+  this: *const Context,
+) -> *mut c_void {
+  if this.is_null() {
+    return ptr::null_mut();
+  }
+  iso_state(this as *mut RealIsolate).microtask_queue
+}
+
+/// `Context::set_microtask_queue`. Stores the pointer so a later
+/// `get_microtask_queue` returns the same value (the identity check in
+/// `microtask_queue_new`). No real queue is installed.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__SetMicrotaskQueue(
+  this: *const Context,
+  queue: *mut c_void,
+) {
+  if this.is_null() {
+    return;
+  }
+  iso_state(this as *mut RealIsolate).microtask_queue = queue;
 }
 
 // ---- Context embedder data (aligned-pointer fields) -----------------------
@@ -1343,6 +1398,140 @@ pub extern "C" fn v8__Data__EQ(
   unsafe { v8x_hermes_strict_equals(rtw, a, b) == 1 }
 }
 
+// ---- ArrayBuffer + TypedArray (C8) ----------------------------------------
+//
+// Hermes/JSI has a real jsi::ArrayBuffer but no C++ factory for a fresh one, so
+// ArrayBuffer allocation and every typed-array constructor route through the JS
+// `ArrayBuffer`/`Uint8Array`/etc constructors on the runtime's global (see the
+// C++ bridge). A `Local<ArrayBuffer>`/`Local<Uint8Array>` is the usual tagged
+// handle-table slot pointer. See
+// docs/hermes-spike/experiments/C8-hermes-testapi.md.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBuffer__New__with_byte_length(
+  isolate: *mut RealIsolate,
+  byte_length: usize,
+) -> *const ArrayBuffer {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  let slot = unsafe { v8x_hermes_array_buffer_new(rtw, byte_length) };
+  slot_ptr::<ArrayBuffer>(slot)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBuffer__ByteLength(this: *const ArrayBuffer) -> usize {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return 0;
+  }
+  let n = unsafe { v8x_hermes_array_buffer_byte_length(rtw, slot_of(this)) };
+  if n == usize::MAX { 0 } else { n }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBuffer__Data(this: *const ArrayBuffer) -> *mut c_void {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return ptr::null_mut();
+  }
+  unsafe { v8x_hermes_array_buffer_data(rtw, slot_of(this)) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TypedArray__Length(this: *const Value) -> usize {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return 0;
+  }
+  let n = unsafe { v8x_hermes_typed_array_length(rtw, slot_of(this)) };
+  if n == usize::MAX { 0 } else { n }
+}
+
+/// Shared body for the twelve `v8__<Name>Array__New` constructors: call the JS
+/// constructor `ctor_name` (a `&CStr`) with `(buffer, byte_offset, length)`.
+#[inline]
+fn typed_array_new(
+  ctor_name: &std::ffi::CStr,
+  buf_ptr: *const ArrayBuffer,
+  byte_offset: usize,
+  length: usize,
+) -> i64 {
+  let rtw = current_rtw();
+  if rtw.is_null() || buf_ptr.is_null() {
+    return NULL_SLOT;
+  }
+  unsafe {
+    v8x_hermes_typed_array_new(
+      rtw,
+      ctor_name.as_ptr(),
+      slot_of(buf_ptr),
+      byte_offset,
+      length,
+    )
+  }
+}
+
+/// A `&'static CStr` literal (avoids allocating a CString per call).
+macro_rules! c_str {
+  ($s:literal) => {{
+    // SAFETY: the literal has no interior NUL and ends with one.
+    unsafe {
+      std::ffi::CStr::from_bytes_with_nul_unchecked(concat!($s, "\0").as_bytes())
+    }
+  }};
+}
+
+/// Define `v8__<Name>Array__New` for each JS typed-array constructor. Each maps
+/// a v8 `<Name>Array::new(buf, offset, len)` to `new <Name>Array(buf, ...)` on
+/// the Hermes global. The return type is the concrete rusty_v8 view struct, but
+/// every value is the same tagged handle-table slot pointer.
+macro_rules! hermes_typed_array_new {
+  ($fn_name:ident, $view:ident, $ctor:literal) => {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn $fn_name(
+      buf_ptr: *const ArrayBuffer,
+      byte_offset: usize,
+      length: usize,
+    ) -> *const crate::$view {
+      let slot = typed_array_new(
+        c_str!($ctor),
+        buf_ptr,
+        byte_offset,
+        length,
+      );
+      slot_ptr::<crate::$view>(slot)
+    }
+  };
+}
+
+hermes_typed_array_new!(v8__Uint8Array__New, Uint8Array, "Uint8Array");
+hermes_typed_array_new!(
+  v8__Uint8ClampedArray__New,
+  Uint8ClampedArray,
+  "Uint8ClampedArray"
+);
+hermes_typed_array_new!(v8__Int8Array__New, Int8Array, "Int8Array");
+hermes_typed_array_new!(v8__Uint16Array__New, Uint16Array, "Uint16Array");
+hermes_typed_array_new!(v8__Int16Array__New, Int16Array, "Int16Array");
+hermes_typed_array_new!(v8__Uint32Array__New, Uint32Array, "Uint32Array");
+hermes_typed_array_new!(v8__Int32Array__New, Int32Array, "Int32Array");
+hermes_typed_array_new!(v8__Float32Array__New, Float32Array, "Float32Array");
+hermes_typed_array_new!(v8__Float64Array__New, Float64Array, "Float64Array");
+hermes_typed_array_new!(
+  v8__BigUint64Array__New,
+  BigUint64Array,
+  "BigUint64Array"
+);
+hermes_typed_array_new!(v8__BigInt64Array__New, BigInt64Array, "BigInt64Array");
+
+// Float16Array is behind V8's --js-float16array flag and not a JS global in
+// Hermes, but the vendored `typed_array!(Float16Array)` still declares the
+// symbol, so it must link. Route it through the same path (it returns the null
+// slot when the `Float16Array` global is absent, rather than aborting).
+hermes_typed_array_new!(v8__Float16Array__New, Float16Array, "Float16Array");
+
 /// `Function::Call`: JSI's `Function::call`/`callWithThis`. `recv` may be
 /// null (v8 passes a null receiver for `undefined`), in which case the shim
 /// uses the undefined-`this` call path. Returns the null handle on any error
@@ -1495,6 +1684,19 @@ pub extern "C" fn v8__V8__Dispose() -> bool {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__DisposePlatform() {}
+
+/// `V8::get_version()`. Reports the V8 version string the vendored rusty_v8
+/// surface was generated against (`crate::VERSION_STRING`), so the round-trip
+/// exact-match test holds. Returning null here would SEGV in the vendored
+/// `CStr::from_ptr(null)`, so this is also a process-crash guard.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__V8__GetVersion() -> *const c_char {
+  use std::sync::OnceLock;
+  static VERSION: OnceLock<std::ffi::CString> = OnceLock::new();
+  VERSION
+    .get_or_init(|| std::ffi::CString::new(crate::VERSION_STRING).unwrap())
+    .as_ptr()
+}
 
 /// Called on isolate teardown; Hermes needs no platform notification.
 #[unsafe(no_mangle)]
