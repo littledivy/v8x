@@ -11,6 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
+- [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities
 - [x] C0 research: v8x integration surface (how to add engine_hermes)
 - [x] C0 research: AOT-solves-snapshot feasibility (HBC / static-hermes / Porffor)
@@ -19,13 +20,41 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 - [ ] C3 implement: core v8__* (isolate/context/primitives/strings)
 - [ ] C4 test: rusty_v8 harness on hermes, hill-climb
 - [ ] C5 AOT E5: QuickJS bytecode-boot vs source (parse-cost)
-- [ ] C6 AOT E6: REAL QuickJS heap snapshot via JS_WriteObject (dissolve 'AOT!=state')
+- [x] C6 AOT E6: REAL QuickJS heap snapshot WORKS (but no startup speedup - see log)
 - [ ] C7 AOT E7: Static Hermes native AOT on real bootstrap chunk (push past 'untyped=no win')
 - [ ] C8 AOT E8: AOT-native Deno north star - tiny native binary running a Deno program
 - [ ] C9 AOT E9: hybrid AOT-bytecode + build-time-precomputed constant data (partial heap)
 
 ## Cycle log
 (newest first)
+
+### DELIVERABLE - working QuickJS deno binary (01:21) SHIPPED
+Built deno release --no-default-features --features quickjs on v8x 149.4.0-rc.1 (crates.io) in
+~/gh/deno-v8x-rebase. 68M. VERIFIED fully working: JS builtins, async+setTimeout, Deno.readTextFile,
+TypeScript, Deno.serve+fetch (200), npm import (change-case). Delivered ~/deno-quickjs/{deno,README.md}.
+
+### Cycle - E6 REAL QuickJS heap snapshot (agent: e6) DONE - the 'AOT vs snapshot' answer
+FRONTIER RESULT: a real post-bootstrap heap snapshot IS achievable on QuickJS and v8x already has
+the machinery. JS_WriteObject + JS_WRITE_OBJ_REFERENCE serializes the whole reachable graph by value
+(nested objs, prototypes, frozen bits, Map/Set, typed arrays, BigInt, cycles, Symbol identity all
+round-trip). Native C fn pointers (unserializable) are solved by a SYMBOLIC reference-path registry
+(__v8x_snapshot_intrinsics + patch quickjs-67-snapshot-native-function-state): writer emits a
+property PATH to each native fn, re-resolved on read against the fresh runtime. Patch 67 also
+serializes native object state -> a REAL heap snapshot, not just rebinding. Residual blocker: opaque
+JS_SetOpaque C-state (sockets/napi) needs per-class hooks.
+Hybrid (re-install natives -> refresh registry -> JS_ReadObject pure-JS on top) WORKS: prototype
+docs/hermes-spike/experiments/e6-src/e6_snap.c, 16/16 checks incl a native add() callable after
+restore carrying heap-added callCount=42.
+MEASURED (arm64 standalone C): small graph 17.9KB blob / 0.08ms restore; 20k-obj graph: from-source
+reboot 8.4ms vs snapshot restore 10.0ms, blob 1.46MB.
+KEY INSIGHT that refines the whole idea: on QuickJS, restore is NOT faster than re-execution (no
+mmap-and-fixup fast path like V8; JS_ReadObject re-allocs+re-hashes every node = same order of work
+as running the code). So the heap snapshot's value is STATE CAPTURE (side effects, non-determinism,
+expensive-to-recompute state), NOT startup latency. Corollary for the user's vision: for STARTUP,
+parse-free AOT-bytecode boot is already ~as good as snapshot-restore on QuickJS -> AOT genuinely
+'solves' the startup half without needing snapshots. Snapshots only earn their keep for stateful boot.
+Next (E7): drive src/quickjs/snapshot.rs capture/replay across a REAL Deno bootstrap; test replacing
+the replay-tape, isolating the load-bearing synthetic ext:core/ops module identity.
 
 ### Cycle 1 - scaffold engine_hermes, fix link failure (agent: executor) DONE
 The prior commit (9d3d86a) already added Cargo.toml/src/lib.rs wiring and
