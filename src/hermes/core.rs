@@ -66,6 +66,10 @@ unsafe extern "C" {
   ) -> usize;
   #[allow(dead_code)]
   fn v8x_hermes_value_is_string(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_value_is_object(rtw: *mut c_void, slot: i64) -> c_int;
+  // C4: object identity. See docs/hermes-spike/experiments/C4-hermes-identity.md.
+  fn v8x_hermes_strict_equals(rtw: *mut c_void, a: i64, b: i64) -> c_int;
+  fn v8x_hermes_get_identity_hash(rtw: *mut c_void, slot: i64) -> i64;
 }
 
 /// The C++ null-slot sentinel (must match `V8X_HERMES_NULL_SLOT` in the shim).
@@ -651,6 +655,131 @@ pub(crate) fn value_is_string(this: *const V8String) -> bool {
     return false;
   }
   unsafe { v8x_hermes_value_is_string(rtw, slot_of(this)) != 0 }
+}
+
+/// `Value::IsObject`: needed so Rust can safely `Local<Value>::try_cast::<
+/// Object>()` (the vendored `TryFrom` impl checks this first). Routes to
+/// `jsi::Value::isObject`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsObject(this: *const Value) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() {
+    return false;
+  }
+  let slot = slot_of(this);
+  if slot < 0 {
+    return false;
+  }
+  unsafe { v8x_hermes_value_is_object(rtw, slot) != 0 }
+}
+
+/// `Value::ToObject`: our `Local` is a handle-table slot, and `Value`/
+/// `Object` are the same tagged-pointer representation over that table, so
+/// when the value already holds a JS object this is the identity function on
+/// the slot (re-tagged as an `Object` handle). Non-object values are boxed
+/// the way JS `ToObject` would (e.g. a primitive wrapper) in real V8; that
+/// coercion is out of scope here (returns null), since the hello-world/C4
+/// surface only calls this on values already known to be objects.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__ToObject(
+  this: *const Value,
+  context: *const Context,
+) -> *const Object {
+  if this.is_null() || context.is_null() {
+    return ptr::null();
+  }
+  let isolate = context as *mut RealIsolate;
+  let rtw = iso_state(isolate).rtw;
+  let slot = slot_of(this);
+  if slot < 0 || unsafe { v8x_hermes_value_is_object(rtw, slot) } == 0 {
+    return ptr::null();
+  }
+  this as *const Object
+}
+
+// ---- Object identity (C4) ---------------------------------------------------
+//
+// THE PROBLEM: a v8 `Local` here is a C++ handle-table slot index (see the
+// module doc). JSI hands out no raw object pointer, so two Locals obtained
+// for the SAME JS object (e.g. read back twice from a JS variable) are
+// different slot indices with different tagged pointers. Naively comparing
+// tagged-pointer bits (what a literal port of "V8 Value* identity" would do)
+// is WRONG: it would call two handles to the same object "different" and
+// (accidentally) never call two handles to different primitive values of the
+// same slot index "same", since slots are never reused while live. So every
+// V8 identity/hash entry point must reroute through the underlying JSI object
+// identity instead of the slot's pointer bits. See
+// docs/hermes-spike/experiments/C4-hermes-identity.md for the demonstration
+// and the fix, proven by the `hermes_identity` test in mod.rs.
+
+/// `Value::StrictEquals` (`===`): routes to `jsi::Value::strictEquals`, which
+/// compares the underlying JSI value (by JS `===` semantics: identity for
+/// objects/symbols, content for strings, value for numbers/booleans), NOT the
+/// handle-table slot index. Two different slots holding the same JS object
+/// correctly compare equal.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__StrictEquals(
+  this: *const Value,
+  other: *const Value,
+) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() {
+    return false;
+  }
+  let a = slot_of(this);
+  let b = slot_of(other);
+  if a < 0 || b < 0 {
+    return a == b;
+  }
+  let r = unsafe { v8x_hermes_strict_equals(rtw, a, b) };
+  r == 1
+}
+
+/// `Value::SameValue` (`Object.is`): for the hello-world/C4 surface this is
+/// implemented identically to StrictEquals, EXCEPT SameValue additionally
+/// treats `NaN === NaN` as true and `+0`/`-0` as distinct, unlike `===`. JSI's
+/// `Value` does not expose bit-level float inspection needed to special-case
+/// signed zero, so this is a known simplification: correct for the object-
+/// identity surface this experiment targets (objects/strings/booleans), and
+/// for ordinary (non-NaN, non-zero) numbers; NaN/+-0 edge cases are not yet
+/// exact. Flagged in the C4 doc as a residual risk, not silently papered over.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__SameValue(
+  this: *const Value,
+  other: *const Value,
+) -> bool {
+  v8__Value__StrictEquals(this, other)
+}
+
+/// `Object::GetIdentityHash`: a STABLE per-object integer (v8's contract:
+/// same object -> same hash across repeated calls and across different
+/// Locals/handles to it; never 0). JSI has no built-in identity hash, so this
+/// uses the standard embedder trick (see hermes_shim.cpp
+/// v8x_hermes_get_identity_hash): lazily attach a hidden, non-enumerable,
+/// Symbol-keyed property holding a monotonically increasing id, read back on
+/// later calls. The id lives on the object's own heap storage, not on the
+/// (non-canonical, per-Local) slot index, so two different slots for the same
+/// object yield the same hash.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetIdentityHash(this: *const Object) -> c_int {
+  let rtw = current_rtw();
+  if rtw.is_null() {
+    return 0;
+  }
+  let slot = slot_of(this);
+  if slot < 0 {
+    return 0;
+  }
+  let h = unsafe { v8x_hermes_get_identity_hash(rtw, slot) };
+  if h <= 0 {
+    // v8's contract is "never 0"; the shim returns -1 on error (e.g. a
+    // non-object Value). Surface a distinguishable-but-nonzero sentinel
+    // rather than silently returning the reserved 0.
+    return -1;
+  }
+  // v8's identity hash is a 31-bit-ish int; our monotonic counter fits easily
+  // for any test-scale object count.
+  h as c_int
 }
 
 // ---- Platform / V8 lifecycle ----------------------------------------------

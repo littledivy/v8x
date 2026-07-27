@@ -619,6 +619,7 @@ pub extern "C" fn v8__Object__GetAlignedPointerFromInternalField() { unimplement
 pub extern "C" fn v8__Object__GetConstructorName() { unimplemented!("v8__Object__GetConstructorName") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetCreationContext() { unimplemented!("v8__Object__GetCreationContext") }
+#[cfg(not(feature = "link_hermes"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetIdentityHash() { unimplemented!("v8__Object__GetIdentityHash") }
 #[unsafe(no_mangle)]
@@ -1277,6 +1278,7 @@ pub extern "C" fn v8__Value__IsNullOrUndefined() { unimplemented!("v8__Value__Is
 pub extern "C" fn v8__Value__IsNumber() { unimplemented!("v8__Value__IsNumber") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsNumberObject() { unimplemented!("v8__Value__IsNumberObject") }
+#[cfg(not(feature = "link_hermes"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsObject() { unimplemented!("v8__Value__IsObject") }
 #[unsafe(no_mangle)]
@@ -1327,8 +1329,10 @@ pub extern "C" fn v8__Value__IsWeakMap() { unimplemented!("v8__Value__IsWeakMap"
 pub extern "C" fn v8__Value__IsWeakSet() { unimplemented!("v8__Value__IsWeakSet") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__NumberValue() { unimplemented!("v8__Value__NumberValue") }
+#[cfg(not(feature = "link_hermes"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__SameValue() { unimplemented!("v8__Value__SameValue") }
+#[cfg(not(feature = "link_hermes"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__StrictEquals() { unimplemented!("v8__Value__StrictEquals") }
 #[unsafe(no_mangle)]
@@ -1343,6 +1347,7 @@ pub extern "C" fn v8__Value__ToInt32() { unimplemented!("v8__Value__ToInt32") }
 pub extern "C" fn v8__Value__ToInteger() { unimplemented!("v8__Value__ToInteger") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToNumber() { unimplemented!("v8__Value__ToNumber") }
+#[cfg(not(feature = "link_hermes"))]
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToObject() { unimplemented!("v8__Value__ToObject") }
 #[cfg(not(feature = "link_hermes"))]

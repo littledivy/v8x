@@ -50,6 +50,25 @@ mod smoke {
 #[cfg(feature = "link_hermes")]
 pub use smoke::smoke_eval;
 
+// Shared, PROCESS-WIDE V8 platform/init guard for every test module below.
+// `v8::V8::initialize_platform`/`initialize` gate a single global state
+// machine (Uninitialized -> PlatformInitialized -> Initialized) shared across
+// the whole test binary; calling either a second time from an independent
+// `Once` (e.g. one per test module) panics with "Invalid global state". So
+// every hermes test module that needs a live isolate must call through this
+// one shared `Once`, not declare its own.
+#[cfg(all(test, feature = "link_hermes"))]
+fn init_v8_once() {
+  use crate as v8;
+  use std::sync::Once;
+  static START: Once = Once::new();
+  START.call_once(|| {
+    let platform = v8::new_default_platform(0, false).make_shared();
+    v8::V8::initialize_platform(platform);
+    v8::V8::initialize();
+  });
+}
+
 // C3: drive the vendored v8x Rust surface (Isolate -> HandleScope -> Context
 // -> String -> Script::compile -> Script::run -> read string) end to end on a
 // real Hermes runtime, through the v8__* symbols in `core`. This is the
@@ -59,16 +78,7 @@ pub use smoke::smoke_eval;
 #[cfg(all(test, feature = "link_hermes"))]
 mod hello_world {
   use crate as v8;
-
-  fn init_v8_once() {
-    use std::sync::Once;
-    static START: Once = Once::new();
-    START.call_once(|| {
-      let platform = v8::new_default_platform(0, false).make_shared();
-      v8::V8::initialize_platform(platform);
-      v8::V8::initialize();
-    });
-  }
+  use super::init_v8_once;
 
   #[test]
   fn hermes_backend_runs_hello_world() {
@@ -88,6 +98,179 @@ mod hello_world {
 
     println!("hermes backend ran: 'hello' + ' ' + 'world' = {result:?}");
     assert_eq!(result, "hello world", "real Hermes should produce 'hello world'");
+  }
+}
+
+// C4: de-risk object identity, the deepest known blocker for a Hermes v8x
+// backend. JSI hands out no raw pointer, so two Locals (handle-table slot
+// indices) obtained for the SAME JS object are different tagged pointers.
+// This proves (1) the problem is real, (2) v8__Value__StrictEquals/SameValue
+// correctly reroute through JSI's own object identity instead of slot
+// identity, and (3) v8__Object__GetIdentityHash returns a STABLE per-object
+// hash via a hidden, non-enumerable property, invisible to ordinary JS
+// enumeration. See docs/hermes-spike/experiments/C4-hermes-identity.md.
+#[cfg(all(test, feature = "link_hermes"))]
+mod hermes_identity {
+  use crate as v8;
+  use super::init_v8_once;
+
+  fn eval<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    src: &str,
+  ) -> v8::Local<'s, v8::Value> {
+    let source = v8::String::new(scope, src).unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    script.run(scope).unwrap()
+  }
+
+  #[test]
+  fn hermes_identity() {
+    init_v8_once();
+
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // Stash one real JS object on the global object, so it can be read back
+    // through two INDEPENDENT eval calls -> two independent handle-table
+    // slots for the exact same underlying JS heap object.
+    eval(scope, "globalThis.o = { marker: 'same-object' };");
+    eval(scope, "globalThis.p = { marker: 'different-object' };");
+
+    let o_first = eval(scope, "globalThis.o");
+    let o_second = eval(scope, "globalThis.o");
+    let p = eval(scope, "globalThis.p");
+
+    assert!(o_first.is_object(), "globalThis.o should be a JS object");
+    assert!(o_second.is_object(), "globalThis.o should be a JS object");
+    assert!(p.is_object(), "globalThis.p should be a JS object");
+
+    // ---- Point 1: DEMONSTRATE the problem ---------------------------------
+    // Two Locals to the SAME JS object are different handle-table slots, so
+    // their tagged pointers differ. A naive port of V8 identity (raw pointer
+    // equality on Local<Value>/Local<Object>) would therefore wrongly call
+    // these "different objects".
+    let ptr_first = &*o_first as *const v8::Value;
+    let ptr_second = &*o_second as *const v8::Value;
+    println!(
+      "hermes_identity: two Locals to globalThis.o -> tagged pointers {:p} vs {:p} (differ: {})",
+      ptr_first, ptr_second, ptr_first != ptr_second
+    );
+    assert_ne!(
+      ptr_first, ptr_second,
+      "two independently-evaluated Locals to the same JS object must be \
+       different handle-table slots (this IS the problem C4 de-risks)"
+    );
+
+    // ---- Point 2: STRICT EQUALITY over JSI identity, not slot identity -----
+    // v8__Value__StrictEquals must reroute through jsi::Value::strictEquals
+    // (the underlying JS object identity), not the differing slot pointers.
+    assert!(
+      o_first.strict_equals(o_second),
+      "StrictEquals must recognize two Locals to the same object as === \
+       (routes through jsi::Runtime::strictEquals, not slot-pointer identity)"
+    );
+    assert!(
+      !o_first.strict_equals(p),
+      "StrictEquals must correctly distinguish two DIFFERENT objects"
+    );
+    assert!(o_first.same_value(o_second), "SameValue: same object -> true");
+    assert!(!o_first.same_value(p), "SameValue: different objects -> false");
+    println!(
+      "hermes_identity: StrictEquals(o,o)={} StrictEquals(o,p)={}",
+      o_first.strict_equals(o_second),
+      o_first.strict_equals(p)
+    );
+
+    // ---- Point 3: STABLE IDENTITY HASH (the crux) --------------------------
+    let obj_first = o_first.to_object(scope).unwrap();
+    let obj_second = o_second.to_object(scope).unwrap();
+    let obj_p = p.to_object(scope).unwrap();
+
+    let hash_first = obj_first.get_identity_hash();
+    let hash_second = obj_second.get_identity_hash();
+    let hash_p = obj_p.get_identity_hash();
+    println!(
+      "hermes_identity: GetIdentityHash(o via slot A)={hash_first} \
+       GetIdentityHash(o via slot B)={hash_second} GetIdentityHash(p)={hash_p}"
+    );
+
+    assert_eq!(
+      hash_first, hash_second,
+      "GetIdentityHash must be STABLE: the same object read back through \
+       two different Locals/slots must yield the same hash"
+    );
+    assert_ne!(
+      hash_first, hash_p,
+      "GetIdentityHash must distinguish two different objects"
+    );
+
+    // Calling it again must still be stable (not re-assigned on every call).
+    let obj_first_again = eval(scope, "globalThis.o").to_object(scope).unwrap();
+    assert_eq!(
+      obj_first_again.get_identity_hash(),
+      hash_first,
+      "GetIdentityHash must remain stable across repeated reads of the same object"
+    );
+
+    // ---- The hidden id must be invisible to ordinary JS enumeration --------
+    let keys_of_o = eval(scope, "JSON.stringify(Object.keys(globalThis.o))")
+      .to_rust_string_lossy(scope);
+    let json_of_o =
+      eval(scope, "JSON.stringify(globalThis.o)").to_rust_string_lossy(scope);
+    let for_in_count = eval(
+      scope,
+      "(function(){ let n = 0; for (const k in globalThis.o) n++; return String(n); })()",
+    )
+    .to_rust_string_lossy(scope);
+    let own_symbols =
+      eval(scope, "String(Object.getOwnPropertySymbols(globalThis.o).length)")
+        .to_rust_string_lossy(scope);
+
+    println!(
+      "hermes_identity: Object.keys={keys_of_o} JSON.stringify={json_of_o} \
+       for-in-count={for_in_count} getOwnPropertySymbols.length={own_symbols}"
+    );
+
+    assert_eq!(
+      keys_of_o, r#"["marker"]"#,
+      "the hidden identity-hash slot must not appear in Object.keys"
+    );
+    assert_eq!(
+      json_of_o,
+      r#"{"marker":"same-object"}"#,
+      "the hidden identity-hash slot must not appear in JSON.stringify"
+    );
+    assert_eq!(
+      for_in_count, "1",
+      "the hidden identity-hash slot must not appear in for-in"
+    );
+    // Object.getOwnPropertySymbols DOES see the hidden Symbol key by design
+    // (Symbol-keyed props are only invisible to *enumerable-string*
+    // enumeration, never to explicit reflection); assert it is non-
+    // enumerable there too, which is the actual "fully hidden" guarantee.
+    assert_eq!(
+      own_symbols, "1",
+      "the hidden id IS a real Symbol-keyed own property (only invisible to \
+       string-keyed/enumerable enumeration, not to explicit reflection)"
+    );
+    let symbol_is_enumerable = eval(
+      scope,
+      "(function(){ const s = Object.getOwnPropertySymbols(globalThis.o)[0]; \
+       return String(Object.getOwnPropertyDescriptor(globalThis.o, s).enumerable); })()",
+    )
+    .to_rust_string_lossy(scope);
+    assert_eq!(
+      symbol_is_enumerable, "false",
+      "the hidden identity-hash property must be installed non-enumerable"
+    );
+
+    println!(
+      "hermes_identity: PASS - StrictEquals/SameValue and GetIdentityHash both \
+       reroute through JSI object identity, not slot identity; hidden id \
+       invisible to Object.keys/JSON.stringify/for-in and non-enumerable"
+    );
   }
 }
 
