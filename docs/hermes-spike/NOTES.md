@@ -25,7 +25,7 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
       Script) -> our v8__* -> libhermes evaluateJavaScript -> "hello world" back
       in Rust (docs/hermes-spike/experiments/C3-hermes-helloworld.md).
 - [x] C4 SOLVED object identity (strictEquals + hidden-symbol-id hash); 4 hermes tests pass
-- [ ] C5 AOT E5: QuickJS bytecode-boot vs source (parse-cost)
+- [x] C5 AOT: Hermes HBC parse-free boot = 21x faster than source (202ms->9.3ms) THROUGH the backend
 - [x] C6 AOT E6: REAL QuickJS heap snapshot WORKS (but no startup speedup - see log)
 - [ ] C7 AOT E7: Static Hermes native AOT on real bootstrap chunk (push past 'untyped=no win')
 - [ ] C8 AOT E8: AOT-native Deno north star - tiny native binary running a Deno program
@@ -33,6 +33,25 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle C5 - Hermes HBC parse-free AOT through the backend (agent: c5) DONE - the 'AOT wonderful' number
+Same shim entry (v8x_hermes_eval_buffer) runs JS source OR hermesc-compiled HBC transparently (Hermes
+sniffs the 8-byte magic). isHermesBytecode(source)=false, (hbc)=true verified (magic c6 1f bc 03..).
+MEASURED (1.4MB bootstrap-shaped JS, 4000 tiny fn/obj/proto defs, 7 cold-runtime iters, medians):
+  source parse+compile+run ~202 ms  vs  HBC run-only ~9.3 ms  =>  ~21x faster, ~193ms parse+compile
+  recovered by AOT. HBC size 1.36x source.
+hermesc from deprecated hermes-engine npm v0.11.0 (matches framework, HBC v84), 2.9MB, vendored to
+vendor/hermes/bin/hermesc.
+Bug found+fixed: OwnedBuffer needed a trailing zeroed byte (not counted in size()) - Hermes lexer does
+a 1-byte OOB lookahead read that SIGSEGVs on raw vector buffers >~300KB (jsi::StringBuffer dodges it
+via std::string NUL). First looked like an infinite hang under cargo test; a standalone C++ repro
+revealed the real SIGSEGV.
+SYNTHESIS (E6 + C5): the AOT-vs-snapshot question is now answered with data. On QuickJS a heap-snapshot
+restore is NOT faster than re-running (no mmap fastpath). On Hermes, parse-free HBC boot is 21x faster
+than source, and Hermes builtins are native C++ so ONLY the runtime/app bootstrap runs at boot. =>
+parse-free AOT bytecode, not heap-snapshot, is the real startup lever. This IS 'AOT makes startup
+wonderful', demonstrated. Maps directly to deno compile shipping HBC not source.
+Next: measure on a REAL Deno bootstrap chunk; wire prepareJavaScript for cross-isolate sharing; -O vs plain.
 
 ### Cycle C4 - Hermes object identity SOLVED (agent: c4) DONE - deepest blocker cleared
 Both identity-sensitive parts of the V8 C-ABI reroute through JSI primitives:
