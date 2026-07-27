@@ -71,8 +71,8 @@ replay-tape pain entirely.
 
 ## Honest state and next steps
 
-Delivered and solid: the QuickJS Deno binary; a Hermes backend that runs real JS and passes 61 real
-V8 tests with identity, exceptions, and callbacks; the AOT measurements.
+Delivered and solid: the QuickJS Deno binary; a Hermes backend that runs real JS and passes 76 real
+V8 tests with identity, exceptions, callbacks, and templates/accessors; the AOT measurements.
 
 Not done (this was a spike, not a product):
 - Hermes is nowhere near running Deno yet. 76/267 rusty_v8 tests; then comes the whole deno_core suite
