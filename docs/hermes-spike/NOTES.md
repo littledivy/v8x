@@ -16,7 +16,10 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 - [x] C0 research: v8x integration surface (how to add engine_hermes)
 - [x] C0 research: AOT-solves-snapshot feasibility (HBC / static-hermes / Porffor)
 - [x] C1 scaffold: engine_hermes feature + src/hermes/ skeleton (build.rs untouched, not needed yet)
-- [ ] C2 build: vendor + build static Hermes, link stubs
+- [x] C2 FFI feasibility PROVEN: Rust -> extern "C" C++ -> real libhermes JSI
+      evals "40 + 2" == 42, prints it (docs/hermes-spike/experiments/C2-hermes-ffi.md).
+      Prebuilt macOS hermes.framework (facebook/hermes v0.11.0 release, 4.5MB
+      vendored, no source build). `--features hermes,link_hermes`.
 - [ ] C3 implement: core v8__* (isolate/context/primitives/strings)
 - [ ] C4 test: rusty_v8 harness on hermes, hill-climb
 - [ ] C5 AOT E5: QuickJS bytecode-boot vs source (parse-cost)
