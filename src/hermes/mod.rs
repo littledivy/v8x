@@ -861,6 +861,82 @@ mod hermes_surface {
     println!("hermes_native_callback: nativeCb('hello') = 1005");
   }
 
+  /// C11: ObjectTemplate + internal fields + a native-data-property accessor,
+  /// end to end. Builds an ObjectTemplate with one internal field and a
+  /// `key` getter that returns the internal field, instantiates it, sets the
+  /// internal field to 42, installs the instance on the global, and confirms
+  /// `obj.key === 42` from JS (through the accessor -> internal field path).
+  #[test]
+  fn hermes_object_template_basic() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let getter = |scope: &mut v8::PinScope,
+                  _key: v8::Local<v8::Name>,
+                  args: v8::PropertyCallbackArguments,
+                  mut rv: v8::ReturnValue<v8::Value>| {
+      let this = args.holder();
+      assert!(!args.should_throw_on_error());
+      let field: v8::Local<v8::Value> =
+        this.get_internal_field(scope, 0).unwrap().try_into().unwrap();
+      rv.set(field);
+    };
+
+    let key = v8::String::new(scope, "key").unwrap();
+    let templ = v8::ObjectTemplate::new(scope);
+    assert!(templ.set_internal_field_count(1));
+    templ.set_accessor(key.into(), getter);
+
+    let obj = templ.new_instance(scope).unwrap();
+    assert_eq!(obj.internal_field_count(), 1);
+
+    // Unset internal field reads back as undefined.
+    let unset: v8::Local<v8::Value> =
+      obj.get_internal_field(scope, 0).unwrap().try_into().unwrap();
+    assert!(unset.is_undefined());
+
+    let fortytwo = v8::Integer::new(scope, 42);
+    assert!(obj.set_internal_field(0, fortytwo.into()));
+
+    let name = v8::String::new(scope, "otObj").unwrap();
+    context.global(scope).set(scope, name.into(), obj.into());
+    let result = eval(scope, "otObj.key");
+    assert_eq!(result.to_rust_string_lossy(scope), "42");
+    println!("hermes_object_template_basic: otObj.key = 42 (via accessor -> internal field)");
+
+    // A FunctionTemplate instance-template with an internal field, invoked via
+    // `new`: the constructor callback sets the field on the receiver, and it
+    // reads back through GetInternalField (matches
+    // instance_template_with_internal_field).
+    pub fn ctor_cb(
+      scope: &mut v8::PinScope,
+      args: v8::FunctionCallbackArguments,
+      mut retval: v8::ReturnValue<v8::Value>,
+    ) {
+      let this = args.this();
+      assert!(this.set_internal_field(0, v8::Integer::new(scope, 42).into()));
+      retval.set(this.into());
+    }
+    let ctor_templ = v8::FunctionTemplate::new(scope, ctor_cb);
+    ctor_templ.instance_template(scope).set_internal_field_count(1);
+    let cn = v8::String::new(scope, "WIF").unwrap();
+    let cf = ctor_templ.get_function(scope).unwrap();
+    context.global(scope).set(scope, cn.into(), cf.into());
+    let made = eval(scope, "new WIF()");
+    let field: v8::Local<v8::Value> = made
+      .to_object(scope)
+      .unwrap()
+      .get_internal_field(scope, 0)
+      .unwrap()
+      .try_into()
+      .unwrap();
+    assert_eq!(field.integer_value(scope).unwrap(), 42);
+    println!("hermes_object_template_basic: new WIF() internal field = 42");
+  }
+
   /// `JSON.stringify` run as a script that reads back a value built entirely
   /// through the v8x Object/Array/primitive surface (not constructed as a
   /// JS-source literal), proving the C++-side writes are indistinguishable

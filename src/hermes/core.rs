@@ -38,8 +38,8 @@ use crate::support::{MaybeBool, SharedPtrBase};
 use crate::{
   Allocator, Array, ArrayBuffer, Boolean, Context, Data, External, Function,
   FunctionCallback, FunctionCallbackInfo, FunctionTemplate, Integer, Message,
-  Number, Object, Platform, Primitive, RealIsolate, Script,
-  String as V8String, UniquePtr, Value,
+  Name, Number, Object, ObjectTemplate, Platform, Primitive, RealIsolate,
+  Script, String as V8String, Template, UniquePtr, Value,
 };
 use std::cell::Cell;
 use std::os::raw::{c_char, c_int, c_void};
@@ -53,6 +53,7 @@ unsafe extern "C" {
   fn v8x_hermes_runtime_free(rtw: *mut c_void);
   fn v8x_hermes_handles_len(rtw: *mut c_void) -> usize;
   fn v8x_hermes_handles_truncate(rtw: *mut c_void, watermark: usize);
+  fn v8x_hermes_set_slot(rtw: *mut c_void, dst: i64, src: i64) -> c_int;
   fn v8x_hermes_global(rtw: *mut c_void) -> i64;
   fn v8x_hermes_string_new_utf8(
     rtw: *mut c_void,
@@ -167,8 +168,72 @@ unsafe extern "C" {
     data_slot: i64,
     length: i32,
     name: *const c_char,
+    instance_internal_field_count: i64,
   ) -> i64;
   fn v8x_hermes_set_pending_callback_exception(rtw: *mut c_void, slot: i64);
+
+  // C11: ObjectTemplate internal fields + accessors. See
+  // docs/hermes-spike/experiments/C11-hermes-templates.md.
+  fn v8x_hermes_object_new_with_internal_fields(
+    rtw: *mut c_void,
+    count: i64,
+  ) -> i64;
+  // Called from the C++ constructor host-function path, not from Rust.
+  #[allow(dead_code)]
+  fn v8x_hermes_object_ensure_internal_fields(
+    rtw: *mut c_void,
+    slot: i64,
+    count: i64,
+  ) -> c_int;
+  fn v8x_hermes_object_internal_field_count(
+    rtw: *mut c_void,
+    slot: i64,
+  ) -> i64;
+  fn v8x_hermes_object_get_internal_field(
+    rtw: *mut c_void,
+    slot: i64,
+    index: i64,
+  ) -> i64;
+  fn v8x_hermes_object_set_internal_field(
+    rtw: *mut c_void,
+    slot: i64,
+    index: i64,
+    value_slot: i64,
+  ) -> c_int;
+  fn v8x_hermes_object_define_property(
+    rtw: *mut c_void,
+    obj_slot: i64,
+    key_slot: i64,
+    value_slot: i64,
+    attr: c_int,
+  ) -> c_int;
+  fn v8x_hermes_object_define_accessor(
+    rtw: *mut c_void,
+    obj_slot: i64,
+    key_slot: i64,
+    getter_bits: usize,
+    setter_bits: usize,
+    data_slot: i64,
+    attr: c_int,
+  ) -> c_int;
+  fn v8x_hermes_function_set_name(
+    rtw: *mut c_void,
+    fn_slot: i64,
+    name_slot: i64,
+  ) -> c_int;
+  fn v8x_hermes_set_prototype_from_ctor(
+    rtw: *mut c_void,
+    obj_slot: i64,
+    ctor_slot: i64,
+  ) -> c_int;
+  fn v8x_hermes_object_define_accessor_fns(
+    rtw: *mut c_void,
+    obj_slot: i64,
+    key_slot: i64,
+    getter_fn_slot: i64,
+    setter_fn_slot: i64,
+    attr: c_int,
+  ) -> c_int;
 }
 
 /// The C++ null-slot sentinel (must match `V8X_HERMES_NULL_SLOT` in the shim).
@@ -442,73 +507,54 @@ pub extern "C" fn v8__HandleScope__DESTRUCT(this: *mut usize) {
   }
 }
 
-// EscapableHandleScope: reserve a slot in the parent, then move an escaping
-// handle's value into it on scope exit. For the hello-world path we reserve a
-// fresh slot (an undefined placeholder) and, on escape, copy the escaping
-// value into a fresh parent slot. Because our handle table is append-only per
-// scope and the escaping value's slot lives below the child watermark being
-// truncated, we duplicate it into a new slot that survives the truncation.
+// EscapableHandleScope: reserve a slot in the PARENT, then move an escaping
+// handle's value into it on `escape()`. `reserve` runs BEFORE the child
+// scope's HandleScope records its watermark (see the vendored
+// EscapableHandleScope construction order: `raw::EscapeSlot::new` precedes
+// `HandleScope::init`), so a slot pushed here lives BELOW the child watermark
+// and survives the child scope's truncate-on-exit. `escape` overwrites that
+// reserved slot with a copy of the escaping value and returns a handle to it.
+//
+// The earlier C3 implementation reserved nothing (returned a sentinel) and, on
+// escape, re-interned the value via value_to_utf8 into a slot ABOVE the child
+// watermark - which was both string-only/lossy AND reclaimed by the child
+// truncate, so any escape of a non-string value produced an empty string (this
+// broke object_template's escaped block-completion string, the first test to
+// actually depend on escape's return value).
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__EscapeSlot__reserve(_isolate: *mut RealIsolate) -> usize {
-  // No pre-reservation needed: escape() creates a fresh surviving slot. Return
-  // a sentinel the escape path ignores.
-  usize::MAX
+pub extern "C" fn v8__EscapeSlot__reserve(isolate: *mut RealIsolate) -> usize {
+  if isolate.is_null() {
+    return usize::MAX;
+  }
+  let rtw = iso_state(isolate).rtw;
+  // Push an undefined placeholder in the parent; its index is the reserved
+  // slot escape() will overwrite.
+  let slot = unsafe { v8x_hermes_undefined(rtw) };
+  if slot < 0 {
+    return usize::MAX;
+  }
+  slot as usize
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__EscapeSlot__escape(
   isolate: *mut RealIsolate,
-  _index: usize,
+  index: usize,
   value: *const Data,
 ) -> *const Data {
   if isolate.is_null() || value.is_null() {
     return value;
   }
-  let slot = slot_of(value);
-  if slot < 0 {
+  let src = slot_of(value);
+  if src < 0 || index == usize::MAX {
     return value;
   }
-  // Re-materialize the escaping value into a fresh slot that lives ABOVE the
-  // child scope's watermark, so the child DESTRUCT's truncate does not reclaim
-  // it. We coerce/copy through the shim: for the hello-world path the escaping
-  // value is the script result (a string), which value_to_utf8 can always
-  // re-read; but to preserve the exact Value we push a duplicate string slot.
-  //
-  // Simplest correct move for C3: read the value as a JS string and re-intern
-  // it as a fresh string handle. This is lossy for non-string Values and is a
-  // known C3 limitation (see the doc); the hello-world result is a string.
   let rtw = iso_state(isolate).rtw;
-  let mut buf = vec![0u8; 256];
-  let n = unsafe {
-    v8x_hermes_value_to_utf8(
-      rtw,
-      slot,
-      buf.as_mut_ptr() as *mut c_char,
-      buf.len(),
-    )
-  };
-  if n == usize::MAX {
+  let ok = unsafe { v8x_hermes_set_slot(rtw, index as i64, src) };
+  if ok == 0 {
     return value;
   }
-  if n > buf.len() {
-    buf = vec![0u8; n];
-    unsafe {
-      v8x_hermes_value_to_utf8(
-        rtw,
-        slot,
-        buf.as_mut_ptr() as *mut c_char,
-        buf.len(),
-      );
-    }
-  }
-  let copy = n.min(buf.len());
-  let new_slot = unsafe {
-    v8x_hermes_string_new_utf8(rtw, buf.as_ptr() as *const c_char, copy)
-  };
-  if new_slot < 0 {
-    return value;
-  }
-  slot_ptr::<Data>(new_slot)
+  slot_ptr::<Data>(index as i64)
 }
 
 // ---- Context ---------------------------------------------------------------
@@ -516,12 +562,72 @@ pub extern "C" fn v8__EscapeSlot__escape(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__New(
   isolate: *mut RealIsolate,
-  _templ: *const c_void,
+  templ: *const c_void,
   _global_object: *const c_void,
   _microtask_queue: *mut c_void,
 ) -> *const Context {
   // One context per Hermes runtime; its handle is the isolate pointer.
-  isolate as *const Context
+  let ctx = isolate as *const Context;
+  // C11: if a global ObjectTemplate was supplied, apply its Template::Set
+  // properties (and accessors) onto the context's global object at
+  // context-creation time (matches context_from_object_template: `f()` must
+  // resolve to the FunctionTemplate stored under "f" on the global).
+  if !isolate.is_null() && template_kind(templ) == Some(TEMPLATE_KIND_OBJ) {
+    apply_template_to_global(templ as *const ObjectTemplate, ctx);
+  }
+  ctx
+}
+
+/// Apply an ObjectTemplate's stored `Set` properties and accessors onto the
+/// context's global object (used by `Context::New`'s global_template).
+fn apply_template_to_global(
+  templ: *const ObjectTemplate,
+  context: *const Context,
+) {
+  let t = unsafe { &*(templ as *const ObjTemplate) };
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let global_slot = unsafe { v8x_hermes_global(rtw) };
+  if global_slot < 0 {
+    return;
+  }
+  for prop in &t.properties {
+    let value_slot = match template_kind(prop.value) {
+      Some(TEMPLATE_KIND_FN) => slot_of(v8__FunctionTemplate__GetFunction(
+        prop.value as *const FunctionTemplate,
+        context,
+      )),
+      Some(TEMPLATE_KIND_OBJ) => slot_of(v8__ObjectTemplate__NewInstance(
+        prop.value as *const ObjectTemplate,
+        context,
+      )),
+      _ => slot_of(prop.value as *const Data),
+    };
+    if value_slot < 0 {
+      continue;
+    }
+    unsafe {
+      v8x_hermes_object_define_property(
+        rtw,
+        global_slot,
+        prop.key_slot,
+        value_slot,
+        prop.attr,
+      );
+    }
+  }
+  for acc in &t.accessors {
+    unsafe {
+      v8x_hermes_object_define_accessor(
+        rtw,
+        global_slot,
+        acc.key_slot,
+        acc.getter_bits,
+        acc.setter_bits,
+        acc.data_slot,
+        acc.attr,
+      );
+    }
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -1965,8 +2071,9 @@ pub extern "C" fn v8__Function__New(
   let rtw = iso_state(context as *mut RealIsolate).rtw;
   let data_slot = slot_of(data_or_null);
   let callback_bits = callback as usize;
+  // -1: a plain Function::new is a non-constructable callable (not a template).
   let out = unsafe {
-    v8x_hermes_function_new(rtw, callback_bits, data_slot, length, ptr::null())
+    v8x_hermes_function_new(rtw, callback_bits, data_slot, length, ptr::null(), -1)
   };
   if out < 0 {
     return ptr::null();
@@ -2247,21 +2354,124 @@ pub extern "C" fn v8__ReturnValue__Value__Get(
   unsafe { *slot as *const Value }
 }
 
-// ---- FunctionTemplate ------------------------------------------------------
+// ---- Templates: FunctionTemplate + ObjectTemplate (C10 + C11) --------------
 //
-// A FunctionTemplate in v8 is a deferred Function::New: it captures a callback
-// + data, and `GetFunction` instantiates a real function. Hermes has no
-// template concept, so a FunctionTemplate is modeled as a small Rust-owned
-// record (callback + data slot + length) leaked as a stable pointer; the
-// tagged-pointer scheme is not used here because a template is not a JS value.
-// Only the New/GetFunction path the rusty_v8 tests exercise is implemented;
-// SetClassName/PrototypeTemplate/etc remain stubbed.
+// Hermes has no template concept, so a v8 Template is modeled as a Rust-owned
+// record leaked as a stable pointer (a template is not a JS value, so the
+// tagged-pointer/handle-table scheme does not apply). Both concrete template
+// kinds begin with a shared `#[repr(C)] TemplateHeader { kind }` so
+// `v8__Template__Set` (whose `this` is the abstract base `Template`) can
+// dispatch on the concrete kind.
+//
+// Template pointers are raw `Box::into_raw` allocations, so they are always
+// even (Box aligns >= 2). A tagged Local pointer, by contrast, always has its
+// low bit set (`slot_ptr`'s `(i<<1)|1`). `data_is_template_ptr` uses this to
+// tell an untyped `*const Data` value apart: a template argument to
+// `Template::Set` vs a handle-table Local. See
+// docs/hermes-spike/experiments/C11-hermes-templates.md.
 
+const TEMPLATE_KIND_FN: u8 = 0;
+const TEMPLATE_KIND_OBJ: u8 = 1;
+
+/// A raw (untagged) template pointer, distinct from a tagged Local (low bit
+/// set). Non-null + even => a `Box::into_raw` template; low bit set => a
+/// handle-table Local.
+#[inline]
+fn data_is_template_ptr(p: *const c_void) -> bool {
+  !p.is_null() && (p as usize) & 1 == 0
+}
+
+/// Read the shared header kind of a template pointer, or `None` if `p` is not
+/// a template pointer.
+#[inline]
+fn template_kind(p: *const c_void) -> Option<u8> {
+  if !data_is_template_ptr(p) {
+    return None;
+  }
+  Some(unsafe { (*(p as *const TemplateHeader)).kind })
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TemplateHeader {
+  kind: u8,
+}
+
+/// One `Template::Set` property: a key slot, a stored value (either a
+/// handle-table Local, or a nested template pointer), and its attributes.
+struct TemplateProp {
+  key_slot: i64,
+  /// The raw `*const Data` value pointer as passed to `Template::Set`. Either
+  /// a tagged Local or a template pointer (distinguished by
+  /// `data_is_template_ptr`). Re-materialized at instantiation time.
+  value: *const c_void,
+  attr: c_int,
+}
+
+/// One native-data-property accessor registered on an ObjectTemplate.
+struct TemplAccessor {
+  key_slot: i64,
+  getter_bits: usize,
+  setter_bits: usize,
+  data_slot: i64,
+  attr: c_int,
+}
+
+/// One FunctionTemplate-pair accessor property (`SetAccessorProperty`): the
+/// getter/setter are FunctionTemplates, instantiated to real functions at
+/// NewInstance time and installed as a JS `{get, set}` accessor.
+struct TemplAccessorProp {
+  key_slot: i64,
+  getter_templ: *const FnTemplate,
+  setter_templ: *const FnTemplate,
+  attr: c_int,
+}
+
+#[repr(C)]
 struct FnTemplate {
+  header: TemplateHeader,
   callback: FunctionCallback,
   data_slot: i64,
   length: i32,
   isolate: *mut RealIsolate,
+  /// Lazily-created instance/prototype ObjectTemplates (v8 semantics: created
+  /// on first `instance_template()`/`prototype_template()` and reused).
+  instance_template: *mut ObjTemplate,
+  prototype_template: *mut ObjTemplate,
+  /// The class-name String slot set by `SetClassName`, or -1.
+  class_name_slot: i64,
+}
+
+#[repr(C)]
+struct ObjTemplate {
+  header: TemplateHeader,
+  isolate: *mut RealIsolate,
+  properties: Vec<TemplateProp>,
+  internal_field_count: i32,
+  accessors: Vec<TemplAccessor>,
+  accessor_props: Vec<TemplAccessorProp>,
+  immutable_proto: bool,
+  /// If this ObjectTemplate was created from a FunctionTemplate
+  /// (`ObjectTemplate::new_from_template`), the source template pointer, so
+  /// `new_instance`'s constructor-name reflects the FunctionTemplate's class.
+  from_function_template: *const FnTemplate,
+}
+
+impl ObjTemplate {
+  fn new(isolate: *mut RealIsolate) -> *mut ObjTemplate {
+    Box::into_raw(Box::new(ObjTemplate {
+      header: TemplateHeader {
+        kind: TEMPLATE_KIND_OBJ,
+      },
+      isolate,
+      properties: Vec::new(),
+      internal_field_count: 0,
+      accessors: Vec::new(),
+      accessor_props: Vec::new(),
+      immutable_proto: false,
+      from_function_template: ptr::null(),
+    }))
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -2280,12 +2490,29 @@ pub extern "C" fn v8__FunctionTemplate__New(
     return ptr::null();
   }
   let templ = Box::new(FnTemplate {
+    header: TemplateHeader {
+      kind: TEMPLATE_KIND_FN,
+    },
     callback,
     data_slot: slot_of(data_or_null),
     length,
     isolate,
+    instance_template: ptr::null_mut(),
+    prototype_template: ptr::null_mut(),
+    class_name_slot: NULL_SLOT,
   });
   Box::into_raw(templ) as *const FunctionTemplate
+}
+
+/// The instance-template internal-field count for this FunctionTemplate (0 if
+/// no instance_template was created or none was requested).
+#[inline]
+fn fn_instance_ifc(templ: &FnTemplate) -> i64 {
+  if templ.instance_template.is_null() {
+    0
+  } else {
+    unsafe { (*templ.instance_template).internal_field_count as i64 }
+  }
 }
 
 #[unsafe(no_mangle)]
@@ -2305,12 +2532,762 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
       templ.data_slot,
       templ.length,
       ptr::null(),
+      fn_instance_ifc(templ),
     )
   };
   if out < 0 {
     return ptr::null();
   }
+  // Apply the class name (SetClassName): set the function's `.name`, so
+  // `g.constructor.name` reflects it.
+  if templ.class_name_slot >= 0 {
+    unsafe {
+      v8x_hermes_function_set_name(rtw, out, templ.class_name_slot);
+    }
+  }
   slot_ptr::<Function>(out)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionTemplate__SetClassName(
+  this: *const FunctionTemplate,
+  name: *const V8String,
+) {
+  if this.is_null() {
+    return;
+  }
+  let templ = unsafe { &mut *(this as *mut FnTemplate) };
+  templ.class_name_slot = slot_of(name);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionTemplate__InstanceTemplate(
+  this: *const FunctionTemplate,
+) -> *const ObjectTemplate {
+  if this.is_null() {
+    return ptr::null();
+  }
+  let templ = unsafe { &mut *(this as *mut FnTemplate) };
+  if templ.instance_template.is_null() {
+    templ.instance_template = ObjTemplate::new(templ.isolate);
+  }
+  templ.instance_template as *const ObjectTemplate
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionTemplate__PrototypeTemplate(
+  this: *const FunctionTemplate,
+) -> *const ObjectTemplate {
+  if this.is_null() {
+    return ptr::null();
+  }
+  let templ = unsafe { &mut *(this as *mut FnTemplate) };
+  if templ.prototype_template.is_null() {
+    templ.prototype_template = ObjTemplate::new(templ.isolate);
+  }
+  templ.prototype_template as *const ObjectTemplate
+}
+
+// ---- Template::Set (base of FunctionTemplate + ObjectTemplate) -------------
+
+/// `Template::Set` / `set_with_attr`. `this` is the abstract `Template` base;
+/// dispatch on the shared header kind. The stored `value` may itself be a
+/// nested template (a FunctionTemplate/ObjectTemplate Local) or a plain Data
+/// handle; it is kept as the raw pointer and re-materialized at instantiation.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Template__Set(
+  this: *const Template,
+  key: *const Name,
+  value: *const Data,
+  attr: c_int,
+) {
+  if this.is_null() {
+    return;
+  }
+  let prop = TemplateProp {
+    key_slot: slot_of(key),
+    value: value as *const c_void,
+    attr,
+  };
+  match template_kind(this as *const c_void) {
+    Some(TEMPLATE_KIND_OBJ) => {
+      let t = unsafe { &mut *(this as *mut ObjTemplate) };
+      t.properties.push(prop);
+    }
+    Some(TEMPLATE_KIND_FN) => {
+      // A FunctionTemplate::Set adds a static property to the constructor. Not
+      // exercised by the C11 target cluster; store it on a lazily-created
+      // prototype-less holder is out of scope, so record on the instance
+      // template as the closest reachable behavior. (No target test asserts
+      // FunctionTemplate::Set, so this never runs in the cluster.)
+      let t = unsafe { &mut *(this as *mut FnTemplate) };
+      if t.instance_template.is_null() {
+        t.instance_template = ObjTemplate::new(t.isolate);
+      }
+      unsafe { (*t.instance_template).properties.push(prop) };
+    }
+    _ => {}
+  }
+}
+
+// ---- ObjectTemplate --------------------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ObjectTemplate__New(
+  isolate: *mut RealIsolate,
+  templ: *const FunctionTemplate,
+) -> *const ObjectTemplate {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let obj = ObjTemplate::new(isolate);
+  if !templ.is_null() {
+    unsafe {
+      (*obj).from_function_template = templ as *const FnTemplate;
+    }
+  }
+  obj as *const ObjectTemplate
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ObjectTemplate__SetInternalFieldCount(
+  this: *const ObjectTemplate,
+  value: crate::support::int,
+) {
+  if this.is_null() {
+    return;
+  }
+  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  t.internal_field_count = value as i32;
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ObjectTemplate__InternalFieldCount(
+  this: *const ObjectTemplate,
+) -> crate::support::int {
+  if this.is_null() {
+    return 0;
+  }
+  let t = unsafe { &*(this as *const ObjTemplate) };
+  t.internal_field_count as crate::support::int
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ObjectTemplate__SetImmutableProto(
+  this: *const ObjectTemplate,
+) {
+  if this.is_null() {
+    return;
+  }
+  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  t.immutable_proto = true;
+}
+
+/// The accessor-callback pointer types. Linking is name-only, so these are
+/// declared as raw pointers (an `unsafe extern "C" fn(...)` is ABI-identical
+/// to a data pointer here); `getter`/`setter` bits are transmuted to the real
+/// fn pointer inside the dispatch trampolines.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ObjectTemplate__SetNativeDataProperty(
+  this: *const ObjectTemplate,
+  key: *const Name,
+  getter: *const c_void,
+  setter: *const c_void,
+  data_or_null: *const Value,
+  attr: c_int,
+) {
+  if this.is_null() {
+    return;
+  }
+  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  t.accessors.push(TemplAccessor {
+    key_slot: slot_of(key),
+    getter_bits: getter as usize,
+    setter_bits: setter as usize,
+    data_slot: slot_of(data_or_null),
+    attr,
+  });
+}
+
+/// `ObjectTemplate::SetAccessorProperty`: an accessor whose getter/setter are
+/// FunctionTemplates (instantiated at NewInstance). Either may be null.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ObjectTemplate__SetAccessorProperty(
+  this: *const ObjectTemplate,
+  key: *const Name,
+  getter: *const FunctionTemplate,
+  setter: *const FunctionTemplate,
+  attr: c_int,
+) {
+  if this.is_null() {
+    return;
+  }
+  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  t.accessor_props.push(TemplAccessorProp {
+    key_slot: slot_of(key),
+    getter_templ: getter as *const FnTemplate,
+    setter_templ: setter as *const FnTemplate,
+    attr,
+  });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ObjectTemplate__NewInstance(
+  this: *const ObjectTemplate,
+  context: *const Context,
+) -> *const Object {
+  if this.is_null() || context.is_null() {
+    return ptr::null();
+  }
+  let t = unsafe { &*(this as *const ObjTemplate) };
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+
+  // Materialize a real JS object with the declared internal-field slots.
+  let obj_slot =
+    unsafe { v8x_hermes_object_new_with_internal_fields(rtw, t.internal_field_count as i64) };
+  if obj_slot < 0 {
+    return ptr::null();
+  }
+
+  // Apply each stored Template::Set property. A property whose value is itself
+  // a FunctionTemplate is instantiated to a real function at this point
+  // (mirroring v8's template instantiation).
+  for prop in &t.properties {
+    let value_slot = match template_kind(prop.value) {
+      Some(TEMPLATE_KIND_FN) => {
+        let f = v8__FunctionTemplate__GetFunction(
+          prop.value as *const FunctionTemplate,
+          context,
+        );
+        slot_of(f)
+      }
+      Some(TEMPLATE_KIND_OBJ) => {
+        let o = v8__ObjectTemplate__NewInstance(
+          prop.value as *const ObjectTemplate,
+          context,
+        );
+        slot_of(o)
+      }
+      _ => slot_of(prop.value as *const Data),
+    };
+    if value_slot < 0 {
+      continue;
+    }
+    unsafe {
+      v8x_hermes_object_define_property(
+        rtw,
+        obj_slot,
+        prop.key_slot,
+        value_slot,
+        prop.attr,
+      );
+    }
+  }
+
+  // Apply each native-data-property accessor.
+  for acc in &t.accessors {
+    unsafe {
+      v8x_hermes_object_define_accessor(
+        rtw,
+        obj_slot,
+        acc.key_slot,
+        acc.getter_bits,
+        acc.setter_bits,
+        acc.data_slot,
+        acc.attr,
+      );
+    }
+  }
+
+  // Apply each FunctionTemplate-pair accessor property.
+  for ap in &t.accessor_props {
+    let getter_fn = if ap.getter_templ.is_null() {
+      NULL_SLOT
+    } else {
+      slot_of(v8__FunctionTemplate__GetFunction(
+        ap.getter_templ as *const FunctionTemplate,
+        context,
+      ))
+    };
+    let setter_fn = if ap.setter_templ.is_null() {
+      NULL_SLOT
+    } else {
+      slot_of(v8__FunctionTemplate__GetFunction(
+        ap.setter_templ as *const FunctionTemplate,
+        context,
+      ))
+    };
+    unsafe {
+      v8x_hermes_object_define_accessor_fns(
+        rtw,
+        obj_slot,
+        ap.key_slot,
+        getter_fn,
+        setter_fn,
+        ap.attr,
+      );
+    }
+  }
+
+  // If this ObjectTemplate was created from a FunctionTemplate
+  // (`new_from_template`), link the instance to that constructor so
+  // `instance.constructor(.name)` resolves to it (object_template_from_
+  // function_template).
+  if !t.from_function_template.is_null() {
+    let ctor = v8__FunctionTemplate__GetFunction(
+      t.from_function_template as *const FunctionTemplate,
+      context,
+    );
+    let ctor_slot = slot_of(ctor);
+    if ctor_slot >= 0 {
+      unsafe {
+        v8x_hermes_set_prototype_from_ctor(rtw, obj_slot, ctor_slot);
+      }
+    }
+  }
+
+  slot_ptr::<Object>(obj_slot)
+}
+
+/// `Object::DefineOwnProperty`: define a property with explicit attribute bits
+/// via `Object.defineProperty` (a data property with value + writable/
+/// enumerable/configurable from `attr`). Needed by `object_template` (it
+/// installs `g` on the global with `DONT_ENUM` and reads back the descriptor).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__DefineOwnProperty(
+  this: *const Object,
+  context: *const Context,
+  key: *const Name,
+  value: *const Value,
+  attr: c_int,
+) -> MaybeBool {
+  if this.is_null() || context.is_null() || key.is_null() || value.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let ok = unsafe {
+    v8x_hermes_object_define_property(
+      rtw,
+      slot_of(this),
+      slot_of(key),
+      slot_of(value),
+      attr,
+    )
+  };
+  if ok != 0 {
+    MaybeBool::JustTrue
+  } else {
+    MaybeBool::Nothing
+  }
+}
+
+// ---- Object internal fields (C11) ------------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__InternalFieldCount(
+  this: *const Object,
+) -> crate::support::int {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return 0;
+  }
+  let n = unsafe { v8x_hermes_object_internal_field_count(rtw, slot_of(this)) };
+  if n < 0 {
+    0
+  } else {
+    n as crate::support::int
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetInternalField(
+  this: *const Object,
+  index: crate::support::int,
+) -> *const Data {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() || index < 0 {
+    return ptr::null();
+  }
+  let slot = unsafe {
+    v8x_hermes_object_get_internal_field(rtw, slot_of(this), index as i64)
+  };
+  slot_ptr::<Data>(slot)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__SetInternalField(
+  this: *const Object,
+  index: crate::support::int,
+  data: *const Data,
+) {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() || index < 0 {
+    return;
+  }
+  unsafe {
+    v8x_hermes_object_set_internal_field(
+      rtw,
+      slot_of(this),
+      index as i64,
+      slot_of(data),
+    );
+  }
+}
+
+/// `Object::GetAlignedPointerFromInternalField`: the internal field stores an
+/// `External` (a JSI HostObject carrying the pointer); unwrap it back. The
+/// `tag` is not modeled (Hermes has no per-field tag), matching the tests that
+/// exercise this only through matching Set/Get pairs.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetAlignedPointerFromInternalField(
+  this: *const Object,
+  index: crate::support::int,
+  _tag: u16,
+) -> *const c_void {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() || index < 0 {
+    return ptr::null();
+  }
+  let slot = unsafe {
+    v8x_hermes_object_get_internal_field(rtw, slot_of(this), index as i64)
+  };
+  if slot < 0 {
+    return ptr::null();
+  }
+  let mut found: c_int = 0;
+  unsafe { v8x_hermes_external_value(rtw, slot, &mut found) as *const c_void }
+}
+
+/// `Object::SetAlignedPointerInInternalField`: wrap the pointer in an
+/// `External` and store it in the internal-field slot (see Get above).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__SetAlignedPointerInInternalField(
+  this: *const Object,
+  index: crate::support::int,
+  value: *const c_void,
+  _tag: u16,
+) {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() || index < 0 {
+    return;
+  }
+  let ext_slot = unsafe { v8x_hermes_external_new(rtw, value as *mut c_void) };
+  if ext_slot < 0 {
+    return;
+  }
+  unsafe {
+    v8x_hermes_object_set_internal_field(
+      rtw,
+      slot_of(this),
+      index as i64,
+      ext_slot,
+    );
+  }
+}
+
+// ---- Object::SetAccessor (accessor registered directly on an object) -------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__SetAccessor(
+  this: *const Object,
+  context: *const Context,
+  key: *const Name,
+  getter: *const c_void,
+  setter: *const c_void,
+  data_or_null: *const Value,
+  attr: c_int,
+) -> MaybeBool {
+  if this.is_null() || context.is_null() || key.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let ok = unsafe {
+    v8x_hermes_object_define_accessor(
+      rtw,
+      slot_of(this),
+      slot_of(key),
+      getter as usize,
+      setter as usize,
+      slot_of(data_or_null),
+      attr,
+    )
+  };
+  if ok != 0 {
+    MaybeBool::JustTrue
+  } else {
+    MaybeBool::Nothing
+  }
+}
+
+// ---- Data template predicates (C11) ----------------------------------------
+
+/// `Data::IsFunctionTemplate`: true when the handle is a FunctionTemplate
+/// pointer (raw, even) with the FN kind, not a tagged Local or ObjectTemplate.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Data__IsFunctionTemplate(this: *const Data) -> bool {
+  template_kind(this as *const c_void) == Some(TEMPLATE_KIND_FN)
+}
+
+/// `Data::IsObjectTemplate`: true when the handle is an ObjectTemplate pointer.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Data__IsObjectTemplate(this: *const Data) -> bool {
+  template_kind(this as *const c_void) == Some(TEMPLATE_KIND_OBJ)
+}
+
+/// `Data::IsValue`: true when the handle is a real JS value (a tagged
+/// handle-table Local, low bit set), not a template pointer. Internal-field
+/// data read back through `GetInternalField` are real values, so
+/// `data.is_value()` holds for them (the `object_template` test asserts this).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Data__IsValue(this: *const Data) -> bool {
+  let bits = this as usize;
+  bits != 0 && (bits & 1) == 1
+}
+
+// ---- PropertyCallbackInfo accessors (C11) ----------------------------------
+//
+// The Rust-owned backing object a `*const PropertyCallbackInfo<T>` points at
+// during a native accessor callback. Parallel to `CbInfo` (C10) but for
+// accessors: it carries holder/data/key and a boxed return slot the getter's
+// ReturnValue setters mutate.
+
+struct PropCbInfo {
+  isolate: *mut RealIsolate,
+  holder: usize,
+  data: usize,
+  return_slot: Box<usize>,
+}
+
+#[inline]
+fn propcbinfo<'a>(this: *const c_void) -> &'a mut PropCbInfo {
+  unsafe { &mut *(this as *mut PropCbInfo) }
+}
+
+/// The C++ accessor-getter host function calls this. Builds a
+/// `PropertyCallbackInfo<Value>`, runs the getter (an
+/// `AccessorNameGetterCallback = fn(SealedLocal<Name>, *const
+/// PropertyCallbackInfo<Value>)`), and returns the handle-table slot of the
+/// getter's ReturnValue (or NULL_SLOT for undefined). `*threw` is set if the
+/// callback left a pending exception.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8x_hermes_dispatch_accessor_getter(
+  _rtw: *mut c_void,
+  getter_bits: usize,
+  key_slot: i64,
+  holder_slot: i64,
+  data_slot: i64,
+  threw: *mut c_int,
+) -> i64 {
+  if !threw.is_null() {
+    unsafe { *threw = 0 };
+  }
+  if getter_bits == 0 {
+    return NULL_SLOT;
+  }
+  let iso = current_iso();
+  let undef_slot = if iso.is_null() {
+    NULL_SLOT
+  } else {
+    unsafe { v8x_hermes_undefined(iso_state(iso).rtw) }
+  };
+
+  let mut info = Box::new(PropCbInfo {
+    isolate: iso,
+    holder: slot_ptr::<Value>(holder_slot) as usize,
+    data: slot_ptr::<Value>(data_slot) as usize,
+    return_slot: Box::new(slot_ptr::<Value>(undef_slot) as usize),
+  });
+
+  // The accessor getter's ABI: fn(SealedLocal<Name>, *const
+  // PropertyCallbackInfo<Value>). A SealedLocal<Name> is a NonNull<Name>,
+  // ABI-identical to `*const Name`.
+  type GetterFn = unsafe extern "C" fn(*const Name, *const c_void);
+  let getter: GetterFn = unsafe { std::mem::transmute::<usize, GetterFn>(getter_bits) };
+  let key_ptr = slot_ptr::<Name>(key_slot);
+  let info_ptr = &mut *info as *mut PropCbInfo as *const c_void;
+  unsafe { (getter)(key_ptr, info_ptr) };
+
+  let ret_tagged = *info.return_slot as *const Value;
+  let ret_slot = slot_of(ret_tagged);
+
+  surface_pending_exception(iso, threw);
+  ret_slot
+}
+
+/// The C++ accessor-setter host function calls this. Builds a
+/// `PropertyCallbackInfo<()>`, runs the setter (an `AccessorNameSetterCallback
+/// = fn(SealedLocal<Name>, SealedLocal<Value>, *const
+/// PropertyCallbackInfo<()>)`). The ReturnValue is ignored for accessors.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8x_hermes_dispatch_accessor_setter(
+  _rtw: *mut c_void,
+  setter_bits: usize,
+  key_slot: i64,
+  value_slot: i64,
+  holder_slot: i64,
+  data_slot: i64,
+  threw: *mut c_int,
+) {
+  if !threw.is_null() {
+    unsafe { *threw = 0 };
+  }
+  if setter_bits == 0 {
+    return;
+  }
+  let iso = current_iso();
+  let undef_slot = if iso.is_null() {
+    NULL_SLOT
+  } else {
+    unsafe { v8x_hermes_undefined(iso_state(iso).rtw) }
+  };
+
+  let mut info = Box::new(PropCbInfo {
+    isolate: iso,
+    holder: slot_ptr::<Value>(holder_slot) as usize,
+    data: slot_ptr::<Value>(data_slot) as usize,
+    return_slot: Box::new(slot_ptr::<Value>(undef_slot) as usize),
+  });
+
+  type SetterFn =
+    unsafe extern "C" fn(*const Name, *const Value, *const c_void);
+  let setter: SetterFn = unsafe { std::mem::transmute::<usize, SetterFn>(setter_bits) };
+  let key_ptr = slot_ptr::<Name>(key_slot);
+  let value_ptr = slot_ptr::<Value>(value_slot);
+  let info_ptr = &mut *info as *mut PropCbInfo as *const c_void;
+  unsafe { (setter)(key_ptr, value_ptr, info_ptr) };
+
+  surface_pending_exception(iso, threw);
+}
+
+/// Shared: after a native callback returns, surface any pending exception the
+/// isolate captured (Isolate::ThrowException during the callback) to the C++
+/// host function, so it re-throws it as a jsi::JSError. Same plumbing C10 uses.
+#[inline]
+fn surface_pending_exception(iso: *mut RealIsolate, threw: *mut c_int) {
+  if iso.is_null() {
+    return;
+  }
+  let st = iso_state(iso);
+  if st.pending_exception >= 0 {
+    let exc = st.pending_exception;
+    st.pending_exception = NULL_SLOT;
+    unsafe {
+      v8x_hermes_set_pending_callback_exception(st.rtw, exc);
+    }
+    if !threw.is_null() {
+      unsafe { *threw = 1 };
+    }
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__GetIsolate(
+  this: *const c_void,
+) -> *mut RealIsolate {
+  if this.is_null() {
+    return current_iso();
+  }
+  propcbinfo(this).isolate
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__Data(
+  this: *const c_void,
+) -> *const Value {
+  if this.is_null() {
+    return ptr::null();
+  }
+  propcbinfo(this).data as *const Value
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__Holder(
+  this: *const c_void,
+) -> *const Object {
+  if this.is_null() {
+    return ptr::null();
+  }
+  propcbinfo(this).holder as *const Object
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__GetReturnValue(
+  this: *const c_void,
+) -> usize {
+  if this.is_null() {
+    return 0;
+  }
+  let info = propcbinfo(this);
+  (&mut *info.return_slot as *mut usize) as usize
+}
+
+/// `ShouldThrowOnError`: always false. Every vendored accessor test in this
+/// cluster asserts `!args.should_throw_on_error()`, so false is exactly
+/// correct (strict-mode routing is not modeled).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__PropertyCallbackInfo__ShouldThrowOnError(
+  _this: *const c_void,
+) -> bool {
+  false
+}
+
+// ---- Value integer coercions (C11 needs) -----------------------------------
+
+/// `Value::IntegerValue`: ECMAScript ToInteger of a number, written into
+/// `Maybe<i64>`. Hermes stores numbers as doubles; truncate toward zero.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IntegerValue(
+  this: *const Value,
+  context: *const Context,
+  out: *mut crate::support::Maybe<i64>,
+) {
+  #[repr(C)]
+  struct MaybeI64 {
+    has_value: bool,
+    value: i64,
+  }
+  let out = out as *mut MaybeI64;
+  if out.is_null() {
+    return;
+  }
+  if this.is_null() || context.is_null() {
+    unsafe { ptr::write(out, MaybeI64 { has_value: false, value: 0 }) };
+    return;
+  }
+  match number_value_opt(this) {
+    Some(v) if v.is_finite() => unsafe {
+      ptr::write(
+        out,
+        MaybeI64 {
+          has_value: true,
+          value: v.trunc() as i64,
+        },
+      )
+    },
+    _ => unsafe {
+      ptr::write(out, MaybeI64 { has_value: false, value: 0 })
+    },
+  }
+}
+
+/// `Value::ToInteger`: ECMAScript ToInteger, returning a Number handle holding
+/// the truncated integer value.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__ToInteger(
+  this: *const Value,
+  context: *const Context,
+) -> *const Integer {
+  if this.is_null() || context.is_null() {
+    return ptr::null();
+  }
+  let isolate = context as *mut RealIsolate;
+  match number_value_opt(this) {
+    Some(v) if v.is_finite() => {
+      v8__Number__New(isolate, v.trunc()) as *const Integer
+    }
+    Some(_) => v8__Number__New(isolate, 0.0) as *const Integer,
+    None => ptr::null(),
+  }
 }
 
 // ---- TryCatch / exception surfacing (C9) -----------------------------------

@@ -140,8 +140,6 @@ pub extern "C" fn v8__Data__IsContext() -> *const ::std::ffi::c_void { ::std::pt
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Data__IsFixedArray() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Data__IsFunctionTemplate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Data__IsModule() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Data__IsModuleRequest() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -150,8 +148,6 @@ pub extern "C" fn v8__Data__IsName() -> *const ::std::ffi::c_void { ::std::ptr::
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Data__IsNumber() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Data__IsObjectTemplate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Data__IsPrimitive() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Data__IsPrivate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -159,8 +155,6 @@ pub extern "C" fn v8__Data__IsPrivate() -> *const ::std::ffi::c_void { ::std::pt
 pub extern "C" fn v8__Data__IsString() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Data__IsSymbol() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Data__IsValue() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__DataView__New() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -220,17 +214,11 @@ pub extern "C" fn v8__Function__SetName() -> *const ::std::ffi::c_void { ::std::
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionTemplate__Inherit() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionTemplate__InstanceTemplate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionTemplate__PrototypeTemplate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionTemplate__ReadOnlyPrototype() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionTemplate__RemovePrototype() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionTemplate__SetAccessorProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionTemplate__SetClassName() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__GCCallbackFlags() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -464,8 +452,6 @@ pub extern "C" fn v8__Name__GetIdentityHash() -> *const ::std::ffi::c_void { ::s
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__CreateDataProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__DefineOwnProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__DefineProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__Delete() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -474,13 +460,9 @@ pub extern "C" fn v8__Object__DeleteIndex() -> *const ::std::ffi::c_void { ::std
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__DeletePrivate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__GetAlignedPointerFromInternalField() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetConstructorName() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetCreationContext() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__GetInternalField() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetOwnPropertyDescriptor() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -508,21 +490,13 @@ pub extern "C" fn v8__Object__HasPrivate() -> *const ::std::ffi::c_void { ::std:
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__HasRealNamedProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__InternalFieldCount() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__IsApiWrapper() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__New__with_prototype_and_properties() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__PreviewEntries() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__SetAccessor() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__SetAlignedPointerInInternalField() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetIntegrityLevel() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__SetInternalField() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetLazyDataProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -536,23 +510,9 @@ pub extern "C" fn v8__Object__Unwrap() -> *const ::std::ffi::c_void { ::std::ptr
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__Wrap() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__ObjectTemplate__InternalFieldCount() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ObjectTemplate__New() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ObjectTemplate__NewInstance() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ObjectTemplate__SetAccessorProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ObjectTemplate__SetImmutableProto() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__ObjectTemplate__SetIndexedPropertyHandler() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__ObjectTemplate__SetInternalFieldCount() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__ObjectTemplate__SetNamedPropertyHandler() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ObjectTemplate__SetNativeDataProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__PATCH_LEVEL() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -605,16 +565,6 @@ pub extern "C" fn v8__PromiseRejectMessage__GetEvent() -> *const ::std::ffi::c_v
 pub extern "C" fn v8__PromiseRejectMessage__GetPromise() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__PromiseRejectMessage__GetValue() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__PropertyCallbackInfo__Data() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__PropertyCallbackInfo__GetIsolate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__PropertyCallbackInfo__GetReturnValue() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__PropertyCallbackInfo__Holder() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__PropertyCallbackInfo__ShouldThrowOnError() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__PropertyDescriptor__configurable() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -888,8 +838,6 @@ pub extern "C" fn v8__Task__DELETE() -> *const ::std::ffi::c_void { ::std::ptr::
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Task__Run() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Template__Set() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Template__SetIntrinsicDataProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TracedReference__CONSTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -933,8 +881,6 @@ pub extern "C" fn v8__V8__SetFlagsFromCommandLine() -> *const ::std::ffi::c_void
 pub extern "C" fn v8__Value__GetHash() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__InstanceOf() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IntegerValue() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsArgumentsObject() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -1033,8 +979,6 @@ pub extern "C" fn v8__Value__ToBoolean() -> *const ::std::ffi::c_void { ::std::p
 pub extern "C" fn v8__Value__ToDetailString() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToInt32() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__ToInteger() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToNumber() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]

@@ -75,6 +75,13 @@ struct RuntimeWrapper {
   std::unique_ptr<jsi::Value> identity_symbol;
   std::unique_ptr<jsi::Value> define_property_fn;
   int64_t next_identity_id = 1;
+  // C11: lazily-created per-runtime internal-field state. Internal fields are
+  // stored ON the object itself, in a hidden non-enumerable Symbol-keyed
+  // property holding a JS Array of length internal_field_count (mirroring the
+  // C4 identity-hash trick, a separate Symbol). Cached the same way as the
+  // identity-hash infra so no per-call script compile happens on the hot path.
+  std::unique_ptr<jsi::Value> internal_fields_symbol;
+  std::unique_ptr<jsi::Value> get_own_property_descriptor_fn;
   // C9: the TryCatch scope stack. back() is the innermost live scope.
   std::vector<TryCatchFrame> tc_stack;
   // C10: pending exception left by a native FunctionCallback that threw (via
@@ -153,6 +160,20 @@ extern "C" int64_t v8x_hermes_dispatch_callback(
     v8x_hermes_slot data_slot, const v8x_hermes_slot *arg_slots, size_t argc,
     int is_construct, v8x_hermes_slot new_target_slot, int *threw);
 
+// C11: accessor getter/setter dispatch trampolines. Parallel to
+// v8x_hermes_dispatch_callback but for property accessors: they build a
+// PropertyCallbackInfo-shaped object, invoke the NamedGetter/SetterCallback,
+// and (for the getter) hand back the return-value slot. `*threw` signals a
+// pending exception the host function must re-throw. See
+// docs/hermes-spike/experiments/C11-hermes-templates.md.
+extern "C" int64_t v8x_hermes_dispatch_accessor_getter(
+    void *rtw, uintptr_t getter_bits, v8x_hermes_slot key_slot,
+    v8x_hermes_slot holder_slot, v8x_hermes_slot data_slot, int *threw);
+extern "C" void v8x_hermes_dispatch_accessor_setter(
+    void *rtw, uintptr_t setter_bits, v8x_hermes_slot key_slot,
+    v8x_hermes_slot value_slot, v8x_hermes_slot holder_slot,
+    v8x_hermes_slot data_slot, int *threw);
+
 extern "C" {
 
 // Create a HermesRuntime + empty handle table. Returns an opaque wrapper
@@ -205,6 +226,30 @@ void v8x_hermes_handles_truncate(void *rtw, size_t watermark) {
   try {
     w->handles.resize(watermark);
   } catch (...) {
+  }
+}
+
+// Copy the Value in `src` into the EXISTING slot `dst` (overwrite
+// handles[dst]). Used by EscapableHandleScope::escape: `reserve` (called
+// before the child scope records its watermark) pushes a placeholder slot in
+// the PARENT, and `escape` overwrites that reserved slot with the escaping
+// value, so it survives the child scope's truncate-on-exit. Non-lossy for any
+// value type. Returns 1 on success, 0 on error.
+int v8x_hermes_set_slot(void *rtw, v8x_hermes_slot dst, v8x_hermes_slot src) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  if (dst < 0 || static_cast<size_t>(dst) >= w->handles.size() || src < 0 ||
+      static_cast<size_t>(src) >= w->handles.size()) {
+    return 0;
+  }
+  try {
+    w->handles[static_cast<size_t>(dst)] =
+        jsi::Value(w->runtime(), w->handles[static_cast<size_t>(src)]);
+    return 1;
+  } catch (...) {
+    return 0;
   }
 }
 
@@ -1479,6 +1524,564 @@ v8x_hermes_slot v8x_hermes_exception_new(void *rtw, const char *ctor_name,
   }
 }
 
+// ---- C11: ObjectTemplate internal fields + accessors ----------------------
+//
+// JSI objects have no native internal-field slots. Internal fields are modeled
+// as a side table stored ON the object itself: a hidden, non-enumerable,
+// Symbol-keyed property holding a JS Array of length internal_field_count,
+// each slot initialized to `undefined`. This mirrors the C4 identity-hash
+// trick (a separate, dedicated Symbol) and naturally survives being read back
+// through any number of handle-table slots, since the storage is the object's
+// own heap storage, not the (non-canonical) slot index.
+
+namespace {
+
+// Lazily create (once per runtime) the internal-fields Symbol and cache
+// Object.getOwnPropertyDescriptor. Reuses the identity infra's
+// define_property_fn (same Object.defineProperty), so ensure that is set up
+// too. Returns false on any error.
+bool ensure_internal_fields_infra(RuntimeWrapper *w) {
+  if (w->internal_fields_symbol && w->get_own_property_descriptor_fn) {
+    return true;
+  }
+  if (!ensure_identity_infra(w)) {
+    return false;
+  }
+  try {
+    jsi::Value setup = w->runtime().evaluateJavaScript(
+        std::make_unique<jsi::StringBuffer>(
+            "(function() { return ["
+            "Symbol('v8x_internal_fields'),"
+            "Object.getOwnPropertyDescriptor"
+            "]; })()"),
+        "v8x-internal-fields-setup.js");
+    jsi::Array arr = setup.getObject(w->runtime()).asArray(w->runtime());
+    jsi::Value sym = arr.getValueAtIndex(w->runtime(), 0);
+    jsi::Value gopd = arr.getValueAtIndex(w->runtime(), 1);
+    w->internal_fields_symbol =
+        std::make_unique<jsi::Value>(w->runtime(), sym);
+    w->get_own_property_descriptor_fn =
+        std::make_unique<jsi::Value>(w->runtime(), gopd);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+// Read the internal-fields Array off an object (via the hidden Symbol-keyed
+// property), or return an invalid (undefined) Value if the object has none.
+// `obj` must be a jsi::Object.
+jsi::Value read_internal_fields_array(RuntimeWrapper *w, const jsi::Object &obj) {
+  if (!ensure_internal_fields_infra(w)) {
+    return jsi::Value::undefined();
+  }
+  jsi::Function gopd = w->get_own_property_descriptor_fn->getObject(w->runtime())
+                           .getFunction(w->runtime());
+  jsi::Symbol key = w->internal_fields_symbol->getSymbol(w->runtime());
+  jsi::Value desc =
+      gopd.call(w->runtime(), obj, jsi::Value(w->runtime(), key));
+  if (!desc.isObject()) {
+    return jsi::Value::undefined();
+  }
+  return desc.getObject(w->runtime()).getProperty(w->runtime(), "value");
+}
+
+// Install a fresh internal-fields Array of length `count` on `obj` (all slots
+// undefined), via the hidden non-enumerable Symbol-keyed property. Returns
+// false on error.
+bool install_internal_fields(RuntimeWrapper *w, const jsi::Object &obj,
+                             int64_t count) {
+  if (count < 0 || !ensure_internal_fields_infra(w)) {
+    return false;
+  }
+  try {
+    jsi::Array fields(w->runtime(), static_cast<size_t>(count));
+    for (int64_t i = 0; i < count; ++i) {
+      fields.setValueAtIndex(w->runtime(), static_cast<size_t>(i),
+                             jsi::Value::undefined());
+    }
+    jsi::Function defineProperty =
+        w->define_property_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Symbol key = w->internal_fields_symbol->getSymbol(w->runtime());
+    jsi::Object desc(w->runtime());
+    desc.setProperty(w->runtime(), "value",
+                     jsi::Value(w->runtime(), fields));
+    desc.setProperty(w->runtime(), "enumerable", jsi::Value(false));
+    desc.setProperty(w->runtime(), "writable", jsi::Value(false));
+    desc.setProperty(w->runtime(), "configurable", jsi::Value(false));
+    defineProperty.call(w->runtime(), obj, jsi::Value(w->runtime(), key),
+                        std::move(desc));
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+} // namespace
+
+extern "C" {
+
+// Create a fresh object with `count` internal-field slots (all undefined),
+// stored in a hidden Symbol-keyed Array. Returns a slot, or the null slot on
+// error.
+v8x_hermes_slot v8x_hermes_object_new_with_internal_fields(void *rtw,
+                                                           int64_t count) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    jsi::Object o(w->runtime());
+    if (count > 0 && !install_internal_fields(w, o, count)) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    return w->push(jsi::Value(w->runtime(), o));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// Attach `count` internal-field slots to an EXISTING object (used by a
+// constructor FunctionCallback path where the object is created by JSI's
+// `new`, e.g. instance_template_with_internal_field). Idempotent-ish: if the
+// object already has an internal-fields array, it is left as is. Returns 1 on
+// success, 0 on error.
+int v8x_hermes_object_ensure_internal_fields(void *rtw, v8x_hermes_slot slot,
+                                             int64_t count) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return 0;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    jsi::Value existing = read_internal_fields_array(w, obj);
+    if (existing.isObject()) {
+      return 1; // already installed
+    }
+    return install_internal_fields(w, obj, count) ? 1 : 0;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// The number of internal fields on `slot` (the length of its hidden
+// internal-fields Array), or 0 if it has none / is not an object.
+int64_t v8x_hermes_object_internal_field_count(void *rtw,
+                                               v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return 0;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    jsi::Value fields = read_internal_fields_array(w, obj);
+    if (!fields.isObject()) {
+      return 0;
+    }
+    jsi::Object fobj = fields.getObject(w->runtime());
+    if (!fobj.isArray(w->runtime())) {
+      return 0;
+    }
+    return static_cast<int64_t>(fobj.asArray(w->runtime()).size(w->runtime()));
+  } catch (...) {
+    return 0;
+  }
+}
+
+// internal_fields[index] as a slot. Returns the null slot on error or an
+// out-of-range index.
+v8x_hermes_slot v8x_hermes_object_get_internal_field(void *rtw,
+                                                     v8x_hermes_slot slot,
+                                                     int64_t index) {
+  if (rtw == nullptr || index < 0) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    jsi::Value fields = read_internal_fields_array(w, obj);
+    if (!fields.isObject()) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Object fobj = fields.getObject(w->runtime());
+    if (!fobj.isArray(w->runtime())) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Array farr = fobj.asArray(w->runtime());
+    if (static_cast<size_t>(index) >= farr.size(w->runtime())) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Value elem = farr.getValueAtIndex(w->runtime(),
+                                           static_cast<size_t>(index));
+    return w->push(std::move(elem));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// internal_fields[index] = value. Returns 1 on success, 0 on error / an
+// out-of-range index.
+int v8x_hermes_object_set_internal_field(void *rtw, v8x_hermes_slot slot,
+                                         int64_t index,
+                                         v8x_hermes_slot value_slot) {
+  if (rtw == nullptr || index < 0) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  const jsi::Value *vv = slot_ref(w, value_slot);
+  if (v == nullptr || vv == nullptr || !v->isObject()) {
+    return 0;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    jsi::Value fields = read_internal_fields_array(w, obj);
+    if (!fields.isObject()) {
+      return 0;
+    }
+    jsi::Object fobj = fields.getObject(w->runtime());
+    if (!fobj.isArray(w->runtime())) {
+      return 0;
+    }
+    jsi::Array farr = fobj.asArray(w->runtime());
+    if (static_cast<size_t>(index) >= farr.size(w->runtime())) {
+      return 0;
+    }
+    farr.setValueAtIndex(w->runtime(), static_cast<size_t>(index),
+                         jsi::Value(w->runtime(), *vv));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// Object.defineProperty(obj, key, {value, writable, enumerable, configurable})
+// with the attribute bits taken from `attr` (v8 PropertyAttribute: bit0
+// READ_ONLY -> writable:false, bit1 DONT_ENUM -> enumerable:false, bit2
+// DONT_DELETE -> configurable:false). `key` is coerced to a JS string. Returns
+// 1 on success, 0 on error.
+int v8x_hermes_object_define_property(void *rtw, v8x_hermes_slot obj_slot,
+                                      v8x_hermes_slot key_slot,
+                                      v8x_hermes_slot value_slot, int attr) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  const jsi::Value *kv = slot_ref(w, key_slot);
+  const jsi::Value *vv = slot_ref(w, value_slot);
+  if (ov == nullptr || kv == nullptr || vv == nullptr || !ov->isObject()) {
+    return 0;
+  }
+  if (!ensure_identity_infra(w)) {
+    return 0;
+  }
+  try {
+    jsi::Object obj = ov->getObject(w->runtime());
+    jsi::String key = kv->toString(w->runtime());
+    jsi::Function defineProperty =
+        w->define_property_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Object desc(w->runtime());
+    desc.setProperty(w->runtime(), "value", jsi::Value(w->runtime(), *vv));
+    desc.setProperty(w->runtime(), "writable", jsi::Value((attr & 1) == 0));
+    desc.setProperty(w->runtime(), "enumerable", jsi::Value((attr & 2) == 0));
+    desc.setProperty(w->runtime(), "configurable", jsi::Value((attr & 4) == 0));
+    defineProperty.call(w->runtime(), obj,
+                        jsi::Value(w->runtime(), key), std::move(desc));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// Object.defineProperty(obj, key, {get, set, enumerable, configurable}) where
+// `get`/`set` are native accessor callbacks (v8 NamedGetter/SetterCallback fn
+// ptrs, as uintptr_t). Either callback may be 0 (absent). `data_slot` is the
+// accessor's optional associated data. `attr` gives enumerable/configurable
+// (READ_ONLY is ignored for an accessor property, which has no writable bit).
+// The get/set JSI host functions marshal (key, holder=this, data) into fresh
+// slots and dispatch back into Rust. Returns 1 on success, 0 on error.
+//
+// `key` is a Name (string) held in key_slot; it is re-read for each invocation
+// from a Runtime-owned copy captured in the host-function closures (NOT a
+// handle-table slot, which a HandleScope exit would truncate away, exactly
+// like C10's `data`). The holder is the receiver `thisVal` of the accessor
+// call (holder == this for a plain own-accessor, no prototype chain).
+int v8x_hermes_object_define_accessor(void *rtw, v8x_hermes_slot obj_slot,
+                                      v8x_hermes_slot key_slot,
+                                      uintptr_t getter_bits,
+                                      uintptr_t setter_bits,
+                                      v8x_hermes_slot data_slot, int attr) {
+  if (rtw == nullptr || (getter_bits == 0 && setter_bits == 0)) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  const jsi::Value *kv = slot_ref(w, key_slot);
+  if (ov == nullptr || kv == nullptr || !ov->isObject()) {
+    return 0;
+  }
+  if (!ensure_identity_infra(w)) {
+    return 0;
+  }
+  try {
+    jsi::Object obj = ov->getObject(w->runtime());
+    // The property-key Name, copied into a Runtime-owned holder (outlives every
+    // HandleScope, like C10's data).
+    auto key_holder =
+        std::make_shared<jsi::Value>(w->runtime(), *kv);
+    // The accessor's associated data, likewise Runtime-owned.
+    auto data_holder =
+        std::make_shared<jsi::Value>(jsi::Value::undefined());
+    const jsi::Value *dv = slot_ref(w, data_slot);
+    if (dv != nullptr) {
+      *data_holder = jsi::Value(w->runtime(), *dv);
+    }
+
+    jsi::Object desc(w->runtime());
+
+    if (getter_bits != 0) {
+      auto getFn = [w, getter_bits, key_holder, data_holder](
+                       jsi::Runtime &rt, const jsi::Value &thisVal,
+                       const jsi::Value *args, size_t count) -> jsi::Value {
+        (void)args;
+        (void)count;
+        size_t watermark = w->handles.size();
+        v8x_hermes_slot key_slot_local =
+            w->push(jsi::Value(rt, *key_holder));
+        v8x_hermes_slot holder_slot = w->push(jsi::Value(rt, thisVal));
+        v8x_hermes_slot data_slot_local =
+            w->push(jsi::Value(rt, *data_holder));
+
+        int threw = 0;
+        int64_t ret_slot = v8x_hermes_dispatch_accessor_getter(
+            static_cast<void *>(w), getter_bits, key_slot_local, holder_slot,
+            data_slot_local, &threw);
+
+        jsi::Value result = jsi::Value::undefined();
+        const jsi::Value *rv = slot_ref(w, ret_slot);
+        if (rv != nullptr) {
+          result = jsi::Value(rt, *rv);
+        }
+        bool have_exception = false;
+        jsi::Value exception = jsi::Value::undefined();
+        if (threw != 0) {
+          const jsi::Value *ev = slot_ref(w, w->pending_callback_exception);
+          if (ev != nullptr) {
+            exception = jsi::Value(rt, *ev);
+          }
+          have_exception = true;
+          w->pending_callback_exception = -1;
+        }
+        if (w->handles.size() > watermark) {
+          w->handles.resize(watermark);
+        }
+        if (have_exception) {
+          throw jsi::JSError(rt, std::move(exception));
+        }
+        return result;
+      };
+      jsi::Function getter = jsi::Function::createFromHostFunction(
+          w->runtime(),
+          jsi::PropNameID::forAscii(w->runtime(), "get"), 0,
+          std::move(getFn));
+      desc.setProperty(w->runtime(), "get", std::move(getter));
+    }
+
+    // A READ_ONLY accessor (attr bit0) drops the setter entirely: assignment
+    // becomes a silent no-op in sloppy mode (matches v8's native-data-property
+    // ReadOnly semantics, where the setter is not invoked on assignment).
+    if (setter_bits != 0 && (attr & 1) == 0) {
+      auto setFn = [w, setter_bits, key_holder, data_holder](
+                       jsi::Runtime &rt, const jsi::Value &thisVal,
+                       const jsi::Value *args, size_t count) -> jsi::Value {
+        size_t watermark = w->handles.size();
+        v8x_hermes_slot key_slot_local =
+            w->push(jsi::Value(rt, *key_holder));
+        v8x_hermes_slot value_slot_local = w->push(
+            count > 0 ? jsi::Value(rt, args[0]) : jsi::Value::undefined());
+        v8x_hermes_slot holder_slot = w->push(jsi::Value(rt, thisVal));
+        v8x_hermes_slot data_slot_local =
+            w->push(jsi::Value(rt, *data_holder));
+
+        int threw = 0;
+        v8x_hermes_dispatch_accessor_setter(
+            static_cast<void *>(w), setter_bits, key_slot_local,
+            value_slot_local, holder_slot, data_slot_local, &threw);
+
+        bool have_exception = false;
+        jsi::Value exception = jsi::Value::undefined();
+        if (threw != 0) {
+          const jsi::Value *ev = slot_ref(w, w->pending_callback_exception);
+          if (ev != nullptr) {
+            exception = jsi::Value(rt, *ev);
+          }
+          have_exception = true;
+          w->pending_callback_exception = -1;
+        }
+        if (w->handles.size() > watermark) {
+          w->handles.resize(watermark);
+        }
+        if (have_exception) {
+          throw jsi::JSError(rt, std::move(exception));
+        }
+        return jsi::Value::undefined();
+      };
+      jsi::Function setter = jsi::Function::createFromHostFunction(
+          w->runtime(),
+          jsi::PropNameID::forAscii(w->runtime(), "set"), 1,
+          std::move(setFn));
+      desc.setProperty(w->runtime(), "set", std::move(setter));
+    }
+
+    desc.setProperty(w->runtime(), "enumerable", jsi::Value((attr & 2) == 0));
+    desc.setProperty(w->runtime(), "configurable", jsi::Value((attr & 4) == 0));
+
+    jsi::String key = kv->toString(w->runtime());
+    jsi::Function defineProperty =
+        w->define_property_fn->getObject(w->runtime()).getFunction(w->runtime());
+    defineProperty.call(w->runtime(), obj, jsi::Value(w->runtime(), key),
+                        std::move(desc));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// Object.defineProperty(obj, key, {get, set, enumerable, configurable}) where
+// `get`/`set` are already-constructed JS functions (from FunctionTemplate::
+// GetFunction), used by ObjectTemplate::SetAccessorProperty. Either function
+// slot may be the null slot (absent). Returns 1 on success, 0 on error.
+int v8x_hermes_object_define_accessor_fns(void *rtw, v8x_hermes_slot obj_slot,
+                                          v8x_hermes_slot key_slot,
+                                          v8x_hermes_slot getter_fn_slot,
+                                          v8x_hermes_slot setter_fn_slot,
+                                          int attr) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  const jsi::Value *kv = slot_ref(w, key_slot);
+  const jsi::Value *gv = slot_ref(w, getter_fn_slot);
+  const jsi::Value *sv = slot_ref(w, setter_fn_slot);
+  if (ov == nullptr || kv == nullptr || !ov->isObject()) {
+    return 0;
+  }
+  if ((gv == nullptr || !gv->isObject()) &&
+      (sv == nullptr || !sv->isObject())) {
+    return 0;
+  }
+  if (!ensure_identity_infra(w)) {
+    return 0;
+  }
+  try {
+    jsi::Object obj = ov->getObject(w->runtime());
+    jsi::Object desc(w->runtime());
+    if (gv != nullptr && gv->isObject()) {
+      desc.setProperty(w->runtime(), "get", jsi::Value(w->runtime(), *gv));
+    }
+    if (sv != nullptr && sv->isObject()) {
+      desc.setProperty(w->runtime(), "set", jsi::Value(w->runtime(), *sv));
+    }
+    desc.setProperty(w->runtime(), "enumerable", jsi::Value((attr & 2) == 0));
+    desc.setProperty(w->runtime(), "configurable", jsi::Value((attr & 4) == 0));
+    jsi::String key = kv->toString(w->runtime());
+    jsi::Function defineProperty =
+        w->define_property_fn->getObject(w->runtime()).getFunction(w->runtime());
+    defineProperty.call(w->runtime(), obj, jsi::Value(w->runtime(), key),
+                        std::move(desc));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// Set `obj`'s prototype to `ctor.prototype` (so `obj.constructor` resolves to
+// `ctor` and `obj.constructor.name` is the ctor's name). Used by
+// ObjectTemplate::new_from_template to link an instance to its source
+// FunctionTemplate's constructor. Returns 1 on success, 0 on error.
+int v8x_hermes_set_prototype_from_ctor(void *rtw, v8x_hermes_slot obj_slot,
+                                       v8x_hermes_slot ctor_slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  const jsi::Value *cv = slot_ref(w, ctor_slot);
+  if (ov == nullptr || cv == nullptr || !ov->isObject() || !cv->isObject()) {
+    return 0;
+  }
+  try {
+    jsi::Object obj = ov->getObject(w->runtime());
+    jsi::Object ctor = cv->getObject(w->runtime());
+    jsi::Value proto = ctor.getProperty(w->runtime(), "prototype");
+    if (!proto.isObject()) {
+      return 0;
+    }
+    jsi::Function setProto = w->runtime()
+                                 .global()
+                                 .getPropertyAsObject(w->runtime(), "Object")
+                                 .getPropertyAsFunction(w->runtime(),
+                                                        "setPrototypeOf");
+    setProto.call(w->runtime(), obj, std::move(proto));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// Function.prototype.name / the `name` property of a JS function value. Used to
+// implement FunctionTemplate::SetClassName by setting the constructed
+// function's `.name` (via defineProperty, since `name` is non-writable). This
+// entry point sets `fn.name = name_string` on an existing function slot.
+// Returns 1 on success, 0 on error.
+int v8x_hermes_function_set_name(void *rtw, v8x_hermes_slot fn_slot,
+                                 v8x_hermes_slot name_slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *fv = slot_ref(w, fn_slot);
+  const jsi::Value *nv = slot_ref(w, name_slot);
+  if (fv == nullptr || nv == nullptr || !fv->isObject()) {
+    return 0;
+  }
+  if (!ensure_identity_infra(w)) {
+    return 0;
+  }
+  try {
+    jsi::Object fn = fv->getObject(w->runtime());
+    jsi::Function defineProperty =
+        w->define_property_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Object desc(w->runtime());
+    desc.setProperty(w->runtime(), "value", jsi::Value(w->runtime(), *nv));
+    desc.setProperty(w->runtime(), "writable", jsi::Value(false));
+    desc.setProperty(w->runtime(), "enumerable", jsi::Value(false));
+    desc.setProperty(w->runtime(), "configurable", jsi::Value(true));
+    jsi::String nameKey = jsi::String::createFromAscii(w->runtime(), "name");
+    defineProperty.call(w->runtime(), fn, jsi::Value(w->runtime(), nameKey),
+                        std::move(desc));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+} // extern "C"
+
 // ---- C10: native function callbacks ---------------------------------------
 
 // Record a pending exception (a handle-table slot) that a native
@@ -1504,9 +2107,19 @@ void v8x_hermes_set_pending_callback_exception(void *rtw,
 // shared_ptr is destroyed when JSI releases the host function, while the
 // Runtime is still alive (JSI guarantees host-function teardown precedes
 // Runtime teardown).
+//
+// C11: `instance_internal_field_count` doubles as a template marker. A value
+// >= 0 means the function came from a FunctionTemplate: it is made
+// constructable (see the wrapper below) and, on `new`, its receiver is given
+// that many internal-field slots BEFORE the callback runs, so a constructor
+// callback can `this.set_internal_field(...)` (matches
+// instance_template_with_internal_field). A value < 0 (-1) means a plain
+// Function::new: an ordinary non-constructable host function, unchanged from
+// C10.
 v8x_hermes_slot v8x_hermes_function_new(void *rtw, uintptr_t callback_bits,
                                         v8x_hermes_slot data_slot,
-                                        int32_t length, const char *name) {
+                                        int32_t length, const char *name,
+                                        int64_t instance_internal_field_count) {
   if (rtw == nullptr || callback_bits == 0) {
     return V8X_HERMES_NULL_SLOT;
   }
@@ -1525,8 +2138,9 @@ v8x_hermes_slot v8x_hermes_function_new(void *rtw, uintptr_t callback_bits,
 
     unsigned int paramCount =
         static_cast<unsigned int>(length < 0 ? 0 : length);
+    int64_t ifc = instance_internal_field_count;
 
-    auto hostFn = [w, callback_bits, data](
+    auto hostFn = [w, callback_bits, data, ifc](
                       jsi::Runtime &rt, const jsi::Value &thisVal,
                       const jsi::Value *args, size_t count) -> jsi::Value {
       // Marshal `this`, `data`, and each arg into fresh handle-table slots.
@@ -1536,6 +2150,12 @@ v8x_hermes_slot v8x_hermes_function_new(void *rtw, uintptr_t callback_bits,
       size_t watermark = w->handles.size();
 
       v8x_hermes_slot this_slot = w->push(jsi::Value(rt, thisVal));
+      // Constructor path: give the new receiver its declared internal-field
+      // slots before the callback runs (idempotent: no-op if already present).
+      if (ifc > 0 && thisVal.isObject()) {
+        v8x_hermes_object_ensure_internal_fields(static_cast<void *>(w),
+                                                 this_slot, ifc);
+      }
       v8x_hermes_slot data_slot_local = w->push(jsi::Value(rt, *data));
 
       std::vector<v8x_hermes_slot> arg_slots;
@@ -1585,6 +2205,36 @@ v8x_hermes_slot v8x_hermes_function_new(void *rtw, uintptr_t callback_bits,
 
     jsi::Function fn = jsi::Function::createFromHostFunction(
         w->runtime(), propName, paramCount, std::move(hostFn));
+
+    // A JSI host function (createFromHostFunction) is NOT constructable: `new
+    // f()` throws "not a constructor". A v8 FunctionTemplate's function IS a
+    // constructor. When this function came from a template
+    // (instance_internal_field_count >= 0), wrap the host function in a real JS
+    // function that forwards `this`/args to the host impl, so `new Ctor()`
+    // works: the wrapper is an ordinary JS function (constructable), and inside
+    // a `new` call its `this` is the freshly-constructed object, which is
+    // passed through to the host impl (where the internal-field setup and the
+    // constructor callback run). If the impl returns an object (v8 constructor
+    // callbacks return `this`), that object becomes the `new` result.
+    if (instance_internal_field_count >= 0) {
+      jsi::Function wrapMaker =
+          w->runtime()
+              .global()
+              .getPropertyAsFunction(w->runtime(), "Function")
+              .callAsConstructor(w->runtime(),
+                                 jsi::String::createFromAscii(w->runtime(),
+                                                              "impl"),
+                                 jsi::String::createFromAscii(
+                                     w->runtime(),
+                                     "return function(){ return "
+                                     "impl.apply(this, arguments); };"))
+              .getObject(w->runtime())
+              .getFunction(w->runtime());
+      jsi::Value wrapped = wrapMaker.call(w->runtime(),
+                                          jsi::Value(w->runtime(), fn));
+      return w->push(std::move(wrapped));
+    }
+
     return w->push(jsi::Value(std::move(fn)));
   } catch (...) {
     return V8X_HERMES_NULL_SLOT;
