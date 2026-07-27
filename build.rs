@@ -224,7 +224,11 @@ fn build_hermes(manifest_dir: &Path) {
   );
 
   let shim = manifest_dir.join("src/hermes/hermes_eval_shim.cpp");
+  // The real-backend C++/JSI bridge the v8__* symbols in src/hermes/core.rs
+  // call into (handle table + runtime wrapper). See C3.
+  let backend_shim = manifest_dir.join("src/hermes/hermes_shim.cpp");
   println!("cargo:rerun-if-changed={}", shim.display());
+  println!("cargo:rerun-if-changed={}", backend_shim.display());
   println!("cargo:rerun-if-env-changed=HERMES_LIB_DIR");
   println!("cargo:rerun-if-env-changed=HERMES_INCLUDE_DIR");
 
@@ -232,6 +236,7 @@ fn build_hermes(manifest_dir: &Path) {
     .cpp(true)
     .std("c++17")
     .file(&shim)
+    .file(&backend_shim)
     .include(&inc_dir)
     .compile("v8x_hermes_shim");
 
