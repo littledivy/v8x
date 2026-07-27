@@ -12,6 +12,12 @@
 //! pointer punning), built against Hermes's C++ JSI through an extern "C"
 //! bridge.
 
+// The real backend core (hello-world path: isolate/context/handle-scope/
+// string/script) is authored against the C++/JSI bridge and therefore only
+// exists when `link_hermes` links a real libhermes. Without it, the pure-Rust
+// stub build keeps the auto-generated stubs for these symbols in `shims`.
+#[cfg(feature = "link_hermes")]
+mod core;
 mod misc;
 mod shims;
 
@@ -43,6 +49,47 @@ mod smoke {
 
 #[cfg(feature = "link_hermes")]
 pub use smoke::smoke_eval;
+
+// C3: drive the vendored v8x Rust surface (Isolate -> HandleScope -> Context
+// -> String -> Script::compile -> Script::run -> read string) end to end on a
+// real Hermes runtime, through the v8__* symbols in `core`. This is the
+// hello-world proof that a script runs THROUGH the hermes backend, not just
+// through the standalone eval shim. See
+// docs/hermes-spike/experiments/C3-hermes-helloworld.md.
+#[cfg(all(test, feature = "link_hermes"))]
+mod hello_world {
+  use crate as v8;
+
+  fn init_v8_once() {
+    use std::sync::Once;
+    static START: Once = Once::new();
+    START.call_once(|| {
+      let platform = v8::new_default_platform(0, false).make_shared();
+      v8::V8::initialize_platform(platform);
+      v8::V8::initialize();
+    });
+  }
+
+  #[test]
+  fn hermes_backend_runs_hello_world() {
+    init_v8_once();
+
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let source =
+      v8::String::new(scope, "'hello' + ' ' + 'world'").unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    let result = script.run(scope).unwrap();
+    let result = result.to_rust_string_lossy(scope);
+
+    println!("hermes backend ran: 'hello' + ' ' + 'world' = {result:?}");
+    assert_eq!(result, "hello world", "real Hermes should produce 'hello world'");
+  }
+}
 
 #[cfg(all(test, feature = "link_hermes"))]
 mod tests {
