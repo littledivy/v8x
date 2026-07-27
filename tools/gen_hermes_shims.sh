@@ -36,6 +36,17 @@ done > /tmp/hermes_all_src.txt
     | sed -E 's/^!\(//'
 } | sort -u > /tmp/hermes_implemented.txt
 
+# Symbols vendor/rusty_v8/src/*.rs itself DEFINES with #[unsafe(no_mangle)]
+# (the engine-independent "BASE" callback bridges for CustomPlatform tasks
+# and Value(De)Serializer::Delegate/Inspector Channel/Client trampolines, plus
+# the crdtp_shim.rs-provided inspector protocol). These are real definitions,
+# not just extern decls, and are compiled unconditionally for every backend,
+# so stubbing them again would be a duplicate-symbol error.
+for f in vendor/rusty_v8/src/*.rs; do
+  awk '/#\[unsafe\(no_mangle\)\]/{getline; print}' "$f"
+done | grep -oE "${P}" | sort -u >> /tmp/hermes_implemented.txt
+sort -u /tmp/hermes_implemented.txt -o /tmp/hermes_implemented.txt
+
 {
   echo "//! AUTO-GENERATED Hermes link stubs (tools/gen_hermes_shims.sh)."
   echo "//!"

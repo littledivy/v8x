@@ -14,7 +14,7 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 - [x] C0 research: Hermes embedding API + AOT capabilities
 - [x] C0 research: v8x integration surface (how to add engine_hermes)
 - [x] C0 research: AOT-solves-snapshot feasibility (HBC / static-hermes / Porffor)
-- [ ] C1 scaffold: engine_hermes feature + src/hermes/ skeleton + build.rs
+- [x] C1 scaffold: engine_hermes feature + src/hermes/ skeleton (build.rs untouched, not needed yet)
 - [ ] C2 build: vendor + build static Hermes, link stubs
 - [ ] C3 implement: core v8__* (isolate/context/primitives/strings)
 - [ ] C4 test: rusty_v8 harness on hermes, hill-climb
@@ -26,6 +26,47 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle 1 - scaffold engine_hermes, fix link failure (agent: executor) DONE
+The prior commit (9d3d86a) already added Cargo.toml/src/lib.rs wiring and
+src/hermes/{mod,misc,shims}.rs, but `cargo build --no-default-features
+--features hermes` did not actually compile: rustc rejected it with "symbol
+`v8__Platform__CustomPlatform__BASE__DROP` is already defined" (a
+duplicate-symbol error, not a linker error - it happens during codegen of the
+v8x crate itself, since both the generated stub and the real definition live
+in the same crate). Root-caused and fixed tools/gen_hermes_shims.sh; after
+the fix, `cargo build --no-default-features --features hermes` compiles and
+links clean (0 errors, 0 warnings) with zero Hermes dependency. Pure-Rust
+stub backend only, nothing runs real JavaScript yet.
+- Cargo.toml / src/lib.rs / src/hermes/{mod,misc}.rs: already correct as
+  committed. `engine_hermes`, `link_hermes` (unused so far), `hermes =
+  ["engine_hermes"]` alias (deliberately does not pull in `link_hermes`);
+  `#[cfg(feature="engine_hermes")] mod hermes;` in lib.rs next to the other
+  backends, `V8X_ENGINE` returns `"hermes"`; misc.rs has 25 `cppgc__*` stubs
+  with small real bodies backed by a raw pointer slot, since the
+  Member/Persistent wrapper code in cppgc.rs treats them as plain data, not
+  just link placeholders.
+- src/hermes/shims.rs: regenerated, now 737 `v8__*`/`v8_inspector__*` stubs
+  (down from the prior 764 - the 27 symbols below are excluded).
+- tools/gen_hermes_shims.sh: adapted from tools/gen_qjs_shims.sh. Diverges in
+  one important way: it sources symbol names directly from
+  `vendor/rusty_v8/src/*.rs` extern decls (no test-build union.txt exists yet
+  for hermes) and explicitly excludes symbols the vendored crate itself
+  DEFINES with `#[unsafe(no_mangle)]` (the engine-independent
+  CustomPlatform-task and Value(De)Serializer::Delegate/Inspector
+  Channel/Client callback trampolines in platform.rs/value_serializer.rs/
+  value_deserializer.rs/inspector.rs). Stubbing those again is a
+  duplicate-symbol error at compile time, not a linker warning, since they
+  live in the same crate.
+- Confirmed empirically: Rust `extern "C"` FFI linking is name-only (no
+  signature check across module/file boundaries), so no-arg
+  `unimplemented!()` stub bodies link fine against any real declared
+  signature. Same technique the QuickJS/JSC generators already rely on.
+- No regression: `cargo check --no-default-features --features quickjs` still
+  builds clean.
+Next: C2, vendor a real Hermes static library and start replacing shims with
+real JSI-backed implementations, starting with the 9-symbol hello-world path
+noted in the C0 integration-surface log entry.
 
 ### Cycle 0 - Hermes embedding feasibility (agent: hermes-embed-aot) DONE => GO-WITH-CAVEATS
 Verdict: technically feasible, hardest of the 3 backends. Decision: SPIKE it (not a commitment);

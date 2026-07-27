@@ -696,18 +696,6 @@ pub extern "C" fn v8__Platform__CONVERT__std__unique_ptr() { unimplemented!("v8_
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__COPY() { unimplemented!("v8__Platform__COPY") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__CustomPlatform__BASE__DROP() { unimplemented!("v8__Platform__CustomPlatform__BASE__DROP") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__CustomPlatform__BASE__PostDelayedTask() { unimplemented!("v8__Platform__CustomPlatform__BASE__PostDelayedTask") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__CustomPlatform__BASE__PostIdleTask() { unimplemented!("v8__Platform__CustomPlatform__BASE__PostIdleTask") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__CustomPlatform__BASE__PostNonNestableDelayedTask() { unimplemented!("v8__Platform__CustomPlatform__BASE__PostNonNestableDelayedTask") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__CustomPlatform__BASE__PostNonNestableTask() { unimplemented!("v8__Platform__CustomPlatform__BASE__PostNonNestableTask") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__CustomPlatform__BASE__PostTask() { unimplemented!("v8__Platform__CustomPlatform__BASE__PostTask") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__DELETE() { unimplemented!("v8__Platform__DELETE") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__get() { unimplemented!("v8__Platform__get") }
@@ -1336,12 +1324,6 @@ pub extern "C" fn v8__ValueDeserializer__CONSTRUCT() { unimplemented!("v8__Value
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ValueDeserializer__Delegate__CONSTRUCT() { unimplemented!("v8__ValueDeserializer__Delegate__CONSTRUCT") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__Delegate__GetSharedArrayBufferFromId() { unimplemented!("v8__ValueDeserializer__Delegate__GetSharedArrayBufferFromId") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__Delegate__GetWasmModuleFromId() { unimplemented!("v8__ValueDeserializer__Delegate__GetWasmModuleFromId") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__Delegate__ReadHostObject() { unimplemented!("v8__ValueDeserializer__Delegate__ReadHostObject") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__ValueDeserializer__DESTRUCT() { unimplemented!("v8__ValueDeserializer__DESTRUCT") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ValueDeserializer__GetWireFormatVersion() { unimplemented!("v8__ValueDeserializer__GetWireFormatVersion") }
@@ -1367,22 +1349,6 @@ pub extern "C" fn v8__ValueDeserializer__TransferSharedArrayBuffer() { unimpleme
 pub extern "C" fn v8__ValueSerializer__CONSTRUCT() { unimplemented!("v8__ValueSerializer__CONSTRUCT") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ValueSerializer__Delegate__CONSTRUCT() { unimplemented!("v8__ValueSerializer__Delegate__CONSTRUCT") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__Delegate__FreeBufferMemory() { unimplemented!("v8__ValueSerializer__Delegate__FreeBufferMemory") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__Delegate__GetSharedArrayBufferId() { unimplemented!("v8__ValueSerializer__Delegate__GetSharedArrayBufferId") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__Delegate__GetWasmModuleTransferId() { unimplemented!("v8__ValueSerializer__Delegate__GetWasmModuleTransferId") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__Delegate__HasCustomHostObject() { unimplemented!("v8__ValueSerializer__Delegate__HasCustomHostObject") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__Delegate__IsHostObject() { unimplemented!("v8__ValueSerializer__Delegate__IsHostObject") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__Delegate__ReallocateBufferMemory() { unimplemented!("v8__ValueSerializer__Delegate__ReallocateBufferMemory") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__Delegate__ThrowDataCloneError() { unimplemented!("v8__ValueSerializer__Delegate__ThrowDataCloneError") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__Delegate__WriteHostObject() { unimplemented!("v8__ValueSerializer__Delegate__WriteHostObject") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ValueSerializer__DESTRUCT() { unimplemented!("v8__ValueSerializer__DESTRUCT") }
 #[unsafe(no_mangle)]
@@ -1468,12 +1434,6 @@ pub extern "C" fn v8_inspector__V8Inspector__asyncTaskStarted() { unimplemented!
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__Channel__BASE__CONSTRUCT() { unimplemented!("v8_inspector__V8Inspector__Channel__BASE__CONSTRUCT") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications() { unimplemented!("v8_inspector__V8Inspector__Channel__BASE__flushProtocolNotifications") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8_inspector__V8Inspector__Channel__BASE__sendNotification() { unimplemented!("v8_inspector__V8Inspector__Channel__BASE__sendNotification") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8_inspector__V8Inspector__Channel__BASE__sendResponse() { unimplemented!("v8_inspector__V8Inspector__Channel__BASE__sendResponse") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__Channel__flushProtocolNotifications() { unimplemented!("v8_inspector__V8Inspector__Channel__flushProtocolNotifications") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__Channel__sendNotification() { unimplemented!("v8_inspector__V8Inspector__Channel__sendNotification") }
@@ -1498,21 +1458,7 @@ pub extern "C" fn v8_inspector__V8Inspector__idleFinished() { unimplemented!("v8
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8Inspector__idleStarted() { unimplemented!("v8_inspector__V8Inspector__idleStarted") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8_inspector__V8InspectorClient__BASE__consoleAPIMessage() { unimplemented!("v8_inspector__V8InspectorClient__BASE__consoleAPIMessage") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8InspectorClient__BASE__CONSTRUCT() { unimplemented!("v8_inspector__V8InspectorClient__BASE__CONSTRUCT") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8_inspector__V8InspectorClient__BASE__ensureDefaultContextInGroup() { unimplemented!("v8_inspector__V8InspectorClient__BASE__ensureDefaultContextInGroup") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8_inspector__V8InspectorClient__BASE__generateUniqueId() { unimplemented!("v8_inspector__V8InspectorClient__BASE__generateUniqueId") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8_inspector__V8InspectorClient__BASE__quitMessageLoopOnPause() { unimplemented!("v8_inspector__V8InspectorClient__BASE__quitMessageLoopOnPause") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8_inspector__V8InspectorClient__BASE__resourceNameToUrl() { unimplemented!("v8_inspector__V8InspectorClient__BASE__resourceNameToUrl") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8_inspector__V8InspectorClient__BASE__runIfWaitingForDebugger() { unimplemented!("v8_inspector__V8InspectorClient__BASE__runIfWaitingForDebugger") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause() { unimplemented!("v8_inspector__V8InspectorClient__BASE__runMessageLoopOnPause") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8InspectorClient__consoleAPIMessage() { unimplemented!("v8_inspector__V8InspectorClient__consoleAPIMessage") }
 #[unsafe(no_mangle)]
