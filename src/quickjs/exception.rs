@@ -2885,7 +2885,16 @@ unsafe fn source_mapped_stack(
       crate::Local::from_raw(sites_h),
     ) {
       (Some(c_l), Some(e_l), Some(s_l)) => {
+        // Windows ABI: rusty_v8 declares struct-returning callbacks with an
+        // explicit leading return-slot out-param (MSVC sret).
+        #[cfg(not(target_os = "windows"))]
         let ret = cb(c_l, e_l, s_l);
+        #[cfg(target_os = "windows")]
+        let ret = {
+          let mut ret = std::ptr::null();
+          cb(&mut ret, c_l, e_l, s_l);
+          ret
+        };
         if JS_HasException(ctx) {
           let exception = JS_GetException(ctx);
           if jsv_is_object(&exception) {

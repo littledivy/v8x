@@ -1096,6 +1096,9 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
       super::isolate::codegen_release_ctx(*c);
     }
     super::isolate::codegen_release_ctx(st.ctx);
+    // Free dup'd promise-hook functions while their runtime is still alive;
+    // the thread-local would otherwise poison the next isolate on this thread.
+    super::isolate::release_promise_hooks(st.ctx);
     for c in st.extra_contexts.drain(..) {
       JS_FreeContext(c);
     }

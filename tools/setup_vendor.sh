@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# NOTE: build.rs carries a pure-Rust port of this script (fn setup_vendor and
+# friends) so `cargo build` works without bash, notably on Windows. This script
+# stays for manual/CI use — keep the two in sync when changing patch semantics.
+#
 # Init the pinned vendor submodules and apply our patches on top. Every vendored
 # dependency lives in vendor/<name> at an exact upstream commit (see .gitmodules /
 # the gitlinks); our edits ship as patches/<name>-NN-*.patch applied to the
@@ -50,6 +54,11 @@ apply_series() {
     fi
     if ! git -C "$sub" apply --reverse --check "../../$p" 2>/dev/null; then
       if ! git -C "$sub" apply "../../$p"; then
+        # patch(1) silently SKIPS git binary deltas while exiting 0 on the
+        # text hunks — never fall back to it for those (half-applied patch).
+        if grep -q "GIT binary patch" "$p"; then
+          return 1
+        fi
         if patch --batch --dry-run --forward -p1 -d "$sub" < "$p" \
              >/dev/null 2>&1; then
           patch --batch --forward -p1 -d "$sub" < "$p"

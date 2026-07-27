@@ -112,6 +112,35 @@ jobs:
           if-no-files-found: ignore
 
   # ---------------------------------------------------------------------------
+  # Windows buildability for the quickjs backend (issue #65). Build-only: no
+  # test cell/baseline yet — this just keeps `cargo build` green on MSVC
+  # (pure-Rust vendor setup in build.rs, per-target gen bindings, MSVC C11
+  # atomics for quickjs, multi-config cmake for WAMR).
+  # ---------------------------------------------------------------------------
+  windows-build:
+    name: check-quickjs-windows
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      # Git for Windows defaults to core.autocrlf=true, which corrupts the
+      # git-binary-delta patches at checkout and CRLFs the submodule trees the
+      # text patches context-match against. .gitattributes pins *.patch, but
+      # the submodule checkouts below have no such attributes — force LF.
+      - name: Force LF checkouts
+        run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Init submodules
+        run: git submodule update --init --depth 1 vendor/rusty_v8 vendor/quickjs-ng vendor/wamr
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: check-quickjs-windows
+      - name: Build --lib (quickjs)
+        run: cargo build --no-default-features --features quickjs --lib
+
+  # ---------------------------------------------------------------------------
   # deno_core test suite per backend: clone+patch deno, `cargo nextest run -p
   # deno_core` against our v8 shim. No full deno binary (node-compat + unit are
   # dropped for now to keep CI cheap). macOS so the JSC backends link/JIT.
