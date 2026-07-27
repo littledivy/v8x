@@ -11,6 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
+- [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities
 - [x] C0 research: v8x integration surface (how to add engine_hermes)
@@ -37,6 +38,24 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle C6 - Hermes surface widened + on the ratchet (agent: c6) DONE
+Now REAL through the backend: Object New/Get/Set/Has, Array New/Length + indexed get/set, Number/
+Integer/Boolean New+Value, Function::Call (jsi::Function::call/callWithThis), Undefined/Null, and the
+Is{Array,Function,Number,Boolean,String} predicates. 6 new smoke tests build objects/nested/arrays/
+numeric+bool/Function.call and cross-check vs real JSON.stringify/Array.isArray/.reduce via Script::run.
+=> 12/12 hermes tests pass (stable parallel + single-thread); quickjs + stub-hermes unaffected.
+gen_hermes_shims.sh FIXED: 2 real bugs (regex matched mid-identifier -> wrong std__shared_ptr__v8__*
+stub names; scan missed vendor/rusty_v8/src/scope/raw.rs one dir deep = the old '14 hand-appended
+symbols' cause). Now idempotent (byte-identical shims.rs on re-run). Preserves link_hermes gates.
+RATCHET: registered 4th backend 'hermes' (features hermes,link_hermes, os macos) in
+tests/harness/config.json + empty baselines. node run.mjs rusty_v8 hermes --check clean.
+BASELINE (honest, not --updated): 0 passing / 16 total. 14 targets LINK (0 pass - they exercise
+slots/flags/entropy/snapshot/platform machinery not yet built); 2 don't link (rv8_test_api,
+rv8_test_cppgc) on missing ICU syms (icu_get/set_default_locale, udata_setCommonData_77) + the 11
+TypedArray ctor family for test_api.
+Next: hill-climb - implement slots/flags/platform/external/entropy to pass the FIRST rusty_v8 tests on
+Hermes, then --update the baseline. Plus AOT: measure HBC parse-free win on a REAL Deno bootstrap chunk.
 
 ### Cycle C6 - widen the surface (Object/Array/Number/Function) + register the rusty_v8 baseline (agent: c6) DONE
 PART 1: Object (New/Get/Set/Has, keys coerced to string via JSI toString - no Symbol-key overload in
