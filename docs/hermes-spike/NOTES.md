@@ -26,13 +26,48 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
       in Rust (docs/hermes-spike/experiments/C3-hermes-helloworld.md).
 - [x] C4 SOLVED object identity (strictEquals + hidden-symbol-id hash); 4 hermes tests pass
 - [x] C5 AOT: Hermes HBC parse-free boot = 21x faster than source (202ms->9.3ms) THROUGH the backend
-- [x] C6 AOT E6: REAL QuickJS heap snapshot WORKS (but no startup speedup - see log)
+- [x] E6 AOT: REAL QuickJS heap snapshot WORKS (but no startup speedup - see log)
+- [x] C6 widen surface: Object/Array/Number/Integer/Boolean/Function real + 6 smoke tests pass (12/12
+      hermes tests total); registered hermes as 4th harness backend, rusty_v8 baseline honestly 0/16
+      (14 targets link, 2 don't - ICU + TypedArray gaps, named not chased); gen_hermes_shims.sh gate
+      + symbol-detection bugs fixed (docs/hermes-spike/experiments/C6-hermes-surface.md).
 - [ ] C7 AOT E7: Static Hermes native AOT on real bootstrap chunk (push past 'untyped=no win')
 - [ ] C8 AOT E8: AOT-native Deno north star - tiny native binary running a Deno program
 - [ ] C9 AOT E9: hybrid AOT-bytecode + build-time-precomputed constant data (partial heap)
 
 ## Cycle log
 (newest first)
+
+### Cycle C6 - widen the surface (Object/Array/Number/Function) + register the rusty_v8 baseline (agent: c6) DONE
+PART 1: Object (New/Get/Set/Has, keys coerced to string via JSI toString - no Symbol-key overload in
+JSI's C++ surface), Array (New/Length/indexed get-set via the existing Object__GetIndex/SetIndex),
+Number/Integer/Boolean (New/Value, Integer routed through Number - JSI has no separate int repr),
+Function::Call (jsi::Function::call/callWithThis, argv marshaled through a std::vector<jsi::Value>),
+plus v8__Undefined/Null (static jsi::Value factories, needed as Function::Call's receiver) and the
+Is{Array,Function,Number,Boolean,String} predicates. 6 new hermes_surface smoke tests (v8x Rust API,
+not raw shim calls) build {a:1,b:"x"}, a nested object, a [10,20,30] array summed via indexed gets, a
+number/integer/boolean roundtrip, add(19,23) via Function::Call, and cross-check every one against a
+real JS JSON.stringify/Array.isArray/.reduce run through Script::compile/run - not just our own
+read-back. 12/12 hermes tests pass (6 pre-existing + 6 new), stable parallel and --test-threads=1.
+PART 2: registered hermes as tests/harness/config.json's 4th backend (features "hermes,link_hermes",
+os "macos" - build.rs's build_hermes panics off-macOS). Empty baselines created. `run.mjs rusty_v8
+hermes` runs clean end to end; --check holds against the empty baseline. Honest baseline: 0 passing /
+16 total, 14 targets LINK (0 pass each - they exercise slots/flags/entropy/External/snapshot/platform
+machinery this cycle didn't touch), 2 don't link (rv8_test_api, rv8_test_cppgc) on genuinely-missing
+ICU symbols (icu_get_default_locale/icu_set_default_locale/udata_setCommonData_77) +, for test_api
+only, the 11 TypedArray-constructor symbols. Named, not chased tonight per the mission.
+BONUS FIX (gen_hermes_shims.sh): found and fixed the actual root cause behind the old "14 hand-appended
+symbols" note - (1) gate-preservation was entirely missing (blind regen dropped every hand-added
+`#[cfg(not(feature = "link_hermes"))]`, breaking the stub build's link step) - fixed by reading the
+CURRENTLY-gated set from the checked-in file first and reapplying it; (2) the symbol-scan regex matched
+mid-identifier (truncating e.g. std__shared_ptr__v8__Platform__CONVERT__... to a wrong shorter name) and
+only scanned vendor/rusty_v8/src/*.rs one level deep, silently missing src/scope/raw.rs entirely (the
+file that declares TryCatch/Allow/DisallowJavascriptExecutionScope CONSTRUCT). Both fixed at the regex/
+glob level; verified idempotent (two back-to-back runs on an unchanged tree produce a byte-identical
+shims.rs) and no regression on the stub (`--features hermes`) or quickjs builds.
+Full report: docs/hermes-spike/experiments/C6-hermes-surface.md.
+Next: ICU trio (smallest highest-leverage unlock - both nonlinking targets need only this), then
+TypedArrays to fully unlock test_api's link, then TryCatch/exception surfacing.
 
 ### Cycle C5 - Hermes HBC parse-free AOT through the backend (agent: c5) DONE - the 'AOT wonderful' number
 Same shim entry (v8x_hermes_eval_buffer) runs JS source OR hermesc-compiled HBC transparently (Hermes
