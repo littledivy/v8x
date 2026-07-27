@@ -20,7 +20,10 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
       evals "40 + 2" == 42, prints it (docs/hermes-spike/experiments/C2-hermes-ffi.md).
       Prebuilt macOS hermes.framework (facebook/hermes v0.11.0 release, 4.5MB
       vendored, no source build). `--features hermes,link_hermes`.
-- [ ] C3 implement: core v8__* (isolate/context/primitives/strings)
+- [x] C3 implement: core v8__* hello-world path runs a REAL script THROUGH the
+      hermes backend: v8x Rust surface (Isolate/HandleScope/Context/String/
+      Script) -> our v8__* -> libhermes evaluateJavaScript -> "hello world" back
+      in Rust (docs/hermes-spike/experiments/C3-hermes-helloworld.md).
 - [ ] C4 test: rusty_v8 harness on hermes, hill-climb
 - [ ] C5 AOT E5: QuickJS bytecode-boot vs source (parse-cost)
 - [x] C6 AOT E6: REAL QuickJS heap snapshot WORKS (but no startup speedup - see log)
@@ -30,6 +33,40 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle C3 - Hermes backend runs hello world (agent: executor, opus) DONE => script runs THROUGH the backend
+A real script runs end to end through engine_hermes via the v8 C-ABI: a v8x smoke test drives the
+vendored rusty_v8 Rust surface (Isolate -> scope! -> Context -> String -> Script::compile -> run ->
+to_rust_string_lossy) and gets "hello world" back on real libhermes. Not the standalone C2 eval shim:
+the source is compiled+run by our v8__Script__Compile/Run and read back by the same String/Value path
+every real V8 string uses. Test: cargo test --no-default-features --features hermes,link_hermes --lib
+hermes:: -- --nocapture => "hermes backend ran: 'hello' + ' ' + 'world' = \"hello world\"", 3 passed.
+- Design: the arena lives on the C++ SIDE (src/hermes/hermes_shim.cpp). jsi::Value is move-only and
+  Runtime-bound, so unlike quickjs's Rust arena, the handle table is a std::vector<jsi::Value> inside a
+  RuntimeWrapper (rt declared first => destroyed last, C2 lifetime rule; one runtime/thread). A v8 Local
+  is a table index handed to Rust as the tagged pointer ((i<<1)|1) (non-null, slot 0 safe). HandleScope
+  = watermark; DESTRUCT truncates the vector. Thread-local current iso/ctx; one context per runtime so a
+  Context* handle is the isolate ptr reused.
+- Made REAL in src/hermes/core.rs (stubs gated cfg(not(link_hermes)) so stub build + no dup symbols):
+  Isolate New/Dispose/Enter/Exit/GetCurrent/Get+SetData/GetNumberOfDataSlots/GetCurrentContext;
+  HandleScope CONSTRUCT/DESTRUCT + EscapeSlot reserve/escape; Context New/Enter/Exit/Global; String
+  NewFromUtf8/NewFromOneByte/Length/Utf8Length/WriteUtf8_v2 + the ValueView quintet (the actual read
+  fast-path to_rust_string_lossy uses - traced empirically, NOT WriteUtf8); Script Compile/Run; Value
+  ToString; plus inert Platform/V8-init/ArrayBuffer-allocator/CreateParams lifecycle to bring an isolate
+  up (Hermes owns its own heap). Only hello-world-touched symbols were made real; rest stay stubs.
+- One real compromise: EscapeSlot__escape re-materializes the escaping value AS A STRING (reads utf8,
+  interns fresh string handle above the watermark) because the shim has no dup-slot primitive yet. Exact
+  for the hello-world string result; lossy for non-string Values. Clean fix = a handles_dup shim entry
+  (copy jsi::Value via its Runtime), one-function follow-up.
+- Harness note: use --lib hermes:: not the bare cargo test command - the bare one also builds the
+  vendored rv8_test_api target (hundreds of stubbed symbols, fails to link) and the crate's inline
+  array-buffer/sandbox #[test]s hit stubs and SIGABRT the shared lib-test process. Scoping is a harness
+  detail, not a backend limit.
+- No regressions: --features hermes (stub) and --features quickjs (default) both compile clean.
+Next: (1) de-risk object IDENTITY (JSI gives no raw ptr; two Locals to one object differ - reroute
+identity/hash/Map/Set/Global to strictEquals or intern one slot per object). This is the deepest
+unchanged risk and gates broad surface work. (2) OR widen surface: add handles_dup for exact escape,
+then Value Is/To, Object/Array, register the 4th backend in tests/harness/config.json + hill-climb.
 
 ### Cycle C2 - Hermes FFI PROOF (agent: c2, opus) DONE => GO CONFIRMED (breakthrough)
 Rust -> extern "C" C++ shim -> real libhermes JSI evaluateJavaScript("40 + 2") -> asNumber -> 42
