@@ -14,3 +14,53 @@
 
 mod misc;
 mod shims;
+
+// Feasibility proof (C2): with `--features link_hermes`, build.rs compiles
+// src/hermes/hermes_eval_shim.cpp against a real libhermes and links it. The
+// extern "C" bridge below reaches jsi::Runtime::evaluateJavaScript through
+// that shim. This is the go/no-go for the whole engine_hermes idea: Hermes is
+// C++-only JSI, so proving a Rust -> extern "C" C++ -> real Hermes -> value
+// round-trip de-risks authoring the full v8__* surface the same way. Gated on
+// `link_hermes` so the default `--features hermes` stub build stays dependency
+// free. See docs/hermes-spike/experiments/C2-hermes-ffi.md.
+#[cfg(feature = "link_hermes")]
+mod smoke {
+  unsafe extern "C" {
+    fn v8x_hermes_smoke_eval(src: *const std::os::raw::c_char) -> i32;
+  }
+
+  /// Evaluate `src` on a fresh HermesRuntime and return the numeric result as
+  /// an `i32`. Negative sentinels (`<= -1000`) signal a non-number result, a
+  /// JS error, or a C++ error caught at the boundary. `src` must be valid
+  /// UTF-8 with no interior NUL.
+  pub fn smoke_eval(src: &str) -> i32 {
+    let c = std::ffi::CString::new(src).expect("src has interior NUL");
+    // SAFETY: the shim catches every C++ exception before returning, so no
+    // unwinding crosses this boundary; `c` outlives the call.
+    unsafe { v8x_hermes_smoke_eval(c.as_ptr()) }
+  }
+}
+
+#[cfg(feature = "link_hermes")]
+pub use smoke::smoke_eval;
+
+#[cfg(all(test, feature = "link_hermes"))]
+mod tests {
+  // The whole point of the spike: prove libhermes links, JSI runs, a C++
+  // exception can't escape the boundary, and a value marshals back to Rust.
+  #[test]
+  fn hermes_smoke_eval_40_plus_2() {
+    let r = super::smoke_eval("40 + 2");
+    println!("hermes eval \"40 + 2\" = {r}");
+    assert_eq!(r, 42, "expected Hermes to evaluate 40 + 2 to 42");
+  }
+
+  #[test]
+  fn hermes_smoke_catches_js_error() {
+    // A thrown JS error must be caught at the extern "C" boundary and mapped
+    // to a sentinel, never unwind into Rust.
+    let r = super::smoke_eval("throw new Error('boom')");
+    println!("hermes eval throwing = {r}");
+    assert_eq!(r, -2000, "JS error should map to the JS_ERROR sentinel");
+  }
+}

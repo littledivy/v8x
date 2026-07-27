@@ -178,6 +178,76 @@ fn main() {
     // wasm-c-api in src/quickjs/wasm.rs.
     build_wamr(&manifest_dir);
   }
+
+  // --- Hermes backend spike (C2 feasibility proof) ---
+  // With `--features link_hermes`, compile the extern "C" C++ shim in
+  // src/hermes/ against a real libhermes and link it. The default
+  // `--features hermes` build stays pure-Rust stubs (no native dep).
+  if env::var_os("CARGO_FEATURE_LINK_HERMES").is_some() {
+    build_hermes(&manifest_dir);
+  }
+}
+
+/// Compile the extern "C" C++ shim (src/hermes/hermes_eval_shim.cpp) against
+/// the JSI + hermes headers and link a real libhermes. Modeled on the cc
+/// pattern used for the QuickJS/WAMR glue.
+///
+/// libhermes is obtained as a prebuilt macOS framework (facebook/hermes
+/// release `hermes-runtime-darwin`, extracted to vendor/hermes/). It ships a
+/// universal (arm64+x86_64) `hermes.framework` plus the JSI/hermes headers,
+/// so no LLVM-vendoring source build is needed. Override the location with
+/// `HERMES_LIB_DIR` (a dir containing `hermes.framework`) and
+/// `HERMES_INCLUDE_DIR` (a dir containing `jsi/` and `hermes/`).
+fn build_hermes(manifest_dir: &Path) {
+  let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+  if target_os != "macos" {
+    panic!(
+      "the Hermes spike backend (`--features link_hermes`) currently links a \
+       prebuilt macOS framework and is macOS-only; got target_os={target_os}"
+    );
+  }
+
+  let vendor = manifest_dir.join("vendor/hermes");
+  let lib_dir = env::var_os("HERMES_LIB_DIR")
+    .map(PathBuf::from)
+    .unwrap_or_else(|| vendor.clone());
+  let inc_dir = env::var_os("HERMES_INCLUDE_DIR")
+    .map(PathBuf::from)
+    .unwrap_or_else(|| vendor.join("include"));
+
+  let framework = lib_dir.join("hermes.framework");
+  assert!(
+    framework.exists(),
+    "hermes.framework not found at {} — set HERMES_LIB_DIR to a dir that \
+     contains it (see docs/hermes-spike/experiments/C2-hermes-ffi.md)",
+    framework.display()
+  );
+
+  let shim = manifest_dir.join("src/hermes/hermes_eval_shim.cpp");
+  println!("cargo:rerun-if-changed={}", shim.display());
+  println!("cargo:rerun-if-env-changed=HERMES_LIB_DIR");
+  println!("cargo:rerun-if-env-changed=HERMES_INCLUDE_DIR");
+
+  cc::Build::new()
+    .cpp(true)
+    .std("c++17")
+    .file(&shim)
+    .include(&inc_dir)
+    .compile("v8x_hermes_shim");
+
+  // Link the prebuilt macOS framework and the C++ runtime. The framework is a
+  // dylib, so also emit an rpath so the test/example binary finds it at run
+  // time without DYLD_FRAMEWORK_PATH.
+  println!(
+    "cargo:rustc-link-search=framework={}",
+    lib_dir.display()
+  );
+  println!("cargo:rustc-link-lib=framework=hermes");
+  println!("cargo:rustc-link-lib=c++");
+  println!(
+    "cargo:rustc-link-arg=-Wl,-rpath,{}",
+    lib_dir.display()
+  );
 }
 
 /// Init the pinned vendor submodules and apply our patch files on top.

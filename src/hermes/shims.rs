@@ -1481,3 +1481,36 @@ pub extern "C" fn v8_inspector__V8InspectorSession__dispatchProtocolMessage() { 
 pub extern "C" fn v8_inspector__V8InspectorSession__schedulePauseOnNextStatement() { unimplemented!("v8_inspector__V8InspectorSession__schedulePauseOnNextStatement") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8StackTrace__DELETE() { unimplemented!("v8_inspector__V8StackTrace__DELETE") }
+
+// --- C2 spike: 14 scope/platform/allocator symbols the generator missed.
+// The vendored rusty_v8 scope.rs/platform.rs decls use a form
+// gen_hermes_shims.sh did not capture. Referenced by the lib-test binary
+// (the plain rlib build dead-strips them). Stubbed no-arg like the rest.
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__ArrayBuffer__Allocator__CONVERT__std__unique_ptr() { unimplemented!("std__shared_ptr__v8__ArrayBuffer__Allocator__CONVERT__std__unique_ptr") }
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__ArrayBuffer__Allocator__get() { unimplemented!("std__shared_ptr__v8__ArrayBuffer__Allocator__get") }
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__ArrayBuffer__Allocator__reset() { unimplemented!("std__shared_ptr__v8__ArrayBuffer__Allocator__reset") }
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__Platform__CONVERT__std__unique_ptr() { unimplemented!("std__shared_ptr__v8__Platform__CONVERT__std__unique_ptr") }
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__Platform__COPY() { unimplemented!("std__shared_ptr__v8__Platform__COPY") }
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__Platform__get() { unimplemented!("std__shared_ptr__v8__Platform__get") }
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__Platform__reset() { unimplemented!("std__shared_ptr__v8__Platform__reset") }
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__AllowJavascriptExecutionScope__CONSTRUCT() { unimplemented!("v8__AllowJavascriptExecutionScope__CONSTRUCT") }
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__Enter() { unimplemented!("v8__Context__Enter") }
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__Exit() { unimplemented!("v8__Context__Exit") }
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__DisallowJavascriptExecutionScope__CONSTRUCT() { unimplemented!("v8__DisallowJavascriptExecutionScope__CONSTRUCT") }
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__EscapeSlot__reserve() { unimplemented!("v8__EscapeSlot__reserve") }
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__HandleScope__CONSTRUCT() { unimplemented!("v8__HandleScope__CONSTRUCT") }
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__CONSTRUCT() { unimplemented!("v8__TryCatch__CONSTRUCT") }

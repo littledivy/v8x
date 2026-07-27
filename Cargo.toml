@@ -68,11 +68,15 @@ path = "src/lib.rs"
 default = ["engine_jsc", "vendor_jsc"]
 engine_jsc = []
 engine_quickjs = []
-# Hermes backend spike: scaffold only. `engine_hermes` builds a pure-Rust
-# stub backend (every v8__*/cppgc__* symbol defined as an unimplemented!()
-# stub) so the crate compiles and links with zero Hermes dependency. Linking
-# the real Hermes static library is a separate, later feature (`link_hermes`,
-# not yet wired into build.rs).
+# Hermes backend spike. `engine_hermes` alone builds a pure-Rust stub backend
+# (every v8__*/cppgc__* symbol defined as an unimplemented!() stub) so the
+# crate compiles and links with zero Hermes dependency. Adding `link_hermes`
+# compiles the extern "C" C++ shim (src/hermes/hermes_eval_shim.cpp) against a
+# real libhermes and links it (macOS only; prebuilt framework in
+# vendor/hermes/, override with HERMES_LIB_DIR/HERMES_INCLUDE_DIR). This is the
+# C2 feasibility proof that Hermes' C++-only JSI can be reached from Rust
+# through an extern "C" boundary. See docs/hermes-spike/experiments/
+# C2-hermes-ffi.md.
 engine_hermes = []
 link_hermes = []
 # Short aliases (README-facing).
