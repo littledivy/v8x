@@ -24,7 +24,7 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
       hermes backend: v8x Rust surface (Isolate/HandleScope/Context/String/
       Script) -> our v8__* -> libhermes evaluateJavaScript -> "hello world" back
       in Rust (docs/hermes-spike/experiments/C3-hermes-helloworld.md).
-- [ ] C4 de-risk OBJECT IDENTITY (deepest blocker) -> then hill-climb rusty_v8
+- [x] C4 SOLVED object identity (strictEquals + hidden-symbol-id hash); 4 hermes tests pass
 - [ ] C5 AOT E5: QuickJS bytecode-boot vs source (parse-cost)
 - [x] C6 AOT E6: REAL QuickJS heap snapshot WORKS (but no startup speedup - see log)
 - [ ] C7 AOT E7: Static Hermes native AOT on real bootstrap chunk (push past 'untyped=no win')
@@ -33,6 +33,26 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle C4 - Hermes object identity SOLVED (agent: c4) DONE - deepest blocker cleared
+Both identity-sensitive parts of the V8 C-ABI reroute through JSI primitives:
+- v8__Value__StrictEquals/SameValue -> jsi::Value::strictEquals (shim v8x_hermes_strict_equals).
+- v8__Object__GetIdentityHash -> lazily attach a HIDDEN non-enumerable Symbol-keyed prop (real JS
+  Symbol + Object.defineProperty; no JSI-native symbol-prop API) holding a monotonic id. VERIFIED
+  stable: same object via 2 independent slots -> hash 1 & 1; different object -> 2. Invisible to
+  Object.keys/JSON/for-in (visible to getOwnPropertySymbols = correct JS, enumerable:false).
+- 4 hermes tests pass; quickjs + stub-hermes still clean. Bonus fixes: v8__Value__IsObject/ToObject,
+  a process-wide init_v8_once shared across hermes test modules (V8::initialize gates one global state
+  machine; a 2nd module's private Once panicked).
+Residual risks (documented, not hidden): (1) SameValue==StrictEquals, not exact for NaN/+0/-0 (JSI has
+no bit-level float inspection). (2) no canonicalization (interned slot per obj) built - likely
+unneeded since strictEquals+GetIdentityHash match V8's embedder identity contract, BUT unaudited
+whether any Rust-side rusty_v8 code hashes raw Local pointers directly (bypassing GetIdentityHash).
+(3) GetIdentityHash costs 1-2 real JS calls, unmeasured.
+SHARP EDGE: tools/gen_hermes_shims.sh drops hand-added cfg(not(link_hermes)) gates on re-run - do NOT
+blindly re-run it; hand-patch new stubs. NEEDS FIX before more shim regen.
+NEXT: AOT flourish (run Hermes HBC bytecode through the backend, parse-free) + widen Object/Array +
+register 4th backend in tests/harness/config.json (after auditing residual risk 2).
 
 ### Cycle C3 - Hermes backend runs hello world through v8 C-ABI (agent: c3, opus) DONE (headline)
 A v8x smoke test drives the VENDORED rusty_v8 Rust surface: Isolate -> scope! -> Context -> String ->
