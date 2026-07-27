@@ -11,6 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
+- [x] *** Hermes passes 10/16 rusty_v8 tests (real V8 test suite, on the ratchet) ***
 - [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities
@@ -39,6 +40,23 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 ## Cycle log
 (newest first)
 
+### Cycle C7 - first rusty_v8 tests GREEN on Hermes: 10/16 (agent: c7, opus) DONE
+Up from 0/16. All genuinely green, baseline --updated, --check holds, no regressions (12/12 smoke +
+quickjs clean). Passing: rv8_slots (7 of 9: context_slots, dropped_context_slots_on_kept_context,
+slots_auto_boxing, slots_general_1/2, slots_layer1/2), test_api_flags::set_flags_from_string,
+test_simple_external::test, test_single_threaded_default_platform.
+Implemented (core.rs + hermes_shim.cpp): PerformMicrotaskCheckpoint(noop), SetFlagsFromString(honors
+--use_strict via injected "use strict" directive), Context embedder-data slots (grow-on-demand Vec on
+IsoState), Global__New/NewWeak(non-firing, over-retains = leak-not-UAF)/Reset, External as a JSI
+HostObject carrying void* + Data__EQ via strictEquals, IsUndefined/IsExternal/Uint32Value.
+6 remaining (legit skips): entropy_source (no JSI entropy hook), custom_platform +
+platform_atomics_pump_message_loop (need SharedArrayBuffer async-wait + %-natives), external_deserialize
+(snapshot subsystem), slots::dropped_context_slots (needs real GC weak-callback reclaim - our weak
+never fires by design). rv8_test_api + rv8_test_cppgc still don't LINK (missing ICU trio
+icu_get/set_default_locale + udata_setCommonData_77, and TypedArray ctor family).
+HIGHEST-LEVERAGE NEXT: ICU trio + TypedArrays -> makes test_api LINK -> surfaces HUNDREDS of test_api
+outcomes (big potential jump). Then TryCatch/exception surfacing.
+
 ### Cycle C6 - Hermes surface widened + on the ratchet (agent: c6) DONE
 Now REAL through the backend: Object New/Get/Set/Has, Array New/Length + indexed get/set, Number/
 Integer/Boolean New+Value, Function::Call (jsi::Function::call/callWithThis), Undefined/Null, and the
@@ -56,37 +74,6 @@ rv8_test_cppgc) on missing ICU syms (icu_get/set_default_locale, udata_setCommon
 TypedArray ctor family for test_api.
 Next: hill-climb - implement slots/flags/platform/external/entropy to pass the FIRST rusty_v8 tests on
 Hermes, then --update the baseline. Plus AOT: measure HBC parse-free win on a REAL Deno bootstrap chunk.
-
-### Cycle C6 - widen the surface (Object/Array/Number/Function) + register the rusty_v8 baseline (agent: c6) DONE
-PART 1: Object (New/Get/Set/Has, keys coerced to string via JSI toString - no Symbol-key overload in
-JSI's C++ surface), Array (New/Length/indexed get-set via the existing Object__GetIndex/SetIndex),
-Number/Integer/Boolean (New/Value, Integer routed through Number - JSI has no separate int repr),
-Function::Call (jsi::Function::call/callWithThis, argv marshaled through a std::vector<jsi::Value>),
-plus v8__Undefined/Null (static jsi::Value factories, needed as Function::Call's receiver) and the
-Is{Array,Function,Number,Boolean,String} predicates. 6 new hermes_surface smoke tests (v8x Rust API,
-not raw shim calls) build {a:1,b:"x"}, a nested object, a [10,20,30] array summed via indexed gets, a
-number/integer/boolean roundtrip, add(19,23) via Function::Call, and cross-check every one against a
-real JS JSON.stringify/Array.isArray/.reduce run through Script::compile/run - not just our own
-read-back. 12/12 hermes tests pass (6 pre-existing + 6 new), stable parallel and --test-threads=1.
-PART 2: registered hermes as tests/harness/config.json's 4th backend (features "hermes,link_hermes",
-os "macos" - build.rs's build_hermes panics off-macOS). Empty baselines created. `run.mjs rusty_v8
-hermes` runs clean end to end; --check holds against the empty baseline. Honest baseline: 0 passing /
-16 total, 14 targets LINK (0 pass each - they exercise slots/flags/entropy/External/snapshot/platform
-machinery this cycle didn't touch), 2 don't link (rv8_test_api, rv8_test_cppgc) on genuinely-missing
-ICU symbols (icu_get_default_locale/icu_set_default_locale/udata_setCommonData_77) +, for test_api
-only, the 11 TypedArray-constructor symbols. Named, not chased tonight per the mission.
-BONUS FIX (gen_hermes_shims.sh): found and fixed the actual root cause behind the old "14 hand-appended
-symbols" note - (1) gate-preservation was entirely missing (blind regen dropped every hand-added
-`#[cfg(not(feature = "link_hermes"))]`, breaking the stub build's link step) - fixed by reading the
-CURRENTLY-gated set from the checked-in file first and reapplying it; (2) the symbol-scan regex matched
-mid-identifier (truncating e.g. std__shared_ptr__v8__Platform__CONVERT__... to a wrong shorter name) and
-only scanned vendor/rusty_v8/src/*.rs one level deep, silently missing src/scope/raw.rs entirely (the
-file that declares TryCatch/Allow/DisallowJavascriptExecutionScope CONSTRUCT). Both fixed at the regex/
-glob level; verified idempotent (two back-to-back runs on an unchanged tree produce a byte-identical
-shims.rs) and no regression on the stub (`--features hermes`) or quickjs builds.
-Full report: docs/hermes-spike/experiments/C6-hermes-surface.md.
-Next: ICU trio (smallest highest-leverage unlock - both nonlinking targets need only this), then
-TypedArrays to fully unlock test_api's link, then TryCatch/exception surfacing.
 
 ### Cycle C5 - Hermes HBC parse-free AOT through the backend (agent: c5) DONE - the 'AOT wonderful' number
 Same shim entry (v8x_hermes_eval_buffer) runs JS source OR hermesc-compiled HBC transparently (Hermes
@@ -148,40 +135,6 @@ hermes or quickjs.
 NEXT C4: de-risk OBJECT IDENTITY (the deepest C0 risk) - JSI hands out no raw ptr so two Locals to one
 object differ. Intern same object twice, show tagged ptrs differ, wire jsi::Runtime::strictEquals,
 demo a Set with one logical member. Gate before broad surface / rusty_v8 hill-climb.
-
-### Cycle C3 - Hermes backend runs hello world (agent: executor, opus) DONE => script runs THROUGH the backend
-A real script runs end to end through engine_hermes via the v8 C-ABI: a v8x smoke test drives the
-vendored rusty_v8 Rust surface (Isolate -> scope! -> Context -> String -> Script::compile -> run ->
-to_rust_string_lossy) and gets "hello world" back on real libhermes. Not the standalone C2 eval shim:
-the source is compiled+run by our v8__Script__Compile/Run and read back by the same String/Value path
-every real V8 string uses. Test: cargo test --no-default-features --features hermes,link_hermes --lib
-hermes:: -- --nocapture => "hermes backend ran: 'hello' + ' ' + 'world' = \"hello world\"", 3 passed.
-- Design: the arena lives on the C++ SIDE (src/hermes/hermes_shim.cpp). jsi::Value is move-only and
-  Runtime-bound, so unlike quickjs's Rust arena, the handle table is a std::vector<jsi::Value> inside a
-  RuntimeWrapper (rt declared first => destroyed last, C2 lifetime rule; one runtime/thread). A v8 Local
-  is a table index handed to Rust as the tagged pointer ((i<<1)|1) (non-null, slot 0 safe). HandleScope
-  = watermark; DESTRUCT truncates the vector. Thread-local current iso/ctx; one context per runtime so a
-  Context* handle is the isolate ptr reused.
-- Made REAL in src/hermes/core.rs (stubs gated cfg(not(link_hermes)) so stub build + no dup symbols):
-  Isolate New/Dispose/Enter/Exit/GetCurrent/Get+SetData/GetNumberOfDataSlots/GetCurrentContext;
-  HandleScope CONSTRUCT/DESTRUCT + EscapeSlot reserve/escape; Context New/Enter/Exit/Global; String
-  NewFromUtf8/NewFromOneByte/Length/Utf8Length/WriteUtf8_v2 + the ValueView quintet (the actual read
-  fast-path to_rust_string_lossy uses - traced empirically, NOT WriteUtf8); Script Compile/Run; Value
-  ToString; plus inert Platform/V8-init/ArrayBuffer-allocator/CreateParams lifecycle to bring an isolate
-  up (Hermes owns its own heap). Only hello-world-touched symbols were made real; rest stay stubs.
-- One real compromise: EscapeSlot__escape re-materializes the escaping value AS A STRING (reads utf8,
-  interns fresh string handle above the watermark) because the shim has no dup-slot primitive yet. Exact
-  for the hello-world string result; lossy for non-string Values. Clean fix = a handles_dup shim entry
-  (copy jsi::Value via its Runtime), one-function follow-up.
-- Harness note: use --lib hermes:: not the bare cargo test command - the bare one also builds the
-  vendored rv8_test_api target (hundreds of stubbed symbols, fails to link) and the crate's inline
-  array-buffer/sandbox #[test]s hit stubs and SIGABRT the shared lib-test process. Scoping is a harness
-  detail, not a backend limit.
-- No regressions: --features hermes (stub) and --features quickjs (default) both compile clean.
-Next: (1) de-risk object IDENTITY (JSI gives no raw ptr; two Locals to one object differ - reroute
-identity/hash/Map/Set/Global to strictEquals or intern one slot per object). This is the deepest
-unchanged risk and gates broad surface work. (2) OR widen surface: add handles_dup for exact escape,
-then Value Is/To, Object/Array, register the 4th backend in tests/harness/config.json + hill-climb.
 
 ### Cycle C2 - Hermes FFI PROOF (agent: c2, opus) DONE => GO CONFIRMED (breakthrough)
 Rust -> extern "C" C++ shim -> real libhermes JSI evaluateJavaScript("40 + 2") -> asNumber -> 42
@@ -301,43 +254,3 @@ Two overnight tracks:
   boot-from-bytecode vs boot-from-source for bootstrap-shaped JS; tests whether native-builtins+AOT
   makes snapshot unnecessary. Independent of Hermes.
 
-### Cycle 0 - AOT vs snapshot (agent: aot-snapshot) DONE
-CRUX: "AOT solves snapshot" is FALSE as stated. V8 snapshot = serialized INITIALIZED HEAP
-STATE (deserialize -> skip running bootstrap, ~2ms restore). AOT/HBC = CODE only (still RUNS
-bootstrap each boot, just no parse). They capture different things.
-Defensible reframing that DOES hold: native builtins (Hermes/QuickJS both init builtins in C/C++,
-not JS) + AOT-compiled runtime bootstrap can make snapshotting UNNECESSARY *iff* parse-free
-bootstrap EXECUTION fits the startup budget. So the real question is empirical: how much of Deno's
-snapshot win is parse (recoverable by AOT) vs heap-construction execution (not).
-- Static Hermes (shermes, native via LLVM): WIP; needs static types for native speed; on UNTYPED
-  Deno internals it falls back to dynamic path (no speedup) + typed-mode feature gaps. Not viable
-  for compiling the bootstrap.
-- Porffor: pre-alpha, ~50% Test262, no eval, cannot run Deno-sized JS. Research reference only,
-  NOT a v8x backend.
-High-value experiments (prioritized):
-  E5 (IN-REPO, do first): QuickJS bytecode-boot - run Deno bootstrap from precompiled qjs bytecode
-     vs source vs the abandoned snapshot-tape. If bytecode-boot ~ snapshot-restore, validates
-     dropping the tape hacks. Uses existing engine, no Hermes needed. Directly actionable.
-  E2: decompose Deno startup (snapshot on vs off) into parse vs execute fractions.
-  E1: HBC boot-cost microbenchmark (needs hermesc).
-Takeaway: Hermes is the credible AOT/mobile path but CHANGES architecture from "restore state"
-to "re-run bootstrap cheaply". The snapshot pain reframes as "make bootstrap exec cheap", which
-E5 can test in-repo tonight regardless of Hermes feasibility.
-
-### Cycle 0 - integration surface (agent: v8x-integration) DONE
-Plan to add `engine_hermes` is clear and mirrors quickjs:
-- Features: `engine_hermes`, `link_hermes`, alias `hermes = [engine_hermes, link_hermes]`.
-- `build.rs`: add `build_hermes` on the **build_wamr CMake pattern** (Hermes uses CMake+LLVM
-  libs), honor `HERMES_LIB_DIR` override, link `static=hermesvm` + `c++`; add a `setup_vendor`
-  `mode=="hermes"` branch + `CARGO_FEATURE_LINK_HERMES` dispatch with early return.
-- **Backend = clone `src/quickjs/`, NOT `src/jsc/`**: Hermes JSI `Value` is a 16-byte NaN-boxed
-  struct like QuickJS `JSValue`, so the arena-handle + one-refcount-per-slot model in
-  `src/quickjs/core.rs` fits; JSC's "pointer IS the value" trick does not.
-- Type map: Isolate=Box<IsoState> holding HermesRuntime*, Local=arena slot, HandleScope=root/unroot.
-- Surface: 722 v8__ + 26 cppgc__ stubs to LINK; **crdtp__ (55, inspector) is FREE** via engine-
-  independent `src/crdtp_shim.rs`. Hello-world path = 9 symbols (Isolate__New, Enter,
-  HandleScope__CONSTRUCT, Context__New, String__NewFromUtf8, Script__Compile, Script__Run, read).
-- Scaffold: `src/hermes/{mod,hermes_sys,core,shims,misc}.rs` + domain placeholders; auto-gen the
-  ~722 no-op shims (clone tools/gen_qjs_shims.sh). Register 4th backend in tests/harness/config.json
-  + CI matrix + empty baselines once it links.
-Open question gating scaffold: does Hermes expose a C API or only C++ JSI? (waiting on embed agent)
