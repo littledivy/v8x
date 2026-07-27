@@ -610,3 +610,256 @@ mod tests {
     assert_eq!(r, -2000, "JS error should map to the JS_ERROR sentinel");
   }
 }
+
+// C6: widen the surface past hello-world (C3) + identity (C4). These tests
+// drive the vendored rusty_v8 Rust surface end to end (Object/Array/
+// Number/Integer/Boolean/Function), the same way hello_world/hermes_identity
+// above do, so the proof is at the v8x API level, not the raw shim level. See
+// docs/hermes-spike/experiments/C6-hermes-surface.md.
+#[cfg(all(test, feature = "link_hermes"))]
+mod hermes_surface {
+  use crate as v8;
+  use super::init_v8_once;
+
+  fn eval<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    src: &str,
+  ) -> v8::Local<'s, v8::Value> {
+    let source = v8::String::new(scope, src).unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    script.run(scope).unwrap()
+  }
+
+  /// Build `{a: 1, b: "x"}` with `Object::new` + `Object::set`, read both
+  /// fields back with `Object::get`, and cross-check with a JS-side
+  /// `JSON.stringify` of the SAME object (proving the writes are visible to
+  /// real JS code, not just to our own read-back).
+  #[test]
+  fn hermes_object_new_get_set() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let obj = v8::Object::new(scope);
+    let key_a = v8::String::new(scope, "a").unwrap();
+    let key_b = v8::String::new(scope, "b").unwrap();
+    let val_1 = v8::Integer::new(scope, 1);
+    let val_x = v8::String::new(scope, "x").unwrap();
+
+    assert_eq!(obj.set(scope, key_a.into(), val_1.into()), Some(true));
+    assert_eq!(obj.set(scope, key_b.into(), val_x.into()), Some(true));
+
+    assert_eq!(obj.has(scope, key_a.into()), Some(true));
+    let missing = v8::String::new(scope, "c").unwrap();
+    assert_eq!(obj.has(scope, missing.into()), Some(false));
+
+    let read_a = obj.get(scope, key_a.into()).unwrap();
+    let read_b = obj.get(scope, key_b.into()).unwrap();
+    assert_eq!(read_a.to_rust_string_lossy(scope), "1");
+    assert_eq!(read_b.to_rust_string_lossy(scope), "x");
+
+    // Stash the object on the global object and confirm real JS sees the
+    // exact same writes (not just our own read-back path).
+    let global = context.global(scope);
+    let name = v8::String::new(scope, "c6_obj").unwrap();
+    global.set(scope, name.into(), obj.into());
+    let json = eval(scope, "JSON.stringify(c6_obj)").to_rust_string_lossy(scope);
+    println!(
+      "hermes_object_new_get_set: read a={:?} b={:?}, JSON.stringify(obj)={json}",
+      read_a.to_rust_string_lossy(scope),
+      read_b.to_rust_string_lossy(scope),
+    );
+    assert_eq!(json, r#"{"a":1,"b":"x"}"#);
+  }
+
+  /// Build `[10, 20, 30]` with `Array::new` + indexed `set_index`, read the
+  /// length back with `Array::length`, sum the elements via indexed
+  /// `get_index`, and cross-check with JS-side `Array.isArray` +
+  /// `.reduce(...)` on the SAME array.
+  #[test]
+  fn hermes_array_new_length_indexed_get_set() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let arr = v8::Array::new(scope, 3);
+    assert_eq!(arr.length(), 3);
+
+    let v10 = v8::Integer::new(scope, 10);
+    let v20 = v8::Integer::new(scope, 20);
+    let v30 = v8::Integer::new(scope, 30);
+    assert_eq!(arr.set_index(scope, 0, v10.into()), Some(true));
+    assert_eq!(arr.set_index(scope, 1, v20.into()), Some(true));
+    assert_eq!(arr.set_index(scope, 2, v30.into()), Some(true));
+
+    let mut sum: i64 = 0;
+    for i in 0..arr.length() {
+      let v = arr.get_index(scope, i).unwrap();
+      sum += v.to_rust_string_lossy(scope).parse::<i64>().unwrap();
+    }
+    println!(
+      "hermes_array_new_length_indexed_get_set: length={} sum={sum}",
+      arr.length()
+    );
+    assert_eq!(sum, 60, "10 + 20 + 30 via indexed Array gets");
+
+    let global = context.global(scope);
+    let name = v8::String::new(scope, "c6_arr").unwrap();
+    global.set(scope, name.into(), arr.into());
+    let js_is_array =
+      eval(scope, "String(Array.isArray(c6_arr))").to_rust_string_lossy(scope);
+    let js_sum = eval(scope, "String(c6_arr.reduce((a, b) => a + b, 0))")
+      .to_rust_string_lossy(scope);
+    println!(
+      "hermes_array_new_length_indexed_get_set: JS Array.isArray={js_is_array} \
+       JS reduce-sum={js_sum}"
+    );
+    assert_eq!(js_is_array, "true");
+    assert_eq!(js_sum, "60");
+  }
+
+  /// A nested object (`{outer: {inner: 42}}`), built purely through the v8x
+  /// Object surface, read back through two levels of `Object::get` AND
+  /// cross-checked by a real JS script that reads the same nested path.
+  #[test]
+  fn hermes_nested_object() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let inner = v8::Object::new(scope);
+    let key_inner_field = v8::String::new(scope, "inner").unwrap();
+    let val_42 = v8::Integer::new(scope, 42);
+    assert_eq!(
+      inner.set(scope, key_inner_field.into(), val_42.into()),
+      Some(true)
+    );
+
+    let outer = v8::Object::new(scope);
+    let key_outer_field = v8::String::new(scope, "outer").unwrap();
+    assert_eq!(
+      outer.set(scope, key_outer_field.into(), inner.into()),
+      Some(true)
+    );
+
+    let read_outer = outer.get(scope, key_outer_field.into()).unwrap();
+    assert!(read_outer.is_object(), "outer.outer should read back as an object");
+    let read_outer_obj = read_outer.to_object(scope).unwrap();
+    let read_inner = read_outer_obj.get(scope, key_inner_field.into()).unwrap();
+    let read_value = read_inner.to_rust_string_lossy(scope);
+    println!("hermes_nested_object: outer.inner (read via two Object::get) = {read_value}");
+    assert_eq!(read_value, "42");
+
+    let global = context.global(scope);
+    let name = v8::String::new(scope, "c6_nested").unwrap();
+    global.set(scope, name.into(), outer.into());
+    let json = eval(scope, "JSON.stringify(c6_nested)").to_rust_string_lossy(scope);
+    println!("hermes_nested_object: JSON.stringify(nested) = {json}");
+    assert_eq!(json, r#"{"outer":{"inner":42}}"#);
+  }
+
+  /// `Number`/`Integer`/`Boolean` construction and read-back, plus
+  /// `Value::Is*` predicates, exercised end to end.
+  #[test]
+  fn hermes_number_integer_boolean_roundtrip() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let n = v8::Number::new(scope, 3.5);
+    assert_eq!(n.value(), 3.5);
+    let i = v8::Integer::new(scope, -7);
+    assert_eq!(i.value(), -7);
+    let b_true = v8::Boolean::new(scope, true);
+    let b_false = v8::Boolean::new(scope, false);
+
+    let n_val: v8::Local<v8::Value> = n.into();
+    let b_val: v8::Local<v8::Value> = b_true.into();
+    assert!(n_val.is_number());
+    assert!(!n_val.is_boolean());
+    assert!(b_val.is_boolean());
+    assert!(!b_val.is_number());
+    assert!(b_true.boolean_value(scope));
+    assert!(!b_false.boolean_value(scope));
+
+    println!(
+      "hermes_number_integer_boolean_roundtrip: n={} i={} b_true={} b_false={}",
+      n.value(),
+      i.value(),
+      b_true.boolean_value(scope),
+      b_false.boolean_value(scope),
+    );
+  }
+
+  /// Calling a JS function value via `Function::call`: define `add(a, b)` in
+  /// JS, read it back as a `Local<Function>`, and call it from Rust with
+  /// `Integer` arguments built on the Rust side.
+  #[test]
+  fn hermes_function_call() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    eval(scope, "globalThis.add = function(a, b) { return a + b; };");
+    let add_val = eval(scope, "globalThis.add");
+    assert!(add_val.is_function(), "globalThis.add should read back as a function");
+    let add_fn: v8::Local<v8::Function> = add_val.cast();
+
+    let a = v8::Integer::new(scope, 19);
+    let b = v8::Integer::new(scope, 23);
+    let undef = v8::undefined(scope);
+    let result = add_fn
+      .call(scope, undef.into(), &[a.into(), b.into()])
+      .unwrap();
+    let result_str = result.to_rust_string_lossy(scope);
+    println!("hermes_function_call: add(19, 23) via Function::call = {result_str}");
+    assert_eq!(result_str, "42");
+  }
+
+  /// `JSON.stringify` run as a script that reads back a value built entirely
+  /// through the v8x Object/Array/primitive surface (not constructed as a
+  /// JS-source literal), proving the C++-side writes are indistinguishable
+  /// from a real JS-authored object to Hermes's own JSON implementation.
+  #[test]
+  fn hermes_json_stringify_of_native_built_value() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let obj = v8::Object::new(scope);
+    let key_list = v8::String::new(scope, "list").unwrap();
+    let key_ok = v8::String::new(scope, "ok").unwrap();
+
+    let arr = v8::Array::new(scope, 2);
+    let e0 = v8::Integer::new(scope, 1);
+    let e1 = v8::Integer::new(scope, 2);
+    arr.set_index(scope, 0, e0.into());
+    arr.set_index(scope, 1, e1.into());
+
+    let ok = v8::Boolean::new(scope, true);
+
+    obj.set(scope, key_list.into(), arr.into());
+    obj.set(scope, key_ok.into(), ok.into());
+
+    let global = context.global(scope);
+    let name = v8::String::new(scope, "c6_json_target").unwrap();
+    global.set(scope, name.into(), obj.into());
+
+    let json = eval(scope, "JSON.stringify(c6_json_target)")
+      .to_rust_string_lossy(scope);
+    println!("hermes_json_stringify_of_native_built_value: {json}");
+    assert_eq!(json, r#"{"list":[1,2],"ok":true}"#);
+  }
+}

@@ -487,4 +487,419 @@ v8x_hermes_slot v8x_hermes_eval_buffer(void *rtw, const uint8_t *data,
   }
 }
 
+// ---- C6: Object / Array / Number / Integer / Boolean / Function ----------
+//
+// Widens the surface past the C3 hello-world path + C4 identity de-risking:
+// object/array/primitive construction and read/write, and calling a JS
+// function value. Every entry point follows the same shape as the ones
+// above: operate on handle-table slots, wrap the JSI call in the C2
+// catch-all, and return a sentinel (-1 slot, or an out-param `ok`/`*_or_err`
+// int) instead of ever letting a C++ exception (including jsi::JSError)
+// unwind across the extern "C" boundary.
+//
+// Object/Array property KEYS: the v8 C-ABI's Object::Get/Set/Has take a
+// generic `Value` key (any JS value, not just a string), but JSI's
+// Object::getProperty/setProperty/hasProperty are string- (or PropNameID-)
+// keyed only, with no generic-Value-key overload in the C++ surface. So the
+// key Value is coerced to a JS string via `Value::toString`, matching how
+// v8 itself ultimately coerces non-Name property keys to strings (ordinary
+// property access, not the Symbol-keyed path C4 uses internally via raw JS).
+
+namespace {
+
+// Helper: safely read `handles[slot]` by const reference, or nullptr if out
+// of range. Never throws.
+const jsi::Value *slot_ref(RuntimeWrapper *w, v8x_hermes_slot slot) {
+  if (slot < 0 || static_cast<size_t>(slot) >= w->handles.size()) {
+    return nullptr;
+  }
+  return &w->handles[static_cast<size_t>(slot)];
+}
+
+} // namespace
+
+// jsi::Value::undefined() / jsi::Value::null(): static factories, no Runtime
+// call needed. Pushed straight into the handle table. Returns a slot, or the
+// null slot on error (out-of-memory in `handles.emplace_back`, in practice).
+v8x_hermes_slot v8x_hermes_undefined(void *rtw) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    return w->push(jsi::Value::undefined());
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+v8x_hermes_slot v8x_hermes_null(void *rtw) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    return w->push(jsi::Value::null());
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// jsi::Object() (empty object). Returns a slot, or the null slot on error.
+v8x_hermes_slot v8x_hermes_object_new(void *rtw) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    jsi::Object o(w->runtime());
+    jsi::Value v(w->runtime(), o);
+    return w->push(std::move(v));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// obj[key] where key is coerced to a JS string. Returns a slot with the
+// property's value (undefined if absent), or the null slot on error (obj is
+// not an object, or a bad slot).
+v8x_hermes_slot v8x_hermes_object_get(void *rtw, v8x_hermes_slot obj_slot,
+                                      v8x_hermes_slot key_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  const jsi::Value *kv = slot_ref(w, key_slot);
+  if (ov == nullptr || kv == nullptr || !ov->isObject()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    jsi::String key = kv->toString(w->runtime());
+    jsi::Value result =
+        ov->getObject(w->runtime()).getProperty(w->runtime(), key);
+    return w->push(std::move(result));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// obj[key] = value, key coerced to a JS string. Returns 1 on success, 0 on
+// error (obj is not an object, bad slot, or the set threw).
+int v8x_hermes_object_set(void *rtw, v8x_hermes_slot obj_slot,
+                          v8x_hermes_slot key_slot,
+                          v8x_hermes_slot value_slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  const jsi::Value *kv = slot_ref(w, key_slot);
+  const jsi::Value *vv = slot_ref(w, value_slot);
+  if (ov == nullptr || kv == nullptr || vv == nullptr || !ov->isObject()) {
+    return 0;
+  }
+  try {
+    jsi::String key = kv->toString(w->runtime());
+    // getObject() returns a temporary Object handle; setProperty mutates the
+    // underlying JS heap object it points at, which is what we want (the
+    // handle itself is not stored anywhere further).
+    jsi::Object obj = ov->getObject(w->runtime());
+    obj.setProperty(w->runtime(), key, jsi::Value(w->runtime(), *vv));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// key in obj, key coerced to a JS string. Returns 1 (true), 0 (false), or -1
+// on error (obj is not an object, or a bad slot).
+int v8x_hermes_object_has(void *rtw, v8x_hermes_slot obj_slot,
+                          v8x_hermes_slot key_slot) {
+  if (rtw == nullptr) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  const jsi::Value *kv = slot_ref(w, key_slot);
+  if (ov == nullptr || kv == nullptr || !ov->isObject()) {
+    return -1;
+  }
+  try {
+    jsi::String key = kv->toString(w->runtime());
+    bool has = ov->getObject(w->runtime()).hasProperty(w->runtime(), key);
+    return has ? 1 : 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+// jsi::Array(runtime, length). Returns a slot, or the null slot on error.
+v8x_hermes_slot v8x_hermes_array_new(void *rtw, int64_t length) {
+  if (rtw == nullptr || length < 0) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    jsi::Array a(w->runtime(), static_cast<size_t>(length));
+    jsi::Value v(w->runtime(), a);
+    return w->push(std::move(v));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// Array::length via runtime.size(Array). Returns the length, or -1 on error
+// (not an array, or a bad slot).
+int64_t v8x_hermes_array_length(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return -1;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    if (!obj.isArray(w->runtime())) {
+      return -1;
+    }
+    jsi::Array arr = obj.asArray(w->runtime());
+    return static_cast<int64_t>(arr.size(w->runtime()));
+  } catch (...) {
+    return -1;
+  }
+}
+
+// array[index]. Returns a slot with the element, or the null slot on error
+// (not an array, out of range per JSI, or a bad slot).
+v8x_hermes_slot v8x_hermes_array_get_index(void *rtw, v8x_hermes_slot slot,
+                                           uint32_t index) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    if (!obj.isArray(w->runtime())) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Array arr = obj.asArray(w->runtime());
+    jsi::Value result = arr.getValueAtIndex(w->runtime(), index);
+    return w->push(std::move(result));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// array[index] = value. Returns 1 on success, 0 on error (not an array, or a
+// bad slot).
+int v8x_hermes_array_set_index(void *rtw, v8x_hermes_slot slot,
+                               uint32_t index, v8x_hermes_slot value_slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  const jsi::Value *vv = slot_ref(w, value_slot);
+  if (v == nullptr || vv == nullptr || !v->isObject()) {
+    return 0;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    if (!obj.isArray(w->runtime())) {
+      return 0;
+    }
+    jsi::Array arr = obj.asArray(w->runtime());
+    arr.setValueAtIndex(w->runtime(), index, jsi::Value(w->runtime(), *vv));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// jsi::Value(double). Returns a slot, or the null slot on error.
+v8x_hermes_slot v8x_hermes_number_new(void *rtw, double value) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    jsi::Value v(value);
+    return w->push(std::move(v));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// Value::getNumber(). Writes the number into *out and returns 1 on success,
+// 0 on error (not a number, or a bad slot).
+int v8x_hermes_number_value(void *rtw, v8x_hermes_slot slot, double *out) {
+  if (rtw == nullptr || out == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isNumber()) {
+    return 0;
+  }
+  try {
+    *out = v->getNumber();
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// jsi::Value(bool). Returns a slot, or the null slot on error.
+v8x_hermes_slot v8x_hermes_boolean_new(void *rtw, int value) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    jsi::Value v(value != 0);
+    return w->push(std::move(v));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// Value::getBool(). Returns 1 (true), 0 (false), or -1 on error (not a
+// bool, or a bad slot).
+int v8x_hermes_boolean_value(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isBool()) {
+    return -1;
+  }
+  try {
+    return v->getBool() ? 1 : 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+// Function::call(runtime, recv, args, argc). `recv_slot` may be the null
+// slot (Rust passes NULL_SLOT for a null/undefined receiver), in which case
+// JSI's Function::call(runtime, args, count) (undefined `this`) is used
+// instead of Function::callWithThis. Returns a slot with the call's result,
+// or the null slot on error (fn_slot is not a function, a bad slot, or the
+// call threw a jsi::JSError / any other C++ exception).
+v8x_hermes_slot v8x_hermes_function_call(void *rtw, v8x_hermes_slot fn_slot,
+                                         v8x_hermes_slot recv_slot,
+                                         const v8x_hermes_slot *arg_slots,
+                                         size_t argc, int *ok) {
+  if (ok != nullptr) {
+    *ok = 0;
+  }
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *fv = slot_ref(w, fn_slot);
+  if (fv == nullptr || !fv->isObject()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    jsi::Object fnObj = fv->getObject(w->runtime());
+    if (!fnObj.isFunction(w->runtime())) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Function fn = fnObj.getFunction(w->runtime());
+
+    std::vector<jsi::Value> args;
+    args.reserve(argc);
+    for (size_t i = 0; i < argc; ++i) {
+      const jsi::Value *av =
+          arg_slots != nullptr ? slot_ref(w, arg_slots[i]) : nullptr;
+      if (av == nullptr) {
+        return V8X_HERMES_NULL_SLOT;
+      }
+      args.emplace_back(w->runtime(), *av);
+    }
+
+    jsi::Value result;
+    const jsi::Value *rv = slot_ref(w, recv_slot);
+    const jsi::Value *argv = args.data();
+    if (rv != nullptr && rv->isObject()) {
+      jsi::Object recv = rv->getObject(w->runtime());
+      result = fn.callWithThis(w->runtime(), recv, argv,
+                                static_cast<size_t>(argc));
+    } else {
+      result = fn.call(w->runtime(), argv, static_cast<size_t>(argc));
+    }
+    v8x_hermes_slot out = w->push(std::move(result));
+    if (ok != nullptr) {
+      *ok = 1;
+    }
+    return out;
+  } catch (const jsi::JSError &) {
+    // Destroyed here, while `w->rt` is still alive (the C2 lifetime rule).
+    return V8X_HERMES_NULL_SLOT;
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// ---- Value type predicates needed by the widened surface ------------------
+
+int v8x_hermes_value_is_array(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return 0;
+  }
+  try {
+    return v->getObject(w->runtime()).isArray(w->runtime()) ? 1 : 0;
+  } catch (...) {
+    return 0;
+  }
+}
+
+int v8x_hermes_value_is_function(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return 0;
+  }
+  try {
+    return v->getObject(w->runtime()).isFunction(w->runtime()) ? 1 : 0;
+  } catch (...) {
+    return 0;
+  }
+}
+
+int v8x_hermes_value_is_number(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  return (v != nullptr && v->isNumber()) ? 1 : 0;
+}
+
+int v8x_hermes_value_is_boolean(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  return (v != nullptr && v->isBool()) ? 1 : 0;
+}
+
 } // extern "C"

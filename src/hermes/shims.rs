@@ -8,31 +8,27 @@
 #![allow(non_snake_case)]
 
 #[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__ArrayBuffer__Allocator__use_count() { unimplemented!("std__shared_ptr__v8__ArrayBuffer__Allocator__use_count") }
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__BackingStore__CONVERT__std__unique_ptr() { unimplemented!("std__shared_ptr__v8__BackingStore__CONVERT__std__unique_ptr") }
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__BackingStore__COPY() { unimplemented!("std__shared_ptr__v8__BackingStore__COPY") }
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__BackingStore__get() { unimplemented!("std__shared_ptr__v8__BackingStore__get") }
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__BackingStore__reset() { unimplemented!("std__shared_ptr__v8__BackingStore__reset") }
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__BackingStore__use_count() { unimplemented!("std__shared_ptr__v8__BackingStore__use_count") }
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__Platform__use_count() { unimplemented!("std__shared_ptr__v8__Platform__use_count") }
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__AllowJavascriptExecutionScope__CONSTRUCT() { unimplemented!("v8__AllowJavascriptExecutionScope__CONSTRUCT") }
+#[unsafe(no_mangle)]
 pub extern "C" fn v8__AllowJavascriptExecutionScope__DESTRUCT() { unimplemented!("v8__AllowJavascriptExecutionScope__DESTRUCT") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Array__Length() { unimplemented!("v8__Array__Length") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Array__New() { unimplemented!("v8__Array__New") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Array__New_with_elements() { unimplemented!("v8__Array__New_with_elements") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBuffer__Allocator__CONVERT__std__unique_ptr() { unimplemented!("v8__ArrayBuffer__Allocator__CONVERT__std__unique_ptr") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBuffer__Allocator__COPY() { unimplemented!("v8__ArrayBuffer__Allocator__COPY") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBuffer__Allocator__DELETE() { unimplemented!("v8__ArrayBuffer__Allocator__DELETE") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBuffer__Allocator__get() { unimplemented!("v8__ArrayBuffer__Allocator__get") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBuffer__Allocator__NewDefaultAllocator() { unimplemented!("v8__ArrayBuffer__Allocator__NewDefaultAllocator") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__ArrayBuffer__Allocator__NewRustAllocator() { unimplemented!("v8__ArrayBuffer__Allocator__NewRustAllocator") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBuffer__Allocator__reset() { unimplemented!("v8__ArrayBuffer__Allocator__reset") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBuffer__Allocator__use_count() { unimplemented!("v8__ArrayBuffer__Allocator__use_count") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ArrayBuffer__ByteLength() { unimplemented!("v8__ArrayBuffer__ByteLength") }
 #[unsafe(no_mangle)]
@@ -72,23 +68,13 @@ pub extern "C" fn v8__ArrayBufferView__HasBuffer() { unimplemented!("v8__ArrayBu
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__BackingStore__ByteLength() { unimplemented!("v8__BackingStore__ByteLength") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__BackingStore__CONVERT__std__unique_ptr() { unimplemented!("v8__BackingStore__CONVERT__std__unique_ptr") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__BackingStore__COPY() { unimplemented!("v8__BackingStore__COPY") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__BackingStore__Data() { unimplemented!("v8__BackingStore__Data") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__BackingStore__DELETE() { unimplemented!("v8__BackingStore__DELETE") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__BackingStore__get() { unimplemented!("v8__BackingStore__get") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__BackingStore__IsResizableByUserJavaScript() { unimplemented!("v8__BackingStore__IsResizableByUserJavaScript") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__BackingStore__IsShared() { unimplemented!("v8__BackingStore__IsShared") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__BackingStore__reset() { unimplemented!("v8__BackingStore__reset") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__BackingStore__use_count() { unimplemented!("v8__BackingStore__use_count") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__BigInt__Int64Value() { unimplemented!("v8__BigInt__Int64Value") }
 #[unsafe(no_mangle)]
@@ -103,8 +89,6 @@ pub extern "C" fn v8__BigInt__ToWordsArray() { unimplemented!("v8__BigInt__ToWor
 pub extern "C" fn v8__BigInt__Uint64Value() { unimplemented!("v8__BigInt__Uint64Value") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__BigInt__WordCount() { unimplemented!("v8__BigInt__WordCount") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Boolean__New() { unimplemented!("v8__Boolean__New") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__BUILD_NUMBER() { unimplemented!("v8__BUILD_NUMBER") }
 #[unsafe(no_mangle)]
@@ -137,12 +121,6 @@ pub extern "C" fn v8__Context__GetMicrotaskQueue() { unimplemented!("v8__Context
 pub extern "C" fn v8__Context__GetNumberOfEmbedderDataFields() { unimplemented!("v8__Context__GetNumberOfEmbedderDataFields") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetSecurityToken() { unimplemented!("v8__Context__GetSecurityToken") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Context__Global() { unimplemented!("v8__Context__Global") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Context__New() { unimplemented!("v8__Context__New") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__SetAlignedPointerInEmbedderData() { unimplemented!("v8__Context__SetAlignedPointerInEmbedderData") }
 #[unsafe(no_mangle)]
@@ -208,6 +186,8 @@ pub extern "C" fn v8__Date__New() { unimplemented!("v8__Date__New") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Date__ValueOf() { unimplemented!("v8__Date__ValueOf") }
 #[unsafe(no_mangle)]
+pub extern "C" fn v8__DisallowJavascriptExecutionScope__CONSTRUCT() { unimplemented!("v8__DisallowJavascriptExecutionScope__CONSTRUCT") }
+#[unsafe(no_mangle)]
 pub extern "C" fn v8__DisallowJavascriptExecutionScope__DESTRUCT() { unimplemented!("v8__DisallowJavascriptExecutionScope__DESTRUCT") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Eternal__Clear() { unimplemented!("v8__Eternal__Clear") }
@@ -253,8 +233,6 @@ pub extern "C" fn v8__FastOneByteString() { unimplemented!("v8__FastOneByteStrin
 pub extern "C" fn v8__FixedArray__Get() { unimplemented!("v8__FixedArray__Get") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FixedArray__Length() { unimplemented!("v8__FixedArray__Length") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Function__Call() { unimplemented!("v8__Function__Call") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__CreateCodeCache() { unimplemented!("v8__Function__CreateCodeCache") }
 #[unsafe(no_mangle)]
@@ -319,9 +297,6 @@ pub extern "C" fn v8__Global__New() { unimplemented!("v8__Global__New") }
 pub extern "C" fn v8__Global__NewWeak() { unimplemented!("v8__Global__NewWeak") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Global__Reset() { unimplemented!("v8__Global__Reset") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__HandleScope__DESTRUCT() { unimplemented!("v8__HandleScope__DESTRUCT") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__HeapCodeStatistics() { unimplemented!("v8__HeapCodeStatistics") }
 #[unsafe(no_mangle)]
@@ -336,12 +311,6 @@ pub extern "C" fn v8__IdleTask__DELETE() { unimplemented!("v8__IdleTask__DELETE"
 pub extern "C" fn v8__IdleTask__Run() { unimplemented!("v8__IdleTask__Run") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Int32__Value() { unimplemented!("v8__Int32__Value") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Integer__New() { unimplemented!("v8__Integer__New") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Integer__NewFromUnsigned() { unimplemented!("v8__Integer__NewFromUnsigned") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Integer__Value() { unimplemented!("v8__Integer__Value") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Intercepted() { unimplemented!("v8__Intercepted") }
 #[unsafe(no_mangle)]
@@ -360,38 +329,14 @@ pub extern "C" fn v8__Isolate__AdjustAmountOfExternalAllocatedMemory() { unimple
 pub extern "C" fn v8__Isolate__CancelTerminateExecution() { unimplemented!("v8__Isolate__CancelTerminateExecution") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__ClearKeptObjects() { unimplemented!("v8__Isolate__ClearKeptObjects") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__CreateParams__CONSTRUCT() { unimplemented!("v8__Isolate__CreateParams__CONSTRUCT") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__CreateParams__SIZEOF() { unimplemented!("v8__Isolate__CreateParams__SIZEOF") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__DateTimeConfigurationChangeNotification() { unimplemented!("v8__Isolate__DateTimeConfigurationChangeNotification") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__Dispose() { unimplemented!("v8__Isolate__Dispose") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__EnqueueMicrotask() { unimplemented!("v8__Isolate__EnqueueMicrotask") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__Enter() { unimplemented!("v8__Isolate__Enter") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__Exit() { unimplemented!("v8__Isolate__Exit") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetCppHeap() { unimplemented!("v8__Isolate__GetCppHeap") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__GetCurrent() { unimplemented!("v8__Isolate__GetCurrent") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__GetCurrentContext() { unimplemented!("v8__Isolate__GetCurrentContext") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetCurrentHostDefinedOptions() { unimplemented!("v8__Isolate__GetCurrentHostDefinedOptions") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__GetData() { unimplemented!("v8__Isolate__GetData") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetDataFromSnapshotOnce() { unimplemented!("v8__Isolate__GetDataFromSnapshotOnce") }
 #[unsafe(no_mangle)]
@@ -404,9 +349,6 @@ pub extern "C" fn v8__Isolate__GetHeapSpaceStatistics() { unimplemented!("v8__Is
 pub extern "C" fn v8__Isolate__GetHeapStatistics() { unimplemented!("v8__Isolate__GetHeapStatistics") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetMicrotasksPolicy() { unimplemented!("v8__Isolate__GetMicrotasksPolicy") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__GetNumberOfDataSlots() { unimplemented!("v8__Isolate__GetNumberOfDataSlots") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__HasPendingBackgroundTasks() { unimplemented!("v8__Isolate__HasPendingBackgroundTasks") }
 #[unsafe(no_mangle)]
@@ -415,9 +357,6 @@ pub extern "C" fn v8__Isolate__IsExecutionTerminating() { unimplemented!("v8__Is
 pub extern "C" fn v8__Isolate__LowMemoryNotification() { unimplemented!("v8__Isolate__LowMemoryNotification") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__MemoryPressureNotification() { unimplemented!("v8__Isolate__MemoryPressureNotification") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__New() { unimplemented!("v8__Isolate__New") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__NumberOfHeapSpaces() { unimplemented!("v8__Isolate__NumberOfHeapSpaces") }
 #[unsafe(no_mangle)]
@@ -438,9 +377,6 @@ pub extern "C" fn v8__Isolate__SetAllowAtomicsWait() { unimplemented!("v8__Isola
 pub extern "C" fn v8__Isolate__SetAllowWasmCodeGenerationCallback() { unimplemented!("v8__Isolate__SetAllowWasmCodeGenerationCallback") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetCaptureStackTraceForUncaughtExceptions() { unimplemented!("v8__Isolate__SetCaptureStackTraceForUncaughtExceptions") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__SetData() { unimplemented!("v8__Isolate__SetData") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__SetHostCreateShadowRealmContextCallback() { unimplemented!("v8__Isolate__SetHostCreateShadowRealmContextCallback") }
 #[unsafe(no_mangle)]
@@ -594,12 +530,6 @@ pub extern "C" fn v8__ModuleRequest__GetSpecifier() { unimplemented!("v8__Module
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Name__GetIdentityHash() { unimplemented!("v8__Name__GetIdentityHash") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Null() { unimplemented!("v8__Null") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Number__New() { unimplemented!("v8__Number__New") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Number__Value() { unimplemented!("v8__Number__Value") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__CreateDataProperty() { unimplemented!("v8__Object__CreateDataProperty") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__DefineOwnProperty() { unimplemented!("v8__Object__DefineOwnProperty") }
@@ -612,18 +542,11 @@ pub extern "C" fn v8__Object__DeleteIndex() { unimplemented!("v8__Object__Delete
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__DeletePrivate() { unimplemented!("v8__Object__DeletePrivate") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__Get() { unimplemented!("v8__Object__Get") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetAlignedPointerFromInternalField() { unimplemented!("v8__Object__GetAlignedPointerFromInternalField") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetConstructorName() { unimplemented!("v8__Object__GetConstructorName") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetCreationContext() { unimplemented!("v8__Object__GetCreationContext") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__GetIdentityHash() { unimplemented!("v8__Object__GetIdentityHash") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__GetIndex() { unimplemented!("v8__Object__GetIndex") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetInternalField() { unimplemented!("v8__Object__GetInternalField") }
 #[unsafe(no_mangle)]
@@ -645,8 +568,6 @@ pub extern "C" fn v8__Object__GetRealNamedPropertyAttributes() { unimplemented!(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetWithReceiver() { unimplemented!("v8__Object__GetWithReceiver") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__Has() { unimplemented!("v8__Object__Has") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__HasIndex() { unimplemented!("v8__Object__HasIndex") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__HasOwnProperty() { unimplemented!("v8__Object__HasOwnProperty") }
@@ -659,19 +580,13 @@ pub extern "C" fn v8__Object__InternalFieldCount() { unimplemented!("v8__Object_
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__IsApiWrapper() { unimplemented!("v8__Object__IsApiWrapper") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__New() { unimplemented!("v8__Object__New") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__New__with_prototype_and_properties() { unimplemented!("v8__Object__New__with_prototype_and_properties") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__PreviewEntries() { unimplemented!("v8__Object__PreviewEntries") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__Set() { unimplemented!("v8__Object__Set") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetAccessor() { unimplemented!("v8__Object__SetAccessor") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetAlignedPointerInInternalField() { unimplemented!("v8__Object__SetAlignedPointerInInternalField") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__SetIndex() { unimplemented!("v8__Object__SetIndex") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetIntegrityLevel() { unimplemented!("v8__Object__SetIntegrityLevel") }
 #[unsafe(no_mangle)]
@@ -709,33 +624,17 @@ pub extern "C" fn v8__ObjectTemplate__SetNativeDataProperty() { unimplemented!("
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__PATCH_LEVEL() { unimplemented!("v8__PATCH_LEVEL") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__CONVERT__std__unique_ptr() { unimplemented!("v8__Platform__CONVERT__std__unique_ptr") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__COPY() { unimplemented!("v8__Platform__COPY") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__DELETE() { unimplemented!("v8__Platform__DELETE") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__get() { unimplemented!("v8__Platform__get") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__NewCustomPlatform() { unimplemented!("v8__Platform__NewCustomPlatform") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__NewDefaultPlatform() { unimplemented!("v8__Platform__NewDefaultPlatform") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__NewSingleThreadedDefaultPlatform() { unimplemented!("v8__Platform__NewSingleThreadedDefaultPlatform") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__NewUnprotectedDefaultPlatform() { unimplemented!("v8__Platform__NewUnprotectedDefaultPlatform") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__NotifyIsolateShutdown() { unimplemented!("v8__Platform__NotifyIsolateShutdown") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__PumpMessageLoop() { unimplemented!("v8__Platform__PumpMessageLoop") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__reset() { unimplemented!("v8__Platform__reset") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__RunIdleTasks() { unimplemented!("v8__Platform__RunIdleTasks") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__use_count() { unimplemented!("v8__Platform__use_count") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__PrimitiveArray__Get() { unimplemented!("v8__PrimitiveArray__Get") }
 #[unsafe(no_mangle)]
@@ -888,14 +787,8 @@ pub extern "C" fn v8__ReturnValue__Value__SetEmptyString() { unimplemented!("v8_
 pub extern "C" fn v8__ReturnValue__Value__SetNull() { unimplemented!("v8__ReturnValue__Value__SetNull") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ReturnValue__Value__SetUndefined() { unimplemented!("v8__ReturnValue__Value__SetUndefined") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Script__Compile() { unimplemented!("v8__Script__Compile") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Script__GetUnboundScript() { unimplemented!("v8__Script__GetUnboundScript") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Script__Run() { unimplemented!("v8__Script__Run") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptCompiler__CachedData__DELETE() { unimplemented!("v8__ScriptCompiler__CachedData__DELETE") }
 #[unsafe(no_mangle)]
@@ -1032,9 +925,6 @@ pub extern "C" fn v8__String__IsExternalTwoByte() { unimplemented!("v8__String__
 pub extern "C" fn v8__String__IsOneByte() { unimplemented!("v8__String__IsOneByte") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__kMaxLength() { unimplemented!("v8__String__kMaxLength") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__Length() { unimplemented!("v8__String__Length") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__NewExternalOneByte() { unimplemented!("v8__String__NewExternalOneByte") }
 #[unsafe(no_mangle)]
@@ -1045,41 +935,14 @@ pub extern "C" fn v8__String__NewExternalOneByteStatic() { unimplemented!("v8__S
 pub extern "C" fn v8__String__NewExternalTwoByte() { unimplemented!("v8__String__NewExternalTwoByte") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__NewExternalTwoByteStatic() { unimplemented!("v8__String__NewExternalTwoByteStatic") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__NewFromOneByte() { unimplemented!("v8__String__NewFromOneByte") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__NewFromTwoByte() { unimplemented!("v8__String__NewFromTwoByte") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__NewFromUtf8() { unimplemented!("v8__String__NewFromUtf8") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__Utf8Length() { unimplemented!("v8__String__Utf8Length") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__ValueView__CONSTRUCT() { unimplemented!("v8__String__ValueView__CONSTRUCT") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__ValueView__data() { unimplemented!("v8__String__ValueView__data") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__ValueView__DESTRUCT() { unimplemented!("v8__String__ValueView__DESTRUCT") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__ValueView__is_one_byte() { unimplemented!("v8__String__ValueView__is_one_byte") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__ValueView__length() { unimplemented!("v8__String__ValueView__length") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__ValueView_SIZE() { unimplemented!("v8__String__ValueView_SIZE") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__Write_v2() { unimplemented!("v8__String__Write_v2") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__WriteOneByte_v2() { unimplemented!("v8__String__WriteOneByte_v2") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__WriteUtf8_v2() { unimplemented!("v8__String__WriteUtf8_v2") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Symbol__Description() { unimplemented!("v8__Symbol__Description") }
 #[unsafe(no_mangle)]
@@ -1131,6 +994,8 @@ pub extern "C" fn v8__TracedReference_SIZE() { unimplemented!("v8__TracedReferen
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TryCatch__CanContinue() { unimplemented!("v8__TryCatch__CanContinue") }
 #[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__CONSTRUCT() { unimplemented!("v8__TryCatch__CONSTRUCT") }
+#[unsafe(no_mangle)]
 pub extern "C" fn v8__TryCatch__DESTRUCT() { unimplemented!("v8__TryCatch__DESTRUCT") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TryCatch__Exception() { unimplemented!("v8__TryCatch__Exception") }
@@ -1175,21 +1040,7 @@ pub extern "C" fn v8__UnboundScript__GetSourceMappingURL() { unimplemented!("v8_
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__UnboundScript__GetSourceURL() { unimplemented!("v8__UnboundScript__GetSourceURL") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Undefined() { unimplemented!("v8__Undefined") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__V8__Dispose() { unimplemented!("v8__V8__Dispose") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__V8__DisposePlatform() { unimplemented!("v8__V8__DisposePlatform") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__GetVersion() { unimplemented!("v8__V8__GetVersion") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__V8__Initialize() { unimplemented!("v8__V8__Initialize") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__V8__InitializePlatform() { unimplemented!("v8__V8__InitializePlatform") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__IsSandboxEnabled() { unimplemented!("v8__V8__IsSandboxEnabled") }
 #[unsafe(no_mangle)]
@@ -1201,8 +1052,6 @@ pub extern "C" fn v8__V8__SetFlagsFromCommandLine() { unimplemented!("v8__V8__Se
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__V8__SetFlagsFromString() { unimplemented!("v8__V8__SetFlagsFromString") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__BooleanValue() { unimplemented!("v8__Value__BooleanValue") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__GetHash() { unimplemented!("v8__Value__GetHash") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__InstanceOf() { unimplemented!("v8__Value__InstanceOf") }
@@ -1212,8 +1061,6 @@ pub extern "C" fn v8__Value__Int32Value() { unimplemented!("v8__Value__Int32Valu
 pub extern "C" fn v8__Value__IntegerValue() { unimplemented!("v8__Value__IntegerValue") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsArgumentsObject() { unimplemented!("v8__Value__IsArgumentsObject") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsArray() { unimplemented!("v8__Value__IsArray") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsArrayBuffer() { unimplemented!("v8__Value__IsArrayBuffer") }
 #[unsafe(no_mangle)]
@@ -1228,8 +1075,6 @@ pub extern "C" fn v8__Value__IsBigInt64Array() { unimplemented!("v8__Value__IsBi
 pub extern "C" fn v8__Value__IsBigIntObject() { unimplemented!("v8__Value__IsBigIntObject") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsBigUint64Array() { unimplemented!("v8__Value__IsBigUint64Array") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsBoolean() { unimplemented!("v8__Value__IsBoolean") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsBooleanObject() { unimplemented!("v8__Value__IsBooleanObject") }
 #[unsafe(no_mangle)]
@@ -1246,8 +1091,6 @@ pub extern "C" fn v8__Value__IsFloat16Array() { unimplemented!("v8__Value__IsFlo
 pub extern "C" fn v8__Value__IsFloat32Array() { unimplemented!("v8__Value__IsFloat32Array") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsFloat64Array() { unimplemented!("v8__Value__IsFloat64Array") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsFunction() { unimplemented!("v8__Value__IsFunction") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsGeneratorFunction() { unimplemented!("v8__Value__IsGeneratorFunction") }
 #[unsafe(no_mangle)]
@@ -1275,12 +1118,7 @@ pub extern "C" fn v8__Value__IsNull() { unimplemented!("v8__Value__IsNull") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsNullOrUndefined() { unimplemented!("v8__Value__IsNullOrUndefined") }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsNumber() { unimplemented!("v8__Value__IsNumber") }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsNumberObject() { unimplemented!("v8__Value__IsNumberObject") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsObject() { unimplemented!("v8__Value__IsObject") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsPromise() { unimplemented!("v8__Value__IsPromise") }
 #[unsafe(no_mangle)]
@@ -1295,8 +1133,6 @@ pub extern "C" fn v8__Value__IsSetGeneratorObject() { unimplemented!("v8__Value_
 pub extern "C" fn v8__Value__IsSetIterator() { unimplemented!("v8__Value__IsSetIterator") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsSharedArrayBuffer() { unimplemented!("v8__Value__IsSharedArrayBuffer") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsString() { unimplemented!("v8__Value__IsString") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsStringObject() { unimplemented!("v8__Value__IsStringObject") }
 #[unsafe(no_mangle)]
@@ -1329,12 +1165,6 @@ pub extern "C" fn v8__Value__IsWeakMap() { unimplemented!("v8__Value__IsWeakMap"
 pub extern "C" fn v8__Value__IsWeakSet() { unimplemented!("v8__Value__IsWeakSet") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__NumberValue() { unimplemented!("v8__Value__NumberValue") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__SameValue() { unimplemented!("v8__Value__SameValue") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__StrictEquals() { unimplemented!("v8__Value__StrictEquals") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToBigInt() { unimplemented!("v8__Value__ToBigInt") }
 #[unsafe(no_mangle)]
@@ -1347,12 +1177,6 @@ pub extern "C" fn v8__Value__ToInt32() { unimplemented!("v8__Value__ToInt32") }
 pub extern "C" fn v8__Value__ToInteger() { unimplemented!("v8__Value__ToInteger") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToNumber() { unimplemented!("v8__Value__ToNumber") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__ToObject() { unimplemented!("v8__Value__ToObject") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__ToString() { unimplemented!("v8__Value__ToString") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToUint32() { unimplemented!("v8__Value__ToUint32") }
 #[unsafe(no_mangle)]
@@ -1521,47 +1345,3 @@ pub extern "C" fn v8_inspector__V8InspectorSession__dispatchProtocolMessage() { 
 pub extern "C" fn v8_inspector__V8InspectorSession__schedulePauseOnNextStatement() { unimplemented!("v8_inspector__V8InspectorSession__schedulePauseOnNextStatement") }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8StackTrace__DELETE() { unimplemented!("v8_inspector__V8StackTrace__DELETE") }
-
-// --- C2 spike: 14 scope/platform/allocator symbols the generator missed.
-// The vendored rusty_v8 scope.rs/platform.rs decls use a form
-// gen_hermes_shims.sh did not capture. Referenced by the lib-test binary
-// (the plain rlib build dead-strips them). Stubbed no-arg like the rest.
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn std__shared_ptr__v8__ArrayBuffer__Allocator__CONVERT__std__unique_ptr() { unimplemented!("std__shared_ptr__v8__ArrayBuffer__Allocator__CONVERT__std__unique_ptr") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn std__shared_ptr__v8__ArrayBuffer__Allocator__get() { unimplemented!("std__shared_ptr__v8__ArrayBuffer__Allocator__get") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn std__shared_ptr__v8__ArrayBuffer__Allocator__reset() { unimplemented!("std__shared_ptr__v8__ArrayBuffer__Allocator__reset") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn std__shared_ptr__v8__Platform__CONVERT__std__unique_ptr() { unimplemented!("std__shared_ptr__v8__Platform__CONVERT__std__unique_ptr") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn std__shared_ptr__v8__Platform__COPY() { unimplemented!("std__shared_ptr__v8__Platform__COPY") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn std__shared_ptr__v8__Platform__get() { unimplemented!("std__shared_ptr__v8__Platform__get") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn std__shared_ptr__v8__Platform__reset() { unimplemented!("std__shared_ptr__v8__Platform__reset") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__AllowJavascriptExecutionScope__CONSTRUCT() { unimplemented!("v8__AllowJavascriptExecutionScope__CONSTRUCT") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Context__Enter() { unimplemented!("v8__Context__Enter") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Context__Exit() { unimplemented!("v8__Context__Exit") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__DisallowJavascriptExecutionScope__CONSTRUCT() { unimplemented!("v8__DisallowJavascriptExecutionScope__CONSTRUCT") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__EscapeSlot__reserve() { unimplemented!("v8__EscapeSlot__reserve") }
-#[cfg(not(feature = "link_hermes"))]
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__HandleScope__CONSTRUCT() { unimplemented!("v8__HandleScope__CONSTRUCT") }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__CONSTRUCT() { unimplemented!("v8__TryCatch__CONSTRUCT") }

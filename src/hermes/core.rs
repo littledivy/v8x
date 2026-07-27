@@ -34,10 +34,11 @@
 
 #![allow(non_snake_case)]
 
-use crate::support::SharedPtrBase;
+use crate::support::{MaybeBool, SharedPtrBase};
 use crate::{
-  Allocator, Context, Data, Object, Platform, RealIsolate, Script,
-  String as V8String, UniquePtr, Value,
+  Allocator, Array, Boolean, Context, Data, Function, Integer, Number,
+  Object, Platform, Primitive, RealIsolate, Script, String as V8String,
+  UniquePtr, Value,
 };
 use std::cell::Cell;
 use std::os::raw::{c_char, c_int, c_void};
@@ -70,6 +71,45 @@ unsafe extern "C" {
   // C4: object identity. See docs/hermes-spike/experiments/C4-hermes-identity.md.
   fn v8x_hermes_strict_equals(rtw: *mut c_void, a: i64, b: i64) -> c_int;
   fn v8x_hermes_get_identity_hash(rtw: *mut c_void, slot: i64) -> i64;
+
+  // C6: Object / Array / Number / Integer / Boolean / Function. See
+  // docs/hermes-spike/experiments/C6-hermes-surface.md.
+  fn v8x_hermes_object_new(rtw: *mut c_void) -> i64;
+  fn v8x_hermes_object_get(rtw: *mut c_void, obj_slot: i64, key_slot: i64) -> i64;
+  fn v8x_hermes_object_set(
+    rtw: *mut c_void,
+    obj_slot: i64,
+    key_slot: i64,
+    value_slot: i64,
+  ) -> c_int;
+  fn v8x_hermes_object_has(rtw: *mut c_void, obj_slot: i64, key_slot: i64) -> c_int;
+  fn v8x_hermes_array_new(rtw: *mut c_void, length: i64) -> i64;
+  fn v8x_hermes_array_length(rtw: *mut c_void, slot: i64) -> i64;
+  fn v8x_hermes_array_get_index(rtw: *mut c_void, slot: i64, index: u32) -> i64;
+  fn v8x_hermes_array_set_index(
+    rtw: *mut c_void,
+    slot: i64,
+    index: u32,
+    value_slot: i64,
+  ) -> c_int;
+  fn v8x_hermes_number_new(rtw: *mut c_void, value: f64) -> i64;
+  fn v8x_hermes_number_value(rtw: *mut c_void, slot: i64, out: *mut f64) -> c_int;
+  fn v8x_hermes_boolean_new(rtw: *mut c_void, value: c_int) -> i64;
+  fn v8x_hermes_boolean_value(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_function_call(
+    rtw: *mut c_void,
+    fn_slot: i64,
+    recv_slot: i64,
+    arg_slots: *const i64,
+    argc: usize,
+    ok: *mut c_int,
+  ) -> i64;
+  fn v8x_hermes_value_is_array(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_value_is_function(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_value_is_number(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_value_is_boolean(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_undefined(rtw: *mut c_void) -> i64;
+  fn v8x_hermes_null(rtw: *mut c_void) -> i64;
 }
 
 /// The C++ null-slot sentinel (must match `V8X_HERMES_NULL_SLOT` in the shim).
@@ -780,6 +820,337 @@ pub extern "C" fn v8__Object__GetIdentityHash(this: *const Object) -> c_int {
   // v8's identity hash is a 31-bit-ish int; our monotonic counter fits easily
   // for any test-scale object count.
   h as c_int
+}
+
+// ---- Object / Array / Number / Integer / Boolean / Function (C6) ---------
+//
+// Widens the surface past hello-world (C3) + identity (C4): object/array
+// construction and property access, numeric/boolean primitives, and calling
+// a JS function value. Every op routes through the C++/JSI bridge the same
+// way the rest of this file does: a v8 Local is a handle-table slot, and
+// each entry point is a thin wrapper around one of the
+// `v8x_hermes_*` shim functions (each already wrapped in the C2 catch-all on
+// the C++ side). See docs/hermes-spike/experiments/C6-hermes-surface.md.
+
+/// `v8::undefined(scope)`: needed as the receiver for `Function::Call` when
+/// the caller wants an `undefined` `this` (no JSI Runtime call needed;
+/// `jsi::Value::undefined()` is a static factory, just pushed into the
+/// handle table).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Undefined(isolate: *mut RealIsolate) -> *const Primitive {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  let slot = unsafe { v8x_hermes_undefined(rtw) };
+  slot_ptr::<Primitive>(slot)
+}
+
+/// `v8::null(scope)`: see `v8__Undefined` above.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Null(isolate: *mut RealIsolate) -> *const Primitive {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  let slot = unsafe { v8x_hermes_null(rtw) };
+  slot_ptr::<Primitive>(slot)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__New(isolate: *mut RealIsolate) -> *const Object {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  let slot = unsafe { v8x_hermes_object_new(rtw) };
+  slot_ptr::<Object>(slot)
+}
+
+/// `Object::Get`: the v8 C-ABI key is a generic `Value` (not just a `Name`),
+/// but JSI's `Object::getProperty` is string-/PropNameID-keyed only, so the
+/// key is coerced to a JS string on the C++ side (matching ordinary v8
+/// property-key coercion for non-Name keys).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__Get(
+  this: *const Object,
+  context: *const Context,
+  key: *const Value,
+) -> *const Value {
+  if this.is_null() || context.is_null() || key.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let slot = unsafe { v8x_hermes_object_get(rtw, slot_of(this), slot_of(key)) };
+  slot_ptr::<Value>(slot)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__Set(
+  this: *const Object,
+  context: *const Context,
+  key: *const Value,
+  value: *const Value,
+) -> MaybeBool {
+  if this.is_null() || context.is_null() || key.is_null() || value.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let ok = unsafe {
+    v8x_hermes_object_set(rtw, slot_of(this), slot_of(key), slot_of(value))
+  };
+  if ok != 0 {
+    MaybeBool::JustTrue
+  } else {
+    MaybeBool::Nothing
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__Has(
+  this: *const Object,
+  context: *const Context,
+  key: *const Value,
+) -> MaybeBool {
+  if this.is_null() || context.is_null() || key.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let r = unsafe { v8x_hermes_object_has(rtw, slot_of(this), slot_of(key)) };
+  match r {
+    1 => MaybeBool::JustTrue,
+    0 => MaybeBool::JustFalse,
+    _ => MaybeBool::Nothing,
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Array__New(
+  isolate: *mut RealIsolate,
+  length: c_int,
+) -> *const Array {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  let len = if length < 0 { 0 } else { length as i64 };
+  let slot = unsafe { v8x_hermes_array_new(rtw, len) };
+  slot_ptr::<Array>(slot)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Array__Length(array: *const Array) -> u32 {
+  let rtw = current_rtw();
+  if rtw.is_null() || array.is_null() {
+    return 0;
+  }
+  let n = unsafe { v8x_hermes_array_length(rtw, slot_of(array)) };
+  if n < 0 { 0 } else { n as u32 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetIndex(
+  this: *const Object,
+  context: *const Context,
+  index: u32,
+) -> *const Value {
+  if this.is_null() || context.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let slot = unsafe { v8x_hermes_array_get_index(rtw, slot_of(this), index) };
+  slot_ptr::<Value>(slot)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__SetIndex(
+  this: *const Object,
+  context: *const Context,
+  index: u32,
+  value: *const Value,
+) -> MaybeBool {
+  if this.is_null() || context.is_null() || value.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let ok = unsafe {
+    v8x_hermes_array_set_index(rtw, slot_of(this), index, slot_of(value))
+  };
+  if ok != 0 {
+    MaybeBool::JustTrue
+  } else {
+    MaybeBool::Nothing
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Number__New(
+  isolate: *mut RealIsolate,
+  value: f64,
+) -> *const Number {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  let slot = unsafe { v8x_hermes_number_new(rtw, value) };
+  slot_ptr::<Number>(slot)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Number__Value(this: *const Number) -> f64 {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return 0.0;
+  }
+  let mut out: f64 = 0.0;
+  unsafe { v8x_hermes_number_value(rtw, slot_of(this), &mut out) };
+  out
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Integer__New(
+  isolate: *mut RealIsolate,
+  value: i32,
+) -> *const Integer {
+  v8__Number__New(isolate, value as f64) as *const Integer
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Integer__NewFromUnsigned(
+  isolate: *mut RealIsolate,
+  value: u32,
+) -> *const Integer {
+  v8__Number__New(isolate, value as f64) as *const Integer
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Integer__Value(this: *const Integer) -> i64 {
+  v8__Number__Value(this as *const Number) as i64
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Boolean__New(
+  isolate: *mut RealIsolate,
+  value: bool,
+) -> *const Boolean {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  let slot = unsafe { v8x_hermes_boolean_new(rtw, if value { 1 } else { 0 }) };
+  slot_ptr::<Boolean>(slot)
+}
+
+/// `Value::BooleanValue`: JS-truthiness coercion of ANY value (v8's
+/// contract), not just an already-Boolean handle. `jsi::Value::getBool()`
+/// asserts `isBool()`, so a truthiness coercion for non-boolean values would
+/// need a small JS helper (`!!v`); the hello-world/C6 surface only calls this
+/// on values already known to be booleans, so the shim's `isBool()` check
+/// covers that case exactly and returns a distinguishable `false` (matching
+/// v8's own default-false-on-non-bool call sites in the vendored surface)
+/// otherwise.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__BooleanValue(
+  this: *const Value,
+  _isolate: *mut RealIsolate,
+) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_boolean_value(rtw, slot_of(this)) == 1 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsArray(this: *const Value) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_value_is_array(rtw, slot_of(this)) != 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsFunction(this: *const Value) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_value_is_function(rtw, slot_of(this)) != 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsNumber(this: *const Value) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_value_is_number(rtw, slot_of(this)) != 0 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsBoolean(this: *const Value) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_value_is_boolean(rtw, slot_of(this)) != 0 }
+}
+
+/// `Value::IsString`: routed to the same shim entry `value_is_string` used
+/// internally by `EscapeSlot__escape`; wired to the real symbol here now that
+/// the wider surface needs it directly (previously `#[allow(dead_code)]`).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsString(this: *const Value) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_value_is_string(rtw, slot_of(this)) != 0 }
+}
+
+/// `Function::Call`: JSI's `Function::call`/`callWithThis`. `recv` may be
+/// null (v8 passes a null receiver for `undefined`), in which case the shim
+/// uses the undefined-`this` call path. Returns the null handle on any error
+/// (not a function, a bad slot, or the call threw a `jsi::JSError`/other C++
+/// exception, both caught at the C2 boundary).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Function__Call(
+  this: *const Function,
+  context: *const Context,
+  recv: *const Value,
+  argc: c_int,
+  argv: *const *const Value,
+) -> *const Value {
+  if this.is_null() || context.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let n = if argc < 0 { 0 } else { argc as usize };
+  let mut arg_slots: Vec<i64> = Vec::with_capacity(n);
+  for i in 0..n {
+    let v = unsafe { *argv.add(i) };
+    if v.is_null() {
+      return ptr::null();
+    }
+    arg_slots.push(slot_of(v));
+  }
+  let recv_slot = if recv.is_null() { NULL_SLOT } else { slot_of(recv) };
+  let mut ok: c_int = 0;
+  let out = unsafe {
+    v8x_hermes_function_call(
+      rtw,
+      slot_of(this as *const Value),
+      recv_slot,
+      arg_slots.as_ptr(),
+      n,
+      &mut ok,
+    )
+  };
+  if ok == 0 || out < 0 {
+    return ptr::null();
+  }
+  slot_ptr::<Value>(out)
 }
 
 // ---- Platform / V8 lifecycle ----------------------------------------------
