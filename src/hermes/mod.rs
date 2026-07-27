@@ -826,6 +826,41 @@ mod hermes_surface {
     assert_eq!(result_str, "42");
   }
 
+  /// C10: a native Rust FunctionCallback invoked when JS calls the function.
+  /// Builds a function via `Function::new` whose callback echoes its first
+  /// argument's length + 1000 back as the return value, installs it on the
+  /// global, and calls it from JS via `eval`. Proves the full JSI-host ->
+  /// Rust-callback -> ReturnValue -> JSI round trip.
+  #[test]
+  fn hermes_native_callback() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    fn cb(
+      scope: &mut v8::PinScope,
+      args: v8::FunctionCallbackArguments,
+      mut rv: v8::ReturnValue<v8::Value>,
+    ) {
+      assert_eq!(args.length(), 1);
+      let arg0 = args.get(0);
+      let s = arg0.to_rust_string_lossy(scope);
+      rv.set_int32(1000 + s.len() as i32);
+    }
+
+    let func = v8::Function::new(scope, cb).unwrap();
+    let key = v8::String::new(scope, "nativeCb").unwrap();
+    let global = context.global(scope);
+    global.set(scope, key.into(), func.into());
+
+    let result = eval(scope, "globalThis.nativeCb('hello')");
+    assert!(result.is_int32(), "callback should return an int32");
+    assert_eq!(result.to_rust_string_lossy(scope), "1005");
+    println!("hermes_native_callback: nativeCb('hello') = 1005");
+  }
+
   /// `JSON.stringify` run as a script that reads back a value built entirely
   /// through the v8x Object/Array/primitive surface (not constructed as a
   /// JS-source literal), proving the C++-side writes are indistinguishable

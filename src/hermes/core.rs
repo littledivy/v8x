@@ -37,7 +37,8 @@
 use crate::support::{MaybeBool, SharedPtrBase};
 use crate::{
   Allocator, Array, ArrayBuffer, Boolean, Context, Data, External, Function,
-  Integer, Message, Number, Object, Platform, Primitive, RealIsolate, Script,
+  FunctionCallback, FunctionCallbackInfo, FunctionTemplate, Integer, Message,
+  Number, Object, Platform, Primitive, RealIsolate, Script,
   String as V8String, UniquePtr, Value,
 };
 use std::cell::Cell;
@@ -120,6 +121,7 @@ unsafe extern "C" {
   ) -> *mut c_void;
   fn v8x_hermes_value_is_external(rtw: *mut c_void, slot: i64) -> c_int;
   fn v8x_hermes_value_is_undefined(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_value_is_null(rtw: *mut c_void, slot: i64) -> c_int;
   fn v8x_hermes_uint32_value(
     rtw: *mut c_void,
     slot: i64,
@@ -156,6 +158,17 @@ unsafe extern "C" {
     ctor_name: *const c_char,
     message_slot: i64,
   ) -> i64;
+
+  // C10: native function callbacks. See
+  // docs/hermes-spike/experiments/C10-hermes-callbacks.md.
+  fn v8x_hermes_function_new(
+    rtw: *mut c_void,
+    callback_bits: usize,
+    data_slot: i64,
+    length: i32,
+    name: *const c_char,
+  ) -> i64;
+  fn v8x_hermes_set_pending_callback_exception(rtw: *mut c_void, slot: i64);
 }
 
 /// The C++ null-slot sentinel (must match `V8X_HERMES_NULL_SLOT` in the shim).
@@ -183,6 +196,12 @@ pub(crate) struct IsoState {
   /// the identity check in `microtask_queue_new` holds. Defaults to a stable
   /// per-isolate marker (the field's own address is used).
   pub microtask_queue: *mut c_void,
+  /// C10: a pending exception (handle-table slot) set by
+  /// `Isolate::ThrowException` while a native FunctionCallback is running.
+  /// The callback-dispatch trampoline reads and clears it, then re-throws it
+  /// as a `jsi::JSError` on the C++ side so it propagates through JSI (and is
+  /// caught by any enclosing TryCatch via the normal C9 path). -1 = none.
+  pub pending_exception: i64,
 }
 
 thread_local! {
@@ -257,6 +276,7 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     data_slots: [ptr::null_mut(); 4],
     ctx_embedder_data: Vec::new(),
     microtask_queue: ptr::null_mut(),
+    pending_exception: NULL_SLOT,
   });
   // A stable non-null default marker: the box's own state address. Overwritten
   // by any later SetMicrotaskQueue.
@@ -1282,6 +1302,26 @@ pub extern "C" fn v8__Value__BooleanValue(
   unsafe { v8x_hermes_boolean_value(rtw, slot_of(this)) == 1 }
 }
 
+/// `Value::IsTrue`: the value is the boolean `true` oddball (not truthiness).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsTrue(this: *const Value) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_boolean_value(rtw, slot_of(this)) == 1 }
+}
+
+/// `Value::IsFalse`: the value is the boolean `false` oddball.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsFalse(this: *const Value) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_boolean_value(rtw, slot_of(this)) == 0 }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsArray(this: *const Value) -> bool {
   let rtw = current_rtw();
@@ -1385,6 +1425,160 @@ pub extern "C" fn v8__Value__Uint32Value(
     write(true, v);
   } else {
     write(false, 0);
+  }
+}
+
+/// Read a numeric value as `f64`, or `None` if the handle is not a number.
+/// Hermes stores all JS numbers as doubles, so this is exact.
+#[inline]
+fn number_value_opt(this: *const Value) -> Option<f64> {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return None;
+  }
+  if unsafe { v8x_hermes_value_is_number(rtw, slot_of(this)) } == 0 {
+    return None;
+  }
+  let mut out: f64 = 0.0;
+  let ok = unsafe { v8x_hermes_number_value(rtw, slot_of(this), &mut out) };
+  if ok != 0 { Some(out) } else { None }
+}
+
+/// `Value::IsInt32`: a number whose value is an integer representable as i32.
+/// (V8 tags small integers specially; Hermes has no such tag, so we test the
+/// value shape, matching V8's observable predicate for embedder callers.)
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsInt32(this: *const Value) -> bool {
+  match number_value_opt(this) {
+    Some(v) => v.fract() == 0.0 && v >= i32::MIN as f64 && v <= i32::MAX as f64,
+    None => false,
+  }
+}
+
+/// `Value::IsUint32`: a number whose value is an integer in `0..=u32::MAX`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsUint32(this: *const Value) -> bool {
+  match number_value_opt(this) {
+    Some(v) => v.fract() == 0.0 && v >= 0.0 && v <= u32::MAX as f64,
+    None => false,
+  }
+}
+
+/// `Value::IsNull`: routes to `jsi::Value::isNull`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsNull(this: *const Value) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_value_is_null(rtw, slot_of(this)) != 0 }
+}
+
+/// `Value::NumberValue`: ECMAScript ToNumber, written into `Maybe<f64>`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__NumberValue(
+  this: *const Value,
+  context: *const Context,
+  out: *mut crate::support::Maybe<f64>,
+) {
+  #[repr(C)]
+  struct MaybeF64 {
+    has_value: bool,
+    value: f64,
+  }
+  let out = out as *mut MaybeF64;
+  if out.is_null() {
+    return;
+  }
+  if this.is_null() || context.is_null() {
+    unsafe {
+      ptr::write(
+        out,
+        MaybeF64 {
+          has_value: false,
+          value: 0.0,
+        },
+      )
+    };
+    return;
+  }
+  match number_value_opt(this) {
+    Some(v) => unsafe {
+      ptr::write(
+        out,
+        MaybeF64 {
+          has_value: true,
+          value: v,
+        },
+      )
+    },
+    None => unsafe {
+      ptr::write(
+        out,
+        MaybeF64 {
+          has_value: false,
+          value: 0.0,
+        },
+      )
+    },
+  }
+}
+
+/// `Value::Int32Value`: ECMAScript ToInt32, written into `Maybe<i32>`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__Int32Value(
+  this: *const Value,
+  context: *const Context,
+  out: *mut crate::support::Maybe<i32>,
+) {
+  #[repr(C)]
+  struct MaybeI32 {
+    has_value: bool,
+    value: i32,
+  }
+  let out = out as *mut MaybeI32;
+  if out.is_null() {
+    return;
+  }
+  if this.is_null() || context.is_null() {
+    unsafe {
+      ptr::write(
+        out,
+        MaybeI32 {
+          has_value: false,
+          value: 0,
+        },
+      )
+    };
+    return;
+  }
+  match number_value_opt(this) {
+    // ECMAScript ToInt32: truncate toward zero, wrap modulo 2^32.
+    Some(v) => {
+      let val = if v.is_finite() {
+        (v.trunc() as i64 as u32) as i32
+      } else {
+        0
+      };
+      unsafe {
+        ptr::write(
+          out,
+          MaybeI32 {
+            has_value: true,
+            value: val,
+          },
+        )
+      }
+    }
+    None => unsafe {
+      ptr::write(
+        out,
+        MaybeI32 {
+          has_value: false,
+          value: 0,
+        },
+      )
+    },
   }
 }
 
@@ -1619,6 +1813,506 @@ pub extern "C" fn v8__Function__Call(
   slot_ptr::<Value>(out)
 }
 
+// ---- C10: native function callbacks ----------------------------------------
+//
+// A v8 FunctionCallback is a C fn ptr the vendored surface invokes with a
+// `*const FunctionCallbackInfo`, reading its arguments/this/data/return-value
+// through the `v8__FunctionCallbackInfo__*` / `v8__ReturnValue__*` accessors.
+// Hermes drives host functions through a C++ `std::function`; the C++ bridge
+// (hermes_shim.cpp) marshals each JSI call into handle-table slots and calls
+// `v8x_hermes_dispatch_callback` below, which builds a `CbInfo`, invokes the
+// FunctionCallback, and hands back the slot the callback stored via
+// ReturnValue.
+//
+// The FunctionCallbackInfo the accessors read is a Rust-owned `CbInfo` (the
+// same model the QuickJS backend uses). A v8 Local here is a tagged
+// handle-table index (`slot_ptr`), so the ReturnValue "slot" the setters write
+// into is a `usize` holding a tagged Local pointer (or the tagged undefined
+// pointer initially).
+
+/// The layout the vendored `ReturnValue` reads: a single `usize` that is a raw
+/// pointer to the return-value storage. Matches `function.rs::RawReturnValue`.
+#[repr(C)]
+struct RawReturnValue(usize);
+
+/// The layout the vendored `FunctionCallbackInfo::get_parts` reads. Matches
+/// `function.rs::RawFunctionCallbackInfoParts`.
+#[repr(C)]
+struct RawFunctionCallbackInfoParts {
+  isolate: *mut RealIsolate,
+  return_value: usize,
+  data: *const Value,
+  length: crate::support::int,
+}
+
+/// The Rust-owned backing object a `*const FunctionCallbackInfo` points at
+/// during a native callback. Each field is a tagged Local pointer (as `usize`)
+/// into the isolate's handle table, except `return_slot` which is a boxed
+/// storage the ReturnValue setters mutate.
+struct CbInfo {
+  isolate: *mut RealIsolate,
+  this: usize,
+  data: usize,
+  new_target: usize,
+  is_construct: bool,
+  args: Vec<usize>,
+  /// Boxed so its address is stable while the callback holds a ReturnValue.
+  /// Holds a tagged Local pointer (initialised to tagged-undefined).
+  return_slot: Box<usize>,
+}
+
+#[inline]
+fn cbinfo<'a>(this: *const FunctionCallbackInfo) -> &'a mut CbInfo {
+  unsafe { &mut *(this as *mut CbInfo) }
+}
+
+/// The C++ host-function trampoline calls this when a native-backed JS function
+/// is invoked. It constructs the `FunctionCallbackInfo`, runs the v8
+/// FunctionCallback, and returns the handle-table slot of the callback's
+/// return value (or `NULL_SLOT` for undefined). `*threw` is set to 1 if the
+/// callback left a pending exception the host function must re-throw.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8x_hermes_dispatch_callback(
+  _rtw: *mut c_void,
+  callback_bits: usize,
+  this_slot: i64,
+  data_slot: i64,
+  arg_slots: *const i64,
+  argc: usize,
+  is_construct: c_int,
+  new_target_slot: i64,
+  threw: *mut c_int,
+) -> i64 {
+  if !threw.is_null() {
+    unsafe { *threw = 0 };
+  }
+  if callback_bits == 0 {
+    return NULL_SLOT;
+  }
+  let iso = current_iso();
+
+  // A tagged Local pointer for "undefined" to seed the return slot. Reuse the
+  // isolate's undefined singleton so `rv.get()` before any set reads undefined.
+  let undef_slot = if iso.is_null() {
+    NULL_SLOT
+  } else {
+    unsafe { v8x_hermes_undefined(iso_state(iso).rtw) }
+  };
+
+  let mut args: Vec<usize> = Vec::with_capacity(argc);
+  if !arg_slots.is_null() {
+    for i in 0..argc {
+      let s = unsafe { *arg_slots.add(i) };
+      args.push(slot_ptr::<Value>(s) as usize);
+    }
+  }
+
+  let mut info = Box::new(CbInfo {
+    isolate: iso,
+    this: slot_ptr::<Value>(this_slot) as usize,
+    data: slot_ptr::<Value>(data_slot) as usize,
+    new_target: slot_ptr::<Value>(new_target_slot) as usize,
+    is_construct: is_construct != 0,
+    args,
+    return_slot: Box::new(slot_ptr::<Value>(undef_slot) as usize),
+  });
+
+  let callback: FunctionCallback =
+    unsafe { std::mem::transmute::<usize, FunctionCallback>(callback_bits) };
+  let info_ptr = &mut *info as *mut CbInfo as *const FunctionCallbackInfo;
+  unsafe { (callback)(info_ptr) };
+
+  // Read the return slot back as a handle-table index.
+  let ret_tagged = *info.return_slot as *const Value;
+  let ret_slot = slot_of(ret_tagged);
+
+  // If the callback threw (Isolate::ThrowException stored a pending exception
+  // on the isolate, see below), surface it to the host function.
+  if !iso.is_null() {
+    let st = iso_state(iso);
+    if st.pending_exception >= 0 {
+      let exc = st.pending_exception;
+      st.pending_exception = NULL_SLOT;
+      unsafe {
+        v8x_hermes_set_pending_callback_exception(st.rtw, exc);
+      }
+      if !threw.is_null() {
+        unsafe { *threw = 1 };
+      }
+    }
+  }
+
+  ret_slot
+}
+
+/// `Function::New` (via `FunctionBuilder::build`): create a JS function backed
+/// by a native FunctionCallback. `data_or_null` is the callback's `data`
+/// (optional). ConstructorBehavior/SideEffectType are accepted but not modeled
+/// (Hermes host functions are always callable; constructor behaviour is not
+/// distinguished at the JSI layer). Returns the null handle on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Function__New(
+  context: *const Context,
+  callback: FunctionCallback,
+  data_or_null: *const Value,
+  length: i32,
+  _constructor_behavior: c_int,
+  _side_effect_type: c_int,
+) -> *const Function {
+  if context.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let data_slot = slot_of(data_or_null);
+  let callback_bits = callback as usize;
+  let out = unsafe {
+    v8x_hermes_function_new(rtw, callback_bits, data_slot, length, ptr::null())
+  };
+  if out < 0 {
+    return ptr::null();
+  }
+  slot_ptr::<Function>(out)
+}
+
+// ---- FunctionCallbackInfo accessors ----------------------------------------
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionCallbackInfo__GetIsolate(
+  this: *const FunctionCallbackInfo,
+) -> *mut RealIsolate {
+  if this.is_null() {
+    return current_iso();
+  }
+  cbinfo(this).isolate
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionCallbackInfo__GetParts(
+  this: *const FunctionCallbackInfo,
+) -> RawFunctionCallbackInfoParts {
+  if this.is_null() {
+    return RawFunctionCallbackInfoParts {
+      isolate: current_iso(),
+      return_value: 0,
+      data: ptr::null(),
+      length: 0,
+    };
+  }
+  let info = cbinfo(this);
+  RawFunctionCallbackInfoParts {
+    isolate: info.isolate,
+    return_value: (&mut *info.return_slot as *mut usize) as usize,
+    data: info.data as *const Value,
+    length: info.args.len() as crate::support::int,
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionCallbackInfo__Data(
+  this: *const FunctionCallbackInfo,
+) -> *const Value {
+  if this.is_null() {
+    return ptr::null();
+  }
+  cbinfo(this).data as *const Value
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionCallbackInfo__This(
+  this: *const FunctionCallbackInfo,
+) -> *const Object {
+  if this.is_null() {
+    return ptr::null();
+  }
+  cbinfo(this).this as *const Object
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionCallbackInfo__NewTarget(
+  this: *const FunctionCallbackInfo,
+) -> *const Value {
+  if this.is_null() {
+    return ptr::null();
+  }
+  let info = cbinfo(this);
+  if info.is_construct {
+    info.new_target as *const Value
+  } else {
+    // Not a construct call: undefined.
+    let iso = info.isolate;
+    if iso.is_null() {
+      return ptr::null();
+    }
+    let s = unsafe { v8x_hermes_undefined(iso_state(iso).rtw) };
+    slot_ptr::<Value>(s)
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionCallbackInfo__IsConstructCall(
+  this: *const FunctionCallbackInfo,
+) -> bool {
+  if this.is_null() {
+    return false;
+  }
+  cbinfo(this).is_construct
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionCallbackInfo__Get(
+  this: *const FunctionCallbackInfo,
+  index: crate::support::int,
+) -> *const Value {
+  if this.is_null() {
+    return ptr::null();
+  }
+  let info = cbinfo(this);
+  if index < 0 {
+    return undefined_tagged(info.isolate);
+  }
+  match info.args.get(index as usize) {
+    Some(&v) => v as *const Value,
+    None => undefined_tagged(info.isolate),
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionCallbackInfo__Length(
+  this: *const FunctionCallbackInfo,
+) -> crate::support::int {
+  if this.is_null() {
+    return 0;
+  }
+  cbinfo(this).args.len() as crate::support::int
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionCallbackInfo__GetReturnValue(
+  this: *const FunctionCallbackInfo,
+) -> usize {
+  if this.is_null() {
+    return 0;
+  }
+  let info = cbinfo(this);
+  (&mut *info.return_slot as *mut usize) as usize
+}
+
+/// A tagged Local pointer for undefined on `iso`, or null if none.
+#[inline]
+fn undefined_tagged(iso: *mut RealIsolate) -> *const Value {
+  if iso.is_null() {
+    return ptr::null();
+  }
+  let s = unsafe { v8x_hermes_undefined(iso_state(iso).rtw) };
+  slot_ptr::<Value>(s)
+}
+
+// ---- ReturnValue setters ---------------------------------------------------
+//
+// `RawReturnValue.0` is a raw pointer to the `usize` return slot in `CbInfo`.
+// Each setter writes a tagged Local pointer into that slot. Primitive setters
+// intern a fresh handle for the value.
+
+#[inline]
+unsafe fn rv_slot(this: *mut RawReturnValue) -> *mut usize {
+  if this.is_null() {
+    return ptr::null_mut();
+  }
+  unsafe { (*this).0 as *mut usize }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ReturnValue__Value__Set(
+  this: *mut RawReturnValue,
+  value: *const Value,
+) {
+  let slot = unsafe { rv_slot(this) };
+  if !slot.is_null() {
+    unsafe { *slot = value as usize };
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ReturnValue__Value__Set__Bool(
+  this: *mut RawReturnValue,
+  value: bool,
+) {
+  let slot = unsafe { rv_slot(this) };
+  if slot.is_null() {
+    return;
+  }
+  let iso = current_iso();
+  if iso.is_null() {
+    return;
+  }
+  let s = unsafe { v8x_hermes_boolean_new(iso_state(iso).rtw, value as c_int) };
+  unsafe { *slot = slot_ptr::<Value>(s) as usize };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ReturnValue__Value__Set__Int32(
+  this: *mut RawReturnValue,
+  value: i32,
+) {
+  set_number(this, value as f64);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ReturnValue__Value__Set__Uint32(
+  this: *mut RawReturnValue,
+  value: u32,
+) {
+  set_number(this, value as f64);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ReturnValue__Value__Set__Double(
+  this: *mut RawReturnValue,
+  value: f64,
+) {
+  set_number(this, value);
+}
+
+#[inline]
+fn set_number(this: *mut RawReturnValue, value: f64) {
+  let slot = unsafe { rv_slot(this) };
+  if slot.is_null() {
+    return;
+  }
+  let iso = current_iso();
+  if iso.is_null() {
+    return;
+  }
+  let s = unsafe { v8x_hermes_number_new(iso_state(iso).rtw, value) };
+  unsafe { *slot = slot_ptr::<Value>(s) as usize };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ReturnValue__Value__SetNull(this: *mut RawReturnValue) {
+  let slot = unsafe { rv_slot(this) };
+  if slot.is_null() {
+    return;
+  }
+  let iso = current_iso();
+  if iso.is_null() {
+    return;
+  }
+  let s = unsafe { v8x_hermes_null(iso_state(iso).rtw) };
+  unsafe { *slot = slot_ptr::<Value>(s) as usize };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ReturnValue__Value__SetUndefined(
+  this: *mut RawReturnValue,
+) {
+  let slot = unsafe { rv_slot(this) };
+  if slot.is_null() {
+    return;
+  }
+  let iso = current_iso();
+  if iso.is_null() {
+    return;
+  }
+  let s = unsafe { v8x_hermes_undefined(iso_state(iso).rtw) };
+  unsafe { *slot = slot_ptr::<Value>(s) as usize };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ReturnValue__Value__SetEmptyString(
+  this: *mut RawReturnValue,
+) {
+  let slot = unsafe { rv_slot(this) };
+  if slot.is_null() {
+    return;
+  }
+  let iso = current_iso();
+  if iso.is_null() {
+    return;
+  }
+  let s = intern_string_utf8(iso, b"");
+  unsafe { *slot = s as usize };
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ReturnValue__Value__Get(
+  this: *const RawReturnValue,
+) -> *const Value {
+  if this.is_null() {
+    return ptr::null();
+  }
+  let slot = unsafe { (*this).0 as *const usize };
+  if slot.is_null() {
+    return ptr::null();
+  }
+  unsafe { *slot as *const Value }
+}
+
+// ---- FunctionTemplate ------------------------------------------------------
+//
+// A FunctionTemplate in v8 is a deferred Function::New: it captures a callback
+// + data, and `GetFunction` instantiates a real function. Hermes has no
+// template concept, so a FunctionTemplate is modeled as a small Rust-owned
+// record (callback + data slot + length) leaked as a stable pointer; the
+// tagged-pointer scheme is not used here because a template is not a JS value.
+// Only the New/GetFunction path the rusty_v8 tests exercise is implemented;
+// SetClassName/PrototypeTemplate/etc remain stubbed.
+
+struct FnTemplate {
+  callback: FunctionCallback,
+  data_slot: i64,
+  length: i32,
+  isolate: *mut RealIsolate,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionTemplate__New(
+  isolate: *mut RealIsolate,
+  callback: FunctionCallback,
+  data_or_null: *const Value,
+  _signature_or_null: *const c_void,
+  length: i32,
+  _constructor_behavior: c_int,
+  _side_effect_type: c_int,
+  _c_functions: *const c_void,
+  _c_functions_len: usize,
+) -> *const FunctionTemplate {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let templ = Box::new(FnTemplate {
+    callback,
+    data_slot: slot_of(data_or_null),
+    length,
+    isolate,
+  });
+  Box::into_raw(templ) as *const FunctionTemplate
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__FunctionTemplate__GetFunction(
+  this: *const FunctionTemplate,
+  context: *const Context,
+) -> *const Function {
+  if this.is_null() || context.is_null() {
+    return ptr::null();
+  }
+  let templ = unsafe { &*(this as *const FnTemplate) };
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let out = unsafe {
+    v8x_hermes_function_new(
+      rtw,
+      templ.callback as usize,
+      templ.data_slot,
+      templ.length,
+      ptr::null(),
+    )
+  };
+  if out < 0 {
+    return ptr::null();
+  }
+  slot_ptr::<Function>(out)
+}
+
 // ---- TryCatch / exception surfacing (C9) -----------------------------------
 //
 // v8's TryCatch is a stack-discipline scope (like HandleScope): CONSTRUCT
@@ -1796,9 +2490,16 @@ pub extern "C" fn v8__Isolate__ThrowException(
   if isolate.is_null() || exception.is_null() {
     return ptr::null();
   }
-  let rtw = iso_state(isolate).rtw;
+  let st = iso_state(isolate);
+  let rtw = st.rtw;
   let slot = slot_of(exception);
+  // C9 path: capture into the innermost live TryCatch frame, if any.
   unsafe { v8x_hermes_throw_exception(rtw, slot) };
+  // C10 path: also record it as the isolate's pending exception so a native
+  // FunctionCallback that throws surfaces the error through JSI (the
+  // dispatch trampoline reads this after the callback returns). Cleared by the
+  // trampoline; harmless if no callback is running (nothing reads it).
+  st.pending_exception = slot;
   exception
 }
 

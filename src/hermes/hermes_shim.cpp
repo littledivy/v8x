@@ -77,6 +77,11 @@ struct RuntimeWrapper {
   int64_t next_identity_id = 1;
   // C9: the TryCatch scope stack. back() is the innermost live scope.
   std::vector<TryCatchFrame> tc_stack;
+  // C10: pending exception left by a native FunctionCallback that threw (via
+  // Isolate::ThrowException). -1 = no pending exception. Read and cleared by
+  // the host-function trampoline, which re-throws it as a jsi::JSError so it
+  // propagates through JSI like any JS-level throw.
+  v8x_hermes_slot pending_callback_exception = -1;
 
   jsi::Runtime &runtime() { return *rt; }
 
@@ -127,6 +132,26 @@ private:
 };
 
 } // namespace
+
+// C10: native function callbacks. A v8 FunctionCallback is a C function pointer
+// living on the Rust side; JSI invokes host functions through a
+// std::function<jsi::Value(Runtime&, const Value& this, const Value* args,
+// size_t count)>. The bridge below marshals the JSI-side call into handle-table
+// slots and calls back into Rust (v8x_hermes_dispatch_callback), which
+// constructs a v8 FunctionCallbackInfo, invokes the FunctionCallback, and
+// hands back the slot the callback stored via ReturnValue. See
+// docs/hermes-spike/experiments/C10-hermes-callbacks.md.
+//
+// The Rust dispatch trampoline. `callback_bits` is the FunctionCallback fn ptr
+// reinterpreted as a uintptr_t. `this_slot`/`data_slot`/`new_target_slot` and
+// each `arg_slots[i]` are handle-table indices. On return, `*ret_slot` holds
+// the handle-table index of the callback's return value (or -1 for undefined),
+// and `*threw` is set to 1 if the callback left a pending exception that the
+// host function must surface as a jsi::JSError.
+extern "C" int64_t v8x_hermes_dispatch_callback(
+    void *rtw, uintptr_t callback_bits, v8x_hermes_slot this_slot,
+    v8x_hermes_slot data_slot, const v8x_hermes_slot *arg_slots, size_t argc,
+    int is_construct, v8x_hermes_slot new_target_slot, int *threw);
 
 extern "C" {
 
@@ -1039,6 +1064,15 @@ int v8x_hermes_value_is_undefined(void *rtw, v8x_hermes_slot slot) {
   return (v != nullptr && v->isUndefined()) ? 1 : 0;
 }
 
+int v8x_hermes_value_is_null(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  return (v != nullptr && v->isNull()) ? 1 : 0;
+}
+
 // Uint32 coercion (v8's Value::Uint32Value). JSI has no ToUint32; a Number
 // value is truncated to a uint32 the way ECMAScript ToUint32 does for finite
 // numbers. Writes the result into *out; returns 1 on success, 0 on error
@@ -1440,6 +1474,118 @@ v8x_hermes_slot v8x_hermes_exception_new(void *rtw, const char *ctor_name,
     jsi::Value err =
         ctor.callAsConstructor(w->runtime(), jsi::Value(w->runtime(), *mv));
     return w->push(std::move(err));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// ---- C10: native function callbacks ---------------------------------------
+
+// Record a pending exception (a handle-table slot) that a native
+// FunctionCallback threw. The host-function trampoline reads and clears it,
+// then re-throws it as a jsi::JSError so it propagates through JSI.
+void v8x_hermes_set_pending_callback_exception(void *rtw,
+                                               v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return;
+  }
+  static_cast<RuntimeWrapper *>(rtw)->pending_callback_exception = slot;
+}
+
+// Create a JS function backed by a native v8 FunctionCallback. `callback_bits`
+// is the FunctionCallback fn ptr as a uintptr_t; `data_slot` is an optional
+// handle-table slot for the callback's `data` (or -1 for none); `length` is
+// the reported arity; `name` is an optional NUL-terminated function name.
+// Returns a slot holding the new jsi::Function, or the null slot on error.
+//
+// The callback's `data` must outlive every HandleScope, so it is copied into a
+// std::shared_ptr<jsi::Value> owned by the host function (NOT kept as a raw
+// handle-table slot, which any HandleScope exit would truncate away). The
+// shared_ptr is destroyed when JSI releases the host function, while the
+// Runtime is still alive (JSI guarantees host-function teardown precedes
+// Runtime teardown).
+v8x_hermes_slot v8x_hermes_function_new(void *rtw, uintptr_t callback_bits,
+                                        v8x_hermes_slot data_slot,
+                                        int32_t length, const char *name) {
+  if (rtw == nullptr || callback_bits == 0) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    // Copy `data` into a Runtime-owned, HandleScope-independent holder.
+    auto data = std::make_shared<jsi::Value>(jsi::Value::undefined());
+    const jsi::Value *dv = slot_ref(w, data_slot);
+    if (dv != nullptr) {
+      *data = jsi::Value(w->runtime(), *dv);
+    }
+
+    std::string fn_name = (name != nullptr) ? std::string(name) : std::string();
+    jsi::PropNameID propName = jsi::PropNameID::forUtf8(
+        w->runtime(), fn_name.empty() ? std::string("anonymous") : fn_name);
+
+    unsigned int paramCount =
+        static_cast<unsigned int>(length < 0 ? 0 : length);
+
+    auto hostFn = [w, callback_bits, data](
+                      jsi::Runtime &rt, const jsi::Value &thisVal,
+                      const jsi::Value *args, size_t count) -> jsi::Value {
+      // Marshal `this`, `data`, and each arg into fresh handle-table slots.
+      // Everything pushed here (plus anything the callback interns) is released
+      // by truncating back to `watermark` afterwards, emulating v8's implicit
+      // per-callback HandleScope.
+      size_t watermark = w->handles.size();
+
+      v8x_hermes_slot this_slot = w->push(jsi::Value(rt, thisVal));
+      v8x_hermes_slot data_slot_local = w->push(jsi::Value(rt, *data));
+
+      std::vector<v8x_hermes_slot> arg_slots;
+      arg_slots.reserve(count);
+      for (size_t i = 0; i < count; ++i) {
+        arg_slots.push_back(w->push(jsi::Value(rt, args[i])));
+      }
+
+      int threw = 0;
+      int64_t ret_slot = v8x_hermes_dispatch_callback(
+          static_cast<void *>(w), callback_bits, this_slot, data_slot_local,
+          arg_slots.empty() ? nullptr : arg_slots.data(), count,
+          /*is_construct=*/0, /*new_target_slot=*/V8X_HERMES_NULL_SLOT, &threw);
+
+      // Materialize the result (and any pending exception) BEFORE truncating
+      // the handle table: both live in slots we are about to release.
+      jsi::Value result = jsi::Value::undefined();
+      const jsi::Value *rv = slot_ref(w, ret_slot);
+      if (rv != nullptr) {
+        result = jsi::Value(rt, *rv);
+      }
+
+      bool have_exception = false;
+      jsi::Value exception = jsi::Value::undefined();
+      if (threw != 0) {
+        const jsi::Value *ev =
+            slot_ref(w, w->pending_callback_exception);
+        if (ev != nullptr) {
+          exception = jsi::Value(rt, *ev);
+          have_exception = true;
+        } else {
+          have_exception = true; // threw with no value: still surface an error
+        }
+        w->pending_callback_exception = -1;
+      }
+
+      // Release everything the callback added.
+      if (w->handles.size() > watermark) {
+        w->handles.resize(watermark);
+      }
+
+      if (have_exception) {
+        throw jsi::JSError(rt, std::move(exception));
+      }
+      return result;
+    };
+
+    jsi::Function fn = jsi::Function::createFromHostFunction(
+        w->runtime(), propName, paramCount, std::move(hostFn));
+    return w->push(jsi::Value(std::move(fn)));
   } catch (...) {
     return V8X_HERMES_NULL_SLOT;
   }

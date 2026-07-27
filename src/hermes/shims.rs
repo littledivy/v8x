@@ -212,39 +212,15 @@ pub extern "C" fn v8__Function__GetScriptLineNumber() -> *const ::std::ffi::c_vo
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__GetScriptOrigin() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Function__New() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__NewInstance() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__ScriptId() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__SetName() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionCallbackInfo__Data() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionCallbackInfo__Get() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionCallbackInfo__GetIsolate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionCallbackInfo__GetParts() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionCallbackInfo__GetReturnValue() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionCallbackInfo__IsConstructCall() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionCallbackInfo__Length() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionCallbackInfo__NewTarget() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionCallbackInfo__This() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionTemplate__GetFunction() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionTemplate__Inherit() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionTemplate__InstanceTemplate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__FunctionTemplate__New() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionTemplate__PrototypeTemplate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -722,24 +698,6 @@ pub extern "C" fn v8__ResourceConstraints__set_stack_limit() -> *const ::std::ff
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ResourceConstraints__stack_limit() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__ReturnValue__Value__Get() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ReturnValue__Value__Set() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ReturnValue__Value__Set__Bool() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ReturnValue__Value__Set__Double() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ReturnValue__Value__Set__Int32() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ReturnValue__Value__Set__Uint32() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ReturnValue__Value__SetEmptyString() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ReturnValue__Value__SetNull() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ReturnValue__Value__SetUndefined() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Script__GetUnboundScript() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptCompiler__CachedData__DELETE() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -976,8 +934,6 @@ pub extern "C" fn v8__Value__GetHash() -> *const ::std::ffi::c_void { ::std::ptr
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__InstanceOf() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__Int32Value() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IntegerValue() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsArgumentsObject() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -1002,8 +958,6 @@ pub extern "C" fn v8__Value__IsDataView() -> *const ::std::ffi::c_void { ::std::
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsDate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsFalse() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsFloat16Array() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsFloat32Array() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -1015,8 +969,6 @@ pub extern "C" fn v8__Value__IsGeneratorFunction() -> *const ::std::ffi::c_void 
 pub extern "C" fn v8__Value__IsGeneratorObject() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsInt16Array() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsInt32() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsInt32Array() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -1031,8 +983,6 @@ pub extern "C" fn v8__Value__IsModuleNamespaceObject() -> *const ::std::ffi::c_v
 pub extern "C" fn v8__Value__IsName() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsNativeError() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsNull() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsNullOrUndefined() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -1058,13 +1008,9 @@ pub extern "C" fn v8__Value__IsSymbol() -> *const ::std::ffi::c_void { ::std::pt
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsSymbolObject() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsTrue() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsTypedArray() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsUint16Array() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsUint32() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsUint32Array() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -1079,8 +1025,6 @@ pub extern "C" fn v8__Value__IsWasmModuleObject() -> *const ::std::ffi::c_void {
 pub extern "C" fn v8__Value__IsWeakMap() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsWeakSet() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__NumberValue() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToBigInt() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
