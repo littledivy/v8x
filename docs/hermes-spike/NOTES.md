@@ -11,7 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
-- [x] *** Hermes passes 10/16 rusty_v8 tests (real V8 test suite, on the ratchet) ***
+- [x] *** Hermes passes 33 rusty_v8 tests, all 16 files link (real V8 suite, on the ratchet) ***
 - [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities
@@ -39,6 +39,24 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle C8 - unlock test_api, ratchet 10 -> 33 (agent: c8, opus) DONE
+rv8_test_api (248 cases) + rv8_test_cppgc now LINK -> all 16/16 files link (was 14). 33 baselined (was
+10): 10 file-level + 23 test_api cases (19 engine-independent crdtp_* inspector + cached_data_version_tag,
+get_version, icu_set_common_data_fail, inspector_string_view, latin1_to_utf8). --check holds.
+Implemented: ICU trio (src/hermes/misc.rs, pure Rust, no v8__ prefix so generator never stubs them) -
+this alone unblocked cppgc link; 12 TypedArray ctors + ArrayBuffer New/ByteLength/Data + TypedArray
+Length over jsi::ArrayBuffer via the JS global constructors (paste! names dodge the generator regex).
+HARNESS HARDENING (important): gen_hermes_shims.sh now emits NULL-returning stubs, not unimplemented!().
+A panic in an extern "C" fn cannot unwind and ABORTS the whole test binary; null-return (linking is
+name-only) converts ~20 aborting stubs into graceful single-test FAILURES. Added real crash-guards:
+V8__GetVersion (null -> SEGV in CStr::from_ptr), Context Get/SetMicrotaskQueue (null -> SEGV in &*ptr).
+One remaining process-crasher left: array_buffer_with_shared_backing_store (needs BackingStore +
+std::shared_ptr refcount subsystem) - harness recovery skips just that one cleanly.
+No regressions (12/12 smoke, stub-hermes + quickjs clean, generator idempotent).
+NEXT: TryCatch/exception surfacing (largest failing cluster - every tc_scope! test; v8x_hermes_run
+already catches jsi::JSError, so surface its value into a pending-exception slot = contained plumbing),
+then native Function::new callbacks, then the BackingStore subsystem (also kills the last crasher).
 
 ### Cycle C7 - first rusty_v8 tests GREEN on Hermes: 10/16 (agent: c7, opus) DONE
 Up from 0/16. All genuinely green, baseline --updated, --check holds, no regressions (12/12 smoke +
