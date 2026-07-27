@@ -97,7 +97,7 @@ pub extern "C" fn udata_setCommonData_77(
 macro_rules! typed_array_new_stub {
   ($name:ident) => {
     #[unsafe(no_mangle)]
-    pub extern "C" fn $name() -> *const c_void { std::ptr::null() }
+    pub extern "C" fn $name() -> *const ::std::ffi::c_void { std::ptr::null() }
   };
 }
 
