@@ -38,6 +38,30 @@ static const v8x_hermes_slot V8X_HERMES_NULL_SLOT = -1;
 
 namespace {
 
+// ---- C9: TryCatch / exception surfacing -----------------------------------
+//
+// v8's TryCatch is a stack of exception-capture scopes on the isolate: only
+// the INNERMOST live TryCatch observes an exception thrown while it is on
+// top. We mirror that with a std::vector<TryCatchFrame> on the
+// RuntimeWrapper; v8x_hermes_trycatch_push/pop manage it, and every JS-error
+// boundary (Run, Function::Call, ThrowException, ...) captures into
+// `tc_stack.back()` when the stack is non-empty. A caught jsi::JSError's
+// embedded jsi::Value is moved into the handle table (a fresh slot) and the
+// frame is marked caught; getMessage()/getStack() are read out of the
+// JSError BEFORE it is destroyed (the C2 lifetime rule: the JSError, and the
+// Runtime it references, must both still be alive when value()/getMessage()/
+// getStack() are called - value() is captured via the handle-table push,
+// which itself needs the still-alive Runtime).
+struct TryCatchFrame {
+  v8x_hermes_slot exception_slot = -1; // -1 = nothing caught (yet)
+  bool has_caught = false;
+  // Set once rethrow() has been called on this frame: a later reset() must
+  // NOT clear has_caught (matches the vendored test's documented V8 quirk).
+  bool rethrown = false;
+  std::string message;
+  std::string stack;
+};
+
 struct RuntimeWrapper {
   // Declared first so it is destroyed LAST: every jsi::Value in `handles`
   // holds a PointerValue owned by this Runtime and must be torn down while the
@@ -51,6 +75,8 @@ struct RuntimeWrapper {
   std::unique_ptr<jsi::Value> identity_symbol;
   std::unique_ptr<jsi::Value> define_property_fn;
   int64_t next_identity_id = 1;
+  // C9: the TryCatch scope stack. back() is the innermost live scope.
+  std::vector<TryCatchFrame> tc_stack;
 
   jsi::Runtime &runtime() { return *rt; }
 
@@ -58,6 +84,30 @@ struct RuntimeWrapper {
   v8x_hermes_slot push(jsi::Value &&v) {
     handles.emplace_back(std::move(v));
     return static_cast<v8x_hermes_slot>(handles.size() - 1);
+  }
+
+  // Capture a caught jsi::JSError into the innermost live TryCatch frame, if
+  // any. No-op (exception silently dropped, like V8 with no TryCatch on the
+  // stack reporting to the fatal-error handler) when tc_stack is empty - the
+  // caller still returns its own null/empty-sentinel to signal failure.
+  void capture_exception(const jsi::JSError &err) {
+    if (tc_stack.empty()) {
+      return;
+    }
+    TryCatchFrame &frame = tc_stack.back();
+    try {
+      // err.value() returns a `const jsi::Value&` bound to the JSError's own
+      // shared_ptr<Value>; copy-construct a fresh Value from it (via the
+      // Runtime, still alive here) into the handle table before the JSError
+      // (and its value_ shared_ptr) is destroyed by the catch block.
+      jsi::Value v(runtime(), err.value());
+      frame.exception_slot = push(std::move(v));
+    } catch (...) {
+      frame.exception_slot = -1;
+    }
+    frame.has_caught = true;
+    frame.message = err.getMessage();
+    frame.stack = err.getStack();
   }
 };
 
@@ -193,9 +243,11 @@ v8x_hermes_slot v8x_hermes_run(void *rtw, v8x_hermes_slot src_slot, int *ok) {
       *ok = 1;
     }
     return out;
-  } catch (const jsi::JSError &) {
-    // The JSError and its embedded Values are destroyed here, while `w->rt`
-    // is still alive (the C2 lifetime rule).
+  } catch (const jsi::JSError &err) {
+    // Captured into the innermost live TryCatch frame (C9), while `w->rt` is
+    // still alive (the C2 lifetime rule) - the JSError and its embedded
+    // Value are destroyed at the end of this catch block.
+    w->capture_exception(err);
     return V8X_HERMES_NULL_SLOT;
   } catch (...) {
     return V8X_HERMES_NULL_SLOT;
@@ -494,8 +546,9 @@ v8x_hermes_slot v8x_hermes_eval_buffer(void *rtw, const uint8_t *data,
       *ok = 1;
     }
     return out;
-  } catch (const jsi::JSError &) {
-    // Destroyed here, while `w->rt` is still alive (the C2 lifetime rule).
+  } catch (const jsi::JSError &err) {
+    // Captured (C9), while `w->rt` is still alive (the C2 lifetime rule).
+    w->capture_exception(err);
     return V8X_HERMES_NULL_SLOT;
   } catch (...) {
     return V8X_HERMES_NULL_SLOT;
@@ -857,8 +910,9 @@ v8x_hermes_slot v8x_hermes_function_call(void *rtw, v8x_hermes_slot fn_slot,
       *ok = 1;
     }
     return out;
-  } catch (const jsi::JSError &) {
-    // Destroyed here, while `w->rt` is still alive (the C2 lifetime rule).
+  } catch (const jsi::JSError &err) {
+    // Captured (C9), while `w->rt` is still alive (the C2 lifetime rule).
+    w->capture_exception(err);
     return V8X_HERMES_NULL_SLOT;
   } catch (...) {
     return V8X_HERMES_NULL_SLOT;
@@ -1134,6 +1188,260 @@ size_t v8x_hermes_typed_array_length(void *rtw, v8x_hermes_slot slot) {
     return static_cast<size_t>(len.getNumber());
   } catch (...) {
     return SIZE_MAX;
+  }
+}
+
+// ---- TryCatch / exception surfacing (C9) ----------------------------------
+//
+// v8's TryCatch is a stack-discipline scope: CONSTRUCT pushes a frame,
+// DESTRUCT pops it. While one or more frames are on the stack, a thrown
+// jsi::JSError from Run/Function::Call/etc is captured into the INNERMOST
+// frame (RuntimeWrapper::capture_exception, above). HasCaught/Exception/
+// Message read the frame this v8x_hermes_slot-typed opaque handle refers to
+// by INDEX (not top-of-stack, so a still-open outer frame can be queried
+// after an inner one has already been popped/destructed - see the "rethrow
+// and reset" vendored test, which keeps tc1 alive after tc2 is dropped).
+
+// Push a new (empty) TryCatch frame. Returns its index in `tc_stack`, or -1
+// on error (bad rtw). The index is what Rust stores in its raw::TryCatch
+// buffer and passes back into every other v8x_hermes_trycatch_* call.
+int64_t v8x_hermes_trycatch_push(void *rtw) {
+  if (rtw == nullptr) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    w->tc_stack.emplace_back();
+    return static_cast<int64_t>(w->tc_stack.size() - 1);
+  } catch (...) {
+    return -1;
+  }
+}
+
+// Pop the TryCatch stack down to (and including) `index`. Only ever called
+// with `index == tc_stack.size() - 1` in practice (proper LIFO nesting, the
+// same discipline HandleScope's watermark-truncate relies on), but tolerates
+// a shallower stack defensively (a prior pop already covered it).
+void v8x_hermes_trycatch_pop(void *rtw, int64_t index) {
+  if (rtw == nullptr || index < 0) {
+    return;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  if (static_cast<size_t>(index) >= w->tc_stack.size()) {
+    return;
+  }
+  try {
+    w->tc_stack.resize(static_cast<size_t>(index));
+  } catch (...) {
+  }
+}
+
+namespace {
+// Safely fetch frame `index`, or nullptr if the wrapper/index is invalid.
+TryCatchFrame *tc_frame(RuntimeWrapper *w, int64_t index) {
+  if (w == nullptr || index < 0 ||
+      static_cast<size_t>(index) >= w->tc_stack.size()) {
+    return nullptr;
+  }
+  return &w->tc_stack[static_cast<size_t>(index)];
+}
+} // namespace
+
+int v8x_hermes_trycatch_has_caught(void *rtw, int64_t index) {
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  TryCatchFrame *f = tc_frame(w, index);
+  return (f != nullptr && f->has_caught) ? 1 : 0;
+}
+
+// The caught exception's Value, as a handle-table slot (or the null slot if
+// nothing was caught / a bad index).
+v8x_hermes_slot v8x_hermes_trycatch_exception(void *rtw, int64_t index) {
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  TryCatchFrame *f = tc_frame(w, index);
+  if (f == nullptr || !f->has_caught) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  return f->exception_slot;
+}
+
+// A synthetic v8::Message string ("Uncaught <ctor>: <message>" - matches the
+// vendored test's exact expectation for `throw new Error('foo')`, "Uncaught
+// Error: foo") pushed as a fresh handle-table String slot. Returns the null
+// slot if nothing was caught. JSI's JSError::getMessage() already returns
+// just the Error's own `.message` property (e.g. "foo"), and getStack()
+// starts with "<ctor-name>: <message>\n    at ..." for a real Error object,
+// or is empty for a non-Error thrown primitive (e.g. `throw 'bar'`) - so the
+// "Uncaught " prefix is added here, and the ctor-qualified text is taken from
+// the first line of the stack when available (falls back to the bare
+// message, matching what `throw 'bar'` needs since it has no stack/ctor).
+v8x_hermes_slot v8x_hermes_trycatch_message(void *rtw, int64_t index) {
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  TryCatchFrame *f = tc_frame(w, index);
+  if (f == nullptr || !f->has_caught) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    std::string first_line = f->stack;
+    size_t nl = first_line.find('\n');
+    if (nl != std::string::npos) {
+      first_line = first_line.substr(0, nl);
+    }
+    std::string text =
+        "Uncaught " + (first_line.empty() ? f->message : first_line);
+    jsi::String s = jsi::String::createFromUtf8(
+        w->runtime(), reinterpret_cast<const uint8_t *>(text.data()),
+        text.size());
+    jsi::Value v(w->runtime(), s);
+    return w->push(std::move(v));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// A synthetic stack-trace Value (the raw JSError stack string, or the
+// message as a fallback for a non-Error throw with no stack). Returns the
+// null slot if nothing was caught.
+v8x_hermes_slot v8x_hermes_trycatch_stack_trace(void *rtw, int64_t index) {
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  TryCatchFrame *f = tc_frame(w, index);
+  if (f == nullptr || !f->has_caught) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    const std::string &text = f->stack.empty() ? f->message : f->stack;
+    jsi::String s = jsi::String::createFromUtf8(
+        w->runtime(), reinterpret_cast<const uint8_t *>(text.data()),
+        text.size());
+    jsi::Value v(w->runtime(), s);
+    return w->push(std::move(v));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// Clears has_caught, UNLESS rethrow() was already called on this frame (a
+// documented V8 quirk the vendored test exercises directly: reset() after
+// rethrow() must leave has_caught() true). No-op on a bad index.
+void v8x_hermes_trycatch_reset(void *rtw, int64_t index) {
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  TryCatchFrame *f = tc_frame(w, index);
+  if (f == nullptr || f->rethrown) {
+    return;
+  }
+  f->has_caught = false;
+  f->exception_slot = -1;
+  f->message.clear();
+  f->stack.clear();
+}
+
+// Propagate this frame's caught exception to the next-outer live frame (the
+// one immediately below `index` in tc_stack), mirroring v8's ReThrow: marks
+// the outer frame caught with the SAME exception value, and marks THIS frame
+// as rethrown (so a later reset() on it is a no-op, see above). Returns the
+// exception's handle-table slot (what Rust's rethrow() surfaces as
+// Some(value)), or the null slot if nothing was caught here.
+v8x_hermes_slot v8x_hermes_trycatch_rethrow(void *rtw, int64_t index) {
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  TryCatchFrame *f = tc_frame(w, index);
+  if (f == nullptr || !f->has_caught) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  f->rethrown = true;
+  if (index > 0) {
+    TryCatchFrame *outer = tc_frame(w, index - 1);
+    if (outer != nullptr) {
+      outer->has_caught = true;
+      outer->exception_slot = f->exception_slot;
+      outer->message = f->message;
+      outer->stack = f->stack;
+    }
+  }
+  return f->exception_slot;
+}
+
+// ---- Isolate::ThrowException + Exception::* constructors (C9) ------------
+//
+// v8's ThrowException is the embedder throwing a value INTO the (about to
+// resume) JS execution; the vendored TryCatch tests use it directly on a
+// TryCatch-scoped isolate (no intervening JS call), so the simplification
+// that matches those tests is: capture the thrown value straight into the
+// innermost live TryCatch frame, exactly like a caught jsi::JSError would be
+// (there is no separate "isolate-level pending exception" object distinct
+// from a TryCatch frame in this model - see the doc comment above
+// RuntimeWrapper::tc_stack). If no TryCatch is on the stack, the value is
+// dropped (matches V8: an uncaught embedder throw with no handler runs the
+// message/fatal-error path, which we do not model).
+
+// Throw `value_slot` as the current exception. Returns 1 if a live TryCatch
+// frame accepted it, 0 otherwise (bad rtw/slot, or no live frame - in V8
+// terms, "uncaught").
+int v8x_hermes_throw_exception(void *rtw, v8x_hermes_slot value_slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, value_slot);
+  if (v == nullptr || w->tc_stack.empty()) {
+    return 0;
+  }
+  try {
+    TryCatchFrame &frame = w->tc_stack.back();
+    frame.has_caught = true;
+    frame.message.clear();
+    frame.stack.clear();
+    // If the thrown value is an Error-like object (has a string `.stack`
+    // property - what `Exception::type_error`/`Error`/etc construct via the
+    // real JS `Error` constructor, which auto-populates `.stack` as
+    // "<ctor-name>: <message>\n    at ..."), capture it so
+    // v8x_hermes_trycatch_message can build "Uncaught <ctor>: <message>" the
+    // same way a real JS `throw` does. A plain non-Error value (e.g. `throw
+    // 'bar'`) has no such property, so message/stack stay empty - matching
+    // that case having no "<ctor>: text" line. MUST happen before the push()
+    // below: `handles.push_back` can reallocate the vector, invalidating `v`
+    // (a pointer into the OLD backing storage) - reading through it after a
+    // reallocating push is a use-after-free.
+    if (v->isObject()) {
+      jsi::Object obj = v->getObject(w->runtime());
+      jsi::Value stackVal = obj.getProperty(w->runtime(), "stack");
+      if (stackVal.isString()) {
+        frame.stack = stackVal.getString(w->runtime()).utf8(w->runtime());
+      }
+      jsi::Value msgVal = obj.getProperty(w->runtime(), "message");
+      if (msgVal.isString()) {
+        frame.message = msgVal.getString(w->runtime()).utf8(w->runtime());
+      }
+    }
+    jsi::Value copy(w->runtime(), *v);
+    frame.exception_slot = w->push(std::move(copy));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// new Error(message) / TypeError / RangeError / ReferenceError / SyntaxError,
+// via the JS global constructor (JSI has no C++ Error-subtype factory).
+// `ctor_name` is a NUL-terminated JS global constructor name. Returns a slot
+// with the constructed (but NOT thrown) Error object, or the null slot on
+// error.
+v8x_hermes_slot v8x_hermes_exception_new(void *rtw, const char *ctor_name,
+                                         v8x_hermes_slot message_slot) {
+  if (rtw == nullptr || ctor_name == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *mv = slot_ref(w, message_slot);
+  if (mv == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    jsi::Function ctor =
+        w->runtime().global().getPropertyAsFunction(w->runtime(), ctor_name);
+    jsi::Value err =
+        ctor.callAsConstructor(w->runtime(), jsi::Value(w->runtime(), *mv));
+    return w->push(std::move(err));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
   }
 }
 

@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=hermes suite=rusty_v8.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 33 passing. DO NOT hand-sort; the
+# (run.mjs --update). 58 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 rv8_slots::context_slots
 rv8_slots::dropped_context_slots_on_kept_context
@@ -10,6 +10,8 @@ rv8_slots::slots_general_2
 rv8_slots::slots_layer1
 rv8_slots::slots_layer2
 rv8_test_api::cached_data_version_tag
+rv8_test_api::clear_slots_annex_uninitialized
+rv8_test_api::context_embedder_data
 rv8_test_api::crdtp_create_error_notification
 rv8_test_api::crdtp_create_error_response
 rv8_test_api::crdtp_create_notification
@@ -28,10 +30,33 @@ rv8_test_api::crdtp_json_cbor_conversion
 rv8_test_api::crdtp_json_cbor_invalid_input
 rv8_test_api::crdtp_multiple_domains
 rv8_test_api::crdtp_uber_dispatcher_basic
+rv8_test_api::date_time_configuration_change_notification
+rv8_test_api::ept_torture_test
+rv8_test_api::equality
+rv8_test_api::finalizer_on_kept_global
 rv8_test_api::get_version
+rv8_test_api::global_handle_drop
+rv8_test_api::handle_scope_nested
+rv8_test_api::handles_from_isolate
 rv8_test_api::icu_set_common_data_fail
 rv8_test_api::inspector_string_view
+rv8_test_api::isolate_data_slots
+rv8_test_api::isolate_drop_order
+rv8_test_api::isolate_slot_drop_can_access_annex_during_teardown
+rv8_test_api::isolate_termination_methods
 rv8_test_api::latin1_to_utf8
+rv8_test_api::local_handle_deref
+rv8_test_api::low_memory_notification
+rv8_test_api::memory_pressure_notification
+rv8_test_api::no_internal_field
+rv8_test_api::oom_callback
+rv8_test_api::script_compile_and_run
+rv8_test_api::script_origin
+rv8_test_api::thread_safe_handle_drop_after_isolate
+rv8_test_api::throw_exception
+rv8_test_api::try_catch
+rv8_test_api::try_catch_caught_lifetime
+rv8_test_api::wasm_module_compilation_abort
 rv8_test_api_flags::set_flags_from_string
 rv8_test_simple_external::test_simple_external::test
 rv8_test_single_threaded_default_platform::single_threaded_default_platform

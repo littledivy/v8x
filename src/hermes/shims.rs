@@ -190,17 +190,7 @@ pub extern "C" fn v8__Exception__CaptureStackTrace() -> *const ::std::ffi::c_voi
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Exception__CreateMessage() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Exception__Error() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Exception__GetStackTrace() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Exception__RangeError() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Exception__ReferenceError() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Exception__SyntaxError() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Exception__TypeError() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ExternalOneByteStringResource__data() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -376,8 +366,6 @@ pub extern "C" fn v8__Isolate__SetWasmStreamingCallback() -> *const ::std::ffi::
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__TerminateExecution() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__ThrowException() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__UseCounterFeature() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__JSON__Parse() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -409,8 +397,6 @@ pub extern "C" fn v8__Map__Set() -> *const ::std::ffi::c_void { ::std::ptr::null
 pub extern "C" fn v8__Map__Size() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Message__ErrorLevel() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Message__Get() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Message__GetEndColumn() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -957,32 +943,6 @@ pub extern "C" fn v8__TracedReference__Get() -> *const ::std::ffi::c_void { ::st
 pub extern "C" fn v8__TracedReference__Reset() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TracedReference_SIZE() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__CanContinue() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__CONSTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__DESTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__Exception() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__HasCaught() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__HasTerminated() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__IsVerbose() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__Message() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__Reset() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__ReThrow() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__SetCaptureMessage() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__SetVerbose() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__TryCatch__StackTrace() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TYPED_ARRAY_MAX_SIZE_IN_HEAP() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]

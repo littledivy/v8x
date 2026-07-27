@@ -37,7 +37,7 @@
 use crate::support::{MaybeBool, SharedPtrBase};
 use crate::{
   Allocator, Array, ArrayBuffer, Boolean, Context, Data, External, Function,
-  Integer, Number, Object, Platform, Primitive, RealIsolate, Script,
+  Integer, Message, Number, Object, Platform, Primitive, RealIsolate, Script,
   String as V8String, UniquePtr, Value,
 };
 use std::cell::Cell;
@@ -139,6 +139,23 @@ unsafe extern "C" {
     length: usize,
   ) -> i64;
   fn v8x_hermes_typed_array_length(rtw: *mut c_void, slot: i64) -> usize;
+
+  // C9: TryCatch / exception surfacing. See
+  // docs/hermes-spike/experiments/C9-hermes-trycatch.md.
+  fn v8x_hermes_trycatch_push(rtw: *mut c_void) -> i64;
+  fn v8x_hermes_trycatch_pop(rtw: *mut c_void, index: i64);
+  fn v8x_hermes_trycatch_has_caught(rtw: *mut c_void, index: i64) -> c_int;
+  fn v8x_hermes_trycatch_exception(rtw: *mut c_void, index: i64) -> i64;
+  fn v8x_hermes_trycatch_message(rtw: *mut c_void, index: i64) -> i64;
+  fn v8x_hermes_trycatch_stack_trace(rtw: *mut c_void, index: i64) -> i64;
+  fn v8x_hermes_trycatch_reset(rtw: *mut c_void, index: i64);
+  fn v8x_hermes_trycatch_rethrow(rtw: *mut c_void, index: i64) -> i64;
+  fn v8x_hermes_throw_exception(rtw: *mut c_void, value_slot: i64) -> c_int;
+  fn v8x_hermes_exception_new(
+    rtw: *mut c_void,
+    ctor_name: *const c_char,
+    message_slot: i64,
+  ) -> i64;
 }
 
 /// The C++ null-slot sentinel (must match `V8X_HERMES_NULL_SLOT` in the shim).
@@ -172,6 +189,17 @@ thread_local! {
   /// The current entered isolate for this thread (set by Enter, cleared by
   /// Exit). There is at most one live Hermes isolate per thread.
   static CURRENT_ISO: Cell<*mut RealIsolate> = const { Cell::new(ptr::null_mut()) };
+  /// Isolate re-entrancy stack (C9 fix): real V8's Enter/Exit is a NESTING
+  /// counter, not a flat set/clear - `Isolate::Enter` can be called again
+  /// while already entered (e.g. `Exception::type_error`'s internal
+  /// `scope.enter()`/`scope.exit()` bracketing around a constructor call),
+  /// and `Exit` must restore whatever was current BEFORE that nested Enter,
+  /// not unconditionally null it out (which would otherwise leave
+  /// `CURRENT_ISO` null for the rest of the enclosing scope, breaking every
+  /// later `current_iso()`-dependent call including the isolate's own
+  /// disposal-order assert). Push on Enter, pop-and-restore on Exit.
+  static ISO_STACK: std::cell::RefCell<Vec<*mut RealIsolate>> =
+    const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[inline]
@@ -248,16 +276,31 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
   if current_iso() == this {
     CURRENT_ISO.with(|c| c.set(ptr::null_mut()));
   }
+  // Drop any stale re-entrancy stack entries for a disposed isolate (should
+  // normally already be empty - every Enter is paired with an Exit - but this
+  // guards against a leaked frame outliving Dispose).
+  ISO_STACK.with(|s| s.borrow_mut().retain(|&iso| iso != this));
 }
 
+/// `Isolate::Enter`: real V8 nesting semantics (see `ISO_STACK` doc comment)
+/// - pushes whatever was current before this Enter, then makes `this`
+/// current. A matching `Exit` restores exactly what was pushed here.
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__Enter(this: *mut RealIsolate) {
+  let previous = current_iso();
+  ISO_STACK.with(|s| s.borrow_mut().push(previous));
   CURRENT_ISO.with(|c| c.set(this));
 }
 
+/// `Isolate::Exit`: pop the re-entrancy stack and restore whatever was
+/// current before the matching `Enter`, rather than unconditionally nulling
+/// `CURRENT_ISO` out (which would incorrectly clobber an outer, still-live
+/// entered isolate - see `ISO_STACK` doc comment for the concrete failure
+/// this fixes: `Exception::type_error`'s internal enter/exit bracketing).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__Exit(_this: *mut RealIsolate) {
-  CURRENT_ISO.with(|c| c.set(ptr::null_mut()));
+  let previous = ISO_STACK.with(|s| s.borrow_mut().pop()).unwrap_or(ptr::null_mut());
+  CURRENT_ISO.with(|c| c.set(previous));
 }
 
 #[unsafe(no_mangle)]
@@ -1574,6 +1617,251 @@ pub extern "C" fn v8__Function__Call(
     return ptr::null();
   }
   slot_ptr::<Value>(out)
+}
+
+// ---- TryCatch / exception surfacing (C9) -----------------------------------
+//
+// v8's TryCatch is a stack-discipline scope (like HandleScope): CONSTRUCT
+// pushes a frame on the isolate's exception-capture stack, DESTRUCT pops it.
+// While one is on top, `Script::Run`/`Function::Call` route a thrown
+// `jsi::JSError` into it (see `RuntimeWrapper::capture_exception` in
+// hermes_shim.cpp) instead of just returning a null Local. The frame stack
+// itself lives in C++ (`RuntimeWrapper::tc_stack`); Rust only carries the
+// `(isolate, frame_index)` pair.
+//
+// The vendored `raw::TryCatch` buffer is `[MaybeUninit<usize>; 6]` (48
+// bytes); linking is name-only so only OUR read/write of this buffer needs
+// to agree on layout. `[0]` = isolate ptr, `[1]` = the C++ tc_stack frame
+// index this scope owns.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__CONSTRUCT(
+  buf: *mut usize,
+  isolate: *mut RealIsolate,
+) {
+  let rtw = if isolate.is_null() {
+    current_rtw()
+  } else {
+    iso_state(isolate).rtw
+  };
+  let index = if rtw.is_null() {
+    -1
+  } else {
+    unsafe { v8x_hermes_trycatch_push(rtw) }
+  };
+  unsafe {
+    *buf.offset(0) = isolate as usize;
+    *buf.offset(1) = index as usize;
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__DESTRUCT(this: *mut usize) {
+  unsafe {
+    let isolate = *this.offset(0) as *mut RealIsolate;
+    let index = *this.offset(1) as i64;
+    if isolate.is_null() || index < 0 {
+      return;
+    }
+    v8x_hermes_trycatch_pop(iso_state(isolate).rtw, index);
+  }
+}
+
+/// Read `(rtw, frame_index)` out of a `raw::TryCatch` buffer, or `None` if
+/// the scope failed to acquire a frame (`CONSTRUCT` saw a null isolate/rtw).
+#[inline]
+fn trycatch_frame(this: *const usize) -> Option<(*mut c_void, i64)> {
+  if this.is_null() {
+    return None;
+  }
+  unsafe {
+    let isolate = *this.offset(0) as *mut RealIsolate;
+    let index = *this.offset(1) as i64;
+    if isolate.is_null() || index < 0 {
+      return None;
+    }
+    Some((iso_state(isolate).rtw, index))
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__HasCaught(this: *const usize) -> bool {
+  match trycatch_frame(this) {
+    Some((rtw, index)) => unsafe { v8x_hermes_trycatch_has_caught(rtw, index) != 0 },
+    None => false,
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__Exception(this: *const usize) -> *const Value {
+  match trycatch_frame(this) {
+    Some((rtw, index)) => {
+      let slot = unsafe { v8x_hermes_trycatch_exception(rtw, index) };
+      slot_ptr::<Value>(slot)
+    }
+    None => ptr::null(),
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__Message(this: *const usize) -> *const Message {
+  match trycatch_frame(this) {
+    Some((rtw, index)) => {
+      let slot = unsafe { v8x_hermes_trycatch_message(rtw, index) };
+      slot_ptr::<Message>(slot)
+    }
+    None => ptr::null(),
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__StackTrace(
+  this: *const usize,
+  _context: *const Context,
+) -> *const Value {
+  match trycatch_frame(this) {
+    Some((rtw, index)) => {
+      let slot = unsafe { v8x_hermes_trycatch_stack_trace(rtw, index) };
+      slot_ptr::<Value>(slot)
+    }
+    None => ptr::null(),
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__Reset(this: *mut usize) {
+  if let Some((rtw, index)) = trycatch_frame(this) {
+    unsafe { v8x_hermes_trycatch_reset(rtw, index) };
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__ReThrow(this: *mut usize) -> *const Value {
+  match trycatch_frame(this) {
+    Some((rtw, index)) => {
+      let slot = unsafe { v8x_hermes_trycatch_rethrow(rtw, index) };
+      slot_ptr::<Value>(slot)
+    }
+    None => ptr::null(),
+  }
+}
+
+/// Whether execution can continue (always true: we never model a fatal
+/// termination exception, only regular JS throws).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__CanContinue(this: *const usize) -> bool {
+  trycatch_frame(this).is_some()
+}
+
+/// Never models script termination (`Isolate::TerminateExecution` is not
+/// implemented), so always false.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__HasTerminated(_this: *const usize) -> bool {
+  false
+}
+
+// Verbose mode / capture-message toggles have no observable effect in this
+// model (a Message is always synthesized on demand from the captured
+// JSError, never routed to an isolate-level message listener), so these are
+// safe no-ops mirroring the vendored setter/getter shape.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__IsVerbose(_this: *const usize) -> bool {
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__SetVerbose(_this: *mut usize, _value: bool) {}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__TryCatch__SetCaptureMessage(
+  _this: *mut usize,
+  _value: bool,
+) {
+}
+
+// ---- Isolate::ThrowException + Exception::* constructors (C9) -------------
+//
+// The embedder throwing a value: captured straight into the innermost live
+// TryCatch frame (same sink `capture_exception` uses for a caught
+// `jsi::JSError`), since this backend has no separate "isolate pending
+// exception" object distinct from a TryCatch frame. Returns the vendored
+// contract's `*const Value` (v8 hands back the same exception value it was
+// given); v8 returns it to make chaining easy, callers rarely use the result.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__ThrowException(
+  isolate: *mut RealIsolate,
+  exception: *const Value,
+) -> *const Value {
+  if isolate.is_null() || exception.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  let slot = slot_of(exception);
+  unsafe { v8x_hermes_throw_exception(rtw, slot) };
+  exception
+}
+
+/// `Exception::Error/RangeError/ReferenceError/SyntaxError/TypeError`:
+/// construct (but do not throw) a JS Error subtype via its JS global
+/// constructor, since JSI exposes no C++ Error-subtype factory.
+fn exception_new(
+  ctor_name: &std::ffi::CStr,
+  message: *const V8String,
+) -> *const Value {
+  let rtw = current_rtw();
+  if rtw.is_null() || message.is_null() {
+    return ptr::null();
+  }
+  let slot = unsafe {
+    v8x_hermes_exception_new(rtw, ctor_name.as_ptr(), slot_of(message))
+  };
+  slot_ptr::<Value>(slot)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Exception__Error(message: *const V8String) -> *const Value {
+  exception_new(c_str!("Error"), message)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Exception__RangeError(
+  message: *const V8String,
+) -> *const Value {
+  exception_new(c_str!("RangeError"), message)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Exception__ReferenceError(
+  message: *const V8String,
+) -> *const Value {
+  exception_new(c_str!("ReferenceError"), message)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Exception__SyntaxError(
+  message: *const V8String,
+) -> *const Value {
+  exception_new(c_str!("SyntaxError"), message)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Exception__TypeError(
+  message: *const V8String,
+) -> *const Value {
+  exception_new(c_str!("TypeError"), message)
+}
+
+/// `Message::Get`: the synthesized "Uncaught ..." text is already a String
+/// slot (built by `v8x_hermes_trycatch_message`), so the `Message` handle IS
+/// that String handle; this just re-tags it as `*const String` (a no-op:
+/// same slot, different vendored phantom type).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Message__Get(this: *const Message) -> *const V8String {
+  if this.is_null() {
+    return ptr::null();
+  }
+  this as *const V8String
 }
 
 // ---- Platform / V8 lifecycle ----------------------------------------------
