@@ -7,7 +7,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
-- [ ] C0 research: Hermes embedding API + AOT capabilities
+- [x] C0 research: Hermes embedding API + AOT capabilities
 - [x] C0 research: v8x integration surface (how to add engine_hermes)
 - [x] C0 research: AOT-solves-snapshot feasibility (HBC / static-hermes / Porffor)
 - [ ] C1 scaffold: engine_hermes feature + src/hermes/ skeleton + build.rs
@@ -18,6 +18,35 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle 0 - Hermes embedding feasibility (agent: hermes-embed-aot) DONE => GO-WITH-CAVEATS
+Verdict: technically feasible, hardest of the 3 backends. Decision: SPIKE it (not a commitment);
+de-risk object identity before writing broad surface.
+- Embedding: JSI is C++-only, NOT ABI-stable (vtables/STL/mangling). Experimental C ABI in
+  API/hermes_abi/hermes_abi.h exists but under-documented/not production. => must write ~570 v8__*
+  in C++ against JSI, export extern "C", translate C++ jsi::JSError at every boundary.
+- Good news: JSI managed value = PointerValue* = a STABLE, refcounted, GC-updated slot (Hades moving
+  GC rewrites the tagged ptr in place). That IS V8's handle indirection. Global/Persistent = natural
+  fit; HandleScope = watermark pop; EscapableHandleScope::Escape = move slot to parent.
+- BLOCKERS: (1) IDENTITY - JSI hands out no raw ptr; two handles to same JS object differ. Every
+  V8 Value*/Object* identity/hash/Map/Set site must reroute to strictEquals OR canonicalize (intern
+  one slot per object). Deepest, most invasive. (2) per-Local alloc + atomic refcount cost on hot
+  paths. (3) C++-only boundary = most complex backend.
+- Build: CMake+Ninja, vendors llvh (NO external LLVM), Intl OFF by default. Size ~8MB app contrib
+  (> quickjs ~1MB, < jsc ~12MB). Linux/macOS first-class. PRIOR ART: rust-hermes/rusty_hermes +
+  libhermes-sys build Hermes from source "following the rusty_v8 pattern" - use as reference/dep.
+- AOT: HBC real+shipping (hermesc -emit-binary; prepareJavaScript sniffs source-vs-HBC magic;
+  isHermesBytecode()). Static Hermes (shermes, native via lowering to C) = research branch, NOT
+  shipping, needs types. RN 0.84 default = Hermes V1 = bytecode+small arm64 JIT, still not native.
+
+## DECISION (end of C0)
+Two overnight tracks:
+- TRACK A (Hermes spike): C1 scaffold engine_hermes (link with stubs) -> C2 get static Hermes lib
+  (reuse rusty_hermes/libhermes-sys machinery) -> C3 minimal C++ JSI shim for the 9-symbol hello
+  world (isolate->context->run script->read string) = the feasibility proof -> later de-risk identity.
+- TRACK B (AOT/snapshot): E5 QuickJS bytecode-boot experiment (IN-REPO, existing engine) - measure
+  boot-from-bytecode vs boot-from-source for bootstrap-shaped JS; tests whether native-builtins+AOT
+  makes snapshot unnecessary. Independent of Hermes.
 
 ### Cycle 0 - AOT vs snapshot (agent: aot-snapshot) DONE
 CRUX: "AOT solves snapshot" is FALSE as stated. V8 snapshot = serialized INITIALIZED HEAP
