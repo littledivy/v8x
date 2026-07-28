@@ -51,3 +51,13 @@ Built deno release --no-default-features --features quickjs (v8x 149.4.0-rc.1 fr
 JS builtins, async+setTimeout, Deno.readTextFile, TypeScript, Deno.serve+fetch (200 OK), npm import
 (change-case downloaded+ran). Delivered to ~/deno-quickjs/deno + README.md. NO further work needed.
 (This is the mature QuickJS backend; Hermes backend remains the spike.)
+
+## NEW NORTH STAR (user, morning): BOOT DENO ON THE HERMES BACKEND
+User called it: overnight built the Hermes BACKEND (77/267 rusty_v8, runs JS) but NOT deno-on-hermes,
+which was the real goal. Directive: GRIND toward Deno boot. Realistic multi-session effort.
+Path: D0 recon (map deno_core boot's v8__* needs + set a measurable minimal-boot target) ->
+D1 Promises + microtask queue -> D2 ES modules -> D3 ops/External infra + snapshot-or-bootstrap ->
+D4 deno_core hill-climb -> D5 actually boot a deno_core JsRuntime running a script on Hermes.
+Measure: get deno_core JsRuntime::new + eval "1+1" working on the hermes backend; then the deno_core suite.
+Honest: Hermes v0.11.0 is interpreter-only (no JIT) - not a speed win vs QuickJS; value is AOT/HBC + mobile.
+Same rules: commit+push each step, subagents for heavy work, local branch only, no fake wins.
