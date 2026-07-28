@@ -121,6 +121,23 @@ succeeded via deno_core's `with_event_loop_promise`, a different, op-promise
 path.) Wiring the microtask checkpoint to drain native Hermes promise jobs is
 the blocker for any await-based Web API; deferred to E5.
 
+**Correction / attribution note:** commit `c61a865` (nominally "implement
+v8::Symbol") also contains a `globalThis.queueMicrotask` shim in
+`ensure_promise_infra` (`hermes_shim.cpp`, the `setImmediate`/`drainJobs` setup
+block) that was not written by the primary executor for this cycle — it landed
+via a concurrent process sharing the same working tree mid-cycle and was swept
+into that commit by an unqualified `git add` without review. On inspection it
+is legitimate: Hermes has no native `queueMicrotask` global, `ReadableStream`'s
+chunk-delivery path (`chunkStepsMicrotask`) calls it, and without a shim that
+call is a no-op so the read's reaction never queues. It shares the same `jobs`
+FIFO as `setImmediate`/`drainJobs`, so one drain flushes both. Verified after
+discovery: does not regress the backend suite (still 37/37) and does not, by
+itself, resolve the E5 wall above (retested; the plain
+`Promise.resolve().then()` case still stays `Pending`, so the drain gap is
+upstream of `queueMicrotask` too). Left in place since it is correct, tested,
+and directly relevant groundwork for E5 — flagged here because it was not
+reviewed by the person whose name is on that commit before this note.
+
 ## (5) Backend fixes: files + commits (NOT pushed) + test count
 
 Branch `hermes-backend-spike`, not pushed:
