@@ -100,3 +100,15 @@ API). The boot PROBES are a proxy though; the real milestone is still ahead: wir
 build against the Hermes backend and attempt a JsRuntime boot (full bootstrap + real module graph + ops).
 That is the next cycle. Multi-session effort; no boot claimed until a real deno_core runtime runs a script. Honest note: Hermes v0.11.0 is
 interpreter-only (no JIT) and is not a compute win over QuickJS - benchmarks in ~/deno-quickjs/BENCHMARKS.md.
+
+
+## MILESTONE: deno_core boots on Hermes (into Deno's bootstrap JS)
+
+An actual deno_core::JsRuntime::new now RUNS on the Hermes backend: through v8 platform init, isolate,
+context (with deno_core's global ObjectTemplate + embedder data), the full string-interning surface, and
+the Deno.core namespace, and INTO executing Deno's real bootstrap JavaScript. It stops at the first
+bootstrap script ext:core/00_primordials.js, which throws because the vendored Hermes v0.11.0 is an OLD
+build missing 6 intrinsics Deno needs (AggregateError, BigInt, BigInt64Array, BigUint64Array,
+FinalizationRegistry, WeakRef). The wall is now the Hermes ENGINE VERSION, not our v8 shim. Next: bump the
+vendored Hermes framework (all 6 landed upstream after v0.11.0) to clear primordials, then the boot advances
+to the ext:core/mod.js module graph. rusty_v8 now 84/267. It does NOT run 1+1 yet - honest milestone, not a boot.

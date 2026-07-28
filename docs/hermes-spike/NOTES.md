@@ -11,7 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
-- [x] *** Hermes passes 83/267 rusty_v8; +Promises/microtasks/ES-modules; all 4 boot PROBES green (real deno_core boot next) ***
+- [x] *** deno_core::JsRuntime BOOTS on Hermes into Deno bootstrap JS (00_primordials.js); wall = Hermes v0.11.0 missing 6 intrinsics. rusty_v8 84/267 ***
 - [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities
@@ -39,6 +39,27 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle D4/D5 - REAL deno_core boot on Hermes (agent, opus) DONE - THE MILESTONE
+An actual deno_core::JsRuntime::new RUNS on the Hermes backend. Path a: wired real deno_core (checkout
+~/gh/deno-v8x-rebase, OUTSIDE this branch) - added a `hermes` feature to nathan's libs/deno_v8 facade
+(re-exports v8x_backend::* like quickjs), repointed v8x_backend crates.io->local v82jsc path, workspace
+v8 alias features ["simdutf","hermes"]. deno_core + hello_world example compile+link against Hermes.
+Run with DYLD_FRAMEWORK_PATH=/Users/divy/gh/v82jsc/vendor/hermes.
+RESULT (boots to X, fails at Y): JsRuntime::new runs through v8 platform init, isolate+context (deno_core
+global ObjectTemplate), full string interning, Deno.core namespace, THEN executes deno_core's FIRST
+bootstrap script ext:core/00_primordials.js which throws TypeError: target is not an object. Bisected:
+primordials enumerates every intrinsic via globalThis[name]; Hermes v0.11.0 MISSING 6: AggregateError,
+BigInt, BigInt64Array, BigUint64Array, FinalizationRegistry, WeakRef. ENGINE-completeness gap, NOT a
+v8__* gap. Does not run 1+1 yet (primordials must finish).
+5 native walls knocked down (src/hermes/): simdutf__* link (reuse quickjs impl), Platform__NewCustomPlatform,
+Local__New (+ new v8x_hermes_slot_dup C++ primitive), String__NewExternalOneByteConst/OneByteStatic,
+synthesized console on Context__GetExtrasBindingObject. rusty_v8 83->84 (context_get_extras_binding_object
+green from the console fix). --check --rescue holds. Committed e2d7ac9.
+NEXT (D6): BUMP vendored Hermes framework to a newer release (BigInt/WeakRef/FinalizationRegistry/
+AggregateError all landed upstream post-v0.11.0) -> clears primordials in one move; then walls shift to
+the ext:core/mod.js + synthetic ext:core/ops MODULE GRAPH (D2 module system supports the shape). Watch
+JSI ABI / HBC-version breakage on the bump.
 
 ### Cycle D3 - op glue (salvaged from a crashed agent) DONE - 5/5 boot probes
 The D3-D5 agent CRASHED on an API ConnectionRefused mid-work; salvaged its clean D3 op glue (its bad
