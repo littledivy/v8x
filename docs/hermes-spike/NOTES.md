@@ -11,7 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
-- [x] *** deno_core BOOTS on Hermes past intrinsics into primordials.js; wall = Hermes has no `async function*`. Hermes bumped to 2026/HBC99. rusty_v8 86/267 ***
+- [x] *** deno_core boots to the LAST step of new_inner on Hermes (past primordials, ops, 01_core.js, module graph); wall = ArrayBuffer BackingStore. rusty_v8 89/267. CEILING: async gens pervasive in full runtime ***
 - [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities
@@ -39,6 +39,28 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle D7 - past async-gen wall to the last boot step + the VIABILITY crux (agent, opus) DONE
+PART A (the honest crux): async generators are a ONE-OFF in deno_core's boot JS (only the primordials
+%AsyncGenerator% prototype capture at 00_primordials.js:285 - reflects on the shape, never drives one) so
+deno_core is NOT blocked. But PERVASIVE in the wider Deno runtime (ext/, loaded later): 16 async function*,
+4 async *method(), 58 Symbol.asyncIterator; hot paths ext/net/01_net.js (for await over a listener) +
+ext/web/09_file.js (Blob.stream()) + Node stream polyfills. Those are REAL suspend/resume async generators,
+NOT source-transformable like the one primordials literal. => deno_core CORE boots with a 1-literal
+workaround, but a FULL Deno runtime running user code that hits for-await-over-listener / Blob.stream / Node
+streams WILL hit the Hermes async-gen compiler gap at RUNTIME. Deno-on-Hermes is not viable for a COMPLETE
+runtime without Hermes gaining async generators (a compiler feature we cannot add) or a large per-site
+rewrite of vendored Deno source. THIS IS THE CEILING.
+PART B: rewrote the primordials async function* literal -> synthetic %AsyncGenerator% shape in the Hermes
+compile path, then cleared 6 more walls: Function.length (async-op codegen), Object::with_prototype_and_
+properties, Value::IsPromise (module-eval), value-Global durable pinning (C2 bug: stored object read back
+non-object), builtin globalThis.console, UnboundModuleScript. Boot now runs op registration, the virtual ops
+module, ALL of 01_core.js, and the builtin ES-module graph, stopping at JsRuntime::store_js_callbacks
+(new_inner's LAST step). NEW WALL: v8__ArrayBuffer__NewBackingStore__with_data (null stub) - external-memory
+BackingStore subsystem. Isolated 1+1 boot probe already passes, so close after BackingStores.
+rusty_v8 86 -> 89 (3 fixes turned green). --check --rescue holds. Deno-checkout diagnostics reverted.
+NEXT (D8): implement the external-memory BackingStore chain -> finishes store_js_callbacks -> likely
+deno_core boots + runs 1+1 (a real 'deno_core runs on Hermes' milestone). THEN report the ceiling to the user.
 
 ### Cycle D6 - bump Hermes v0.11.0 -> 260318099.0.1 (HBC 99) (agent, opus) DONE - boot past intrinsics
 Bumped to Hermes 260318099.0.1 (current HERMES_VERSION on RN main, HBC v99); hermesc+runtime both v99

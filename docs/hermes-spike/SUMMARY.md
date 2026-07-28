@@ -115,3 +115,17 @@ compile time: Hermes has no `async function*` (async generators), which primordi
 %AsyncGenerator% prototype. So the wall is now a Hermes source-language gap. Next: transform/polyfill that
 construct and advance toward the ext:core/mod.js module graph. Still no 1+1 - honest, incremental. Risk: async
 generators may recur in Deno's real runtime code, which would make this a pervasive blocker.
+
+
+## The viability ceiling (honest, D7): deno_core yes, full Deno no
+
+D7 answered the crux. The boot now advances to the LAST step of deno_core::JsRuntime::new_inner (past
+primordials, op registration, all of 01_core.js, and the builtin ES-module graph), blocked only on a
+well-scoped ArrayBuffer BackingStore subsystem - so deno_core booting + running 1+1 on Hermes is within reach.
+BUT: Deno's WIDER runtime (ext/net for-await over a listener, ext/web Blob.stream(), Node stream polyfills)
+uses REAL async generators (async function* / async *method / Symbol.asyncIterator) pervasively, and Hermes's
+compiler does not support async function* at all. The one occurrence in deno_core's boot (primordials capturing
+the %AsyncGenerator% prototype) was source-transformable; the runtime ones are real suspend/resume generators
+that are NOT. So the honest result: deno_core (the engine-embedding core) can boot and run code on Hermes, but
+a COMPLETE Deno runtime cannot without upstream Hermes gaining async generators or a large rewrite of vendored
+Deno source. rusty_v8 now 89/267.
