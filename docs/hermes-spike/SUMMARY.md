@@ -214,3 +214,19 @@ real output through ext/web's inspector op (console.log("hi", {a:1}, [2,3]) -> "
 parses through op_url_parse (new URL("https://a.b/p/q?x=1#h") -> pathname "/p/q", searchParams x "1"). Backend
 suite 41/41. So the real async-I/O foundation is in place; the network stack (ext/net, then fetch), where
 for-await over a socket lives, is the next target and reuses exactly this proven op/promise/loop plumbing.
+
+E7 took the network stack to a precise, honest boundary. Real deno_net (ext/net) builds and boots on Hermes;
+op_net_listen returns a real listener; accept/connect dispatch real promises; and the `for await (const conn
+of listener)` construct itself RUNS on Hermes - it reaches the loop, dispatches op_net_accept, and suspends
+awaiting it. What does NOT happen is completion: socket op promises never settle through run_event_loop, so no
+byte round-trips and for-await yields no connection. The root cause was isolated with a reproducing probe (and
+corroborated independently): this scratch deno checkout uses a custom libuv-compat reactor (libs/core/uv_compat),
+and while run_event_loop parks on it, kqueue I/O-readiness wakes and spawn_blocking wakes are not serviced -
+only timer wakes are (which is exactly why E6's timer-backed op settled). Raw tokio sockets and a raw
+spawn_blocking run fine on the very same runtime OUTSIDE run_event_loop. So the residual blocker is a
+runtime-integration bug in the checkout's event loop, NOT the Hermes engine and NOT the op->promise->
+__eventLoopTick bridge E6 proved. En route E7 also fixed a genuine Hermes lowering bug: the async-generator
+pass was targeting ES2017 and thereby also rewriting ES2022 #private fields into helpers we do not provide;
+it now lowers async generators only. Backend suite 42/42. The next cycle fixes the uv_compat reactor so the
+op-driver's spawned poll_task is serviced by the reactor the loop parks on, which unblocks ext/net, the raw-op
+path, and fetch at once.
