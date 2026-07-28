@@ -171,3 +171,14 @@ async iteration inside the booted runtime yields "1,2,3,4", and ext/web-shaped a
 "1,2,3,4,5". The remaining path to full Deno is the ordinary op + Web-API-global surface; the immediate
 blocker for the whole deno_runtime crate is a non-Hermes deno_napi compile error, while deno_web builds
 clean, so the next target is a minimal deno_webidl + deno_web worker on Hermes.
+
+E3 stood that worker up. deno_webidl + deno_web boot on Hermes and all 24 of ext/web's lazy JS files
+(00_infra.js through 18_css_stylesheet.js, including the ~8000-line 06_streams.js and the async-generator
+09_file.js) evaluate without throwing. Getting there needed six real backend gaps closed: script-compiler
+CompileFunction, the Global handle refcount/pin lifetime, capturing Hermes JSIExceptions (not just
+JSErrors), the error-surface shims (Exception::CreateMessage, String::Empty, Object::GetPrototype), and a
+fix so the lowering pass handles deno_core's `"use strict"; return (IIFE)` ext-script wrapper. Functional
+probes pass: atob/btoa, Event, ReadableStream construction. So ext/web is hydrated and partially functional
+on Hermes. The next walls are the v8::Private subsystem (used by the error formatter and callsite metadata)
+and the ArrayBuffer/TypedArray ABI that TextEncoder/structured-clone need. This is exactly the ordinary
+op/API grind the retraction predicted, not a fundamental block.
