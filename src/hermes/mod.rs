@@ -18,6 +18,8 @@
 // stub build keeps the auto-generated stubs for these symbols in `shims`.
 #[cfg(feature = "link_hermes")]
 mod core;
+#[cfg(feature = "link_hermes")]
+mod modules;
 mod misc;
 mod shims;
 

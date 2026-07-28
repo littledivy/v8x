@@ -192,10 +192,6 @@ pub extern "C" fn v8__ExternalOneByteStringResource__length() -> *const ::std::f
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FastOneByteString() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__FixedArray__Get() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__FixedArray__Length() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__CreateCodeCache() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__GetName() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -336,10 +332,6 @@ pub extern "C" fn v8__JSON__Stringify() -> *const ::std::ffi::c_void { ::std::pt
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Local__New() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Location__GetColumnNumber() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Location__GetLineNumber() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__MAJOR_VERSION() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Map__As__Array() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -384,55 +376,11 @@ pub extern "C" fn v8__Message__IsSharedCrossOrigin() -> *const ::std::ffi::c_voi
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__MINOR_VERSION() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__CreateSyntheticModule() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__Evaluate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__EvaluateForImportDefer() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__GetException() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__GetIdentityHash() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__GetModuleNamespace() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__GetModuleNamespace2() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__GetModuleRequests() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__GetStalledTopLevelAwaitMessage() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__GetStatus() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__GetUnboundModuleScript() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__InstantiateModule() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__IsGraphAsync() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__IsSourceTextModule() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__IsSyntheticModule() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__ScriptId() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__SetSyntheticModuleExport() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Module__SourceOffsetToLocation() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__ModuleCachingInterface__GetWireBytes() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ModuleCachingInterface__SetCachedCompiledModuleBytes() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ModuleImportPhase() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ModuleRequest__GetImportAttributes() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ModuleRequest__GetPhase() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ModuleRequest__GetSourceOffset() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ModuleRequest__GetSpecifier() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Name__GetIdentityHash() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -624,23 +572,7 @@ pub extern "C" fn v8__ScriptCompiler__Compile() -> *const ::std::ffi::c_void { :
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptCompiler__CompileFunction() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__ScriptCompiler__CompileModule() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptCompiler__CompileUnboundScript() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ScriptCompiler__Source__CONSTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ScriptCompiler__Source__DESTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ScriptCompiler__Source__GetCachedData() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ScriptOrigin__CONSTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ScriptOrigin__ResourceName() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ScriptOrigin__ScriptId() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ScriptOrigin__SourceMapUrl() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptOrigin_SIZE() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]

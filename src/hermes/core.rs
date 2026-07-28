@@ -315,6 +315,12 @@ pub(crate) struct IsoState {
   /// as a `jsi::JSError` on the C++ side so it propagates through JSI (and is
   /// caught by any enclosing TryCatch via the normal C9 path). -1 = none.
   pub pending_exception: i64,
+  /// D2: every ES-module / ModuleRequest / FixedArray record this isolate has
+  /// created, as erased boxed pointers with their drop glue. Modules are
+  /// Rust-owned records whose raw pointer IS the v8 Local handle (they never go
+  /// through the JSI handle table), so they must be freed here at Dispose. See
+  /// docs/hermes-spike/experiments/D2-hermes-modules.md.
+  pub module_records: Vec<Box<dyn FnOnce()>>,
 }
 
 thread_local! {
@@ -348,7 +354,7 @@ pub(crate) fn current_iso() -> *mut RealIsolate {
 /// Encode a C++ handle-table slot index as a non-null v8 `Local` pointer.
 /// (`(i << 1) | 1` keeps slot 0 distinguishable from a null handle.)
 #[inline]
-fn slot_ptr<T>(slot: i64) -> *const T {
+pub(super) fn slot_ptr<T>(slot: i64) -> *const T {
   if slot < 0 {
     return ptr::null();
   }
@@ -357,7 +363,7 @@ fn slot_ptr<T>(slot: i64) -> *const T {
 
 /// Recover the slot index from a tagged `Local` pointer, or `NULL_SLOT`.
 #[inline]
-fn slot_of<T>(ptr: *const T) -> i64 {
+pub(super) fn slot_of<T>(ptr: *const T) -> i64 {
   let bits = ptr as usize;
   if bits == 0 || (bits & 1) == 0 {
     return NULL_SLOT;
@@ -367,7 +373,7 @@ fn slot_of<T>(ptr: *const T) -> i64 {
 
 /// The `RuntimeWrapper*` for the current thread's isolate, or null.
 #[inline]
-fn current_rtw() -> *mut c_void {
+pub(super) fn current_rtw() -> *mut c_void {
   let iso = current_iso();
   if iso.is_null() {
     return ptr::null_mut();
@@ -390,6 +396,7 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     ctx_embedder_data: Vec::new(),
     microtask_queue: ptr::null_mut(),
     pending_exception: NULL_SLOT,
+    module_records: Vec::new(),
   });
   // A stable non-null default marker: the box's own state address. Overwritten
   // by any later SetMicrotaskQueue.
@@ -402,9 +409,14 @@ pub extern "C" fn v8__Isolate__Dispose(this: *mut RealIsolate) {
   if this.is_null() {
     return;
   }
+  // D2: run every module record's drop glue (unpins its JS values) BEFORE the
+  // runtime is freed, since unpin touches the still-live runtime.
+  let mut st = unsafe { Box::from_raw(this as *mut IsoState) };
+  for drop_fn in st.module_records.drain(..) {
+    drop_fn();
+  }
   // Drop the C++ runtime wrapper (clears the handle table Values while the
   // runtime is alive), then the Rust box.
-  let st = unsafe { Box::from_raw(this as *mut IsoState) };
   unsafe { v8x_hermes_runtime_free(st.rtw) };
   if current_iso() == this {
     CURRENT_ISO.with(|c| c.set(ptr::null_mut()));
@@ -901,6 +913,11 @@ pub extern "C" fn v8__String__WriteUtf8_v2(
     unsafe { *processed_characters_return = written };
   }
   written as c_int
+}
+
+/// Read the JS string in `slot` back into a Rust `String` (coercing if needed).
+pub(super) fn read_string_slot(rtw: *mut c_void, slot: i64) -> Option<String> {
+  read_string(rtw, slot)
 }
 
 /// Read the JS string in `slot` back into a Rust `String` (coercing if needed).

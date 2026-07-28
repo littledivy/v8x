@@ -121,6 +121,13 @@ struct RuntimeWrapper {
   std::unique_ptr<jsi::Value> promise_drain_jobs_fn;
   std::unique_ptr<jsi::Value> promise_mark_handled_fn;
   std::unique_ptr<jsi::Value> promise_has_handler_fn;
+  // D2: durable JS-value pins. ES-module records (exports object, module
+  // namespace, compiled closure) must survive HandleScope pops, so they are
+  // parked here (Runtime-owned holders, torn down before the Runtime, honoring
+  // the C2 lifetime rule) rather than in the scope-managed handle table. A pin
+  // id is an index into this vector; a freed pin leaves a null unique_ptr slot
+  // that a later pin can reuse.
+  std::vector<std::unique_ptr<jsi::Value>> pins;
   // C9: the TryCatch scope stack. back() is the innermost live scope.
   std::vector<TryCatchFrame> tc_stack;
   // C10: pending exception left by a native FunctionCallback that threw (via
@@ -2908,6 +2915,70 @@ int v8x_hermes_drain_microtasks(void *rtw) {
     // like V8's checkpoint does for jobs with no handler. C9: no TryCatch is
     // on the stack at a checkpoint.
     return 1;
+  }
+}
+
+// ---- D2: durable JS-value pins --------------------------------------------
+//
+// ES-module records must outlive the HandleScope in which they were compiled
+// or instantiated, so the module's exports object, namespace object, and
+// compiled closure are pinned here. A pin id is an index into `w->pins`;
+// `pin_get` copies the pinned value into a fresh handle-table slot for use, and
+// `unpin` releases the holder. See docs/hermes-spike/experiments/D2-hermes-modules.md.
+
+// Pin the Value in `slot` into a Runtime-owned holder. Returns a pin id (>= 0),
+// or -1 on error. Reuses a freed pin slot if one exists.
+int64_t v8x_hermes_pin(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr) {
+    return -1;
+  }
+  try {
+    auto holder = std::make_unique<jsi::Value>(w->runtime(), *v);
+    for (size_t i = 0; i < w->pins.size(); ++i) {
+      if (!w->pins[i]) {
+        w->pins[i] = std::move(holder);
+        return static_cast<int64_t>(i);
+      }
+    }
+    w->pins.emplace_back(std::move(holder));
+    return static_cast<int64_t>(w->pins.size() - 1);
+  } catch (...) {
+    return -1;
+  }
+}
+
+// Copy the pinned value `pin_id` into a fresh handle-table slot. Returns the
+// slot, or the null slot if the pin is invalid/freed.
+v8x_hermes_slot v8x_hermes_pin_get(void *rtw, int64_t pin_id) {
+  if (rtw == nullptr || pin_id < 0) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  if (static_cast<size_t>(pin_id) >= w->pins.size() ||
+      !w->pins[static_cast<size_t>(pin_id)]) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    return w->push(
+        jsi::Value(w->runtime(), *w->pins[static_cast<size_t>(pin_id)]));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// Release the holder for pin id `pin_id` (leaves a reusable empty slot).
+void v8x_hermes_unpin(void *rtw, int64_t pin_id) {
+  if (rtw == nullptr || pin_id < 0) {
+    return;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  if (static_cast<size_t>(pin_id) < w->pins.size()) {
+    w->pins[static_cast<size_t>(pin_id)].reset();
   }
 }
 
