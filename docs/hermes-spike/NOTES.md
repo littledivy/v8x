@@ -40,6 +40,17 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 ## Cycle log
 (newest first)
 
+### Cycle D3 - op glue (salvaged from a crashed agent) DONE - 5/5 boot probes
+The D3-D5 agent CRASHED on an API ConnectionRefused mid-work; salvaged its clean D3 op glue (its bad
+mid-run baseline --update was discarded, restored to 83). Implemented v8__Context__GetExtrasBindingObject
+(lazy per-context plain object, deno bootstrap reads built-ins onto it) + v8__Function__SetName/GetName
+(JSI has no name setter -> define name property). New probe boot_op_external_roundtrip: bind one op via
+External + FunctionTemplate, set_name, call from JS, + extras-binding stability -> 5/5 boot probes pass,
+builds clean. rusty_v8 baseline held at 83 (ratchet run timed out at 2min - harness is slow; re-check in D4).
+D4/D5 (wire real deno_core against hermes + attempt a JsRuntime boot) did NOT happen - agent died before
+it + disk was tight (2.5G). Now freed 7G (cargo clean deno-v8x-rebase target; binary already at
+~/deno-quickjs/deno) -> 9.6G free. Re-attempting the real boot next.
+
 ### Cycle D2 - ES modules on Hermes (agent: d2, opus) DONE - all 4 boot probes GREEN
 boot_es_module_instantiate_evaluate GREEN => 4/4 boot probes pass. rusty_v8 81 -> 83
 (script_compiler_source, module_evaluation). --update, no regressions, test_api still links.
