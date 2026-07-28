@@ -1343,4 +1343,46 @@ mod hermes_boot_probe {
       "synthetic %AsyncGenerator% shape is missing next/return/throw/asyncIterator"
     );
   }
+
+  /// Stage 5 (D7): Function.length reflects the declared arity. deno_core's
+  /// `setUpAsyncStub` (00_infra.js) switches on `originalOp.length - 1` to pick
+  /// the async-op wrapper and THROWS "Too many arguments for async op codegen"
+  /// when it is wrong. Hermes host functions report `.length === 0` regardless
+  /// of the paramCount handed to `createFromHostFunction`, so the backend
+  /// defines an explicit non-enumerable `length` own property. This probe builds
+  /// a FunctionTemplate with a declared length and asserts `fn.length` reflects
+  /// it (both the plain and the constructable/template-instance path use the
+  /// same C++ creation, so covering the template path covers both).
+  #[test]
+  fn boot_function_length_reflects_arity() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    fn cb(
+      _scope: &mut v8::PinScope,
+      _args: v8::FunctionCallbackArguments,
+      _rv: v8::ReturnValue<v8::Value>,
+    ) {
+    }
+
+    // A FunctionTemplate whose function should report length 3.
+    let templ = v8::FunctionTemplate::builder(cb).length(3).build(scope);
+    let func = templ.get_function(scope).unwrap();
+
+    let global = context.global(scope);
+    let key = v8::String::new(scope, "op_len_probe").unwrap();
+    global.set(scope, key.into(), func.into()).unwrap();
+
+    let src = v8::String::new(scope, "op_len_probe.length").unwrap();
+    let script = v8::Script::compile(scope, src, None).unwrap();
+    let result = script.run(scope).unwrap();
+    assert_eq!(
+      result.to_rust_string_lossy(scope),
+      "3",
+      "Function.length did not reflect the declared arity (setUpAsyncStub wall)"
+    );
+  }
 }

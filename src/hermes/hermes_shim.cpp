@@ -2474,6 +2474,32 @@ v8x_hermes_slot v8x_hermes_function_new(void *rtw, uintptr_t callback_bits,
     jsi::Function fn = jsi::Function::createFromHostFunction(
         w->runtime(), propName, paramCount, std::move(hostFn));
 
+    // Hermes host functions (createFromHostFunction) report `.length === 0`
+    // regardless of the `paramCount` handed in, and the constructable wrapper
+    // below (a fresh `new Function(...)`) would lose it too. V8 reflects a
+    // FunctionTemplate/Function's declared arity as the non-enumerable,
+    // non-writable, configurable own `length` property. deno_core relies on it:
+    // `setUpAsyncStub` switches on `originalOp.length - 1` to pick an async-op
+    // wrapper, and throws "Too many arguments for async op codegen" when it is
+    // wrong (a `.length` of 0 reads as -1 there). Define `length` explicitly.
+    // `defineLength(target)` sets it from the captured `paramCount`.
+    auto defineLength = [&](const jsi::Value &target) {
+      jsi::Function defineProperty =
+          w->runtime()
+              .global()
+              .getPropertyAsObject(w->runtime(), "Object")
+              .getPropertyAsFunction(w->runtime(), "defineProperty");
+      jsi::Object descriptor(w->runtime());
+      descriptor.setProperty(w->runtime(), "value",
+                             jsi::Value(static_cast<double>(paramCount)));
+      descriptor.setProperty(w->runtime(), "writable", jsi::Value(false));
+      descriptor.setProperty(w->runtime(), "enumerable", jsi::Value(false));
+      descriptor.setProperty(w->runtime(), "configurable", jsi::Value(true));
+      defineProperty.call(w->runtime(), target,
+                          jsi::String::createFromAscii(w->runtime(), "length"),
+                          std::move(descriptor));
+    };
+
     // A JSI host function (createFromHostFunction) is NOT constructable: `new
     // f()` throws "not a constructor". A v8 FunctionTemplate's function IS a
     // constructor. When this function came from a template
@@ -2500,10 +2526,13 @@ v8x_hermes_slot v8x_hermes_function_new(void *rtw, uintptr_t callback_bits,
               .getFunction(w->runtime());
       jsi::Value wrapped = wrapMaker.call(w->runtime(),
                                           jsi::Value(w->runtime(), fn));
+      defineLength(wrapped);
       return w->push(std::move(wrapped));
     }
 
-    return w->push(jsi::Value(std::move(fn)));
+    jsi::Value fn_val(std::move(fn));
+    defineLength(fn_val);
+    return w->push(std::move(fn_val));
   } catch (...) {
     return V8X_HERMES_NULL_SLOT;
   }
