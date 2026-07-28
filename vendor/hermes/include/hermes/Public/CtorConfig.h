@@ -5,8 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#ifndef HERMES_PUBLIC_CTORCONFIG_H
-#define HERMES_PUBLIC_CTORCONFIG_H
+#pragma once
 
 #include <utility>
 
@@ -69,7 +68,7 @@
    public:                                                              \
     Builder() = default;                                                \
                                                                         \
-    explicit Builder(const NAME &config) : config_(config){};           \
+    explicit Builder(const NAME &config) : config_(config) {}           \
                                                                         \
     inline const NAME build() {                                         \
       config_.doBuild(*this);                                           \
@@ -128,11 +127,11 @@
     return TypeAsSingleToken{__VA_ARGS__};             \
   }
 
-#define _HERMES_CTORCONFIG_SETTER(CX, TYPE, NAME, ...) \
-  inline auto with##NAME(TYPE NAME)->decltype(*this) { \
-    config_.NAME##_ = std::move(NAME);                 \
-    NAME##Explicit_ = true;                            \
-    return *this;                                      \
+#define _HERMES_CTORCONFIG_SETTER(CX, TYPE, NAME, ...)   \
+  inline auto with##NAME(TYPE NAME) -> decltype(*this) { \
+    config_.NAME##_ = std::move(NAME);                   \
+    NAME##Explicit_ = true;                              \
+    return *this;                                        \
   }
 
 #define _HERMES_CTORCONFIG_BUILDER_GETTER(CX, TYPE, NAME, ...) \
@@ -144,5 +143,3 @@
   if (newConfig.has##NAME()) {                         \
     with##NAME(newConfig.config_.get##NAME());         \
   }
-
-#endif //  HERMES_PUBLIC_CTORCONFIG_H

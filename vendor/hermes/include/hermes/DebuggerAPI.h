@@ -5,8 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#ifndef HERMES_DEBUGGERAPI_H
-#define HERMES_DEBUGGERAPI_H
+#pragma once
 
 #ifdef HERMES_ENABLE_DEBUGGER
 
@@ -31,6 +30,9 @@ class HermesValue;
 namespace facebook {
 namespace hermes {
 class HermesRuntime;
+// Forward declaration of the internal Root API class, which is marked as a
+// friend of the Debugger.
+class HermesRootAPI;
 
 namespace debugger {
 
@@ -269,6 +271,7 @@ class HERMES_EXPORT Debugger {
   ::facebook::jsi::Value getThrownValue();
 
  private:
+  friend HermesRootAPI;
   friend std::unique_ptr<HermesRuntime> hermes::makeHermesRuntime(
       const ::hermes::vm::RuntimeConfig &);
   friend std::unique_ptr<jsi::ThreadSafeRuntime>
@@ -497,5 +500,3 @@ class EventObserver {
 } // namespace facebook
 
 #endif // !HERMES_ENABLE_DEBUGGER
-
-#endif // HERMES_DEBUGGERAPI_H

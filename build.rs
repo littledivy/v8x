@@ -215,12 +215,22 @@ fn build_hermes(manifest_dir: &Path) {
     .map(PathBuf::from)
     .unwrap_or_else(|| vendor.join("include"));
 
-  let framework = lib_dir.join("hermes.framework");
+  // Newer Hermes prebuilts (react-native main, Hermes 2026+) renamed the
+  // framework `hermes.framework` -> `hermesvm.framework` (and its link name to
+  // `hermesvm`). Detect which one is vendored so both the older RN 0.75.4
+  // (`hermes`) and the newer (`hermesvm`) prebuilts link.
+  let (framework_name, framework) = if lib_dir.join("hermesvm.framework").exists()
+  {
+    ("hermesvm", lib_dir.join("hermesvm.framework"))
+  } else {
+    ("hermes", lib_dir.join("hermes.framework"))
+  };
   assert!(
     framework.exists(),
-    "hermes.framework not found at {} — set HERMES_LIB_DIR to a dir that \
-     contains it (see docs/hermes-spike/experiments/C2-hermes-ffi.md)",
-    framework.display()
+    "hermes.framework / hermesvm.framework not found at {} — set \
+     HERMES_LIB_DIR to a dir that contains it (see \
+     docs/hermes-spike/experiments/C2-hermes-ffi.md)",
+    lib_dir.display()
   );
 
   let shim = manifest_dir.join("src/hermes/hermes_eval_shim.cpp");
@@ -247,7 +257,7 @@ fn build_hermes(manifest_dir: &Path) {
     "cargo:rustc-link-search=framework={}",
     lib_dir.display()
   );
-  println!("cargo:rustc-link-lib=framework=hermes");
+  println!("cargo:rustc-link-lib=framework={framework_name}");
   println!("cargo:rustc-link-lib=c++");
   println!(
     "cargo:rustc-link-arg=-Wl,-rpath,{}",

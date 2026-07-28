@@ -671,7 +671,17 @@ int v8x_hermes_is_hbc(const uint8_t *data, size_t len) {
   if (data == nullptr) {
     return 0;
   }
-  return facebook::hermes::HermesRuntime::isHermesBytecode(data, len) ? 1 : 0;
+  // The 2026 Hermes root-API refactor moved isHermesBytecode from a static
+  // method on HermesRuntime to a virtual on IHermesRootAPI, reached via
+  // makeHermesRootAPI() + castInterface (the vendored framework is that build).
+  using facebook::hermes::IHermesRootAPI;
+  auto *root = facebook::hermes::makeHermesRootAPI();
+  auto *api =
+      static_cast<IHermesRootAPI *>(root->castInterface(IHermesRootAPI::uuid));
+  if (api == nullptr) {
+    return 0;
+  }
+  return api->isHermesBytecode(data, len) ? 1 : 0;
 }
 
 // Evaluate a raw byte buffer that is EITHER JS source OR Hermes bytecode

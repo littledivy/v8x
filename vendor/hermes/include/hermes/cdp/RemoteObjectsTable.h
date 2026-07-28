@@ -5,8 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#ifndef HERMES_CDP_REMOTEOBJECTSTABLE_H
-#define HERMES_CDP_REMOTEOBJECTSTABLE_H
+#pragma once
 
 #include <cstdint>
 #include <unordered_map>
@@ -101,9 +100,9 @@ class RemoteObjectsTable {
 
   /**
    * Removes the scope or JSI value backed by the provided object ID from the
-   * table.
+   * table. \return true if the object was removed, false if it was not found.
    */
-  void releaseObject(const std::string &objId);
+  bool releaseObject(const std::string &objId);
 
   /**
    * Removes all objects that are part of the provided object group from the
@@ -112,7 +111,7 @@ class RemoteObjectsTable {
   void releaseObjectGroup(const std::string &objectGroup);
 
  private:
-  void releaseObject(int64_t id);
+  bool releaseObject(int64_t id);
 
   int64_t scopeId_ = -1;
   int64_t valueId_ = 1;
@@ -126,5 +125,3 @@ class RemoteObjectsTable {
 } // namespace cdp
 } // namespace hermes
 } // namespace facebook
-
-#endif // HERMES_CDP_REMOTEOBJECTSTABLE_H

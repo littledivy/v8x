@@ -5,24 +5,20 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#ifndef HERMES_CDP_DEBUGGERDOMAINAGENT_H
-#define HERMES_CDP_DEBUGGERDOMAINAGENT_H
+#pragma once
 
-#include <functional>
 #include <string>
 
 #include <hermes/AsyncDebuggerAPI.h>
+#include <hermes/cdp/DebuggerDomainCoordinator.h>
+#include <hermes/cdp/DomainAgent.h>
+#include <hermes/cdp/DomainState.h>
 #include <hermes/cdp/MessageConverters.h>
 #include <hermes/hermes.h>
-
-#include "DomainAgent.h"
-#include "DomainState.h"
 
 namespace facebook {
 namespace hermes {
 namespace cdp {
-
-enum class PausedNotificationReason;
 
 namespace m = ::facebook::hermes::cdp::message;
 
@@ -89,11 +85,14 @@ class DebuggerDomainAgent : public DomainAgent {
   DebuggerDomainAgent(
       int32_t executionContextID,
       HermesRuntime &runtime,
-      debugger::AsyncDebuggerAPI &asyncDebugger,
+      debugger::AsyncDebuggerAPI &asyncDebuggerAPI,
+      DebuggerDomainCoordinator &debuggerDomainAPI,
       SynchronizedOutboundCallback messageCallback,
       std::shared_ptr<RemoteObjectsTable> objTable_,
       DomainState &state);
   ~DebuggerDomainAgent();
+
+  // ------ CDP API (used by CDPAgent) ------
 
   /// Enables the Debugger domain without processing CDP message or sending a
   /// CDP response. It will still send CDP notifications if needed.
@@ -117,6 +116,10 @@ class DebuggerDomainAgent : public DomainAgent {
   /// Handles Debugger.stepOver request
   void stepOver(const m::debugger::StepOverRequest &req);
 
+  /// Handles Debugger.setBlackboxedRanges request
+  void setBlackboxedRanges(const m::debugger::SetBlackboxedRangesRequest &req);
+  /// Handles Debugger.setBlackboxPatterns request
+  void setBlackboxPatterns(const m::debugger::SetBlackboxPatternsRequest &req);
   /// Handles Debugger.setPauseOnExceptions
   void setPauseOnExceptions(
       const m::debugger::SetPauseOnExceptionsRequest &req);
@@ -124,11 +127,21 @@ class DebuggerDomainAgent : public DomainAgent {
   /// Handles Debugger.evaluateOnCallFrame
   void evaluateOnCallFrame(const m::debugger::EvaluateOnCallFrameRequest &req);
 
-  /// Debugger.setBreakpoint creates a CDP breakpoint that applies to exactly
-  /// one script (identified by script ID) that does not survive reloads.
+  /// @cdp Debugger.setBreakpoint creates a CDP breakpoint that applies to
+  /// exactly one script (identified by script ID) that does not survive
+  /// reloads. A `condition` equal to an empty string is treated the same as an
+  /// omitted condition (= unconditional breakpoint).
+  /// Hermes allows multiple breakpoints to be set at the same location,
+  /// even in the same CDP session. For comparison, V8 allows it from different
+  /// sessions but disallows it within a single session.
   void setBreakpoint(const m::debugger::SetBreakpointRequest &req);
-  // Debugger.setBreakpointByUrl creates a CDP breakpoint that may apply to
-  // multiple scripts (identified by URL), and survives reloads.
+  /// @cdp Debugger.setBreakpointByUrl creates a CDP breakpoint that may apply
+  /// to multiple scripts (identified by URL), and survives reloads. A
+  /// `condition` equal to an empty string is treated the same as an omitted
+  /// condition (= unconditional breakpoint).
+  /// Hermes allows multiple breakpoints to be set at the same location,
+  /// even in the same CDP session. For comparison, V8 allows it from different
+  /// sessions but disallows it within a single session.
   void setBreakpointByUrl(const m::debugger::SetBreakpointByUrlRequest &req);
   /// Handles Debugger.removeBreakpoint
   void removeBreakpoint(const m::debugger::RemoveBreakpointRequest &req);
@@ -137,75 +150,131 @@ class DebuggerDomainAgent : public DomainAgent {
   void setBreakpointsActive(
       const m::debugger::SetBreakpointsActiveRequest &req);
 
- private:
-  /// Handle an event originating from the runtime.
-  void handleDebuggerEvent(
-      HermesRuntime &runtime,
-      debugger::AsyncDebuggerAPI &asyncDebugger,
-      debugger::DebuggerEventType event);
+  // ------ Coordinator API (used by DebuggerDomainCoordinator) ------
 
+  void processScript(const debugger::SourceLocation &srcLoc);
+  bool locationHasManualBreakpoint(
+      const debugger::SourceLocation &srcLoc) const;
+
+  /// Checks whether the passed location falls within a blackboxed range
+  /// in blackboxedRanges_.
+  /// Chrome looks at full functions ("frames") to determine this. See:
+  /// https://source.chromium.org/chromium/chromium/src/+/318e9cfd9fbbbc70906f6a78d017a2708248dc6d:v8/src/inspector/v8-debugger-agent-impl.cc;l=984-1026
+  /// We, on the other hand, look at individual lines since there's no
+  /// difference in practise because the current way functions are blackboxed is
+  /// by using ignoreList in source maps, which blackboxes full files, which
+  /// means also it blackboxes full functions, so there's no difference between
+  /// checking if a line in a function is blackboxed or if the whole function is
+  /// blackboxed.
+  /// This means that we receive one "Debugger.setBlackboxedRanges" per bundle
+  /// file comprised of source js files.
+  /// For each file appearing in the "ignoreList" in source maps, we receive the
+  /// start positions and end positions of the file inside the bundle file:
+  /// [ file 1 start position,
+  ///   file 1 end position,
+  ///   file 2 start position,
+  ///   file 2 end position,
+  ///   ... ]
+  bool isLocationBlackboxed(const debugger::SourceLocation &loc) const;
+
+  void notifyPaused(PausedNotificationReason reason);
+  void notifyUnpaused();
+
+ private:
   /// Send a Debugger.paused notification to the debug client
   void sendPausedNotificationToClient(PausedNotificationReason reason);
   /// Send a Debugger.scriptParsed notification to the debug client
   void sendScriptParsedNotificationToClient(
       const debugger::SourceLocation srcLoc);
 
-  /// Obtain the newly loaded script and send a ScriptParsed notification to the
-  /// debug client
-  void processNewLoadedScript();
-
   std::pair<unsigned int, CDPBreakpoint &> createCDPBreakpoint(
       CDPBreakpointDescription &&description,
       std::optional<HermesBreakpoint> hermesBreakpoint = std::nullopt);
 
-  std::optional<HermesBreakpointLocation> createHermesBreakpont(
+  std::optional<HermesBreakpointLocation> createHermesBreakpoint(
       debugger::ScriptID scriptID,
       const CDPBreakpointDescription &description);
 
+  void applyBreakpointAndSendNotification(
+      CDPBreakpointID cdpBreakpointID,
+      CDPBreakpoint &cdpBreakpoint,
+      const debugger::SourceLocation &srcLoc);
+
   std::optional<HermesBreakpointLocation> applyBreakpoint(
-      CDPBreakpoint &breakpoint,
+      CDPBreakpoint &cdpBreakpoint,
       debugger::ScriptID scriptID);
+
+  /// Holds a boolean that determines if scripts without a script url
+  /// (e.g. anonymous scripts) should be blackboxed.
+  /// Same as V8:
+  /// https://source.chromium.org/chromium/chromium/src/+/fef5d519bab86dbd712d76bfca5be90a6e03459c:v8/src/inspector/v8-debugger-agent-impl.cc;l=997-999
+  bool blackboxAnonymousScripts_ = false;
+  /// Optionally, holds a compiled regex pattern that is used to test if
+  /// script urls should be blackboxed.
+  /// See isLocationBlackboxed below for more details. Same as V8:
+  /// https://source.chromium.org/chromium/chromium/src/+/fef5d519bab86dbd712d76bfca5be90a6e03459c:v8/src/inspector/v8-debugger-agent-impl.cc;l=993-996
+  /// Matching using the compiled regex should be done with
+  /// ::hermes::regex::searchWithBytecode.
+  std::optional<std::vector<uint8_t>> compiledBlackboxPatternRegex_;
+
+  /// A vector of 1-based positions per script id indicating where blackbox
+  /// state changes using [from inclusive, to exclusive) pairs.
+  /// [  (start)   ... position[0]) range is not blackboxed
+  /// [position[0] ... position[1]) range is blackboxed
+  /// [position[1] ... position[2]) range is not blackboxed ... ...
+  /// [position[n] ...    (end)   ) range is blackboxed if n is even, not
+  /// blackboxed if odd.
+  /// This is used to determine if the debugger is paused on one of these
+  /// blackboxed ranges, to prevent the user from stopping there in the
+  /// following scenarios:
+  /// 1. Step out- repeats stepping out until reaches a non-blackboxed range.
+  /// 2. Step over- stepping over to a blackboxed range meaning that
+  /// the next un-blackboxed range would be after all the stepping in the
+  /// function are done (because blackboxing is per file, meaning per function
+  /// as well) so we can execute step out as well in this case until we
+  /// step out of blackboxed ranges.
+  /// Comparing with v8, we don’t check if the user comes from a blackboxed
+  /// range, but only if a stepover got you to a blackboxed range. However
+  /// both results in the same thing which is stepping out until reaching a
+  /// non-blackboxed range.
+  /// 3. Step into- execute another step into.
+  /// Repeat this step until outside of a blackboxed range.
+  /// 4. Exceptions triggering the debugger pause-
+  /// (uncaught or if the user chooses to stop on all exceptions)-
+  /// ignore and continue execution
+  /// 5. Debugger statements- ignore and continue execution
+  /// 6. Explicit pause- keep stepping in until reaching a non-blackboxed range
+  /// 7. Manual breakpoints- allow stopping in blackboxed ranges
+  std::unordered_map<debugger::ScriptID, std::vector<std::pair<int, int>>>
+      blackboxedRanges_;
 
   bool checkDebuggerEnabled(const m::Request &req);
   bool checkDebuggerPaused(const m::Request &req);
 
   /// Removes any modifications this agent made to Hermes in order to enable
   /// debugging
-  void cleanUp();
+  void disable();
 
   HermesRuntime &runtime_;
   debugger::AsyncDebuggerAPI &asyncDebugger_;
-
-  /// ID for the registered DebuggerEventCallback
-  debugger::DebuggerEventCallbackID debuggerEventCallbackId_;
+  DebuggerDomainCoordinator &debuggerDomainCoordinator_;
 
   /// Details of each CDP breakpoint that has been created, and not
   /// yet destroyed.
   std::unordered_map<CDPBreakpointID, CDPBreakpoint> cdpBreakpoints_{};
 
   /// CDP breakpoint IDs are assigned by the DebuggerDomainAgent. Keep track of
-  /// the next available ID.
-  CDPBreakpointID nextBreakpointID_ = 1;
+  /// the next available ID. Starts with 100 to avoid confusion with Hermes
+  /// breakpoints IDs that start with 1.
+  CDPBreakpointID nextBreakpointID_ = 100;
 
   DomainState &state_;
-
-  /// Whether the currently installed breakpoints actually take effect. If
-  /// they're supposed to be inactive, then debugger agent will automatically
-  /// resume execution when breakpoints are hit.
-  bool breakpointsActive_ = true;
 
   /// Whether Debugger.enable was received and wasn't disabled by receiving
   /// Debugger.disable
   bool enabled_;
-
-  /// Whether to consider the debugger as currently paused. There are some
-  /// debugger events such as ScriptLoaded where we don't consider the debugger
-  /// to be paused.
-  bool paused_;
 };
 
 } // namespace cdp
 } // namespace hermes
 } // namespace facebook
-
-#endif // HERMES_CDP_DEBUGGERDOMAINAGENT_H

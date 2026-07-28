@@ -5,8 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#ifndef HERMES_PUBLIC_GCTRIPWIRECONTEXT_H
-#define HERMES_PUBLIC_GCTRIPWIRECONTEXT_H
+#pragma once
 
 #include <hermes/Public/HermesExport.h>
 
@@ -32,10 +31,10 @@ class HERMES_EXPORT GCTripwireContext {
   /// \param os stream to save the heap capture to.
   /// \return Empty error code if the heap capture succeeded, else a real error
   ///   code.
-  virtual std::error_code createSnapshot(std::ostream &os) = 0;
+  virtual std::error_code createSnapshot(
+      std::ostream &os,
+      bool captureNumericValue) = 0;
 };
 
 } // namespace vm
 } // namespace hermes
-
-#endif // HERMES_PUBLIC_GCTRIPWIRECONTEXT_H

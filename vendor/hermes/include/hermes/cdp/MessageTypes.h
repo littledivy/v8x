@@ -1,5 +1,5 @@
 // Copyright (c) Meta Platforms, Inc. and affiliates. All Rights Reserved.
-// @generated SignedSource<<2d6fd9e085abc8347743709393aff722>>
+// @generated SignedSource<<1284c402aedd087ebdf70e9e76596f1c>>
 
 #pragma once
 
@@ -35,7 +35,11 @@ struct RemoveBreakpointRequest;
 struct ResumeRequest;
 struct ResumedNotification;
 struct Scope;
+using ScriptLanguage = std::string;
 struct ScriptParsedNotification;
+struct ScriptPosition;
+struct SetBlackboxPatternsRequest;
+struct SetBlackboxedRangesRequest;
 struct SetBreakpointByUrlRequest;
 struct SetBreakpointByUrlResponse;
 struct SetBreakpointRequest;
@@ -74,10 +78,13 @@ struct GetPropertiesRequest;
 struct GetPropertiesResponse;
 struct GlobalLexicalScopeNamesRequest;
 struct GlobalLexicalScopeNamesResponse;
+struct InspectRequestedNotification;
 struct InternalPropertyDescriptor;
 struct ObjectPreview;
 struct PropertyDescriptor;
 struct PropertyPreview;
+struct ReleaseObjectGroupRequest;
+struct ReleaseObjectRequest;
 struct RemoteObject;
 using RemoteObjectId = std::string;
 struct RunIfWaitingForDebuggerRequest;
@@ -129,6 +136,8 @@ struct RequestHandler {
   virtual void handle(const debugger::PauseRequest &req) = 0;
   virtual void handle(const debugger::RemoveBreakpointRequest &req) = 0;
   virtual void handle(const debugger::ResumeRequest &req) = 0;
+  virtual void handle(const debugger::SetBlackboxPatternsRequest &req) = 0;
+  virtual void handle(const debugger::SetBlackboxedRangesRequest &req) = 0;
   virtual void handle(const debugger::SetBreakpointRequest &req) = 0;
   virtual void handle(const debugger::SetBreakpointByUrlRequest &req) = 0;
   virtual void handle(const debugger::SetBreakpointsActiveRequest &req) = 0;
@@ -160,6 +169,8 @@ struct RequestHandler {
   virtual void handle(const runtime::GetHeapUsageRequest &req) = 0;
   virtual void handle(const runtime::GetPropertiesRequest &req) = 0;
   virtual void handle(const runtime::GlobalLexicalScopeNamesRequest &req) = 0;
+  virtual void handle(const runtime::ReleaseObjectRequest &req) = 0;
+  virtual void handle(const runtime::ReleaseObjectGroupRequest &req) = 0;
   virtual void handle(const runtime::RunIfWaitingForDebuggerRequest &req) = 0;
 };
 
@@ -172,6 +183,8 @@ struct NoopRequestHandler : public RequestHandler {
   void handle(const debugger::PauseRequest &req) override {}
   void handle(const debugger::RemoveBreakpointRequest &req) override {}
   void handle(const debugger::ResumeRequest &req) override {}
+  void handle(const debugger::SetBlackboxPatternsRequest &req) override {}
+  void handle(const debugger::SetBlackboxedRangesRequest &req) override {}
   void handle(const debugger::SetBreakpointRequest &req) override {}
   void handle(const debugger::SetBreakpointByUrlRequest &req) override {}
   void handle(const debugger::SetBreakpointsActiveRequest &req) override {}
@@ -203,6 +216,8 @@ struct NoopRequestHandler : public RequestHandler {
   void handle(const runtime::GetHeapUsageRequest &req) override {}
   void handle(const runtime::GetPropertiesRequest &req) override {}
   void handle(const runtime::GlobalLexicalScopeNamesRequest &req) override {}
+  void handle(const runtime::ReleaseObjectRequest &req) override {}
+  void handle(const runtime::ReleaseObjectGroupRequest &req) override {}
   void handle(const runtime::RunIfWaitingForDebuggerRequest &req) override {}
 };
 
@@ -392,6 +407,19 @@ struct debugger::CallFrame : public Serializable {
   std::vector<debugger::Scope> scopeChain;
   runtime::RemoteObject thisObj{};
   std::optional<runtime::RemoteObject> returnValue;
+};
+
+struct debugger::ScriptPosition : public Serializable {
+  ScriptPosition() = default;
+  ScriptPosition(ScriptPosition &&) = default;
+  ScriptPosition(const ScriptPosition &) = delete;
+  static std::unique_ptr<ScriptPosition> tryMake(const JSONObject *obj);
+  JSONValue *toJsonVal(JSONFactory &factory) const override;
+  ScriptPosition &operator=(const ScriptPosition &) = delete;
+  ScriptPosition &operator=(ScriptPosition &&) = default;
+
+  long long lineNumber{};
+  long long columnNumber{};
 };
 
 struct heapProfiler::SamplingHeapProfileNode : public Serializable {
@@ -626,6 +654,30 @@ struct debugger::ResumeRequest : public Request {
   void accept(RequestHandler &handler) const override;
 
   std::optional<bool> terminateOnResume;
+};
+
+struct debugger::SetBlackboxPatternsRequest : public Request {
+  SetBlackboxPatternsRequest();
+  static std::unique_ptr<SetBlackboxPatternsRequest> tryMake(
+      const JSONObject *obj);
+
+  JSONValue *toJsonVal(JSONFactory &factory) const override;
+  void accept(RequestHandler &handler) const override;
+
+  std::vector<std::string> patterns;
+  std::optional<bool> skipAnonymous;
+};
+
+struct debugger::SetBlackboxedRangesRequest : public Request {
+  SetBlackboxedRangesRequest();
+  static std::unique_ptr<SetBlackboxedRangesRequest> tryMake(
+      const JSONObject *obj);
+
+  JSONValue *toJsonVal(JSONFactory &factory) const override;
+  void accept(RequestHandler &handler) const override;
+
+  runtime::ScriptId scriptId{};
+  std::vector<debugger::ScriptPosition> positions;
 };
 
 struct debugger::SetBreakpointRequest : public Request {
@@ -922,6 +974,27 @@ struct runtime::GlobalLexicalScopeNamesRequest : public Request {
   std::optional<runtime::ExecutionContextId> executionContextId;
 };
 
+struct runtime::ReleaseObjectRequest : public Request {
+  ReleaseObjectRequest();
+  static std::unique_ptr<ReleaseObjectRequest> tryMake(const JSONObject *obj);
+
+  JSONValue *toJsonVal(JSONFactory &factory) const override;
+  void accept(RequestHandler &handler) const override;
+
+  runtime::RemoteObjectId objectId{};
+};
+
+struct runtime::ReleaseObjectGroupRequest : public Request {
+  ReleaseObjectGroupRequest();
+  static std::unique_ptr<ReleaseObjectGroupRequest> tryMake(
+      const JSONObject *obj);
+
+  JSONValue *toJsonVal(JSONFactory &factory) const override;
+  void accept(RequestHandler &handler) const override;
+
+  std::string objectGroup;
+};
+
 struct runtime::RunIfWaitingForDebuggerRequest : public Request {
   RunIfWaitingForDebuggerRequest();
   static std::unique_ptr<RunIfWaitingForDebuggerRequest> tryMake(
@@ -1124,6 +1197,7 @@ struct debugger::ScriptParsedNotification : public Notification {
   std::optional<bool> hasSourceURL;
   std::optional<bool> isModule;
   std::optional<long long> length;
+  std::optional<debugger::ScriptLanguage> scriptLanguage;
 };
 
 struct heapProfiler::AddHeapSnapshotChunkNotification : public Notification {
@@ -1186,6 +1260,17 @@ struct runtime::ExecutionContextCreatedNotification : public Notification {
   JSONValue *toJsonVal(JSONFactory &factory) const override;
 
   runtime::ExecutionContextDescription context{};
+};
+
+struct runtime::InspectRequestedNotification : public Notification {
+  InspectRequestedNotification();
+  static std::unique_ptr<InspectRequestedNotification> tryMake(
+      const JSONObject *obj);
+  JSONValue *toJsonVal(JSONFactory &factory) const override;
+
+  runtime::RemoteObject object{};
+  JSONBlob hints;
+  std::optional<runtime::ExecutionContextId> executionContextId;
 };
 
 } // namespace message

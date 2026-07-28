@@ -7,12 +7,11 @@
 
 // Based on mutex.h from https://clang.llvm.org/docs/ThreadSafetyAnalysis.html
 
-#ifndef THREAD_SAFETY_ANALYSIS_MUTEX_H
-#define THREAD_SAFETY_ANALYSIS_MUTEX_H
+#pragma once
 
 // Enable thread safety attributes only with clang.
 // The attributes can be safely erased when compiling with other compilers.
-#if defined(__clang__) && (!defined(SWIG)) && \
+#if defined(__clang__) && (!defined(SWIG)) && defined(_LIBCPP_VERSION) && \
     defined(_LIBCPP_ENABLE_THREAD_SAFETY_ANNOTATIONS)
 #define TSA_THREAD_ANNOTATION_ATTRIBUTE__(x) __attribute__((x))
 #else
@@ -74,5 +73,3 @@
 
 #define TSA_NO_THREAD_SAFETY_ANALYSIS \
   TSA_THREAD_ANNOTATION_ATTRIBUTE__(no_thread_safety_analysis)
-
-#endif // THREAD_SAFETY_ANALYSIS_MUTEX_H

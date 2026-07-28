@@ -5,8 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#ifndef HERMES_CDP_DOMAINAGENT_H
-#define HERMES_CDP_DOMAINAGENT_H
+#pragma once
 
 #include <mutex>
 #include <string>
@@ -14,7 +13,7 @@
 #include <hermes/cdp/MessageTypes.h>
 #include <hermes/cdp/RemoteObjectsTable.h>
 
-#if defined(__clang__) && (!defined(SWIG)) && \
+#if defined(__clang__) && (!defined(SWIG)) && defined(_LIBCPP_VERSION) && \
     defined(_LIBCPP_ENABLE_THREAD_SAFETY_ANNOTATIONS)
 #include <hermes/ThreadSafetyAnalysis.h>
 #else
@@ -106,5 +105,3 @@ class DomainAgent {
 } // namespace cdp
 } // namespace hermes
 } // namespace facebook
-
-#endif // HERMES_CDP_DOMAINAGENT_H
