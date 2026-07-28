@@ -11,7 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
-- [x] *** Hermes passes 76/267 rusty_v8 tests; objects/arrays/functions/callbacks/exceptions/templates/accessors (use --rescue) ***
+- [x] *** Hermes passes 77/267 rusty_v8 tests; objects/arrays/functions/callbacks/exceptions/templates/accessors/signatures (use --rescue) ***
 - [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities
@@ -39,6 +39,22 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle C12 - FunctionTemplate signatures + a TryCatch lifetime fix, ratchet 76 -> 77 (agent: c12) DONE (wind-down)
+FunctionTemplate::Signature (v8__Signature__New + receiver check): each FnTemplate gets a process-global
+template_id; instances stamped via hidden Symbol-keyed prop; signature-bearing fns walk the receiver
+prototype chain for a matching stamp before running, else throw "TypeError: Illegal invocation". New
+pass: function_template_signature. 15/15 internal smoke.
+FIXED a load-bearing exception-lifetime bug (same class as C11 EscapableHandleScope): TryCatchFrame held
+the exception as a raw handle-index that a later EscapableHandleScope exit (vendored eval() helper) could
+truncate before the message was read. Now held as a Runtime-owned shared_ptr<jsi::Value>, fresh slot per read.
+DEFERRED (clean, not half-committed per wind-down): named property interceptors - designed in full (ABI
+shapes; Intercepted is #[repr(u32)]{kYes=0,kNo=1}, inverted from intuition) but not implemented. Notes in
+C12 doc for the next cycle.
+CRASHER FINDING (honest): the 4 remaining crashers (array_buffer_with_shared_backing_store + 3 cppgc_*)
+abort via "panic in a fn that cannot unwind" inside the VENDORED support.rs extern C trampoline - cannot
+be caught without editing vendored code (which the ratchet forbids). Prototyped catch_unwind, confirmed no
+effect, reverted. Suite exactly as crash-stable as before; --rescue skips them cleanly. No new crashers.
 
 ### Cycle C11 - ObjectTemplate + property accessors, ratchet 61 -> 76 (agent: c11) DONE
 ObjectTemplate, object internal fields, and native property accessors all work. +15 tests, --check

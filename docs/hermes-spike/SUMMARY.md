@@ -34,12 +34,13 @@ C-ABI as the JSC and QuickJS backends. Progression in one night:
 | C4 identity | object identity solved (`strictEquals` + hidden-symbol-id `GetIdentityHash`) |
 | C5 AOT | precompiled Hermes bytecode (HBC) runs parse-free, 21x faster boot |
 | C6 surface | objects / arrays / numbers / functions run through the backend (12/12 smoke tests) |
-| C7-C11 ratchet | 0 -> 10 -> 33 -> 58 -> 61 -> 76 real rusty_v8 tests passing |
+| C7-C12 ratchet | 0 -> 10 -> 33 -> 58 -> 61 -> 76 -> 77 real rusty_v8 tests passing |
 
 What works through the Hermes backend today: isolates, contexts, handle scopes, strings, numbers,
 booleans, objects, arrays, typed arrays, function calls, native function callbacks
 (`Function::New`/`FunctionTemplate` + the full `FunctionCallbackInfo` bridge), ObjectTemplate with
-internal fields, native property accessors, TryCatch and thrown exceptions, and correct object identity.
+internal fields, native property accessors, FunctionTemplate signatures, TryCatch and thrown
+exceptions, and correct object identity.
 
 Build + test it (macOS; the prebuilt `hermes.framework` is vendored):
 
@@ -71,14 +72,15 @@ replay-tape pain entirely.
 
 ## Honest state and next steps
 
-Delivered and solid: the QuickJS Deno binary; a Hermes backend that runs real JS and passes 76 real
-V8 tests with identity, exceptions, callbacks, and templates/accessors; the AOT measurements.
+Delivered and solid: the QuickJS Deno binary; a Hermes backend that runs real JS and passes 77 real
+V8 tests with identity, exceptions, callbacks, templates/accessors, and signatures; the AOT measurements.
 
 Not done (this was a spike, not a product):
-- Hermes is nowhere near running Deno yet. 76/267 rusty_v8 tests; then comes the whole deno_core suite
+- Hermes is nowhere near running Deno yet. 77/267 rusty_v8 tests; then comes the whole deno_core suite
   (modules, async, ops, microtasks), then the runtime. That is a large, multi-week road, not a night.
 - Known gaps: `SameValue` is not yet exact for NaN/+-0; weak handles over-retain (no GC weak-callback);
-  4 tests crash (need the BackingStore/shared_ptr subsystem); property interceptors, modules,
+  4 tests crash inside the vendored extern-C trampoline (unfixable without editing vendored code;
+  --rescue skips them); named property interceptors are designed but unimplemented; modules,
   async/microtask pump, and Promises are unimplemented.
 
 Prioritized next targets: named/indexed property interceptors -> BackingStore/shared_ptr (also kills the last crashers) -> Promises/microtask queue -> ES modules ->
