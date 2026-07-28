@@ -83,6 +83,7 @@ unsafe extern "C" {
   // per-context extras binding object alive across HandleScope pops (C2).
   fn v8x_hermes_pin(rtw: *mut c_void, slot: i64) -> i64;
   fn v8x_hermes_pin_get(rtw: *mut c_void, pin_id: i64) -> i64;
+  fn v8x_hermes_unpin(rtw: *mut c_void, pin_id: i64);
   fn v8x_hermes_object_get(rtw: *mut c_void, obj_slot: i64, key_slot: i64) -> i64;
   fn v8x_hermes_object_set(
     rtw: *mut c_void,
@@ -536,24 +537,100 @@ pub extern "C" fn v8__Isolate__GetCurrentContext(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Global__New(
-  _isolate: *mut RealIsolate,
+  isolate: *mut RealIsolate,
   data: *const Data,
 ) -> *const Data {
-  data
+  global_new(isolate, data)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Global__NewWeak(
-  _isolate: *mut RealIsolate,
+  isolate: *mut RealIsolate,
   data: *const Data,
   _parameter: *const c_void,
   _callback: unsafe extern "C" fn(*const c_void),
 ) -> *const Data {
-  data
+  // A weak Global still needs its referent kept alive for the boot path (the
+  // backend has no real GC weak-ref semantics; treat weak like strong). This
+  // matches the conservative behavior elsewhere in the shim.
+  global_new(isolate, data)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Global__Reset(_data: *const Data) {}
+pub extern "C" fn v8__Global__Reset(data: *const Data) {
+  // Free the durable pin backing a value Global (no-op for a non-value handle).
+  if let Some(pin_id) = global_pin_id(data) {
+    let rtw = current_rtw();
+    if !rtw.is_null() {
+      unsafe { v8x_hermes_unpin(rtw, pin_id) };
+    }
+  }
+}
+
+// ---- Global durable pins (C2 lifetime) -------------------------------------
+//
+// A v8 `Global` must outlive the HandleScope its value was created in. The
+// handle table is scope-managed (a watermark truncates every slot created since
+// the scope opened), so a Global that merely carried the source slot pointer
+// would dangle after the creating scope popped: a later `Local::New` would read
+// a truncated/reused slot (the exact deno_core boot bug where a stored
+// `ext_import_meta_proto` object read back as a non-object).
+//
+// So a value Global durably PINS its JSI value (the D2 pin infra) and encodes
+// the pin id in the returned handle. A non-value handle (Context == isolate
+// pointer, Module == Box pointer; both >= 8-byte aligned, low 3 bits 0) is
+// already stable and is returned unchanged.
+//
+// Encoding: a global-pin handle is `(pin_id << 2) | 0b10`. Bit 1 set marks a
+// pin; ordinary value slots are `(i << 1) | 1` (bit 0 set) and aligned
+// Context/Module pointers have bits 0..2 clear, so neither collides.
+
+const GLOBAL_PIN_TAG: usize = 0b10;
+
+#[inline]
+fn global_pin_ptr(pin_id: i64) -> *const Data {
+  (((pin_id as usize) << 2) | GLOBAL_PIN_TAG) as *const Data
+}
+
+/// If `ptr` is a global-pin handle, return its pin id; otherwise None.
+#[inline]
+fn global_pin_id(ptr: *const Data) -> Option<i64> {
+  let bits = ptr as usize;
+  if bits & 0b11 == GLOBAL_PIN_TAG {
+    Some((bits >> 2) as i64)
+  } else {
+    None
+  }
+}
+
+fn global_new(isolate: *mut RealIsolate, data: *const Data) -> *const Data {
+  if data.is_null() {
+    return ptr::null();
+  }
+  // Already a global pin (re-wrapping a Global): keep it.
+  if global_pin_id(data).is_some() {
+    return data;
+  }
+  let src = slot_of(data);
+  if src < 0 {
+    // Non-value handle (Context / Module record): stable, identity.
+    return data;
+  }
+  let rtw = if isolate.is_null() {
+    current_rtw()
+  } else {
+    iso_state(isolate).rtw
+  };
+  if rtw.is_null() {
+    return data;
+  }
+  let pin_id = unsafe { v8x_hermes_pin(rtw, src) };
+  if pin_id < 0 {
+    // Pin failed: fall back to identity (best-effort, matches prior behavior).
+    return data;
+  }
+  global_pin_ptr(pin_id)
+}
 
 /// Re-materialize a handle into a live `Local` in the current scope. deno_core
 /// calls this to turn a `Global<Context>` (and other Globals) back into a
@@ -573,16 +650,29 @@ pub extern "C" fn v8__Local__New(
   if other.is_null() {
     return ptr::null();
   }
-  let src = slot_of(other);
-  if src < 0 {
-    // Non-value handle (Context / Module record): identity.
-    return other;
-  }
   let rtw = if isolate.is_null() {
     current_rtw()
   } else {
     iso_state(isolate).rtw
   };
+  // A Global backed by a durable pin (value Global): materialize the pinned
+  // value into a fresh slot in the current scope, so the Local is a live handle
+  // that outlives nothing it must not (it lives until the current scope pops).
+  if let Some(pin_id) = global_pin_id(other) {
+    if rtw.is_null() {
+      return other;
+    }
+    let slot = unsafe { v8x_hermes_pin_get(rtw, pin_id) };
+    if slot < 0 {
+      return ptr::null();
+    }
+    return slot_ptr::<Data>(slot);
+  }
+  let src = slot_of(other);
+  if src < 0 {
+    // Non-value handle (Context / Module record): identity.
+    return other;
+  }
   if rtw.is_null() {
     return other;
   }

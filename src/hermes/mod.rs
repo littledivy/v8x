@@ -1473,4 +1473,111 @@ mod hermes_boot_probe {
       "Local::<Promise>::try_from should accept a real promise"
     );
   }
+
+  /// Stage 8 (D7): the import.meta proto flow. deno_core builds a null-prototype
+  /// object via `with_prototype_and_properties(null, [], [])`, stores it in a
+  /// `Global`, and later reads it back (through an op) to set `.log` on it
+  /// (01_core.js). A null-prototype object must still be a settable Object, and
+  /// the Global round-trip must preserve object identity. This probe reproduces
+  /// exactly that: build the null-proto object, round-trip through a Global, and
+  /// set a property on the recovered Local.
+  #[test]
+  fn boot_null_proto_object_global_roundtrip_settable() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // Build the null-proto object in a NESTED HandleScope and keep only a
+    // Global. When the nested scope pops, the object's handle-table slot is
+    // truncated; a value Global must have durably pinned the value so the later
+    // Local::new still yields the live object (this is the exact deno_core boot
+    // bug: a stored ext_import_meta_proto read back as a non-object).
+    let global_handle = {
+      v8::scope!(let inner, scope);
+      let null = v8::null(inner);
+      let obj = v8::Object::with_prototype_and_properties(
+        inner,
+        null.into(),
+        &[],
+        &[],
+      );
+      assert!(obj.is_object(), "null-proto object should be an Object");
+      v8::Global::new(inner, obj)
+    };
+
+    // The nested scope has popped. Recover a Local (as the op does).
+    let recovered = v8::Local::new(scope, global_handle);
+    assert!(
+      recovered.is_object(),
+      "recovered Global value must still be an Object after the scope popped \
+       (v8__Global__New must pin the value durably)"
+    );
+
+    // Set `.log` on the recovered Local (as 01_core.js does).
+    let obj = v8::Local::<v8::Object>::try_from(recovered)
+      .expect("recovered value should be an Object");
+    let key = v8::String::new(scope, "log").unwrap();
+    let val = v8::Integer::new(scope, 5);
+    let set_ok = obj.set(scope, key.into(), val.into());
+    assert_eq!(
+      set_ok,
+      Some(true),
+      "setting a property on a recovered null-proto object failed"
+    );
+    let key2 = v8::String::new(scope, "log").unwrap();
+    let read = obj.get(scope, key2.into()).unwrap();
+    assert_eq!(
+      read.to_rust_string_lossy(scope),
+      "5",
+      "property set on the recovered object did not read back"
+    );
+  }
+
+  /// Stage 9 (D7): an op that RETURNS a v8::Local object (via ReturnValue::Set),
+  /// mirroring deno_core's `op_get_ext_import_meta_proto`. 01_core.js calls that
+  /// op and immediately sets `.log` on the returned object; if the op return
+  /// value does not propagate, JS sees `undefined` and throws "Cannot set
+  /// property 'log' of undefined". This probe builds an op that returns a fresh
+  /// object and asserts JS can set a property on the returned value.
+  #[test]
+  fn boot_op_returns_object_settable_from_js() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    fn op_returns_obj(
+      scope: &mut v8::PinScope,
+      _args: v8::FunctionCallbackArguments,
+      mut rv: v8::ReturnValue<v8::Value>,
+    ) {
+      let obj = v8::Object::new(scope);
+      rv.set(obj.into());
+    }
+
+    let templ = v8::FunctionTemplate::builder(op_returns_obj).build(scope);
+    let func = templ.get_function(scope).unwrap();
+    let global = context.global(scope);
+    let key = v8::String::new(scope, "op_get_obj").unwrap();
+    global.set(scope, key.into(), func.into()).unwrap();
+
+    // Mirror 01_core.js: call the op, set `.log`, read it back.
+    let src = v8::String::new(
+      scope,
+      "const o = op_get_obj(); o.log = 42; o.log",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, src, None).unwrap();
+    let result = script
+      .run(scope)
+      .expect("op returning an object then setting a prop should run");
+    assert_eq!(
+      result.to_rust_string_lossy(scope),
+      "42",
+      "op did not return a usable object (ReturnValue::Set of a Local broken)"
+    );
+  }
 }
