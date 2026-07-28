@@ -245,3 +245,16 @@ end: async generators lower and run, deno_core boots, ext/web is functional, rea
 through the event loop, and for-await over a real socket delivers bytes. The overnight "full Deno is impossible
 on Hermes" conclusion is retired. The next target is fetch (deno_fetch + hyper + TLS), which rides the same
 now-proven op/promise/event-loop path.
+
+E9 reached it: fetch() works over real HTTP on Hermes. await fetch("http://127.0.0.1:<port>/") returns status
+200 and body "hello-from-hermes", through real ext/fetch JS (26_fetch.js) -> op_fetch (hyper connect) ->
+op_fetch_send (the E8 op-driver/tokio path) -> r.text() draining the response body ReadableStream over a real
+socket, all driven by run_event_loop. One more backend gap surfaced and was fixed: the Latin-1 (one-byte)
+String read ABI (v8__String__ContainsOnlyOneByte / IsOneByte / WriteOneByte_v2) were null stubs, so serde_v8's
+ByteString decode threw ExpectedLatin1 on even "GET" and blocked op_fetch; implementing them fixed the whole
+ext/fetch path. Backend suite 44/44 from a clean build (and the cppgc duplicate-symbol the E8 agent hit did not
+recur, confirming it was a stale target artifact, not a real regression). So a from-scratch Hermes backend now
+runs, in one process through real Deno extension code driven by the real deno_core event loop: async generators,
+ext/web (encoding, structured clone, streams, console, URL), deferred-op async, real socket I/O with for-await
+over a listener, and HTTP fetch. TLS/https fetch is the next increment; the larger capstone is an end-to-end
+Deno program (deno run) assembling these on Hermes.
