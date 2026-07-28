@@ -2754,6 +2754,34 @@ pub extern "C" fn v8__Value__Int32Value(
   }
 }
 
+/// `Uint32::Value`: read a value already known to be a Uint32 as `u32`. Unlike
+/// `Value::Uint32Value` (which does ECMAScript ToUint32 coercion and returns a
+/// `Maybe`), this is the direct accessor the vendored `Uint32::value()` calls on
+/// a handle the caller has already narrowed to a Uint32 (via `IsUint32`). It was
+/// a null-returning stub with the wrong signature, so it always yielded 0 — which
+/// silently zeroed every non-zero async-op `promiseId` (read through
+/// `to_i32_option`, whose first branch is `Uint32::value()`), so every deferred
+/// op whose promise id was > 0 resolved into the wrong (or a missing) promise.
+/// Hermes stores all numbers as doubles; apply ECMAScript ToUint32 to the value.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Uint32__Value(this: *const crate::Uint32) -> u32 {
+  match number_value_opt(this as *const Value) {
+    Some(v) if v.is_finite() => v.trunc() as i64 as u32,
+    _ => 0,
+  }
+}
+
+/// `Int32::Value`: read a value already known to be an Int32 as `i32`. The direct
+/// accessor the vendored `Int32::value()` calls after `IsInt32`. Was a null stub
+/// (always 0); same class of bug as `v8__Uint32__Value` above.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Int32__Value(this: *const crate::Int32) -> i32 {
+  match number_value_opt(this as *const Value) {
+    Some(v) if v.is_finite() => v.trunc() as i64 as u32 as i32,
+    _ => 0,
+  }
+}
+
 // ---- External (v8::External): opaque embedder void* ------------------------
 //
 // A v8 `External` wraps an opaque embedder `void*` in a JS heap value. Hermes

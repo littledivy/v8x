@@ -724,6 +724,55 @@ mod hermes_reflection {
     );
   }
 
+  // E8: the direct Uint32::value()/Int32::value() accessors must return the
+  // real integer, not 0. These are what the vendored `Local<Uint32>::value()`
+  // / `Local<Int32>::value()` call, and are the FIRST branch of deno_core's
+  // `to_i32_option` (used to decode every async op's `promiseId`). Both were
+  // null-returning stubs with the wrong signature, so they always yielded 0 —
+  // which silently zeroed every non-zero promiseId, so any second concurrent
+  // deferred op resolved into a missing promise ("Missing promise @ 0") and no
+  // real socket op (accept/read/write/connect) ever settled through the loop.
+  #[test]
+  fn hermes_uint32_int32_value() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // A non-zero small integer must narrow to Uint32/Int32 and read back
+    // EXACTLY, not 0 (the pre-fix stub value).
+    let v = eval(scope, "1");
+    assert!(v.is_uint32(), "1 is a Uint32");
+    assert!(v.is_int32(), "1 is an Int32");
+    let u = v8::Local::<v8::Uint32>::try_from(v).unwrap();
+    assert_eq!(u.value(), 1, "Uint32::value() must be 1, was 0 pre-fix");
+    let i = v8::Local::<v8::Int32>::try_from(v).unwrap();
+    assert_eq!(i.value(), 1, "Int32::value() must be 1, was 0 pre-fix");
+
+    // A larger value (a realistic promiseId) round-trips exactly.
+    let v = eval(scope, "12345");
+    let u = v8::Local::<v8::Uint32>::try_from(v).unwrap();
+    assert_eq!(u.value(), 12345);
+
+    // A negative integer is an Int32 (not a Uint32); Int32::value() is signed.
+    let v = eval(scope, "-7");
+    assert!(v.is_int32(), "-7 is an Int32");
+    assert!(!v.is_uint32(), "-7 is not a Uint32");
+    let i = v8::Local::<v8::Int32>::try_from(v).unwrap();
+    assert_eq!(i.value(), -7, "Int32::value() is signed");
+
+    // The full `Value::uint32_value` / `int32_value` coercion paths also work
+    // (these are the fallback branches of to_i32_option and stay non-zero).
+    assert_eq!(eval(scope, "42").uint32_value(scope).unwrap(), 42);
+    assert_eq!(eval(scope, "42").int32_value(scope).unwrap(), 42);
+
+    println!(
+      "hermes_uint32_int32_value: PASS - Uint32::value()/Int32::value() return \
+       the real integer (were 0 stubs that zeroed every async-op promiseId)"
+    );
+  }
+
   // The deferred-op crux, isolated at the ABI level: calling a function through
   // a v8::Global<Function> (opened -> a global-pin handle, NOT a scope-local
   // value slot) must succeed. deno_core stores __eventLoopTick this way and

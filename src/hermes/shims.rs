@@ -186,8 +186,8 @@ pub extern "C" fn v8__HeapStatistics() -> *const ::std::ffi::c_void { ::std::ptr
 pub extern "C" fn v8__IdleTask__DELETE() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__IdleTask__Run() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Int32__Value() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Int32__Value implemented in core.rs (E8): was a null stub with the wrong
+// signature, which zeroed every non-zero async-op promiseId read via to_i32_option.
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Intercepted() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -656,8 +656,7 @@ pub extern "C" fn v8__TracedReference_SIZE() -> *const ::std::ffi::c_void { ::st
 pub extern "C" fn v8__TYPED_ARRAY_MAX_SIZE_IN_HEAP() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__TypedArray__kMaxByteLength() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Uint32__Value() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Uint32__Value implemented in core.rs (E8): see the note on v8__Int32__Value.
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__UnboundModuleScript__CreateCodeCache() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
