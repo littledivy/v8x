@@ -122,6 +122,27 @@ struct RuntimeWrapper {
   std::unique_ptr<jsi::Value> symbol_new_fn;     // (desc) => Symbol(desc)
   std::unique_ptr<jsi::Value> symbol_desc_fn;    // (sym) => sym.description
   std::unique_ptr<jsi::Value> symbol_for_fn;     // (key) => Symbol.for(key)
+  // E6: JSI exposes isTypedArray/isUint8Array but no per-kind predicate, so a
+  // cached JS helper reports a TypedArray's constructor name (e.g.
+  // "Uint32Array") for IsUint32Array/IsInt32Array/... needed by ops that take a
+  // #[buffer] of a non-u8 element type (op_url_parse writes a Uint32Array).
+  std::unique_ptr<jsi::Value> typed_array_kind_fn; // (o) => o's TA ctor name or ""
+  // E6: v8::Object::GetConstructorName, used by ext/web's console inspector
+  // (op_console_inspect_args) to label objects. Cached JS helper reads
+  // `o.constructor.name`, falling back to "Object".
+  std::unique_ptr<jsi::Value> ctor_name_fn; // (o) => o.constructor?.name || "Object"
+  // E6: the well-known Symbols (Symbol.iterator, Symbol.toStringTag, ...) as a
+  // cached JS array, indexed by v8x_well_known_symbol_index. Needed by ext/web's
+  // console inspector, which reads obj[Symbol.toStringTag].
+  std::unique_ptr<jsi::Value> well_known_symbols; // Array of the 11 WK symbols
+  // E6: Object::GetOwnPropertyNames for the console inspector. Cached JS helper
+  // (o, filterFlags) => array of own keys, honoring ONLY_ENUMERABLE/SKIP_SYMBOLS.
+  std::unique_ptr<jsi::Value> own_keys_fn;
+  // E6: Value::TypeOf -> a JS `typeof` string, used by the console inspector.
+  std::unique_ptr<jsi::Value> typeof_fn; // (v) => typeof v
+  // E6: Object::GetOwnPropertyDescriptor for the console inspector's constructor
+  // and getter/setter detection. (o, key) => descriptor object or undefined.
+  std::unique_ptr<jsi::Value> own_descriptor_fn;
   // D1: lazily-created per-runtime Promise infra. Hermes has native JS
   // Promises but JSI exposes no Promise API and no [[PromiseState]] accessor,
   // so a small cached JS helper object drives promise creation and state
@@ -1143,6 +1164,203 @@ v8x_hermes_slot v8x_hermes_symbol_description(void *rtw,
   }
 }
 
+// v8::Object::GetConstructorName. Returns a slot holding the object's
+// constructor name string ("Object" fallback), or the null slot on error/
+// non-object. Uses a cached JS helper (JSI has no direct accessor).
+v8x_hermes_slot v8x_hermes_object_get_constructor_name(void *rtw,
+                                                       v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    if (!w->ctor_name_fn) {
+      jsi::Value fn = w->runtime().evaluateJavaScript(
+          std::make_unique<jsi::StringBuffer>(
+              "(function(o){"
+              "  try {"
+              "    var c = o.constructor;"
+              "    var n = c && c.name;"
+              "    return (typeof n === 'string' && n) ? n : 'Object';"
+              "  } catch (_) { return 'Object'; }"
+              "})"),
+          "v8x-ctor-name.js");
+      w->ctor_name_fn = std::make_unique<jsi::Value>(w->runtime(), fn);
+    }
+    jsi::Function f =
+        w->ctor_name_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Value name = f.call(w->runtime(), *v);
+    return w->push(std::move(name));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// v8's well-known Symbols. `which` matches the array order below (same order as
+// vendor/rusty_v8's Symbol::get_* list). Returns a slot holding the Symbol, or
+// the null slot on error. The symbols are the JS-language intrinsics
+// (Symbol.iterator, etc.), so a cached JS array supplies them.
+v8x_hermes_slot v8x_hermes_well_known_symbol(void *rtw, int which) {
+  if (rtw == nullptr || which < 0) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    if (!w->well_known_symbols) {
+      jsi::Value arr = w->runtime().evaluateJavaScript(
+          std::make_unique<jsi::StringBuffer>(
+              "[Symbol.asyncIterator, Symbol.hasInstance,"
+              " Symbol.isConcatSpreadable, Symbol.iterator, Symbol.match,"
+              " Symbol.replace, Symbol.search, Symbol.split,"
+              " Symbol.toPrimitive, Symbol.toStringTag, Symbol.unscopables]"),
+          "v8x-well-known-symbols.js");
+      w->well_known_symbols =
+          std::make_unique<jsi::Value>(w->runtime(), arr);
+    }
+    jsi::Array arr =
+        w->well_known_symbols->getObject(w->runtime()).asArray(w->runtime());
+    if (static_cast<size_t>(which) >= arr.size(w->runtime())) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Value sym = arr.getValueAtIndex(w->runtime(), which);
+    return w->push(std::move(sym));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// v8::Object::GetOwnPropertyNames. Returns a slot holding a JS Array of the
+// object's own keys, honoring the v8 PropertyFilter bits:
+//   ONLY_ENUMERABLE (2) -> only enumerable keys (Object.keys semantics)
+//   SKIP_SYMBOLS   (16) -> string keys only
+//   SKIP_STRINGS   (8)  -> symbol keys only
+// Default (filter==0, ALL_PROPERTIES) returns every own string+symbol key.
+// Needed by ext/web's console inspector to enumerate object properties.
+v8x_hermes_slot v8x_hermes_object_own_property_names(void *rtw,
+                                                     v8x_hermes_slot slot,
+                                                     int filter,
+                                                     int skip_indices) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    if (!w->own_keys_fn) {
+      jsi::Value fn = w->runtime().evaluateJavaScript(
+          std::make_unique<jsi::StringBuffer>(
+              "(function(o, f, skipIdx){"
+              "  var ONLY_ENUM = 2, SKIP_STR = 8, SKIP_SYM = 16;"
+              "  var out = [];"
+              "  var strings = !(f & SKIP_STR);"
+              "  var symbols = !(f & SKIP_SYM);"
+              "  var onlyEnum = !!(f & ONLY_ENUM);"
+              "  var isIndex = function(k){"
+              "    var n = (k >>> 0);"
+              "    return String(n) === k && n !== 0xffffffff;"
+              "  };"
+              "  if (strings) {"
+              "    var names = Object.getOwnPropertyNames(o);"
+              "    for (var i = 0; i < names.length; i++) {"
+              "      if (skipIdx && isIndex(names[i])) continue;"
+              "      if (!onlyEnum ||"
+              "          Object.prototype.propertyIsEnumerable.call(o, names[i]))"
+              "        out.push(names[i]);"
+              "    }"
+              "  }"
+              "  if (symbols) {"
+              "    var syms = Object.getOwnPropertySymbols(o);"
+              "    for (var j = 0; j < syms.length; j++) {"
+              "      if (!onlyEnum ||"
+              "          Object.prototype.propertyIsEnumerable.call(o, syms[j]))"
+              "        out.push(syms[j]);"
+              "    }"
+              "  }"
+              "  return out;"
+              "})"),
+          "v8x-own-keys.js");
+      w->own_keys_fn = std::make_unique<jsi::Value>(w->runtime(), fn);
+    }
+    jsi::Function f =
+        w->own_keys_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Value keys = f.call(w->runtime(), *v,
+                             jsi::Value(static_cast<double>(filter)),
+                             jsi::Value(skip_indices != 0));
+    return w->push(std::move(keys));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// v8::Value::TypeOf: the JS `typeof` operator result as a string slot. Null slot
+// on error. Used by ext/web's console inspector to classify values.
+v8x_hermes_slot v8x_hermes_value_typeof(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    if (!w->typeof_fn) {
+      jsi::Value fn = w->runtime().evaluateJavaScript(
+          std::make_unique<jsi::StringBuffer>("(function(v){return typeof v;})"),
+          "v8x-typeof.js");
+      w->typeof_fn = std::make_unique<jsi::Value>(w->runtime(), fn);
+    }
+    jsi::Function f =
+        w->typeof_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Value t = f.call(w->runtime(), *v);
+    return w->push(std::move(t));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// v8::Object::GetOwnPropertyDescriptor(obj, key). `key` may be a string or a
+// Symbol. Returns a slot holding the descriptor object ({value, writable, get,
+// set, enumerable, configurable}) or `undefined` if absent; null slot on error.
+v8x_hermes_slot v8x_hermes_object_own_descriptor(void *rtw,
+                                                 v8x_hermes_slot obj_slot,
+                                                 v8x_hermes_slot key_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *o = slot_ref(w, obj_slot);
+  const jsi::Value *k = slot_ref(w, key_slot);
+  if (o == nullptr || !o->isObject() || k == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    if (!w->own_descriptor_fn) {
+      jsi::Value fn = w->runtime().evaluateJavaScript(
+          std::make_unique<jsi::StringBuffer>(
+              "(function(o,k){"
+              "  var d = Object.getOwnPropertyDescriptor(o,k);"
+              "  return d === undefined ? undefined : d;"
+              "})"),
+          "v8x-own-descriptor.js");
+      w->own_descriptor_fn = std::make_unique<jsi::Value>(w->runtime(), fn);
+    }
+    jsi::Function f =
+        w->own_descriptor_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Value d = f.call(w->runtime(), *o, *k);
+    return w->push(std::move(d));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
 } // extern "C"
 
 // jsi::Value::undefined() / jsi::Value::null(): static factories, no Runtime
@@ -1253,6 +1471,20 @@ int v8x_hermes_object_has(void *rtw, v8x_hermes_slot obj_slot,
     return -1;
   }
   try {
+    // Route through the `in` operator so BOTH string AND Symbol keys work
+    // (JSI's hasProperty is string-keyed only; stringifying a Symbol key
+    // silently missed Symbol.iterator etc., which the console inspector probes
+    // to detect arrays/iterables). ensure_private_infra caches
+    // `(obj, key) => key in obj`.
+    if (kv->isSymbol()) {
+      if (!ensure_private_infra(w)) {
+        return -1;
+      }
+      jsi::Function inFn =
+          w->private_has_fn->getObject(w->runtime()).getFunction(w->runtime());
+      jsi::Value r = inFn.call(w->runtime(), *ov, *kv);
+      return (r.isBool() && r.getBool()) ? 1 : 0;
+    }
     jsi::String key = kv->toString(w->runtime());
     bool has = ov->getObject(w->runtime()).hasProperty(w->runtime(), key);
     return has ? 1 : 0;
@@ -1903,6 +2135,73 @@ int v8x_hermes_value_is_array_buffer(void *rtw, v8x_hermes_slot slot) {
   }
   try {
     return v->getObject(w->runtime()).isArrayBuffer(w->runtime()) ? 1 : 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+// Value::IsSymbol: jsi::Value::isSymbol. 1/0, or -1 on error.
+int v8x_hermes_value_is_symbol(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr) {
+    return 0;
+  }
+  return v->isSymbol() ? 1 : 0;
+}
+
+// JSI has no per-kind TypedArray predicate (only isTypedArray/isUint8Array), so
+// distinguish Uint32Array etc. by the object's TypedArray constructor name via a
+// cached JS helper. `""` for a non-typed-array. panic-safe (empty on throw).
+static bool ensure_ta_kind_infra(RuntimeWrapper *w) {
+  if (w->typed_array_kind_fn) {
+    return true;
+  }
+  try {
+    jsi::Value fn = w->runtime().evaluateJavaScript(
+        std::make_unique<jsi::StringBuffer>(
+            "(function(o){"
+            "  if (o == null || typeof o !== 'object') return '';"
+            "  if (!ArrayBuffer.isView(o) || o instanceof DataView) return '';"
+            "  var c = o.constructor;"
+            "  return (c && typeof c.name === 'string') ? c.name : '';"
+            "})"),
+        "v8x-ta-kind.js");
+    w->typed_array_kind_fn = std::make_unique<jsi::Value>(w->runtime(), fn);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+// Returns 1 if `slot` is a JS Uint32Array, 0 otherwise, -1 on error.
+int v8x_hermes_value_is_uint32_array(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return 0;
+  }
+  try {
+    if (!v->getObject(w->runtime()).isTypedArray(w->runtime())) {
+      return 0;
+    }
+    if (!ensure_ta_kind_infra(w)) {
+      return -1;
+    }
+    jsi::Function f = w->typed_array_kind_fn->getObject(w->runtime())
+                          .getFunction(w->runtime());
+    jsi::Value name = f.call(w->runtime(), *v);
+    if (!name.isString()) {
+      return 0;
+    }
+    return name.getString(w->runtime()).utf8(w->runtime()) == "Uint32Array" ? 1
+                                                                            : 0;
   } catch (...) {
     return -1;
   }

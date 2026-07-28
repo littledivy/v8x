@@ -15,8 +15,7 @@ pub extern "C" fn std__shared_ptr__v8__Platform__use_count() -> *const ::std::ff
 pub extern "C" fn v8__AllowJavascriptExecutionScope__CONSTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__AllowJavascriptExecutionScope__DESTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Array__New_with_elements() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Array__New_with_elements implemented in core.rs (E6).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ArrayBuffer__Allocator__NewRustAllocator() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -346,20 +345,15 @@ pub extern "C" fn v8__Object__Delete() -> *const ::std::ffi::c_void { ::std::ptr
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__DeleteIndex() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 // v8__Object__DeletePrivate is implemented in core.rs (real impl, E4).
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__GetConstructorName() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Object__GetConstructorName implemented in core.rs (E6).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetCreationContext() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__GetOwnPropertyDescriptor() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__GetOwnPropertyNames() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
+// v8__Object__GetOwnPropertyDescriptor implemented in core.rs (E6).
+// v8__Object__GetOwnPropertyNames implemented in core.rs (E6).
 // v8__Object__GetPrivate is implemented in core.rs (real impl, E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetPropertyAttributes() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__GetPropertyNames() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Object__GetPropertyNames implemented in core.rs (E6).
 // v8__Object__GetPrototype is implemented in core.rs (real impl).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetRealNamedProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -638,28 +632,9 @@ pub extern "C" fn v8__String__Write_v2() -> *const ::std::ffi::c_void { ::std::p
 pub extern "C" fn v8__String__WriteOneByte_v2() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 // v8__Symbol__{Description,For,ForApi} are implemented in core.rs (real, E4).
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__GetAsyncIterator() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__GetHasInstance() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__GetIsConcatSpreadable() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__GetIterator() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__GetMatch() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__GetReplace() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__GetSearch() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__GetSplit() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__GetToPrimitive() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__GetToStringTag() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__GetUnscopables() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Symbol__Get{AsyncIterator,HasInstance,IsConcatSpreadable,Iterator,Match,
+//   Replace,Search,Split,ToPrimitive,ToStringTag,Unscopables} implemented in
+//   core.rs (E6, real well-known Symbols).
 // v8__Symbol__New is implemented in core.rs (real impl, E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Task__DELETE() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -752,8 +727,6 @@ pub extern "C" fn v8__Value__IsName() -> *const ::std::ffi::c_void { ::std::ptr:
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsNativeError() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsNullOrUndefined() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsNumberObject() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsProxy() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -769,17 +742,14 @@ pub extern "C" fn v8__Value__IsSetIterator() -> *const ::std::ffi::c_void { ::st
 pub extern "C" fn v8__Value__IsSharedArrayBuffer() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsStringObject() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsSymbol() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Value__IsSymbol implemented in core.rs (E6).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsSymbolObject() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 // v8__Value__IsTypedArray implemented in core.rs (E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsUint16Array() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsUint32Array() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
+// v8__Value__IsUint32Array implemented in core.rs (E6).
 // v8__Value__IsUint8Array implemented in core.rs (E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsUint8ClampedArray() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -804,7 +774,7 @@ pub extern "C" fn v8__Value__ToNumber() -> *const ::std::ffi::c_void { ::std::pt
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__ToUint32() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__TypeOf() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Value__TypeOf implemented in core.rs (E6).
 // v8__Value{Ser,Deser}ializer__* (25 symbols) are implemented in serializer.rs
 // (real structured-clone wire format over JSI values, E5). Their stubs were
 // dropped here so they do not collide with the real link_hermes definitions.

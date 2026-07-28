@@ -164,6 +164,8 @@ unsafe extern "C" {
   fn v8x_hermes_typed_array_length(rtw: *mut c_void, slot: i64) -> usize;
   fn v8x_hermes_value_is_typed_array(rtw: *mut c_void, slot: i64) -> c_int;
   fn v8x_hermes_value_is_uint8_array(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_value_is_uint32_array(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_value_is_symbol(rtw: *mut c_void, slot: i64) -> c_int;
   fn v8x_hermes_value_is_array_buffer(rtw: *mut c_void, slot: i64) -> c_int;
   fn v8x_hermes_value_is_array_buffer_view(
     rtw: *mut c_void,
@@ -208,6 +210,23 @@ unsafe extern "C" {
   fn v8x_hermes_symbol_new(rtw: *mut c_void, desc_slot: i64) -> i64;
   fn v8x_hermes_symbol_for(rtw: *mut c_void, key_slot: i64) -> i64;
   fn v8x_hermes_symbol_description(rtw: *mut c_void, sym_slot: i64) -> i64;
+  fn v8x_hermes_object_get_constructor_name(
+    rtw: *mut c_void,
+    slot: i64,
+  ) -> i64;
+  fn v8x_hermes_well_known_symbol(rtw: *mut c_void, which: c_int) -> i64;
+  fn v8x_hermes_object_own_property_names(
+    rtw: *mut c_void,
+    slot: i64,
+    filter: c_int,
+    skip_indices: c_int,
+  ) -> i64;
+  fn v8x_hermes_value_typeof(rtw: *mut c_void, slot: i64) -> i64;
+  fn v8x_hermes_object_own_descriptor(
+    rtw: *mut c_void,
+    obj_slot: i64,
+    key_slot: i64,
+  ) -> i64;
 
   // C9: TryCatch / exception surfacing. See
   // docs/hermes-spike/experiments/C9-hermes-trycatch.md.
@@ -447,6 +466,33 @@ pub(super) fn slot_of<T>(ptr: *const T) -> i64 {
     return NULL_SLOT;
   }
   (bits >> 1) as i64
+}
+
+/// Resolve any handle shape to a live JSI slot in the current runtime.
+///
+/// rusty_v8's `Handle::open` returns the `Global`'s stored pointer DIRECTLY
+/// (`&*data.as_ptr()`), without re-materializing through `v8__Local__New`. That
+/// pointer is a global-pin handle (`(pin_id << 2) | 0b10`), NOT an ordinary
+/// tagged value slot (`(i << 1) | 1`). So any C-ABI entry that used
+/// `slot_of(this)` on an opened `Global<Function>`/`Global<Object>` receiver saw
+/// `NULL_SLOT` and failed silently (the deno_core `__eventLoopTick` async-op
+/// resolution path). This decodes both shapes:
+///   * value slot (odd-aligned)      -> its slot index
+///   * global-pin handle (bit 1 set) -> the pinned value's current live slot
+///   * anything else                 -> `NULL_SLOT`
+#[inline]
+pub(super) fn slot_of_handle<T>(rtw: *mut c_void, ptr: *const T) -> i64 {
+  let direct = slot_of(ptr);
+  if direct >= 0 {
+    return direct;
+  }
+  if let Some(pin_id) = global_pin_id(ptr as *const Data) {
+    if rtw.is_null() {
+      return NULL_SLOT;
+    }
+    return unsafe { v8x_hermes_pin_get(rtw, pin_id) };
+  }
+  NULL_SLOT
 }
 
 /// The `RuntimeWrapper*` for the current thread's isolate, or null.
@@ -2089,6 +2135,199 @@ pub extern "C" fn v8__Array__New(
   slot_ptr::<Array>(slot)
 }
 
+/// `Array::New` from an initial element list. Was a null stub, so any V8 API
+/// that builds an array from Rust-side Locals (deno_core / ext/web use it, e.g.
+/// URLSearchParams pair lists) got a null Array and panicked at the vendored
+/// `.unwrap()`. Creates an array of `length` and fills each index.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Array__New_with_elements(
+  isolate: *mut RealIsolate,
+  elements: *const *const Value,
+  length: usize,
+) -> *const Array {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  let arr_slot = unsafe { v8x_hermes_array_new(rtw, length as i64) };
+  if arr_slot < 0 {
+    return ptr::null();
+  }
+  if !elements.is_null() {
+    for i in 0..length {
+      let v = unsafe { *elements.add(i) };
+      if v.is_null() {
+        continue;
+      }
+      unsafe {
+        v8x_hermes_array_set_index(
+          rtw,
+          arr_slot,
+          i as u32,
+          slot_of_handle(rtw, v),
+        );
+      }
+    }
+  }
+  slot_ptr::<Array>(arr_slot)
+}
+
+/// `Object::GetConstructorName`: the object's constructor name (V8 uses it for
+/// the default inspect/`toString` tag). Was a null stub, so ext/web's console
+/// inspector (`op_console_inspect_args`) panicked at the vendored
+/// `get_constructor_name().unwrap()` when formatting any object.
+/// `Value::TypeOf`: the JS `typeof` string. Was a null stub, so ext/web's
+/// console inspector panicked at the vendored `type_of().unwrap()`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__TypeOf(
+  this: *const Value,
+  isolate: *mut RealIsolate,
+) -> *const V8String {
+  if this.is_null() {
+    return ptr::null();
+  }
+  let rtw = if isolate.is_null() {
+    current_rtw()
+  } else {
+    iso_state(isolate).rtw
+  };
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  let slot = unsafe { v8x_hermes_value_typeof(rtw, slot_of(this)) };
+  slot_ptr::<V8String>(slot)
+}
+
+/// `Object::GetOwnPropertyDescriptor`: the property descriptor object (or
+/// `undefined`) for `key` on `this`. Was a null stub, so the console inspector's
+/// constructor-name walk (which reads the "constructor" descriptor) found none
+/// and labeled every object `[Object: null prototype]`. `key` is a `Name`
+/// (String or Symbol).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetOwnPropertyDescriptor(
+  this: *const Object,
+  context: *const Context,
+  key: *const Name,
+) -> *const Value {
+  if this.is_null() || context.is_null() || key.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let slot = unsafe {
+    v8x_hermes_object_own_descriptor(
+      rtw,
+      slot_of(this),
+      slot_of(key as *const Value),
+    )
+  };
+  slot_ptr::<Value>(slot)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetConstructorName(
+  this: *const Object,
+) -> *const V8String {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let slot =
+    unsafe { v8x_hermes_object_get_constructor_name(rtw, slot_of(this)) };
+  slot_ptr::<V8String>(slot)
+}
+
+/// The well-known Symbols (`Symbol.iterator`, `Symbol.toStringTag`, ...). Each
+/// getter takes an isolate and returns the intrinsic Symbol. Order matches
+/// `v8x_hermes_well_known_symbol` in the C++ shim and rusty_v8's `Symbol::get_*`
+/// declarations. ext/web's console inspector reads `obj[Symbol.toStringTag]`,
+/// so these were needed to unblock console object formatting.
+macro_rules! well_known_symbol {
+  ($name:ident, $idx:expr) => {
+    #[unsafe(no_mangle)]
+    pub extern "C" fn $name(isolate: *mut RealIsolate) -> *const Symbol {
+      if isolate.is_null() {
+        return ptr::null();
+      }
+      let rtw = iso_state(isolate).rtw;
+      if rtw.is_null() {
+        return ptr::null();
+      }
+      let slot = unsafe { v8x_hermes_well_known_symbol(rtw, $idx) };
+      slot_ptr::<Symbol>(slot)
+    }
+  };
+}
+
+well_known_symbol!(v8__Symbol__GetAsyncIterator, 0);
+well_known_symbol!(v8__Symbol__GetHasInstance, 1);
+well_known_symbol!(v8__Symbol__GetIsConcatSpreadable, 2);
+well_known_symbol!(v8__Symbol__GetIterator, 3);
+well_known_symbol!(v8__Symbol__GetMatch, 4);
+well_known_symbol!(v8__Symbol__GetReplace, 5);
+well_known_symbol!(v8__Symbol__GetSearch, 6);
+well_known_symbol!(v8__Symbol__GetSplit, 7);
+well_known_symbol!(v8__Symbol__GetToPrimitive, 8);
+well_known_symbol!(v8__Symbol__GetToStringTag, 9);
+well_known_symbol!(v8__Symbol__GetUnscopables, 10);
+
+/// `Object::GetOwnPropertyNames`: an Array of the object's own keys, honoring
+/// the `PropertyFilter` bits (ONLY_ENUMERABLE / SKIP_SYMBOLS / SKIP_STRINGS).
+/// Was a null stub, so ext/web's console inspector enumerated zero properties
+/// and printed every object as `{}`. `PropertyFilter` is a `#[repr(C)]` u32 and
+/// `KeyConversionMode` a C enum; we take them by their integer layout (we only
+/// need `filter`; key-conversion of numeric keys to strings is already how our
+/// helper returns them).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetOwnPropertyNames(
+  this: *const Object,
+  context: *const Context,
+  filter: u32,
+  _key_conversion: u32,
+) -> *const Array {
+  if this.is_null() || context.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  // GetOwnPropertyNames has no index filter (v8 includes indices here).
+  let slot = unsafe {
+    v8x_hermes_object_own_property_names(rtw, slot_of(this), filter as c_int, 0)
+  };
+  slot_ptr::<Array>(slot)
+}
+
+/// `Object::GetPropertyNames`: v8 walks own + inherited keys per the collection
+/// mode. The console inspector's object path only needs own enumerable keys
+/// (the prototype chain is inspected separately), so route to the own-keys
+/// helper with the given property filter. `mode`/`index_filter`/`key_conversion`
+/// are accepted for ABI compatibility.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetPropertyNames(
+  this: *const Object,
+  context: *const Context,
+  _mode: u32,
+  property_filter: u32,
+  index_filter: u32,
+  _key_conversion: u32,
+) -> *const Array {
+  if this.is_null() || context.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  // IndexFilter: IncludeIndices=0, SkipIndices=1. The console inspector uses
+  // SkipIndices to list an array's NON-index own keys (so array elements are
+  // not duplicated as "0"/"1" string keys).
+  let skip_indices = if index_filter == 1 { 1 } else { 0 };
+  let slot = unsafe {
+    v8x_hermes_object_own_property_names(
+      rtw,
+      slot_of(this),
+      property_filter as c_int,
+      skip_indices,
+    )
+  };
+  slot_ptr::<Array>(slot)
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Array__Length(array: *const Array) -> u32 {
   let rtw = current_rtw();
@@ -2396,6 +2635,15 @@ pub extern "C" fn v8__Value__IsNull(this: *const Value) -> bool {
     return false;
   }
   unsafe { v8x_hermes_value_is_null(rtw, slot_of(this)) != 0 }
+}
+
+/// `Value::IsNullOrUndefined`: true for JS `null` or `undefined`. deno_core and
+/// many embedder callers use this to test optional/absent values; it was a null
+/// stub (always false), which silently misclassified real `null`/`undefined`
+/// handles as present. Composed from the two working predicates.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsNullOrUndefined(this: *const Value) -> bool {
+  v8__Value__IsNull(this) || v8__Value__IsUndefined(this)
 }
 
 /// `Value::NumberValue`: ECMAScript ToNumber, written into `Maybe<f64>`.
@@ -3092,6 +3340,22 @@ pub extern "C" fn v8__Value__IsUint8Array(this: *const Value) -> bool {
   is_predicate(v8x_hermes_value_is_uint8_array, this)
 }
 
+/// `Value::IsSymbol`. Was a null stub (always false); real callers (and the
+/// console inspector's well-known-Symbol handling) need it.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsSymbol(this: *const Value) -> bool {
+  is_predicate(v8x_hermes_value_is_symbol, this)
+}
+
+/// `Value::IsUint32Array`: needed by ops taking a `#[buffer] &mut [u32]`
+/// (op_url_parse writes URL component offsets into a JS Uint32Array). Was a null
+/// stub, so the op-layer's `Local<Uint32Array>::try_from` failed with "expected
+/// typed ArrayBufferView", blocking all URL parsing.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsUint32Array(this: *const Value) -> bool {
+  is_predicate(v8x_hermes_value_is_uint32_array, this)
+}
+
 /// `ArrayBufferView::Buffer`: the backing ArrayBuffer, or null on error.
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ArrayBufferView__Buffer(
@@ -3212,14 +3476,22 @@ pub extern "C" fn v8__Function__Call(
     if v.is_null() {
       return ptr::null();
     }
-    arg_slots.push(slot_of(v));
+    // Args may themselves be opened Globals (global-pin handles), not just
+    // scope-local value slots; resolve both shapes.
+    arg_slots.push(slot_of_handle(rtw, v));
   }
-  let recv_slot = if recv.is_null() { NULL_SLOT } else { slot_of(recv) };
+  let recv_slot = if recv.is_null() {
+    NULL_SLOT
+  } else {
+    slot_of_handle(rtw, recv)
+  };
+  // `this` is frequently an opened `Global<Function>` (e.g. deno_core's
+  // `__eventLoopTick`), whose handle is a global-pin, so resolve it too.
   let mut ok: c_int = 0;
   let out = unsafe {
     v8x_hermes_function_call(
       rtw,
-      slot_of(this as *const Value),
+      slot_of_handle(rtw, this as *const Value),
       recv_slot,
       arg_slots.as_ptr(),
       n,

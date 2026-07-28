@@ -611,6 +611,157 @@ mod hermes_typed_array {
   }
 }
 
+// E6: the reflection + async-op-bridge ABI unblocked this cycle. Covers:
+//   * the DEFERRED-OP crux: calling an opened `Global<Function>` (a global-pin
+//     handle, the deno_core `__eventLoopTick` receiver) must resolve to a live
+//     slot, not NULL_SLOT — this is the fix that lets async ops settle their JS
+//     promises through run_event_loop.
+//   * Value::IsNullOrUndefined, Value::IsUint32Array, Value::TypeOf,
+//     Object::GetConstructorName / GetOwnPropertyNames / GetOwnPropertyDescriptor,
+//     Object::Has with a Symbol key, Array::New_with_elements, and the
+//     well-known Symbols — all needed by ext/web URL + console.
+#[cfg(all(test, feature = "link_hermes"))]
+mod hermes_reflection {
+  use crate as v8;
+  use super::init_v8_once;
+
+  fn eval<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    src: &str,
+  ) -> v8::Local<'s, v8::Value> {
+    let source = v8::String::new(scope, src).unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    script.run(scope).unwrap()
+  }
+
+  #[test]
+  fn hermes_reflection_abi() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // IsNullOrUndefined: true for null AND undefined, false otherwise.
+    assert!(eval(scope, "null").is_null_or_undefined());
+    assert!(eval(scope, "undefined").is_null_or_undefined());
+    assert!(!eval(scope, "0").is_null_or_undefined());
+    assert!(!eval(scope, "''").is_null_or_undefined());
+    assert!(!eval(scope, "({})").is_null_or_undefined());
+
+    // IsUint32Array distinguishes kinds (op_url_parse takes a #[buffer] u32).
+    assert!(eval(scope, "new Uint32Array(4)").is_uint32_array());
+    assert!(!eval(scope, "new Uint8Array(4)").is_uint32_array());
+    assert!(!eval(scope, "[1,2,3]").is_uint32_array());
+    assert!(!eval(scope, "({})").is_uint32_array());
+
+    // Value::TypeOf.
+    let t = eval(scope, "({})").type_of(scope).to_rust_string_lossy(scope);
+    assert_eq!(t, "object");
+    let t = eval(scope, "42").type_of(scope).to_rust_string_lossy(scope);
+    assert_eq!(t, "number");
+    let t = eval(scope, "(()=>{})").type_of(scope).to_rust_string_lossy(scope);
+    assert_eq!(t, "function");
+
+    // Object::GetConstructorName.
+    let o = v8::Local::<v8::Object>::try_from(eval(scope, "({a:1})")).unwrap();
+    assert_eq!(o.get_constructor_name().to_rust_string_lossy(scope), "Object");
+    let a = v8::Local::<v8::Object>::try_from(eval(scope, "[1,2]")).unwrap();
+    assert_eq!(a.get_constructor_name().to_rust_string_lossy(scope), "Array");
+
+    // Object::GetOwnPropertyNames (enumerable string keys).
+    let o = v8::Local::<v8::Object>::try_from(eval(scope, "({x:1,y:2})")).unwrap();
+    let names = o.get_own_property_names(scope, Default::default()).unwrap();
+    assert_eq!(names.length(), 2, "two own keys");
+    let n0 = names.get_index(scope, 0).unwrap().to_rust_string_lossy(scope);
+    let n1 = names.get_index(scope, 1).unwrap().to_rust_string_lossy(scope);
+    assert_eq!((n0.as_str(), n1.as_str()), ("x", "y"));
+
+    // Object::GetOwnPropertyDescriptor returns a descriptor object.
+    let o = v8::Local::<v8::Object>::try_from(eval(scope, "({v:7})")).unwrap();
+    let key = v8::String::new(scope, "v").unwrap();
+    let desc = o.get_own_property_descriptor(scope, key.into()).unwrap();
+    assert!(desc.is_object(), "descriptor is an object");
+    let desc_obj = v8::Local::<v8::Object>::try_from(desc).unwrap();
+    let vk = v8::String::new(scope, "value").unwrap();
+    let dv = desc_obj.get(scope, vk.into()).unwrap();
+    assert_eq!(dv.int32_value(scope).unwrap(), 7, "descriptor.value === 7");
+
+    // Object::Has with a SYMBOL key (arrays have Symbol.iterator). Before the
+    // fix, has() stringified the Symbol and missed it, so the console inspector
+    // saw arrays as non-iterable objects.
+    let arr = v8::Local::<v8::Object>::try_from(eval(scope, "[1,2,3]")).unwrap();
+    let iter_sym = v8::Symbol::get_iterator(scope);
+    assert!(
+      arr.has(scope, iter_sym.into()).unwrap(),
+      "an Array has Symbol.iterator"
+    );
+
+    // A well-known Symbol round-trips (used by the console inspector).
+    let tag = v8::Symbol::get_to_string_tag(scope);
+    let tag_val: v8::Local<v8::Value> = tag.into();
+    assert!(tag_val.is_symbol(), "GetToStringTag returns a Symbol");
+
+    // Array::New from elements: the vendored constructor path builds arrays from
+    // Rust-side Locals (deno_core / URLSearchParams use it). Was a null stub.
+    let e0 = v8::Integer::new(scope, 11).into();
+    let e1 = v8::Integer::new(scope, 22).into();
+    let built = v8::Array::new_with_elements(scope, &[e0, e1]);
+    assert_eq!(built.length(), 2, "built array has 2 elements");
+    assert_eq!(
+      built.get_index(scope, 0).unwrap().int32_value(scope).unwrap(),
+      11
+    );
+    assert_eq!(
+      built.get_index(scope, 1).unwrap().int32_value(scope).unwrap(),
+      22
+    );
+
+    println!(
+      "hermes_reflection: PASS - IsNullOrUndefined/IsUint32Array/TypeOf, \
+       GetConstructorName/GetOwnPropertyNames/GetOwnPropertyDescriptor, \
+       Symbol-keyed Has, well-known Symbols, Array::new_with_elements"
+    );
+  }
+
+  // The deferred-op crux, isolated at the ABI level: calling a function through
+  // a v8::Global<Function> (opened -> a global-pin handle, NOT a scope-local
+  // value slot) must succeed. deno_core stores __eventLoopTick this way and
+  // calls it to resolve async ops; before the fix, Function::Call saw NULL_SLOT
+  // for the receiver and returned None, so no async op promise ever settled.
+  #[test]
+  fn hermes_global_function_call() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let f = eval(scope, "(function(a, b){ return a + b; })");
+    let f = v8::Local::<v8::Function>::try_from(f).unwrap();
+    // Round-trip through a Global and back (the deno_core storage pattern).
+    let g = v8::Global::new(scope, f);
+    let reopened = v8::Local::new(scope, &g);
+
+    let recv = v8::undefined(scope).into();
+    let a = v8::Integer::new(scope, 40).into();
+    let b = v8::Integer::new(scope, 2).into();
+    let out = reopened
+      .call(scope, recv, &[a, b])
+      .expect("calling an opened Global<Function> must succeed (not None)");
+    assert_eq!(
+      out.int32_value(scope).unwrap(),
+      42,
+      "the reopened global function returns 40 + 2"
+    );
+
+    println!(
+      "hermes_global_function_call: PASS - an opened Global<Function> \
+       (global-pin handle) resolves to a live slot as the call receiver"
+    );
+  }
+}
+
 // E5: v8::ValueSerializer / ValueDeserializer round-trip (structuredClone wire
 // format over JSI values). Proves the same write_header -> write_value ->
 // release -> read_header -> read_value flow deno_core's op_structured_clone uses
