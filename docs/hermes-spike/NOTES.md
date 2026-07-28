@@ -11,8 +11,10 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
-- [x] *** deno_core::JsRuntime BOOTS + runs 1+1 on the Hermes backend (D8 BackingStore closed the boot) ***
-- [x] *** deno_core boots to the LAST step of new_inner on Hermes (past primordials, ops, 01_core.js, module graph); wall = ArrayBuffer BackingStore. rusty_v8 89/267. CEILING: async gens pervasive in full runtime ***
+- [ ] *** E-SERIES (user: "attempt full Deno anyway"): break the async-gen wall via a compile-boundary lowering pass, then grind the full Deno runtime op/API surface ***
+- [x] *** E0: the async-gen "ceiling" is OVERTURNED. Hermes rejects ONLY `async function*` decl syntax; function*/async-await/Symbol.asyncIterator/`for await` all compile. Async gens lower to Hermes-supported primitives (hermesc compiles the lowered form). D7/D8 "not transformable" RETRACTED. See experiments/E0. ***
+- [x] *** deno_core::JsRuntime BOOTS + runs 1+1 on the Hermes backend (D8 BackingStore closed the boot); rusty_v8 re-derived to 93/267 ***
+- [x] deno_core boots to the LAST step of new_inner on Hermes (past primordials, ops, 01_core.js, module graph); wall was ArrayBuffer BackingStore (closed in D8)
 - [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities

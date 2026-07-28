@@ -142,3 +142,21 @@ ceiling - Deno's ext/ layer uses real async generators (for await over sockets, 
 that Hermes's compiler does not support and that are not source-transformable. deno_core-on-Hermes is the
 deliverable; full-Deno-on-Hermes would need upstream Hermes async-generator support or a large rewrite of
 vendored Deno source.
+
+
+## RETRACTION (E0): the async-generator ceiling was wrong
+
+The paragraph directly above is retracted. On the user's "attempt full Deno anyway" call I
+re-examined the claim empirically and it does not hold. Hermes (260318099.0.1) rejects only the
+`async function*` / `async *method` **declaration syntax**; it compiles regular generators
+(`function*`), async/await, `Symbol.asyncIterator`, and - the construct D7 wrongly flagged - `for await`
+consumption. So async generators lower cleanly to the standard ES2017 form (a `function*` wrapped by the
+tslib `__asyncGenerator`/`__await` helpers), and hermesc compiles that lowered form to HBC with no error.
+The lowering is a source-to-source pass we can insert at v8x's OWN compile boundary (`Script::compile` /
+`CompileModule` in `src/hermes/`), touching zero vendored Deno or vendored-test source. Evidence and
+probe table in `experiments/E0-asyncgen-ceiling-reexamined.md`.
+
+Corrected framing: async generators are a **scalable wall, not a ceiling**. Full Deno on Hermes is now a
+grind over two independent surfaces - (1) the syntax-lowering pass, proven tractable, and (2) the large
+but ordinary op / Web-API surface of the full Deno runtime beyond deno_core - not a fundamental
+engine block. The E-series pursues both.
