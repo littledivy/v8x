@@ -116,6 +116,15 @@ mod quickjs;
 #[cfg(feature = "engine_hermes")]
 mod hermes;
 
+// E14 (spike, NOT part of the stable C-ABI surface): expose the Hermes AOT
+// runtime handle so the deno-side boot_trivial probe can measure a real,
+// parse-free HBC cold-start PROCESS (fair comparison vs V8/QuickJS snapshot
+// boots). Gated on `link_hermes` (a real framework is linked) and marked
+// hidden; it adds no `v8__*` symbol and does not affect the backend suite.
+#[cfg(all(feature = "engine_hermes", feature = "link_hermes"))]
+#[doc(hidden)]
+pub use hermes::aot as hermes_aot;
+
 // Pure-Rust implementation of the `crdtp__*` inspector-protocol C-ABI surface
 // (engine-independent), so `test_api.rs` and friends link and run. See the
 // module docs for the simplified "CBOR == JSON bytes" encoding rationale.

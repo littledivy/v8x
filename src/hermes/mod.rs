@@ -1520,6 +1520,244 @@ mod e11_bench {
   }
 }
 
+// E14: the HONEST HBC-lever benchmark on the REAL Deno boot workload.
+//
+// E11's HBCBOOT used a SYNTHETIC bootstrap-shaped blob (gen_bootstrap: N
+// generated function defs). E13 measured the full boot_trivial binary at
+// ~30-35 ms and attributed most of it to deno_core's core bootstrap + ext/web
+// /net/fetch JS being PARSED AND EXECUTED FROM SOURCE on every launch, with no
+// snapshot and no HBC. This module quantifies the parse-free HBC win on the
+// EXACT JS bytes that boot workload runs: it reads the real ext JS files from
+// the deno checkout, compiles each to HBC with the vendored hermesc (HBC 99,
+// matching the framework), and measures cold-boot SOURCE parse+compile+run vs
+// precompiled-HBC run on the real Hermes backend.
+//
+// These ext files use deno_core's `__bootstrap`-IIFE convention (they read
+// `__bootstrap` / `primordials` as free globals, no ES `import` statements), so
+// each file compiles and runs standalone once a stub `__bootstrap` is seeded.
+// Parse+compile cost — the fraction HBC eliminates — is incurred regardless of
+// whether the body then throws on a missing global, so the source-vs-HBC delta
+// is faithful to the real parse tax even where a file's body can't fully run
+// standalone. We seed a permissive stub global so most files run cleanly.
+//
+// Set E14_DENO_DIR to the deno checkout root (default
+// /Users/divy/gh/deno-v8x-rebase). The test skips (passes, prints SKIP) if the
+// ext files are not present, so it never breaks a clean-tree run of the suite.
+#[cfg(all(test, feature = "link_hermes"))]
+mod e14_bootstrap_hbc {
+  use super::aot::{is_hermes_bytecode, Rt};
+  use std::io::Write;
+  use std::process::Command;
+  use std::time::{Duration, Instant};
+
+  fn hermesc_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/hermes/bin/hermesc")
+  }
+
+  fn deno_dir() -> std::path::PathBuf {
+    std::env::var("E14_DENO_DIR")
+      .map(std::path::PathBuf::from)
+      .unwrap_or_else(|_| std::path::PathBuf::from("/Users/divy/gh/deno-v8x-rebase"))
+  }
+
+  fn compile_to_hbc(source: &str) -> Vec<u8> {
+    let dir = std::env::temp_dir().join(format!(
+      "v8x-e14-hbc-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src_path = dir.join("in.js");
+    let hbc_path = dir.join("out.hbc");
+    std::fs::File::create(&src_path)
+      .unwrap()
+      .write_all(source.as_bytes())
+      .unwrap();
+    let mut cmd = Command::new(hermesc_path());
+    // -O = optimizing pipeline, matches how a real AOT boot blob would ship.
+    cmd.arg("-emit-binary").arg("-O").arg("-out").arg(&hbc_path).arg(&src_path);
+    let out = cmd.output().expect("failed to spawn hermesc");
+    assert!(
+      out.status.success(),
+      "hermesc failed: {}",
+      String::from_utf8_lossy(&out.stderr)
+    );
+    let hbc = std::fs::read(&hbc_path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    hbc
+  }
+
+  fn median(mut xs: Vec<Duration>) -> Duration {
+    xs.sort();
+    xs[xs.len() / 2]
+  }
+  fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+  }
+
+  // A permissive stub for `__bootstrap` / `globalThis` prerequisites so the ext
+  // bodies run instead of throwing on the first missing global. This does not
+  // change parse+compile cost (the thing HBC removes); it only lets the RUN
+  // portion proceed further so the source and HBC paths do equivalent work.
+  fn stub_prelude() -> &'static str {
+    "var __bootstrap = new Proxy(function(){}, {\
+       get: function(){ return new Proxy(function(){ return {}; }, this); },\
+       apply: function(){ return {}; },\
+       construct: function(){ return {}; }\
+     });\
+     var primordials = __bootstrap;\
+     globalThis.__bootstrap = __bootstrap;\
+     globalThis.primordials = primordials;"
+  }
+
+  // The exact ext JS files boot_trivial's webidl+web+net+fetch set parses and
+  // executes. Ordered biggest-cost-first for readability; the concatenation is
+  // what a shipped AOT boot blob would contain. Paths relative to deno_dir().
+  fn ext_files() -> &'static [&'static str] {
+    &[
+      "libs/core/00_primordials.js",
+      "libs/core/00_infra.js",
+      "libs/core/01_core.js",
+      "libs/core/02_timers.js",
+      "ext/web/00_infra.js",
+      "ext/web/01_dom_exception.js",
+      "ext/web/01_mimesniff.js",
+      "ext/web/02_event.js",
+      "ext/web/02_structured_clone.js",
+      "ext/web/02_timers.js",
+      "ext/web/03_abort_signal.js",
+      "ext/web/04_global_interfaces.js",
+      "ext/web/05_base64.js",
+      "ext/web/06_streams.js",
+      "ext/web/08_text_encoding.js",
+      "ext/web/09_file.js",
+      "ext/web/10_filereader.js",
+      "ext/web/12_location.js",
+      "ext/web/13_message_port.js",
+      "ext/web/14_compression.js",
+      "ext/web/15_performance.js",
+      "ext/web/00_url.js",
+      "ext/web/01_urlpattern.js",
+    ]
+  }
+
+  // Concatenate the real ext bodies (with the stub prelude) into one script.
+  // Returns None if any file is missing (test then SKIPs).
+  fn build_boot_source() -> Option<String> {
+    let root = deno_dir();
+    let mut out = String::new();
+    out.push_str(stub_prelude());
+    out.push('\n');
+    for rel in ext_files() {
+      let p = root.join(rel);
+      let body = std::fs::read_to_string(&p).ok()?;
+      // Apply the SAME async-generator lowering the real Hermes backend runs on
+      // every module before compile (ext/web/06_streams + 09_file contain
+      // `async function*`, which Hermes's compiler — and hermesc — reject
+      // natively; the E1 pass downlevels them to plain generators). Both the
+      // source and HBC paths get lowered input, exactly like the real boot, so
+      // the delta isolates parse/compile, not a syntax-acceptance difference.
+      let lowered = super::lower::lower_async_generators(&body);
+      // Each ext file is its own scope in deno_core; wrap in a try/IIFE so one
+      // file's runtime error (missing global under the stub) does not abort the
+      // rest, while its FULL body is still parsed+compiled (the HBC-relevant
+      // cost). This mirrors deno_core evaluating each ext file independently.
+      out.push_str("try{(function(){\n");
+      out.push_str(&lowered);
+      out.push_str("\n})();}catch(e){}\n");
+    }
+    out.push_str("globalThis.__e14_done = 1;\n");
+    Some(out)
+  }
+
+  const ITERS: usize = 25;
+
+  fn bench_cold(buf: &[u8], url: &str) -> Vec<Duration> {
+    let mut times = Vec::with_capacity(ITERS);
+    for _ in 0..ITERS {
+      let rt = Rt::new();
+      let t0 = Instant::now();
+      // Ignore the returned value / errors: we time construct+parse+run of the
+      // real boot bytes. eval_buffer returns None on a thrown error, which is
+      // fine — parse+compile happened regardless, which is what we measure.
+      let _ = rt.eval_buffer(buf, url);
+      times.push(t0.elapsed());
+      drop(rt);
+    }
+    times
+  }
+
+  #[test]
+  fn e14_real_boot_source_vs_hbc() {
+    let source = match build_boot_source() {
+      Some(s) => s,
+      None => {
+        println!(
+          "E14:BOOTHBC SKIP — ext JS not found under {} (set E14_DENO_DIR)",
+          deno_dir().display()
+        );
+        return;
+      }
+    };
+    println!(
+      "E14:BOOTHBC real ext boot source assembled: {} files, {} bytes",
+      ext_files().len(),
+      source.len()
+    );
+
+    let hbc = compile_to_hbc(&source);
+    assert!(
+      is_hermes_bytecode(&hbc),
+      "hermesc output must be recognized as HBC by the vendored framework"
+    );
+    println!(
+      "E14:BOOTHBC hbc compiled: {} bytes ({:.2}x source)",
+      hbc.len(),
+      hbc.len() as f64 / source.len() as f64
+    );
+
+    // Emit the lowered source + its HBC to a stable path so the deno-side
+    // boot_trivial probe (`--hbc-boot`/`--src-boot`) can measure a REAL
+    // parse-free cold-start PROCESS on this exact boot workload (Part C fair
+    // comparison). Env E14_EMIT_DIR overrides the destination.
+    let emit_dir = std::env::var("E14_EMIT_DIR")
+      .map(std::path::PathBuf::from)
+      .unwrap_or_else(|_| std::env::temp_dir().join("v8x-e14-boot"));
+    let _ = std::fs::create_dir_all(&emit_dir);
+    let _ = std::fs::write(emit_dir.join("boot.hbc"), &hbc);
+    let _ = std::fs::write(emit_dir.join("boot.js"), source.as_bytes());
+    println!("E14:BOOTHBC emitted boot.hbc + boot.js to {}", emit_dir.display());
+
+    // Warm the file cache / codegen once (discarded) so the first-iter page
+    // fault does not skew the source median.
+    {
+      let rt = Rt::new();
+      let _ = rt.eval_buffer(source.as_bytes(), "warm-src.js");
+    }
+
+    let t_src = bench_cold(source.as_bytes(), "boot-src.js");
+    let t_hbc = bench_cold(&hbc, "boot.hbc");
+    let m_src = median(t_src.clone());
+    let m_hbc = median(t_hbc.clone());
+    let speedup = ms(m_src) / ms(m_hbc).max(1e-9);
+    println!(
+      "E14:BOOTHBC iters={ITERS} source_median_ms={:.3} hbc_median_ms={:.3} \
+       speedup={:.2}x parse_recovered_ms={:.3}",
+      ms(m_src),
+      ms(m_hbc),
+      speedup,
+      ms(m_src) - ms(m_hbc)
+    );
+    println!("E14:BOOTHBC source raw ms: {:?}", t_src.iter().map(|d| ms(*d)).collect::<Vec<_>>());
+    println!("E14:BOOTHBC hbc raw ms: {:?}", t_hbc.iter().map(|d| ms(*d)).collect::<Vec<_>>());
+    // Sanity: HBC must never be slower than source on this shape.
+    assert!(ms(m_hbc) <= ms(m_src) + 1.0, "HBC should not be slower than source");
+  }
+}
+
 #[cfg(all(test, feature = "link_hermes"))]
 mod tests {
   // The whole point of the spike: prove libhermes links, JSI runs, a C++
