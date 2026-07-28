@@ -63,7 +63,7 @@ use oxc::ast_visit::{walk_mut::walk_for_of_statement, VisitMut};
 use oxc::codegen::Codegen;
 use oxc::parser::Parser;
 use oxc::span::{GetSpan, SourceType};
-use oxc::transformer::{ESTarget, HelperLoaderMode, TransformOptions, Transformer};
+use oxc::transformer::{HelperLoaderMode, TransformOptions, Transformer};
 use std::path::Path;
 
 /// The `babelHelpers` runtime the lowered code calls (oxc External helper mode
@@ -291,9 +291,21 @@ pub fn lower_async_generators(src: &str) -> Cow<'_, str> {
     norm.visit_program(&mut program);
   }
 
-  // Target ES2017 so the ES2018 async-generator pass runs; External helper mode
-  // routes helpers through `babelHelpers.*` (we supply that object).
-  let mut options = TransformOptions::from(ESTarget::ES2017);
+  // Enable ONLY the ES2018 async-generator pass. Using `ESTarget::ES2017` here
+  // would enable every downlevel below ES2017 — including the ES2022
+  // class-properties / private-field pass, which rewrites `#x` fields into
+  // `babelHelpers.classPrivateFieldInitSpec(...)` / `classPrivateFieldSet2(...)`
+  // calls. Those helpers are NOT in our four-helper `BABEL_HELPERS` object, so
+  // any class WITH a private field AND an async-generator method in the same
+  // compile unit (e.g. ext/net's `01_net.js`: the `Conn`/`Listener` classes use
+  // `#rid` fields and the file also has an `async *[Symbol.asyncIterator]()`)
+  // hits `babelHelpers.classPrivateFieldInitSpec` === undefined at construction
+  // ("undefined is not a function"). Hermes supports private fields, class
+  // properties, object spread, optional chaining, etc. NATIVELY, so we must not
+  // downlevel them — only the async-generator declaration syntax Hermes rejects.
+  // Build all-off options and switch on the single pass we need.
+  let mut options = TransformOptions::default();
+  options.env.es2018.async_generator_functions = true;
   options.helper_loader.mode = HelperLoaderMode::External;
 
   let scoping = oxc::semantic::SemanticBuilder::new()
@@ -349,6 +361,48 @@ mod tests {
     assert!(!out.contains("async function*"), "async function* must be lowered away");
     assert!(out.contains("babelHelpers"), "helper prelude must be prepended");
     assert!(out.contains("wrapAsyncGenerator"), "wrap helper must be referenced");
+  }
+
+  #[test]
+  fn private_fields_survive_alongside_async_generator() {
+    // E7 regression: ext/net's `01_net.js` has classes (`Conn`, `Listener`)
+    // whose constructors use native private fields (`#rid`) AND the file also
+    // contains an `async *[Symbol.asyncIterator]()`. Targeting `ESTarget::ES2017`
+    // (all downlevels <= 2017) also enabled the ES2022 class-properties pass,
+    // which rewrote `#x` fields into `babelHelpers.classPrivateFieldInitSpec(...)`
+    // / `classPrivateFieldSet2(...)` — helpers NOT provided by our four-helper
+    // BABEL_HELPERS object. Every such class then threw "undefined is not a
+    // function" at construction. Hermes supports private fields natively, so the
+    // async-generator pass must be the ONLY transform: private fields stay `#x`,
+    // and the ctor's own references survive intact.
+    let src = r#"(function (__bootstrap) {
+"use strict"; return ((function () {
+  const { primordials } = __bootstrap;
+  const { ObjectDefineProperty, PromiseResolve } = primordials;
+  class C {
+    #v = 0;
+    constructor(x) {
+      ObjectDefineProperty(this, "tag", { value: x });
+      this.#v = x;
+    }
+    async *[Symbol.asyncIterator]() { yield await PromiseResolve(1); }
+  }
+  return { C };
+})());
+})"#;
+    let out = lower_async_generators(src);
+    // The ctor's own references must survive the round-trip untouched.
+    assert!(out.contains("ObjectDefineProperty(this"), "ctor ref must survive");
+    // Private fields must be left NATIVE (Hermes supports them); they must NOT
+    // be downleveled into the (unprovided) classPrivateField* babel helpers.
+    assert!(
+      !out.contains("classPrivateField"),
+      "private fields must not be downleveled into missing babel helpers"
+    );
+    assert!(out.contains("#v"), "native private field syntax must survive");
+    // The async generator itself MUST still be lowered away.
+    assert!(!out.contains("async *"), "async generator must be lowered");
+    assert!(out.contains("wrapAsyncGenerator"), "AG helper must be used");
   }
 
   #[test]
