@@ -58,7 +58,7 @@ branch; all previously-null stubs became real, or an identity no-op became
 correct. The boot was re-run after each with
 `DYLD_FRAMEWORK_PATH=vendor/hermes target/debug/examples/hermes_boot`.
 
-### Wall A (compile): `async function*` unsupported — the D6 wall
+### Wall A (compile): `async function*` unsupported: the D6 wall
 
 `00_primordials.js:285` is `Reflect.getPrototypeOf(async function* () {})`.
 Hermes rejects the literal at parse time.
@@ -95,12 +95,12 @@ and on its constructable wrapper.
 `v8__Object__New__with_prototype_and_properties` (a null stub -> `.unwrap()`
 panic).
 
-Fix (`src/hermes/core.rs`): model it on existing primitives — fresh object, set
+Fix (`src/hermes/core.rs`): model it on existing primitives: fresh object, set
 each name/value as an ordinary own property, then set the prototype (null => null
 prototype) via a new C++ helper `v8x_hermes_object_set_prototype`
 (`Object.setPrototypeOf` semantics).
 
-### Wall D (panic): `mod_evaluate_sync` — `BadType` expected Promise
+### Wall D (panic): `mod_evaluate_sync`: `BadType` expected Promise
 
 The virtual ops module (`ext:core/mod.js` shape) evaluates. deno_core reads a
 source module's `Evaluate` result as a Promise. `v8__Value__IsPromise` was a null
@@ -110,7 +110,7 @@ Fix (`src/hermes/core.rs` + `hermes_shim.cpp`): implement `Value::IsPromise` as
 `value instanceof Promise` against the runtime's global `Promise`
 (`v8x_hermes_value_is_promise`, via JSI `Object::instanceOf`).
 
-### Wall E (run): `01_core.js` — `Cannot set property 'log' of undefined`
+### Wall E (run): `01_core.js`: `Cannot set property 'log' of undefined`
 
 The first bootstrap script `ext:core/01_core.js` runs and throws. `01_core.js`
 does `op_get_ext_import_meta_proto().log = ...`. The op returned a value that,
@@ -131,7 +131,7 @@ value into a fresh scope slot; `Global::Reset` unpins. Non-value Globals (Contex
 == isolate pointer, Module == Box record) stay identity, as before. This is the
 C2 lifetime rule applied to Globals.
 
-### Wall F (run): `01_core.js` — `Cannot convert undefined value to object`
+### Wall F (run): `01_core.js`: `Cannot convert undefined value to object`
 
 Further into `01_core.js`: `const v8Console = globalThis.console;
 wrapConsole(coreConsole, v8Console)`, and `wrapConsole` does
@@ -145,7 +145,7 @@ context creation, idempotent (skips if a real console already exists). This
 mirrors the D4 extras-binding console; deno_core forwards real console output
 through its own op-based console.
 
-### Wall G (panic): `Module::get_unbound_module_script().unwrap()` — null
+### Wall G (panic): `Module::get_unbound_module_script().unwrap()`: null
 
 The builtin ES modules now compile. `new_module_from_js_source` unconditionally
 calls `module.get_unbound_module_script().unwrap()`, then
@@ -194,7 +194,7 @@ graph to a single well-scoped subsystem: **external-memory BackingStores**.
 
 Implement the external-memory BackingStore chain, the exact next wall:
 
-1. `v8__ArrayBuffer__NewBackingStore__with_data` — wrap an external
+1. `v8__ArrayBuffer__NewBackingStore__with_data`: wrap an external
    `(ptr, len, deleter, deleter_data)` as a BackingStore. JSI's `createArrayBuffer`
    uses a `jsi::MutableBuffer`, which can wrap external memory directly (unlike
    V8's copy semantics), so a BackingStore can be modeled as a small record
@@ -202,7 +202,7 @@ Implement the external-memory BackingStore chain, the exact next wall:
    over a MutableBuffer that points at that memory.
 2. `BackingStore::make_shared` / the `SharedRef` machinery the vendored
    `array_buffer.rs` uses (`with_backing_store`).
-3. `v8__ArrayBuffer__with_backing_store` — create a JSI ArrayBuffer that aliases
+3. `v8__ArrayBuffer__with_backing_store`: create a JSI ArrayBuffer that aliases
    the backing store's external memory (so Rust writes to `tick_info` are visible
    to the JS `Uint8Array`, which is the whole point of this path).
 4. `NewBackingStore__with_byte_length` and the SharedArrayBuffer siblings are the
@@ -227,9 +227,9 @@ Run inside the deno checkout (`/Users/divy/gh/deno-v8x-rebase`):
 
 The two non-polyfill runtime async generators, for the record:
 
-- `ext/net/01_net.js`: `async *[SymbolAsyncIterator]()` — `for await` over a
+- `ext/net/01_net.js`: `async *[SymbolAsyncIterator]()`: `for await` over a
   `Listener`'s incoming connections.
-- `ext/web/09_file.js`: `async *stream()` — `Blob.prototype.stream()`.
+- `ext/web/09_file.js`: `async *stream()`: `Blob.prototype.stream()`.
 
 These run only when user code exercises those APIs, not during `deno_core`
 bootstrap, which is why the deno_core boot is unblocked by the single
