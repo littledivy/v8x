@@ -1042,3 +1042,166 @@ mod hermes_surface {
     assert_eq!(json, r#"{"list":[1,2],"ok":true}"#);
   }
 }
+
+// D0: Deno boot recon probe. These tests walk the boot-critical v8 subsystems
+// in dependency order (isolate+context, then Promise, then microtask queue,
+// then ES module instantiate+evaluate) using the SAME vendored rusty_v8 Rust
+// surface deno_core drives. Each test isolates one subsystem so a failure names
+// exactly which v8__* wall deno_core would hit at that stage. `boot_baseline`
+// is expected to PASS today (it is the surface C6 already proved); the async +
+// module probes are expected to FAIL today and mark the first walls to Deno
+// boot. See docs/hermes-spike/experiments/D0-deno-boot-recon.md.
+#[cfg(all(test, feature = "link_hermes"))]
+mod hermes_boot_probe {
+  use crate as v8;
+  use super::init_v8_once;
+
+  /// Stage 0: isolate + context + trivial classic-script execution. This is the
+  /// minimum `JsRuntime::new` + `execute_script("1 + 1")` boot path (no
+  /// snapshot, no modules, no async). Expected to PASS: it is the C3/C6 surface.
+  #[test]
+  fn boot_baseline_isolate_context_script() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let source = v8::String::new(scope, "1 + 1").unwrap();
+    let script = v8::Script::compile(scope, source, None)
+      .expect("Script::compile of '1 + 1'");
+    let result = script.run(scope).expect("Script::run of '1 + 1'");
+    assert_eq!(result.to_rust_string_lossy(scope), "2");
+  }
+
+  /// Stage 1a: Promise resolver round trip. deno_core creates a resolver per
+  /// pending op, resolves it, and reads the promise state back. WALL if
+  /// `v8__Promise__Resolver__New` / `GetPromise` / `Resolve` / `State` are stubs.
+  #[test]
+  fn boot_promise_resolver_roundtrip() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let resolver = v8::PromiseResolver::new(scope)
+      .expect("PromiseResolver::new returned None (v8__Promise__Resolver__New is a stub)");
+    let promise = resolver.get_promise(scope);
+    assert_eq!(
+      promise.state(),
+      v8::PromiseState::Pending,
+      "fresh promise should be Pending"
+    );
+
+    let val = v8::Integer::new(scope, 42);
+    resolver
+      .resolve(scope, val.into())
+      .expect("PromiseResolver::resolve returned None (stub)");
+    assert_eq!(
+      promise.state(),
+      v8::PromiseState::Fulfilled,
+      "promise should be Fulfilled after resolve"
+    );
+    let result = promise.result(scope);
+    assert_eq!(result.to_rust_string_lossy(scope), "42");
+  }
+
+  /// Stage 1b: microtask enqueue + checkpoint. deno_core relies on the
+  /// microtask checkpoint to drain `.then` callbacks and settle resolved
+  /// promises after each op batch. WALL if `EnqueueMicrotask` /
+  /// `PerformMicrotaskCheckpoint` do not actually run the queued function.
+  #[test]
+  fn boot_microtask_enqueue_and_checkpoint() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // A microtask that sets a global flag; after the checkpoint the flag must
+    // be observable to JS. Uses a JS closure so we do not need a Rust callback.
+    let setup = v8::String::new(
+      scope,
+      "globalThis.__mt_ran = false; \
+       globalThis.__mt = function () { globalThis.__mt_ran = true; };",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, setup, None).unwrap();
+    script.run(scope).unwrap();
+
+    let global = context.global(scope);
+    let name = v8::String::new(scope, "__mt").unwrap();
+    let mt = global.get(scope, name.into()).unwrap();
+    let mt_fn = v8::Local::<v8::Function>::try_from(mt)
+      .expect("__mt should be a Function");
+
+    scope.enqueue_microtask(mt_fn);
+    scope.perform_microtask_checkpoint();
+
+    let flag = v8::String::new(scope, "__mt_ran").unwrap();
+    let ran = global.get(scope, flag.into()).unwrap();
+    assert_eq!(
+      ran.to_rust_string_lossy(scope),
+      "true",
+      "microtask did not run (PerformMicrotaskCheckpoint is a no-op stub)"
+    );
+  }
+
+  /// Stage 2: ES module compile + instantiate + evaluate. deno_core evaluates
+  /// user code and (in some boot configs) core JS as ES modules. WALL if
+  /// `v8__ScriptCompiler__CompileModule` / `v8__Module__InstantiateModule` /
+  /// `v8__Module__Evaluate` are stubs. A trivial module with no imports still
+  /// needs a resolve callback signature but never calls it.
+  #[test]
+  fn boot_es_module_instantiate_evaluate() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let src = v8::String::new(scope, "globalThis.__mod_ran = 7;").unwrap();
+    let name = v8::String::new(scope, "probe.js").unwrap();
+    let origin = v8::ScriptOrigin::new(
+      scope,
+      name.into(),
+      0,
+      0,
+      false,
+      0,
+      None,
+      false,
+      false,
+      true, // is_module
+      None,
+    );
+    let mut source = v8::script_compiler::Source::new(src, Some(&origin));
+    let module = v8::script_compiler::compile_module(scope, &mut source)
+      .expect("compile_module returned None (v8__ScriptCompiler__CompileModule is a stub)");
+
+    fn resolve_noop<'s>(
+      _context: v8::Local<'s, v8::Context>,
+      _specifier: v8::Local<'s, v8::String>,
+      _import_attributes: v8::Local<'s, v8::FixedArray>,
+      _referrer: v8::Local<'s, v8::Module>,
+    ) -> Option<v8::Local<'s, v8::Module>> {
+      None
+    }
+
+    let ok = module.instantiate_module(scope, resolve_noop);
+    assert_eq!(
+      ok,
+      Some(true),
+      "instantiate_module failed (v8__Module__InstantiateModule is a stub)"
+    );
+    let _ = module
+      .evaluate(scope)
+      .expect("Module::evaluate returned None (v8__Module__Evaluate is a stub)");
+
+    let global = context.global(scope);
+    let flag = v8::String::new(scope, "__mod_ran").unwrap();
+    let ran = global.get(scope, flag.into()).unwrap();
+    assert_eq!(ran.to_rust_string_lossy(scope), "7");
+  }
+}
