@@ -53,7 +53,17 @@ namespace {
 // getStack() are called - value() is captured via the handle-table push,
 // which itself needs the still-alive Runtime).
 struct TryCatchFrame {
-  v8x_hermes_slot exception_slot = -1; // -1 = nothing caught (yet)
+  // C12 fix: the caught exception's VALUE, held in a Runtime-owned
+  // shared_ptr (outlives every HandleScope), not a raw handle-table slot
+  // index. A caught exception commonly outlives the HandleScope active at
+  // capture time (e.g. the vendored `eval()` test helper wraps every eval in
+  // an EscapableHandleScope; when the script throws, that scope's DESTRUCTOR
+  // still truncates the handle table on the way out, before the test ever
+  // calls TryCatch::exception() - the exact same class of bug C11 found and
+  // fixed for EscapableHandleScope::escape). v8x_hermes_trycatch_exception
+  // materializes a FRESH slot from this holder on every read instead of
+  // returning a slot recorded once at capture time, so it is never stale.
+  std::shared_ptr<jsi::Value> exception_value;
   bool has_caught = false;
   // Set once rethrow() has been called on this frame: a later reset() must
   // NOT clear has_caught (matches the vendored test's documented V8 quirk).
@@ -82,6 +92,17 @@ struct RuntimeWrapper {
   // identity-hash infra so no per-call script compile happens on the hot path.
   std::unique_ptr<jsi::Value> internal_fields_symbol;
   std::unique_ptr<jsi::Value> get_own_property_descriptor_fn;
+  // C12: lazily-created per-runtime Signature state. Every instance a
+  // template-backed constructor builds is stamped with its FnTemplate's
+  // template_id via a hidden Symbol-keyed property (same trick as internal
+  // fields / identity), so a Signature's receiver check can walk `this` and
+  // its prototype chain looking for a matching id.
+  std::unique_ptr<jsi::Value> template_id_symbol;
+  std::unique_ptr<jsi::Value> get_prototype_of_fn;
+  // JSI's jsi::Object::getProperty has no Symbol-keyed overload, so reading
+  // the hidden template-id stamp back needs a small JS helper: `(obj, sym) =>
+  // obj[sym]`.
+  std::unique_ptr<jsi::Value> get_symbol_property_fn;
   // C9: the TryCatch scope stack. back() is the innermost live scope.
   std::vector<TryCatchFrame> tc_stack;
   // C10: pending exception left by a native FunctionCallback that threw (via
@@ -110,12 +131,14 @@ struct RuntimeWrapper {
     try {
       // err.value() returns a `const jsi::Value&` bound to the JSError's own
       // shared_ptr<Value>; copy-construct a fresh Value from it (via the
-      // Runtime, still alive here) into the handle table before the JSError
-      // (and its value_ shared_ptr) is destroyed by the catch block.
-      jsi::Value v(runtime(), err.value());
-      frame.exception_slot = push(std::move(v));
+      // Runtime, still alive here) into a Runtime-owned holder (NOT a
+      // handle-table slot - see the TryCatchFrame::exception_value comment)
+      // before the JSError (and its own value_ shared_ptr) is destroyed by
+      // the catch block.
+      frame.exception_value =
+          std::make_shared<jsi::Value>(runtime(), err.value());
     } catch (...) {
-      frame.exception_slot = -1;
+      frame.exception_value.reset();
     }
     frame.has_caught = true;
     frame.message = err.getMessage();
@@ -1332,15 +1355,24 @@ int v8x_hermes_trycatch_has_caught(void *rtw, int64_t index) {
   return (f != nullptr && f->has_caught) ? 1 : 0;
 }
 
-// The caught exception's Value, as a handle-table slot (or the null slot if
-// nothing was caught / a bad index).
+// The caught exception's Value, materialized into a FRESH handle-table slot
+// on every call (never a slot recorded once at capture time - see the
+// TryCatchFrame::exception_value comment: a HandleScope active at capture
+// time may since have been torn down, truncating any such slot away).
+// Returns the null slot if nothing was caught / a bad index / the value
+// holder is empty (capture itself failed).
 v8x_hermes_slot v8x_hermes_trycatch_exception(void *rtw, int64_t index) {
   auto *w = static_cast<RuntimeWrapper *>(rtw);
   TryCatchFrame *f = tc_frame(w, index);
-  if (f == nullptr || !f->has_caught) {
+  if (f == nullptr || !f->has_caught || !f->exception_value) {
     return V8X_HERMES_NULL_SLOT;
   }
-  return f->exception_slot;
+  try {
+    jsi::Value v(w->runtime(), *f->exception_value);
+    return w->push(std::move(v));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
 }
 
 // A synthetic v8::Message string ("Uncaught <ctor>: <message>" - matches the
@@ -1408,7 +1440,7 @@ void v8x_hermes_trycatch_reset(void *rtw, int64_t index) {
     return;
   }
   f->has_caught = false;
-  f->exception_slot = -1;
+  f->exception_value.reset();
   f->message.clear();
   f->stack.clear();
 }
@@ -1416,9 +1448,9 @@ void v8x_hermes_trycatch_reset(void *rtw, int64_t index) {
 // Propagate this frame's caught exception to the next-outer live frame (the
 // one immediately below `index` in tc_stack), mirroring v8's ReThrow: marks
 // the outer frame caught with the SAME exception value, and marks THIS frame
-// as rethrown (so a later reset() on it is a no-op, see above). Returns the
-// exception's handle-table slot (what Rust's rethrow() surfaces as
-// Some(value)), or the null slot if nothing was caught here.
+// as rethrown (so a later reset() on it is a no-op, see above). Returns a
+// FRESH handle-table slot for the exception (what Rust's rethrow() surfaces
+// as Some(value)), or the null slot if nothing was caught here.
 v8x_hermes_slot v8x_hermes_trycatch_rethrow(void *rtw, int64_t index) {
   auto *w = static_cast<RuntimeWrapper *>(rtw);
   TryCatchFrame *f = tc_frame(w, index);
@@ -1430,12 +1462,20 @@ v8x_hermes_slot v8x_hermes_trycatch_rethrow(void *rtw, int64_t index) {
     TryCatchFrame *outer = tc_frame(w, index - 1);
     if (outer != nullptr) {
       outer->has_caught = true;
-      outer->exception_slot = f->exception_slot;
+      outer->exception_value = f->exception_value;
       outer->message = f->message;
       outer->stack = f->stack;
     }
   }
-  return f->exception_slot;
+  if (!f->exception_value) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    jsi::Value v(w->runtime(), *f->exception_value);
+    return w->push(std::move(v));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
 }
 
 // ---- Isolate::ThrowException + Exception::* constructors (C9) ------------
@@ -1490,8 +1530,7 @@ int v8x_hermes_throw_exception(void *rtw, v8x_hermes_slot value_slot) {
         frame.message = msgVal.getString(w->runtime()).utf8(w->runtime());
       }
     }
-    jsi::Value copy(w->runtime(), *v);
-    frame.exception_slot = w->push(std::move(copy));
+    frame.exception_value = std::make_shared<jsi::Value>(w->runtime(), *v);
     return 1;
   } catch (...) {
     return 0;
@@ -2009,6 +2048,132 @@ int v8x_hermes_object_define_accessor_fns(void *rtw, v8x_hermes_slot obj_slot,
   }
 }
 
+// ---- C12: Signature receiver check -----------------------------------------
+//
+// A Signature accepts a receiver iff the receiver (or any of its hidden
+// prototypes) was constructed by the signature's FunctionTemplate. Every
+// template-backed constructor stamps its fresh instance with a hidden
+// Symbol-keyed `template_id` (an integer); the check walks the prototype
+// chain comparing against the signature's target id.
+
+namespace {
+
+// Lazily create (once per runtime) the template-id Symbol and cache
+// Object.getPrototypeOf. Reuses the identity infra's define_property_fn.
+bool ensure_signature_infra(RuntimeWrapper *w) {
+  if (w->template_id_symbol && w->get_prototype_of_fn &&
+      w->get_symbol_property_fn) {
+    return true;
+  }
+  if (!ensure_identity_infra(w)) {
+    return false;
+  }
+  try {
+    jsi::Value setup = w->runtime().evaluateJavaScript(
+        std::make_unique<jsi::StringBuffer>(
+            "(function() { return ["
+            "Symbol('v8x_template_id'),"
+            "Object.getPrototypeOf,"
+            "function(obj, sym) { return obj[sym]; }"
+            "]; })()"),
+        "v8x-signature-setup.js");
+    jsi::Array arr = setup.getObject(w->runtime()).asArray(w->runtime());
+    jsi::Value sym = arr.getValueAtIndex(w->runtime(), 0);
+    jsi::Value gpo = arr.getValueAtIndex(w->runtime(), 1);
+    jsi::Value gsp = arr.getValueAtIndex(w->runtime(), 2);
+    w->template_id_symbol =
+        std::make_unique<jsi::Value>(w->runtime(), sym);
+    w->get_prototype_of_fn =
+        std::make_unique<jsi::Value>(w->runtime(), gpo);
+    w->get_symbol_property_fn =
+        std::make_unique<jsi::Value>(w->runtime(), gsp);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+} // namespace
+
+// Stamp `obj` with `template_id` via a hidden, non-enumerable Symbol-keyed
+// property. Called on every instance a template-backed constructor produces
+// (idempotent in effect: a later stamp simply overwrites the id, which never
+// happens in practice since each instance is constructed once). Returns 1 on
+// success, 0 on error.
+int v8x_hermes_stamp_template_id(void *rtw, v8x_hermes_slot obj_slot,
+                                 int64_t template_id) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  if (ov == nullptr || !ov->isObject()) {
+    return 0;
+  }
+  if (!ensure_signature_infra(w)) {
+    return 0;
+  }
+  try {
+    jsi::Object obj = ov->getObject(w->runtime());
+    jsi::Function defineProperty =
+        w->define_property_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Symbol key = w->template_id_symbol->getSymbol(w->runtime());
+    jsi::Object desc(w->runtime());
+    desc.setProperty(w->runtime(), "value",
+                     jsi::Value(static_cast<double>(template_id)));
+    desc.setProperty(w->runtime(), "enumerable", jsi::Value(false));
+    desc.setProperty(w->runtime(), "writable", jsi::Value(false));
+    desc.setProperty(w->runtime(), "configurable", jsi::Value(false));
+    defineProperty.call(w->runtime(), obj, jsi::Value(w->runtime(), key),
+                        std::move(desc));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// Signature receiver check: does `this_slot` (or any of its hidden
+// prototypes) carry the hidden `template_id` stamp matching `template_id`?
+// Returns 1 (match), 0 (no match), or -1 on error (non-object, etc).
+int v8x_hermes_check_signature(void *rtw, v8x_hermes_slot this_slot,
+                               int64_t template_id) {
+  if (rtw == nullptr) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *tv = slot_ref(w, this_slot);
+  if (tv == nullptr || !tv->isObject()) {
+    return -1;
+  }
+  if (!ensure_signature_infra(w)) {
+    return -1;
+  }
+  try {
+    jsi::Function getProto =
+        w->get_prototype_of_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Function getSymProp =
+        w->get_symbol_property_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Value cur(w->runtime(), *tv);
+    // Walk `this`, then Object.getPrototypeOf repeatedly, until null/
+    // non-object or a match. A real prototype chain is finite; cap the walk
+    // defensively in case of a pathological cycle.
+    for (int i = 0; i < 64 && cur.isObject(); ++i) {
+      jsi::Object curObj = cur.getObject(w->runtime());
+      jsi::Value idVal = getSymProp.call(
+          w->runtime(), jsi::Value(w->runtime(), curObj),
+          jsi::Value(w->runtime(), *w->template_id_symbol));
+      if (idVal.isNumber() &&
+          static_cast<int64_t>(idVal.getNumber()) == template_id) {
+        return 1;
+      }
+      cur = getProto.call(w->runtime(), jsi::Value(w->runtime(), curObj));
+    }
+    return 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
 // Set `obj`'s prototype to `ctor.prototype` (so `obj.constructor` resolves to
 // `ctor` and `obj.constructor.name` is the ctor's name). Used by
 // ObjectTemplate::new_from_template to link an instance to its source
@@ -2116,10 +2281,20 @@ void v8x_hermes_set_pending_callback_exception(void *rtw,
 // instance_template_with_internal_field). A value < 0 (-1) means a plain
 // Function::new: an ordinary non-constructable host function, unchanged from
 // C10.
+//
+// C12: `template_id` is the FunctionTemplate's own stable id (>= 1), stamped
+// (via a hidden Symbol-keyed property) onto every receiver this function
+// constructs via `new`, so a Signature targeting this template can later
+// recognize the instance. `signature_templ_id` (-1 = none) is the template id
+// this function's Signature requires of its receiver; if set, every call
+// (plain or construct) checks `this` (and its prototype chain) for that id
+// before running the callback, throwing "Illegal invocation" if absent.
 v8x_hermes_slot v8x_hermes_function_new(void *rtw, uintptr_t callback_bits,
                                         v8x_hermes_slot data_slot,
                                         int32_t length, const char *name,
-                                        int64_t instance_internal_field_count) {
+                                        int64_t instance_internal_field_count,
+                                        int64_t template_id,
+                                        int64_t signature_templ_id) {
   if (rtw == nullptr || callback_bits == 0) {
     return V8X_HERMES_NULL_SLOT;
   }
@@ -2140,9 +2315,27 @@ v8x_hermes_slot v8x_hermes_function_new(void *rtw, uintptr_t callback_bits,
         static_cast<unsigned int>(length < 0 ? 0 : length);
     int64_t ifc = instance_internal_field_count;
 
-    auto hostFn = [w, callback_bits, data, ifc](
+    auto hostFn = [w, callback_bits, data, ifc, template_id,
+                   signature_templ_id](
                       jsi::Runtime &rt, const jsi::Value &thisVal,
                       const jsi::Value *args, size_t count) -> jsi::Value {
+      // C12 Signature: reject a receiver that (nor any hidden prototype) was
+      // never constructed by the signature's target template, BEFORE any
+      // handle-table/internal-field/callback work runs (matches v8: an
+      // illegal-invocation call has no other side effect).
+      if (signature_templ_id >= 0) {
+        int match = v8x_hermes_check_signature(
+            static_cast<void *>(w),
+            w->push(jsi::Value(rt, thisVal)), signature_templ_id);
+        // The pushed slot above is only needed for the check; nothing else
+        // uses it, so pop it immediately (it was pushed after `watermark`
+        // would be captured below, so do this before that capture).
+        w->handles.pop_back();
+        if (match != 1) {
+          throw jsi::JSError(rt, "Illegal invocation");
+        }
+      }
+
       // Marshal `this`, `data`, and each arg into fresh handle-table slots.
       // Everything pushed here (plus anything the callback interns) is released
       // by truncating back to `watermark` afterwards, emulating v8's implicit
@@ -2151,10 +2344,15 @@ v8x_hermes_slot v8x_hermes_function_new(void *rtw, uintptr_t callback_bits,
 
       v8x_hermes_slot this_slot = w->push(jsi::Value(rt, thisVal));
       // Constructor path: give the new receiver its declared internal-field
-      // slots before the callback runs (idempotent: no-op if already present).
+      // slots before the callback runs (idempotent: no-op if already present),
+      // and stamp it with this template's id for a future Signature check.
       if (ifc > 0 && thisVal.isObject()) {
         v8x_hermes_object_ensure_internal_fields(static_cast<void *>(w),
                                                  this_slot, ifc);
+      }
+      if (template_id > 0 && thisVal.isObject()) {
+        v8x_hermes_stamp_template_id(static_cast<void *>(w), this_slot,
+                                     template_id);
       }
       v8x_hermes_slot data_slot_local = w->push(jsi::Value(rt, *data));
 

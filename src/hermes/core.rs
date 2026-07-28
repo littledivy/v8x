@@ -169,8 +169,15 @@ unsafe extern "C" {
     length: i32,
     name: *const c_char,
     instance_internal_field_count: i64,
+    template_id: i64,
+    signature_templ_id: i64,
   ) -> i64;
   fn v8x_hermes_set_pending_callback_exception(rtw: *mut c_void, slot: i64);
+  // C12 Signature stamp/check (v8x_hermes_stamp_template_id/
+  // v8x_hermes_check_signature) are called only from hermes_shim.cpp itself
+  // (inside v8x_hermes_function_new's hostFn), so they have no Rust-side
+  // extern "C" declaration here - only their C++ definitions
+  // (docs/hermes-spike/experiments/C12-hermes-interceptors.md).
 
   // C11: ObjectTemplate internal fields + accessors. See
   // docs/hermes-spike/experiments/C11-hermes-templates.md.
@@ -2071,9 +2078,20 @@ pub extern "C" fn v8__Function__New(
   let rtw = iso_state(context as *mut RealIsolate).rtw;
   let data_slot = slot_of(data_or_null);
   let callback_bits = callback as usize;
-  // -1: a plain Function::new is a non-constructable callable (not a template).
+  // -1: a plain Function::new is a non-constructable callable (not a
+  // template), so template_id=0 (never stamped) and signature_templ_id=-1
+  // (no signature, any receiver is accepted).
   let out = unsafe {
-    v8x_hermes_function_new(rtw, callback_bits, data_slot, length, ptr::null(), -1)
+    v8x_hermes_function_new(
+      rtw,
+      callback_bits,
+      data_slot,
+      length,
+      ptr::null(),
+      -1,
+      0,
+      -1,
+    )
   };
   if out < 0 {
     return ptr::null();
@@ -2440,7 +2458,25 @@ struct FnTemplate {
   prototype_template: *mut ObjTemplate,
   /// The class-name String slot set by `SetClassName`, or -1.
   class_name_slot: i64,
+  /// A stable per-template id (C12 `Signature`): every instance constructed
+  /// through this template's constructor function is stamped with this id (a
+  /// hidden Symbol-keyed property), so a `Signature`'s receiver check can
+  /// walk the prototype chain looking for it. Never 0 (a real id is always
+  /// >= 1; 0 doubles as "no id assigned").
+  template_id: i64,
+  /// `FunctionTemplate::builder().signature(...)`: the `template_id` of the
+  /// FunctionTemplate the `Signature` was built from (`Signature::New`'s
+  /// `templ` argument), or -1 for no signature (the default, any receiver is
+  /// accepted).
+  signature_templ_id: i64,
 }
+
+/// Process-global monotonic counter backing `FnTemplate::template_id` (C12
+/// `Signature`). Templates are Rust-owned leaked pointers, not tied to any one
+/// runtime, so a single global counter (rather than a per-runtime one like the
+/// C4 identity hash) keeps every template's id distinct. Starts at 1 so 0 can
+/// mean "unset" / "no signature".
+static NEXT_TEMPLATE_ID: AtomicUsize = AtomicUsize::new(1);
 
 #[repr(C)]
 struct ObjTemplate {
@@ -2479,7 +2515,7 @@ pub extern "C" fn v8__FunctionTemplate__New(
   isolate: *mut RealIsolate,
   callback: FunctionCallback,
   data_or_null: *const Value,
-  _signature_or_null: *const c_void,
+  signature_or_null: *const c_void,
   length: i32,
   _constructor_behavior: c_int,
   _side_effect_type: c_int,
@@ -2489,6 +2525,14 @@ pub extern "C" fn v8__FunctionTemplate__New(
   if isolate.is_null() {
     return ptr::null();
   }
+  // A `Signature` is just the source FnTemplate pointer (see
+  // v8__Signature__New below); read its template_id, or -1 for "no
+  // signature" (any receiver is accepted, the v8 default).
+  let signature_templ_id = if signature_or_null.is_null() {
+    -1
+  } else {
+    unsafe { (*(signature_or_null as *const FnTemplate)).template_id }
+  };
   let templ = Box::new(FnTemplate {
     header: TemplateHeader {
       kind: TEMPLATE_KIND_FN,
@@ -2500,8 +2544,24 @@ pub extern "C" fn v8__FunctionTemplate__New(
     instance_template: ptr::null_mut(),
     prototype_template: ptr::null_mut(),
     class_name_slot: NULL_SLOT,
+    template_id: NEXT_TEMPLATE_ID.fetch_add(1, Ordering::Relaxed) as i64,
+    signature_templ_id,
   });
   Box::into_raw(templ) as *const FunctionTemplate
+}
+
+/// `Signature::New`: a Signature is identified by the source FunctionTemplate
+/// it was built from. Rather than a separate allocation, this simply returns
+/// the FnTemplate pointer itself reinterpreted as `*const Signature` (both are
+/// opaque, non-handle-table pointers in this backend, and `FunctionTemplate::
+/// New`'s `signature_or_null` reads the `template_id` straight back off it, so
+/// no unwrapping is ever needed at any other call site).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Signature__New(
+  _isolate: *mut RealIsolate,
+  templ: *const FunctionTemplate,
+) -> *const c_void {
+  templ as *const c_void
 }
 
 /// The instance-template internal-field count for this FunctionTemplate (0 if
@@ -2533,6 +2593,8 @@ pub extern "C" fn v8__FunctionTemplate__GetFunction(
       templ.length,
       ptr::null(),
       fn_instance_ifc(templ),
+      templ.template_id,
+      templ.signature_templ_id,
     )
   };
   if out < 0 {

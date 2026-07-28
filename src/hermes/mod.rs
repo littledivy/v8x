@@ -937,6 +937,74 @@ mod hermes_surface {
     println!("hermes_object_template_basic: new WIF() internal field = 42");
   }
 
+  /// C12: `Signature` receiver check, end to end (mirrors
+  /// `function_template_signature`). `templ0`'s function `C` has no
+  /// signature; `templ1`'s function `f` is built with a signature targeting
+  /// `templ0`. `f.call(new C)` (a receiver constructed by `templ0`) must
+  /// succeed; `f.call(new Object)` (an unrelated receiver) must throw
+  /// "Illegal invocation".
+  #[test]
+  fn hermes_function_template_signature() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+
+    fn fortytwo_cb(
+      _scope: &mut v8::PinScope,
+      _args: v8::FunctionCallbackArguments,
+      mut rv: v8::ReturnValue<v8::Value>,
+    ) {
+      rv.set_int32(42);
+    }
+
+    let templ0 = v8::FunctionTemplate::new(scope, fortytwo_cb);
+    let signature = v8::Signature::new(scope, templ0);
+    let templ1 = v8::FunctionTemplate::builder(fortytwo_cb)
+      .signature(signature)
+      .build(scope);
+
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    v8::tc_scope!(let scope, scope);
+
+    let global = context.global(scope);
+    let name = v8::String::new(scope, "C").unwrap();
+    let value = templ0.get_function(scope).unwrap();
+    global.set(scope, name.into(), value.into()).unwrap();
+    let name = v8::String::new(scope, "f").unwrap();
+    let value = templ1.get_function(scope).unwrap();
+    global.set(scope, name.into(), value.into()).unwrap();
+
+    fn run<'s>(
+      scope: &mut v8::PinScope<'s, '_>,
+      src: &str,
+    ) -> Option<v8::Local<'s, v8::Value>> {
+      let source = v8::String::new(scope, src).unwrap();
+      let script = v8::Script::compile(scope, source, None).unwrap();
+      script.run(scope)
+    }
+
+    let ok = run(scope, "f.call(new C)");
+    assert!(ok.is_some(), "f.call(new C) should succeed");
+    assert!(!scope.has_caught());
+    println!(
+      "hermes_function_template_signature: f.call(new C) = {:?}",
+      ok.map(|v| v.integer_value(scope))
+    );
+
+    let bad = run(scope, "f.call(new Object)");
+    println!("hermes_function_template_signature: f.call(new Object) is_none={}", bad.is_none());
+    println!("hermes_function_template_signature: has_caught={}", scope.has_caught());
+    if let Some(exc) = scope.exception() {
+      let msg = exc.to_rust_string_lossy(scope);
+      println!("hermes_function_template_signature: f.call(new Object) threw {msg:?}");
+    }
+    assert!(bad.is_none(), "f.call(new Object) should throw");
+    assert!(scope.has_caught());
+    let msg = scope.exception().unwrap().to_rust_string_lossy(scope);
+    assert!(msg.contains("Illegal invocation"), "unexpected message: {msg}");
+  }
+
   /// `JSON.stringify` run as a script that reads back a value built entirely
   /// through the v8x Object/Array/primitive surface (not constructed as a
   /// JS-source literal), proving the C++-side writes are indistinguishable

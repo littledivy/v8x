@@ -710,8 +710,6 @@ pub extern "C" fn v8__SharedArrayBuffer__NewBackingStore__with_byte_length() -> 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SharedArrayBuffer__NewBackingStore__with_data() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Signature__New() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__AddContext() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__SnapshotCreator__AddData_to_context() -> *const ::std::ffi::c_void { ::std::ptr::null() }
