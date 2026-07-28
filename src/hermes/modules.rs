@@ -51,7 +51,8 @@ use crate::module::ResolveSourceCallback;
 use crate::module::SyntheticModuleEvaluationSteps;
 use crate::support::MaybeBool;
 use crate::{
-  Context, Data, FixedArray, Module, ModuleRequest, String as V8String, Value,
+  Context, Data, FixedArray, Function, Module, ModuleRequest, Object,
+  String as V8String, Value,
 };
 
 // The JSI-bridge C functions the module linker drives. These are defined in
@@ -365,6 +366,94 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
   }));
   register_drop(isolate, record);
   record as *const Module
+}
+
+// ---- CompileFunction -------------------------------------------------------
+//
+// `v8::script_compiler::compile_function(context, source, args, ctx_exts, ...)`
+// compiles `source` as the BODY of a function whose parameters are `args`,
+// returning that function object (V8's `CompileFunctionInContext`). deno_core
+// uses this to hydrate `lazy_loaded_js` ext scripts (`core.loadExtScript`): the
+// wrapped source is `"use strict"; return (<IIFE>);` compiled with a single
+// parameter `__bootstrap`, then called with the captured bootstrap view.
+//
+// Hermes/JSI has no CompileFunctionInContext, but `new Function(args, body)` is
+// exactly this primitive, and evaluating a `(function (a, b) { <body> })`
+// expression yields the same function object. We build that expression source,
+// run the E1 async-generator lowering on the body (ext/web streams contain
+// async generators), and evaluate it via `v8x_hermes_run`. A parse/eval error
+// is captured into the innermost live TryCatch (the C9 path), so the caller's
+// `tc_scope.exception()` is populated (deno_core unwraps it) and we return null.
+//
+// `context_extensions` (the `with`-scope objects V8 supports) are not modeled:
+// deno_core passes none for ext scripts. If any are passed we ignore them
+// (the compiled function simply won't see those bindings), which is inert.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ScriptCompiler__CompileFunction(
+  context: *const Context,
+  source: *mut c_void,
+  arguments_count: usize,
+  arguments: *const *const V8String,
+  _context_extensions_count: usize,
+  _context_extensions: *const *const Object,
+  _options: c_int,
+  _no_cache_reason: c_int,
+) -> *const Function {
+  if context.is_null() || source.is_null() {
+    return ptr::null();
+  }
+  let isolate = context as *mut RealIsolate;
+  let rtw = iso_state(isolate).rtw;
+
+  // Read the function body out of the Source (field 0 is the source string).
+  let src_layout = source as *const SourceLayout;
+  let source_string = unsafe { (*src_layout).source_string };
+  let body = match read_string_slot(rtw, slot_of(source_string)) {
+    Some(t) => t,
+    None => return ptr::null(),
+  };
+
+  // Read each parameter name.
+  let mut params: Vec<String> = Vec::with_capacity(arguments_count);
+  if !arguments.is_null() {
+    let arg_slice =
+      unsafe { std::slice::from_raw_parts(arguments, arguments_count) };
+    for &arg in arg_slice {
+      if arg.is_null() {
+        return ptr::null();
+      }
+      match read_string_slot(rtw, slot_of(arg)) {
+        Some(name) => params.push(name),
+        None => return ptr::null(),
+      }
+    }
+  }
+
+  // Build `(function (<params>) { <body> })`, an expression evaluating to the
+  // function object. Parameter names come from V8 and are plain identifiers.
+  // The body may contain a top-level `return` (deno_core wraps ext scripts as
+  // `"use strict"; return (<IIFE>);`), which is only valid INSIDE a function,
+  // so the function wrapper must be applied BEFORE the async-generator lowering
+  // parses it. Lowering the bare body first would make oxc reject the top-level
+  // `return`, silently pass the source through unchanged, and leave the
+  // `async function*` syntax for Hermes to reject ("async generators are
+  // unsupported"). See docs/hermes-spike/experiments/E3-deno-web.md.
+  let params_joined = params.join(", ");
+  let wrapped = format!("(function ({params_joined}) {{\n{body}\n}})");
+
+  // E1 async-generator lowering on the whole wrapped expression (ext/web
+  // streams, e.g. ext/web/09_file.js, use `async function*` / `async *m()`).
+  let lowered = crate::hermes::lower::lower_async_generators(&wrapped);
+
+  let src_slot = intern(rtw, &lowered);
+  let mut ok: c_int = 0;
+  let fn_slot = unsafe { v8x_hermes_run(rtw, src_slot, &mut ok) };
+  if ok == 0 || fn_slot < 0 {
+    // Parse/eval error already captured into the live TryCatch (C9). Returning
+    // null makes the caller read that captured exception.
+    return ptr::null();
+  }
+  slot_ptr::<Function>(fn_slot)
 }
 
 // ---- Module status / metadata ----------------------------------------------

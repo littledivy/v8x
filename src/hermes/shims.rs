@@ -151,8 +151,7 @@ pub extern "C" fn v8__Eternal__Set() -> *const ::std::ffi::c_void { ::std::ptr::
 pub extern "C" fn v8__Eternal_SIZE() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Exception__CaptureStackTrace() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Exception__CreateMessage() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Exception__CreateMessage is implemented in core.rs (real impl).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Exception__GetStackTrace() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -371,8 +370,7 @@ pub extern "C" fn v8__Object__GetPrivate() -> *const ::std::ffi::c_void { ::std:
 pub extern "C" fn v8__Object__GetPropertyAttributes() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetPropertyNames() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__GetPrototype() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Object__GetPrototype is implemented in core.rs (real impl).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetRealNamedProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -529,8 +527,7 @@ pub extern "C" fn v8__ScriptCompiler__CachedData__NEW() -> *const ::std::ffi::c_
 pub extern "C" fn v8__ScriptCompiler__CachedDataVersionTag() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptCompiler__Compile() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ScriptCompiler__CompileFunction() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__ScriptCompiler__CompileFunction is implemented in modules.rs (real impl).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ScriptCompiler__CompileUnboundScript() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -623,8 +620,7 @@ pub extern "C" fn v8__StartupData__IsValid() -> *const ::std::ffi::c_void { ::st
 pub extern "C" fn v8__String__Concat() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__ContainsOnlyOneByte() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__Empty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__String__Empty is implemented in core.rs (real impl).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__GetExternalStringResource() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]

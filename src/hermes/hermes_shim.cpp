@@ -130,6 +130,12 @@ struct RuntimeWrapper {
   // id is an index into this vector; a freed pin leaves a null unique_ptr slot
   // that a later pin can reuse.
   std::vector<std::unique_ptr<jsi::Value>> pins;
+  // Reference count parallel to `pins`. A v8 `Global` is refcounted: Rust
+  // `Global::clone` re-wraps the SAME pin handle and each clone's `Drop` calls
+  // `v8__Global__Reset` -> `unpin`, so a pin must survive until the LAST alias
+  // drops. `pin` sets the count to 1, `pin_addref` increments, `unpin`
+  // decrements and frees the holder only at zero.
+  std::vector<int64_t> pin_refs;
   // C9: the TryCatch scope stack. back() is the innermost live scope.
   std::vector<TryCatchFrame> tc_stack;
   // C10: pending exception left by a native FunctionCallback that threw (via
@@ -170,6 +176,31 @@ struct RuntimeWrapper {
     frame.has_caught = true;
     frame.message = err.getMessage();
     frame.stack = err.getStack();
+  }
+
+  // Capture a non-JSError C++ exception (e.g. a Hermes COMPILE/parse error,
+  // which is a `jsi::JSIException` but NOT a `jsi::JSError`, so it carries no JS
+  // value) into the innermost live TryCatch frame. Without this, a syntax error
+  // during `evaluateJavaScript` would escape capture and the embedder's
+  // `TryCatch::HasCaught()` would read false, so `TryCatch::Exception()` returns
+  // an empty handle (deno_core unwraps it -> panic). We synthesize a JS `Error`
+  // value from the C++ message so the embedder sees a real thrown exception.
+  void capture_message(const std::string &msg) {
+    if (tc_stack.empty()) {
+      return;
+    }
+    TryCatchFrame &frame = tc_stack.back();
+    try {
+      auto err = runtime().global().getPropertyAsFunction(runtime(), "Error");
+      jsi::Value v = err.callAsConstructor(
+          runtime(), jsi::String::createFromUtf8(runtime(), msg));
+      frame.exception_value = std::make_shared<jsi::Value>(runtime(), v);
+    } catch (...) {
+      frame.exception_value.reset();
+    }
+    frame.has_caught = true;
+    frame.message = msg;
+    frame.stack = std::string();
   }
 };
 
@@ -402,7 +433,18 @@ v8x_hermes_slot v8x_hermes_run(void *rtw, v8x_hermes_slot src_slot, int *ok) {
     // Value are destroyed at the end of this catch block.
     w->capture_exception(err);
     return V8X_HERMES_NULL_SLOT;
+  } catch (const jsi::JSIException &ex) {
+    // A Hermes COMPILE/parse error (syntax error) surfaces as a JSIException
+    // that is NOT a JSError (no JS value). Capture its message as a synthesized
+    // JS Error so the embedder's TryCatch reports it (instead of an empty
+    // handle -> unwrap panic).
+    w->capture_message(ex.what());
+    return V8X_HERMES_NULL_SLOT;
+  } catch (const std::exception &ex) {
+    w->capture_message(ex.what());
+    return V8X_HERMES_NULL_SLOT;
   } catch (...) {
+    w->capture_message("unknown native exception during evaluateJavaScript");
     return V8X_HERMES_NULL_SLOT;
   }
 }
@@ -2401,6 +2443,34 @@ int v8x_hermes_object_set_prototype(void *rtw, v8x_hermes_slot obj_slot,
   }
 }
 
+// Object::GetPrototype -> `Object.getPrototypeOf(obj)`. Returns a fresh slot
+// holding the prototype (which may be JS null). Returns the null slot only on
+// error / non-object input. deno_core's `is_instance_of_error` walks the
+// prototype chain via this.
+v8x_hermes_slot v8x_hermes_object_get_prototype(void *rtw,
+                                                v8x_hermes_slot obj_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  if (ov == nullptr || !ov->isObject()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    jsi::Function gpo = w->runtime()
+                            .global()
+                            .getPropertyAsObject(w->runtime(), "Object")
+                            .getPropertyAsFunction(w->runtime(),
+                                                   "getPrototypeOf");
+    jsi::Value proto =
+        gpo.call(w->runtime(), jsi::Value(w->runtime(), *ov));
+    return w->push(std::move(proto));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
 // Function.prototype.name / the `name` property of a JS function value. Used to
 // implement FunctionTemplate::SetClassName by setting the constructed
 // function's `.name` (via defineProperty, since `name` is non-writable). This
@@ -3153,14 +3223,31 @@ int64_t v8x_hermes_pin(void *rtw, v8x_hermes_slot slot) {
     for (size_t i = 0; i < w->pins.size(); ++i) {
       if (!w->pins[i]) {
         w->pins[i] = std::move(holder);
+        w->pin_refs[i] = 1;
         return static_cast<int64_t>(i);
       }
     }
     w->pins.emplace_back(std::move(holder));
+    w->pin_refs.emplace_back(1);
     return static_cast<int64_t>(w->pins.size() - 1);
   } catch (...) {
     return -1;
   }
+}
+
+// Increment the reference count of an existing pin. Called when a v8 `Global`
+// is cloned (Rust re-wraps the same pin handle); balanced by an `unpin` on each
+// clone's drop. No-op / -1 on an invalid pin id.
+int64_t v8x_hermes_pin_addref(void *rtw, int64_t pin_id) {
+  if (rtw == nullptr || pin_id < 0) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  if (static_cast<size_t>(pin_id) >= w->pins.size() ||
+      !w->pins[static_cast<size_t>(pin_id)]) {
+    return -1;
+  }
+  return ++w->pin_refs[static_cast<size_t>(pin_id)];
 }
 
 // Copy the pinned value `pin_id` into a fresh handle-table slot. Returns the
@@ -3182,13 +3269,23 @@ v8x_hermes_slot v8x_hermes_pin_get(void *rtw, int64_t pin_id) {
   }
 }
 
-// Release the holder for pin id `pin_id` (leaves a reusable empty slot).
+// Drop one reference to pin id `pin_id`. Frees the holder (leaving a reusable
+// empty slot) only when the last reference is released. Refcounting matches v8
+// `Global` semantics: clone -> addref, each drop -> unpin.
 void v8x_hermes_unpin(void *rtw, int64_t pin_id) {
   if (rtw == nullptr || pin_id < 0) {
     return;
   }
   auto *w = static_cast<RuntimeWrapper *>(rtw);
-  if (static_cast<size_t>(pin_id) < w->pins.size()) {
+  if (static_cast<size_t>(pin_id) >= w->pins.size() ||
+      !w->pins[static_cast<size_t>(pin_id)]) {
+    return;
+  }
+  int64_t &rc = w->pin_refs[static_cast<size_t>(pin_id)];
+  if (rc > 0) {
+    --rc;
+  }
+  if (rc <= 0) {
     w->pins[static_cast<size_t>(pin_id)].reset();
   }
 }

@@ -84,6 +84,7 @@ unsafe extern "C" {
   // per-context extras binding object alive across HandleScope pops (C2).
   fn v8x_hermes_pin(rtw: *mut c_void, slot: i64) -> i64;
   fn v8x_hermes_pin_get(rtw: *mut c_void, pin_id: i64) -> i64;
+  fn v8x_hermes_pin_addref(rtw: *mut c_void, pin_id: i64) -> i64;
   fn v8x_hermes_unpin(rtw: *mut c_void, pin_id: i64);
   fn v8x_hermes_object_get(rtw: *mut c_void, obj_slot: i64, key_slot: i64) -> i64;
   fn v8x_hermes_object_set(
@@ -256,6 +257,7 @@ unsafe extern "C" {
     obj_slot: i64,
     proto_slot: i64,
   ) -> c_int;
+  fn v8x_hermes_object_get_prototype(rtw: *mut c_void, obj_slot: i64) -> i64;
   fn v8x_hermes_object_define_accessor_fns(
     rtw: *mut c_void,
     obj_slot: i64,
@@ -617,8 +619,18 @@ fn global_new(isolate: *mut RealIsolate, data: *const Data) -> *const Data {
   if data.is_null() {
     return ptr::null();
   }
-  // Already a global pin (re-wrapping a Global): keep it.
-  if global_pin_id(data).is_some() {
+  // Already a global pin (re-wrapping a Global, e.g. `Global::clone`): share the
+  // same pin but bump its refcount, so the holder survives until the LAST alias
+  // drops (each alias's `Global::drop` calls `v8__Global__Reset` -> `unpin`).
+  if let Some(pin_id) = global_pin_id(data) {
+    let rtw = if isolate.is_null() {
+      current_rtw()
+    } else {
+      iso_state(isolate).rtw
+    };
+    if !rtw.is_null() {
+      unsafe { v8x_hermes_pin_addref(rtw, pin_id) };
+    }
     return data;
   }
   let src = slot_of(data);
@@ -1086,6 +1098,16 @@ fn intern_string_utf8(isolate: *mut RealIsolate, bytes: &[u8]) -> *const V8Strin
     )
   };
   slot_ptr::<V8String>(slot)
+}
+
+/// `String::Empty(isolate)`: the interned empty JS string. V8 treats this as
+/// infallible; deno_core's error-formatting path calls it (via `String::empty`)
+/// for absent fields, so a null stub panics on the unwrap.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__Empty(
+  isolate: *mut RealIsolate,
+) -> *const V8String {
+  intern_string_utf8(isolate, b"")
 }
 
 #[unsafe(no_mangle)]
@@ -1671,6 +1693,27 @@ pub extern "C" fn v8__Object__Get(
   }
   let rtw = iso_state(context as *mut RealIsolate).rtw;
   let slot = unsafe { v8x_hermes_object_get(rtw, slot_of(this), slot_of(key)) };
+  slot_ptr::<Value>(slot)
+}
+
+/// `Object::GetPrototype`: `Object.getPrototypeOf(this)`. Returns a `Value`
+/// (which may hold JS null) or a null handle on error. deno_core's
+/// `is_instance_of_error` walks the chain via this to brand thrown exceptions.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetPrototype(
+  this: *const Object,
+) -> *const Value {
+  if this.is_null() {
+    return ptr::null();
+  }
+  let rtw = current_rtw();
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  let slot = unsafe { v8x_hermes_object_get_prototype(rtw, slot_of(this)) };
+  if slot < 0 {
+    return ptr::null();
+  }
   slot_ptr::<Value>(slot)
 }
 
@@ -4738,6 +4781,48 @@ pub extern "C" fn v8__Exception__TypeError(
   message: *const V8String,
 ) -> *const Value {
   exception_new(c_str!("TypeError"), message)
+}
+
+/// `Exception::CreateMessage`: build a `Message` from an exception value.
+///
+/// Our `Message` is modeled as a String slot holding the message text (see
+/// `Message::Get`, which just re-tags the slot). V8's message text is the
+/// stringification of the exception (`"Uncaught <Error>: <msg>"`-ish). We coerce
+/// the exception value to a string via the shim and intern that as the Message.
+/// deno_core reads the structured `.message`/stack off the Error object itself;
+/// the line/column accessors are best-effort (their stubs return null, which
+/// `JsError::from_v8_message` handles as `None`). Returning a non-null Message
+/// here is what stops `create_message(...).unwrap()` from panicking on an empty
+/// handle when an ext script fails to compile.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Exception__CreateMessage(
+  isolate: *mut RealIsolate,
+  exception: *const Value,
+) -> *const Message {
+  if exception.is_null() {
+    return ptr::null();
+  }
+  let rtw = if isolate.is_null() {
+    current_rtw()
+  } else {
+    iso_state(isolate).rtw
+  };
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  let text = read_string(rtw, slot_of(exception))
+    .unwrap_or_else(|| "uncaught exception".to_string());
+  let slot = unsafe {
+    v8x_hermes_string_new_utf8(
+      rtw,
+      text.as_ptr() as *const c_char,
+      text.len(),
+    )
+  };
+  if slot < 0 {
+    return ptr::null();
+  }
+  slot_ptr::<Message>(slot)
 }
 
 /// `Message::Get`: the synthesized "Uncaught ..." text is already a String

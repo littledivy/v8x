@@ -350,4 +350,18 @@ mod tests {
     assert!(out.contains("babelHelpers"), "helper prelude must be prepended");
     assert!(out.contains("wrapAsyncGenerator"), "wrap helper must be referenced");
   }
+
+  #[test]
+  fn wraps_before_lowering_preserves_top_level_return() {
+    // deno_core's `load_ext_script` compiles `"use strict"; return (<IIFE>);`
+    // as a function BODY. The Hermes CompileFunction shim must wrap that in a
+    // function before lowering, or oxc rejects the top-level `return` and the
+    // async-generator syntax survives. This asserts the lowering handles the
+    // wrapped shape (function body with a top-level return + async generator).
+    let wrapped =
+      "(function (__bootstrap) {\n\"use strict\"; return (async function* ag(){ yield 1; });\n})";
+    let out = lower_async_generators(wrapped);
+    assert!(matches!(out, Cow::Owned(_)), "wrapped async-gen must be rewritten");
+    assert!(!out.contains("async function*"), "async function* must be lowered away");
+  }
 }
