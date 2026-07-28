@@ -782,7 +782,58 @@ pub extern "C" fn v8__Context__New(
   if !isolate.is_null() && template_kind(templ) == Some(TEMPLATE_KIND_OBJ) {
     apply_template_to_global(templ as *const ObjectTemplate, ctx);
   }
+  // V8 exposes a built-in `globalThis.console`. deno_core's 01_core.js reads it
+  // (`const v8Console = globalThis.console; wrapConsole(coreConsole, v8Console)`,
+  // which does `ObjectKeys(v8Console)`), so an undefined `console` throws
+  // "Cannot convert undefined value to object". Hermes has no built-in console,
+  // so synthesize a minimal one on the global (same no-op console the extras
+  // binding object carries; deno_core forwards real console output through its
+  // own op-based console, these are the fallback sinks).
+  if !isolate.is_null() {
+    install_global_console(ctx);
+  }
   ctx
+}
+
+/// The JS source for a minimal console: an object of no-op methods, with the
+/// method names as ENUMERABLE own properties so deno_core's `wrapConsole`
+/// (`ObjectKeys(console)`) can enumerate them. Shared by the global console and
+/// the extras-binding console.
+const CONSOLE_LITERAL_SRC: &str = "(function(){var c={};var m=['log','info',\
+  'debug','error','warn','dir','dirxml','table','trace','group',\
+  'groupCollapsed','groupEnd','clear','count','countReset','assert','profile',\
+  'profileEnd','time','timeLog','timeEnd','timeStamp'];\
+  for(var i=0;i<m.length;i++){c[m[i]]=function(){};}return c;})()";
+
+/// Intern a UTF-8 str into a fresh JSI string slot (local helper).
+#[inline]
+fn intern_str(rtw: *mut c_void, s: &str) -> i64 {
+  unsafe {
+    v8x_hermes_string_new_utf8(rtw, s.as_ptr() as *const c_char, s.len())
+  }
+}
+
+/// Install a synthetic `console` on the context's global object (V8 built-in
+/// parity for deno_core bootstrap). Idempotent: only sets it if absent.
+fn install_global_console(context: *const Context) {
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let global_slot = unsafe { v8x_hermes_global(rtw) };
+  if global_slot < 0 {
+    return;
+  }
+  let key_slot = intern_str(rtw, "console");
+  // Do not clobber a real console if one already exists.
+  if unsafe { v8x_hermes_object_has(rtw, global_slot, key_slot) } == 1 {
+    return;
+  }
+  let src_slot = intern_str(rtw, CONSOLE_LITERAL_SRC);
+  let mut ok: c_int = 0;
+  let console_slot = unsafe { v8x_hermes_run(rtw, src_slot, &mut ok) };
+  if ok != 0 && console_slot >= 0 {
+    unsafe {
+      v8x_hermes_object_set(rtw, global_slot, key_slot, console_slot);
+    }
+  }
 }
 
 /// Apply an ObjectTemplate's stored `Set` properties and accessors onto the

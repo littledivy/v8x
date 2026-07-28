@@ -1580,4 +1580,65 @@ mod hermes_boot_probe {
       "op did not return a usable object (ReturnValue::Set of a Local broken)"
     );
   }
+
+  /// Stage 10 (D7): typed-array `.buffer` + view construction. 01_core.js does
+  /// `const b = new Uint32Array(2); new Uint8Array(b.buffer)`. If TypedArray
+  /// `.buffer` returns undefined, `new Uint8Array(undefined)` throws "Cannot
+  /// convert undefined value to object". This probe reproduces exactly that.
+  #[test]
+  fn boot_typed_array_buffer_accessor() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let src = v8::String::new(
+      scope,
+      "const b = new Uint32Array(2); \
+       const u8 = new Uint8Array(b.buffer); \
+       (u8 instanceof Uint8Array && u8.length === 8) ? 'ok' : 'bad'",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, src, None)
+      .expect("typed-array buffer probe should compile");
+    let result = script
+      .run(scope)
+      .expect("new Uint8Array(typedArray.buffer) should run");
+    assert_eq!(
+      result.to_rust_string_lossy(scope),
+      "ok",
+      "TypedArray.buffer accessor is broken (01_core.js callSiteRetBuf wall)"
+    );
+  }
+
+  /// Stage 11 (D7): a built-in `globalThis.console`. V8 exposes one; deno_core's
+  /// 01_core.js reads `globalThis.console` and calls `ObjectKeys` on it
+  /// (`wrapConsole`), so an undefined console throws "Cannot convert undefined
+  /// value to object". The Hermes backend synthesizes a no-op console on the
+  /// global at Context::New. This probe asserts it exists, is an object, and its
+  /// keys are enumerable (ObjectKeys returns method names).
+  #[test]
+  fn boot_global_console_present() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let src = v8::String::new(
+      scope,
+      "(typeof globalThis.console === 'object' && \
+        typeof globalThis.console.log === 'function' && \
+        Object.keys(globalThis.console).length > 0) ? 'ok' : 'bad'",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, src, None).unwrap();
+    let result = script.run(scope).unwrap();
+    assert_eq!(
+      result.to_rust_string_lossy(scope),
+      "ok",
+      "globalThis.console missing/empty (01_core.js wrapConsole wall)"
+    );
+  }
 }
