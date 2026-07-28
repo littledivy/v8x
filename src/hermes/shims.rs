@@ -324,8 +324,6 @@ pub extern "C" fn v8__JSON__Parse() -> *const ::std::ffi::c_void { ::std::ptr::n
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__JSON__Stringify() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Local__New() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__MAJOR_VERSION() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Map__As__Array() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -445,8 +443,6 @@ pub extern "C" fn v8__ObjectTemplate__SetNamedPropertyHandler() -> *const ::std:
 pub extern "C" fn v8__PATCH_LEVEL() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__DELETE() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Platform__NewCustomPlatform() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Platform__PumpMessageLoop() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -675,10 +671,6 @@ pub extern "C" fn v8__String__IsOneByte() -> *const ::std::ffi::c_void { ::std::
 pub extern "C" fn v8__String__kMaxLength() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__NewExternalOneByte() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__NewExternalOneByteConst() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__NewExternalOneByteStatic() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__NewExternalTwoByte() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]

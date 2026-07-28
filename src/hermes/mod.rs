@@ -23,6 +23,16 @@ mod modules;
 mod misc;
 mod shims;
 
+// Pure-Rust simdutf__* C-ABI surface (UTF validation/conversion/base64) the
+// vendored rusty_v8 `simdutf` binding references on Deno's hot path. It is
+// engine-independent, so the Hermes backend reuses the real implementation
+// authored for the quickjs backend rather than re-stubbing it. Gated to match
+// the rusty_v8 simdutf binding (lib.rs, feature = "simdutf"), which is what
+// references these symbols; without it deno_core fails to link.
+#[cfg(feature = "simdutf")]
+#[path = "../quickjs/simdutf.rs"]
+mod simdutf;
+
 // Feasibility proof (C2): with `--features link_hermes`, build.rs compiles
 // src/hermes/hermes_eval_shim.cpp against a real libhermes and links it. The
 // extern "C" bridge below reaches jsi::Runtime::evaluateJavaScript through

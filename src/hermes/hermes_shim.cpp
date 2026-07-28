@@ -301,6 +301,27 @@ int v8x_hermes_set_slot(void *rtw, v8x_hermes_slot dst, v8x_hermes_slot src) {
   }
 }
 
+// Duplicate the Value in `src` into a NEW appended handle-table slot, returning
+// its index. Unlike v8x_hermes_set_slot (which overwrites an existing slot),
+// this grows the table, so the copy lives in the CURRENT scope independent of
+// the source handle. Used by v8__Local__New to re-materialize a Global's value
+// into a live Local. Returns NULL_SLOT on error.
+v8x_hermes_slot v8x_hermes_slot_dup(void *rtw, v8x_hermes_slot src) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  if (src < 0 || static_cast<size_t>(src) >= w->handles.size()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    jsi::Value v(w->runtime(), w->handles[static_cast<size_t>(src)]);
+    return w->push(std::move(v));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
 // global object as a slot.
 v8x_hermes_slot v8x_hermes_global(void *rtw) {
   if (rtw == nullptr) {

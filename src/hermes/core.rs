@@ -38,8 +38,8 @@ use crate::support::{MaybeBool, SharedPtrBase};
 use crate::{
   Allocator, Array, ArrayBuffer, Boolean, Context, Data, External, Function,
   FunctionCallback, FunctionCallbackInfo, FunctionTemplate, Integer, Message,
-  MicrotaskQueue, Name, Number, Object, ObjectTemplate, Platform, Primitive,
-  Promise, PromiseResolver, PromiseState, RealIsolate, Script,
+  MicrotaskQueue, Name, Number, Object, ObjectTemplate, OneByteConst, Platform,
+  Primitive, Promise, PromiseResolver, PromiseState, RealIsolate, Script,
   String as V8String, Template, UniquePtr, Value,
 };
 use std::cell::Cell;
@@ -55,6 +55,7 @@ unsafe extern "C" {
   fn v8x_hermes_handles_len(rtw: *mut c_void) -> usize;
   fn v8x_hermes_handles_truncate(rtw: *mut c_void, watermark: usize);
   fn v8x_hermes_set_slot(rtw: *mut c_void, dst: i64, src: i64) -> c_int;
+  fn v8x_hermes_slot_dup(rtw: *mut c_void, src: i64) -> i64;
   fn v8x_hermes_global(rtw: *mut c_void) -> i64;
   fn v8x_hermes_string_new_utf8(
     rtw: *mut c_void,
@@ -548,6 +549,44 @@ pub extern "C" fn v8__Global__NewWeak(
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Global__Reset(_data: *const Data) {}
 
+/// Re-materialize a handle into a live `Local` in the current scope. deno_core
+/// calls this to turn a `Global<Context>` (and other Globals) back into a
+/// `Local` during boot. Three handle shapes:
+///   * null -> null.
+///   * a non-value handle (even-aligned: a Context == isolate pointer, or a
+///     Box-backed Module/record) -> returned as-is; these are stable, not
+///     scope-managed, so no re-interning is needed.
+///   * a value handle (odd-aligned tagged slot in the JSI handle table) -> its
+///     JSI value is duplicated into a fresh slot in the current scope so the
+///     new Local outlives the source handle's scope.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Local__New(
+  isolate: *mut RealIsolate,
+  other: *const Data,
+) -> *const Data {
+  if other.is_null() {
+    return ptr::null();
+  }
+  let src = slot_of(other);
+  if src < 0 {
+    // Non-value handle (Context / Module record): identity.
+    return other;
+  }
+  let rtw = if isolate.is_null() {
+    current_rtw()
+  } else {
+    iso_state(isolate).rtw
+  };
+  if rtw.is_null() {
+    return other;
+  }
+  let dup = unsafe { v8x_hermes_slot_dup(rtw, src) };
+  if dup < 0 {
+    return other;
+  }
+  slot_ptr::<Data>(dup)
+}
+
 // ---- HandleScope -----------------------------------------------------------
 
 #[unsafe(no_mangle)]
@@ -776,6 +815,45 @@ pub extern "C" fn v8__Context__GetExtrasBindingObject(
     if slot < 0 {
       return ptr::null();
     }
+    // V8's extras binding object exposes a built-in `console`. deno_core reads
+    // it (bindings.rs::initialize_deno_core_namespace) and binds it to
+    // Deno.core.console, and it must be an Object or boot panics ("unable to
+    // convert"). Hermes has no V8 console, so synthesize a minimal one whose
+    // methods are no-ops (deno_core forwards real console output through its
+    // own op-based console; these are the fallback sinks). Built by evaluating
+    // an object literal so the methods are real callable functions.
+    let console_src = "(function(){var c={};var m=['log','info','debug',\
+      'error','warn','dir','dirxml','table','trace','group','groupCollapsed',\
+      'groupEnd','clear','count','countReset','assert','profile','profileEnd',\
+      'time','timeLog','timeEnd','timeStamp'];for(var i=0;i<m.length;i++){\
+      c[m[i]]=function(){};}return c;})()";
+    let src_bytes = console_src.as_bytes();
+    let src_slot = unsafe {
+      v8x_hermes_string_new_utf8(
+        rtw,
+        src_bytes.as_ptr() as *const c_char,
+        src_bytes.len(),
+      )
+    };
+    if src_slot >= 0 {
+      let mut ok: c_int = 0;
+      let console_slot = unsafe { v8x_hermes_run(rtw, src_slot, &mut ok) };
+      if ok != 0 && console_slot >= 0 {
+        let key_bytes = b"console";
+        let key_slot = unsafe {
+          v8x_hermes_string_new_utf8(
+            rtw,
+            key_bytes.as_ptr() as *const c_char,
+            key_bytes.len(),
+          )
+        };
+        if key_slot >= 0 {
+          unsafe {
+            v8x_hermes_object_set(rtw, slot, key_slot, console_slot);
+          }
+        }
+      }
+    }
     let pin = unsafe { v8x_hermes_pin(rtw, slot) };
     if pin < 0 {
       return ptr::null();
@@ -890,6 +968,41 @@ pub extern "C" fn v8__String__NewFromOneByte(
   // Latin-1: each byte is a code point. Re-encode to UTF-8 so JSI gets valid
   // UTF-8 (bytes >= 0x80 are 2-byte UTF-8 sequences).
   let latin1 = unsafe { std::slice::from_raw_parts(data, len) };
+  let utf8: String = latin1.iter().map(|&b| b as char).collect();
+  intern_string_utf8(isolate, utf8.as_bytes())
+}
+
+/// `String::create_external_onebyte_const`: a static ASCII string resource
+/// baked at build time (`OneByteConst { vtable, cached_data, length }`).
+/// deno_core interns most of its bootstrap strings this way (see
+/// deno_core::FastString::StaticConst). Hermes has no external-string resource
+/// concept, so we copy the ASCII bytes into a normal JSI string. The bytes are
+/// guaranteed ASCII by the resource contract, so `as_str()` is valid UTF-8.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__NewExternalOneByteConst(
+  isolate: *mut RealIsolate,
+  onebyte_const: *const OneByteConst,
+) -> *const V8String {
+  if onebyte_const.is_null() {
+    return ptr::null();
+  }
+  let s: &str = unsafe { (*onebyte_const).as_str() };
+  intern_string_utf8(isolate, s.as_bytes())
+}
+
+/// `String::create_external_onebyte_static`: like above but the resource is a
+/// raw `(buffer, length)` of ASCII/Latin-1 bytes rather than a `OneByteConst`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__NewExternalOneByteStatic(
+  isolate: *mut RealIsolate,
+  buffer: *const c_char,
+  length: c_int,
+) -> *const V8String {
+  if buffer.is_null() || length < 0 {
+    return ptr::null();
+  }
+  let latin1 =
+    unsafe { std::slice::from_raw_parts(buffer as *const u8, length as usize) };
   let utf8: String = latin1.iter().map(|&b| b as char).collect();
   intern_string_utf8(isolate, utf8.as_bytes())
 }
@@ -4057,16 +4170,39 @@ pub extern "C" fn v8__Message__Get(this: *const Message) -> *const V8String {
 // test to bring the isolate up. The `Platform` object is an inert marker box.
 
 /// Inert platform marker (Hermes has no V8 platform). Its box address is the
-/// `*mut Platform` the shared-pointer carries.
-struct HermesPlatform;
+/// `*mut Platform` the shared-pointer carries. `custom_context` carries the
+/// double-boxed `PlatformImpl` deno_core passes to `NewCustomPlatform` (a raw
+/// pointer we never call back into, since Hermes drives its own JSI job queue
+/// and has no V8 task platform); it is dropped in `drop_platform` so the boxed
+/// impl does not leak.
+struct HermesPlatform {
+  custom_context: *mut ::std::ffi::c_void,
+}
 
 fn new_platform() -> *mut Platform {
-  Box::into_raw(Box::new(HermesPlatform)) as *mut Platform
+  new_custom_platform(::std::ptr::null_mut())
+}
+
+fn new_custom_platform(custom_context: *mut ::std::ffi::c_void) -> *mut Platform {
+  Box::into_raw(Box::new(HermesPlatform { custom_context })) as *mut Platform
+}
+
+unsafe extern "C" {
+  // Defined by the vendored rusty_v8 `platform` module (#[no_mangle]); frees the
+  // double-boxed `PlatformImpl` context deno_core passes to NewCustomPlatform.
+  fn v8__Platform__CustomPlatform__BASE__DROP(context: *mut ::std::ffi::c_void);
 }
 
 unsafe fn drop_platform(platform: *mut Platform) {
   if !platform.is_null() {
-    unsafe { drop(Box::from_raw(platform as *mut HermesPlatform)) };
+    let hp = unsafe { Box::from_raw(platform as *mut HermesPlatform) };
+    // Release the double-boxed `PlatformImpl` deno_core handed to
+    // NewCustomPlatform. The vendored binding frees it through this drop
+    // shim; Hermes has no C++ platform object to do so, so we call it here.
+    if !hp.custom_context.is_null() {
+      unsafe { v8__Platform__CustomPlatform__BASE__DROP(hp.custom_context) };
+    }
+    drop(hp);
   }
 }
 
@@ -4087,6 +4223,21 @@ pub extern "C" fn v8__Platform__NewUnprotectedDefaultPlatform(
   _idle_task_support: bool,
 ) -> *mut Platform {
   new_platform()
+}
+
+/// `new_custom_platform`: deno_core (`v8_init`) always builds a *custom*
+/// platform, handing us a boxed `PlatformImpl` for foreground task ownership.
+/// Hermes has no V8 task platform (it drives its own JSI job/microtask queue),
+/// so the impl is never called back into; we return the same inert marker as
+/// the default platform, carrying the context so it is freed at teardown.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Platform__NewCustomPlatform(
+  _thread_pool_size: c_int,
+  _idle_task_support: bool,
+  _unprotected: bool,
+  context: *mut ::std::ffi::c_void,
+) -> *mut Platform {
+  new_custom_platform(context)
 }
 
 /// `new_single_threaded_default_platform`: same inert marker (Hermes runs
