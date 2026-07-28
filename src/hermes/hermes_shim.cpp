@@ -3383,12 +3383,25 @@ static bool ensure_promise_infra(RuntimeWrapper *w) {
             "    return [p, resolve, reject];"
             "  }"
             // Promises created purely in JS (e.g. the result of an async IIFE,
-            // as produced by the E1 async-generator lowering) never pass through
+            // as produced by the E1 async-generator lowering, or a plain
+            // `Promise.resolve().then(...)`) never pass through
             // makeResolver/record, so they have no WeakMap entry and would read
             // as Pending forever. So getState lazily attaches the state recorder
-            // to any not-yet-tracked promise on first query; a following
-            // drainJobs then runs its reaction and settles the recorded state.
-            // `tracked` guards against attaching the recorder more than once.
+            // to any not-yet-tracked promise on first query.
+            //
+            // V8's `Promise::State()` reflects `[[PromiseState]]` SYNCHRONOUSLY:
+            // the moment a promise settles, the next state read observes the
+            // settled state with no extra drain. Our WeakMap recorder is armed
+            // lazily here, but its `.then` reaction only fires on a microtask
+            // drain. The C++ accessor `v8x_hermes_promise_state` performs that
+            // drain (via v8x_hermes_drain_microtasks, which flushes BOTH our
+            // setImmediate `jobs` FIFO and Hermes's native drainMicrotasks queue
+            // where a freshly-attached reaction on an already-settled promise
+            // actually lands) and then re-reads, so an already-settled promise
+            // reports its state on the same read. `getState` itself stays a
+            // pure, side-effect-free read: it arms the recorder on a miss and
+            // returns 0; the C++ caller does the drain + re-read. This is the
+            // fix for the E5 "plain-promise stays Pending" wall.
             "  var tracked = new WeakSet();"
             "  function ensureTracked(p) {"
             "    if (p && typeof p.then === 'function' && !tracked.has(p)) {"
@@ -3521,8 +3534,14 @@ int v8x_hermes_promise_resolver_reject(void *rtw,
                         value_slot, 2);
 }
 
+// Forward declaration: promise_state drains the microtask queue once on a
+// Pending read so a just-settled promise reports its real state (V8 semantics).
+// The definition is further down with the rest of the D1 microtask machinery.
+int v8x_hermes_drain_microtasks(void *rtw);
+
 // v8__Promise__State: 0=pending, 1=fulfilled, 2=rejected. Reads the recorder
-// WeakMap; a promise's settled state only shows AFTER a microtask drain.
+// WeakMap; on a miss it arms the recorder, drains microtasks once, and re-reads
+// so a just-settled promise reports its real state on the same call.
 int v8x_hermes_promise_state(void *rtw, v8x_hermes_slot promise_slot) {
   if (rtw == nullptr) {
     return 0;
@@ -3539,7 +3558,24 @@ int v8x_hermes_promise_state(void *rtw, v8x_hermes_slot promise_slot) {
     jsi::Function fn = w->promise_get_state_fn->getObject(w->runtime())
                            .getFunction(w->runtime());
     jsi::Value s = fn.call(w->runtime(), jsi::Value(w->runtime(), *p));
-    return s.isNumber() ? static_cast<int>(s.getNumber()) : 0;
+    int state = s.isNumber() ? static_cast<int>(s.getNumber()) : 0;
+    // V8 semantics: Promise::State reflects a settled promise's state on the
+    // read that follows settlement, with no separate microtask checkpoint. On
+    // a WeakMap miss, getState just armed the recorder (record(p) -> p.then);
+    // if `p` was already settled, that reaction is now queued but has not run,
+    // so getState returned 0 (Pending). Drain the microtask queue once and
+    // re-read: an already-settled promise then reports its real state here,
+    // matching V8. A genuinely pending promise stays 0. Only drain on a Pending
+    // result so a settled read costs nothing. The drain flushes both our
+    // setImmediate `jobs` FIFO and Hermes's native drainMicrotasks queue (a
+    // freshly-attached reaction on an already-settled promise lands in the
+    // latter).
+    if (state == 0) {
+      v8x_hermes_drain_microtasks(w);
+      jsi::Value s2 = fn.call(w->runtime(), jsi::Value(w->runtime(), *p));
+      state = s2.isNumber() ? static_cast<int>(s2.getNumber()) : 0;
+    }
+    return state;
   } catch (...) {
     return 0;
   }

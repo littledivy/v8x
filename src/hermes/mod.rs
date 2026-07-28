@@ -1386,6 +1386,57 @@ mod hermes_boot_probe {
     );
   }
 
+  /// E5 regression: a plain JS-created promise (`Promise.resolve().then(...)`,
+  /// never routed through PromiseResolver::new/record) must report its settled
+  /// state on the FIRST `Promise::State()` read after a microtask checkpoint,
+  /// with no pre-arming read. V8's `Promise::State` reflects `[[PromiseState]]`
+  /// synchronously; our WeakMap recorder is armed lazily, so without the
+  /// drain-and-re-read in `v8x_hermes_promise_state` this promise read Pending
+  /// forever (the E5 "plain-promise stays Pending" wall that blocked every
+  /// await-based Web API, e.g. ReadableStream reads).
+  #[test]
+  fn promise_then_state_settles_on_first_read_after_checkpoint() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // A chained promise created entirely in JS; it never passes through our
+    // PromiseResolver machinery, so it has no WeakMap entry until first queried.
+    let setup = v8::String::new(
+      scope,
+      "globalThis.__p = Promise.resolve(7).then(function (v) { return v + 1; });",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, setup, None).unwrap();
+    script.run(scope).unwrap();
+
+    // Drive the event loop exactly as deno_core does: a checkpoint drains the
+    // chained reaction so the promise settles to 8.
+    scope.perform_microtask_checkpoint();
+
+    let global = context.global(scope);
+    let name = v8::String::new(scope, "__p").unwrap();
+    let p_val = global.get(scope, name.into()).unwrap();
+    let promise = v8::Local::<v8::Promise>::try_from(p_val)
+      .expect("__p should be a Promise");
+
+    // FIRST state read: must observe Fulfilled, not Pending (the bug).
+    assert_eq!(
+      promise.state(),
+      v8::PromiseState::Fulfilled,
+      "chained JS promise must report Fulfilled on the first state read after \
+       a checkpoint (E5 plain-promise-stays-Pending regression)"
+    );
+    let result = promise.result(scope);
+    assert_eq!(
+      result.to_rust_string_lossy(scope),
+      "8",
+      "chained .then result should be 8"
+    );
+  }
+
   /// Stage 2: ES module compile + instantiate + evaluate. deno_core evaluates
   /// user code and (in some boot configs) core JS as ES modules. WALL if
   /// `v8__ScriptCompiler__CompileModule` / `v8__Module__InstantiateModule` /
