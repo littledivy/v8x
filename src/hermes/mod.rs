@@ -1331,30 +1331,43 @@ mod hermes_boot_probe {
     let context = v8::Context::new(scope, Default::default());
     let scope = &mut v8::ContextScope::new(scope, context);
 
-    // The lowered async generator must both COMPILE (no "async generators are
-    // unsupported") and produce an instance whose prototype carries the async
-    // iterator protocol.
+    // This reproduces deno_core's ext:core/00_primordials.js %AsyncGenerator%
+    // capture EXACTLY (lines 284-292): it reflects the prototype of an
+    // async-generator FUNCTION OBJECT, then reads `.prototype` off it and
+    // enumerates both with Reflect.ownKeys (via copyPrototype). Under the E1
+    // lowering the wrapper's [[Prototype]] was Function.prototype, whose
+    // `.prototype` is undefined -> primordials threw "target is not an object".
+    // The E2 fix gives the lowered function a %AsyncGeneratorFunction.prototype%
+    // whose `.prototype` is the real %AsyncGeneratorPrototype% (next/return/
+    // throw/asyncIterator), which is what this probe asserts.
     let src = v8::String::new(
       scope,
-      "async function* ag() {} \
-       const inst = ag(); \
-       const proto = Object.getPrototypeOf(inst); \
+      "const AsyncGeneratorFunc = Reflect.getPrototypeOf(async function* () {}); \
+       if (typeof AsyncGeneratorFunc !== 'object' || AsyncGeneratorFunc === null) throw 'AsyncGenerator identity not an object'; \
+       const proto = AsyncGeneratorFunc.prototype; \
+       if (typeof proto !== 'object' || proto === null) throw 'AsyncGenerator.prototype not an object'; \
+       Reflect.ownKeys(AsyncGeneratorFunc); \
+       Reflect.ownKeys(proto); \
        const hasNext = typeof proto.next === 'function'; \
        const hasReturn = typeof proto.return === 'function'; \
        const hasThrow = typeof proto.throw === 'function'; \
        const hasAsyncIter = typeof proto[Symbol.asyncIterator] === 'function'; \
-       (hasNext && hasReturn && hasThrow && hasAsyncIter) ? 'ok' : 'bad';",
+       const callable = typeof (async function* () {}).apply === 'function'; \
+       async function* ag() {} \
+       const instProto = Object.getPrototypeOf(ag()); \
+       const instOk = typeof instProto.next === 'function' && typeof instProto[Symbol.asyncIterator] === 'function'; \
+       (hasNext && hasReturn && hasThrow && hasAsyncIter && callable && instOk) ? 'ok' : 'bad';",
     )
     .unwrap();
     let script = v8::Script::compile(scope, src, None)
       .expect("async function* must compile after the E1 lowering");
     let result = script
       .run(scope)
-      .expect("async-generator prototype-shape script should run");
+      .expect("primordials-shape async-generator capture script should run without throwing");
     assert_eq!(
       result.to_rust_string_lossy(scope),
       "ok",
-      "lowered async-generator instance prototype is missing next/return/throw/asyncIterator"
+      "lowered async-generator function-object reflection does not match the %AsyncGenerator% shape primordials needs"
     );
   }
 
@@ -1700,6 +1713,10 @@ mod hermes_async_generator {
         break;
       }
       scope.perform_microtask_checkpoint();
+    }
+    if promise.state() == v8::PromiseState::Rejected {
+      let reason = promise.result(scope).to_rust_string_lossy(scope);
+      panic!("async-generator promise REJECTED: {reason}");
     }
     assert_eq!(
       promise.state(),

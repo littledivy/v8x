@@ -78,7 +78,16 @@ const BABEL_HELPERS: &str = r#";if (typeof globalThis.babelHelpers === "undefine
   function OverloadYield(e, d) { this.v = e; this.k = d; }
   function _awaitAsyncGenerator(e) { return new OverloadYield(e, 0); }
   function _wrapAsyncGenerator(e) {
-    return function () { return new AsyncGenerator(e.apply(this, arguments)); };
+    var f = function () { return new AsyncGenerator(e.apply(this, arguments)); };
+    // Intrinsic identity: under real V8, reflecting the prototype of an
+    // async-generator function yields %AsyncGeneratorFunction.prototype%
+    // (a.k.a. %AsyncGenerator%), whose `.prototype` is %AsyncGeneratorPrototype%
+    // (next/return/throw/asyncIterator). deno_core's ext:core/00_primordials.js
+    // captures exactly that and then reads `.prototype` off it, so give every
+    // lowered async-generator function that prototype chain instead of the bare
+    // Function.prototype.
+    Object.setPrototypeOf(f, AsyncGeneratorFunctionPrototype);
+    return f;
   }
   function AsyncGenerator(e) {
     var r, t;
@@ -115,6 +124,30 @@ const BABEL_HELPERS: &str = r#";if (typeof globalThis.babelHelpers === "undefine
   AsyncGenerator.prototype.next = function (e) { return this._invoke("next", e); };
   AsyncGenerator.prototype["throw"] = function (e) { return this._invoke("throw", e); };
   AsyncGenerator.prototype["return"] = function (e) { return this._invoke("return", e); };
+  // %AsyncGeneratorFunction.prototype% (= %AsyncGenerator%): the object that
+  // reflecting the prototype of an async-generator function returns under real
+  // V8. Its own `prototype` property is %AsyncGeneratorPrototype% (the instance
+  // proto, AsyncGenerator.prototype above), and it carries the standard
+  // `Symbol.toStringTag`. Every lowered async-generator function's [[Prototype]]
+  // is set to this object (see _wrapAsyncGenerator) so primordials' identity
+  // capture and its subsequent `.prototype` read both succeed.
+  // Its own [[Prototype]] is %Function.prototype% (as in real V8), so a lowered
+  // async-generator function whose [[Prototype]] is set to this object still
+  // reaches Function.prototype.apply / call / bind through the chain (oxc emits
+  // `_ag.apply(this, arguments)` on the wrapper).
+  var AsyncGeneratorFunctionPrototype = Object.create(Function.prototype);
+  Object.defineProperty(AsyncGeneratorFunctionPrototype, "prototype", {
+    value: AsyncGenerator.prototype, writable: false, enumerable: false, configurable: true
+  });
+  if ("function" == typeof Symbol && Symbol.toStringTag) {
+    Object.defineProperty(AsyncGeneratorFunctionPrototype, Symbol.toStringTag, {
+      value: "AsyncGeneratorFunction", writable: false, enumerable: false, configurable: true
+    });
+  }
+  // Reciprocal `constructor` link mirrors V8's %AsyncGeneratorPrototype%.constructor.
+  Object.defineProperty(AsyncGenerator.prototype, "constructor", {
+    value: AsyncGeneratorFunctionPrototype, writable: false, enumerable: false, configurable: true
+  });
   function _asyncIterator(r) {
     var n, t, o, e = 2;
     for ("undefined" != typeof Symbol && (t = Symbol.asyncIterator, o = Symbol.iterator); e--;) {
