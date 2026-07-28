@@ -129,3 +129,16 @@ the %AsyncGenerator% prototype) was source-transformable; the runtime ones are r
 that are NOT. So the honest result: deno_core (the engine-embedding core) can boot and run code on Hermes, but
 a COMPLETE Deno runtime cannot without upstream Hermes gaining async generators or a large rewrite of vendored
 Deno source. rusty_v8 now 89/267.
+
+
+## PAYOFF: deno_core boots and runs 1+1 on the Hermes backend
+
+The Deno-boot grind reached its milestone. An actual deno_core::JsRuntime::new SUCCEEDS on the Hermes
+backend and execute_script("1 + 1") runs cleanly (BOOT OK; value handle returned). D8's external-memory
+BackingStore subsystem closed the last step of JsRuntime::new_inner. So: a third JS engine backend for
+v8x, built from scratch this session, now boots deno_core and runs JavaScript.
+Honest bound: this is deno_core (the runtime core). A COMPLETE Deno runtime remains blocked by the D7
+ceiling - Deno's ext/ layer uses real async generators (for await over sockets, Blob.stream, Node streams)
+that Hermes's compiler does not support and that are not source-transformable. deno_core-on-Hermes is the
+deliverable; full-Deno-on-Hermes would need upstream Hermes async-generator support or a large rewrite of
+vendored Deno source.

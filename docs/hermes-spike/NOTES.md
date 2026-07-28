@@ -11,6 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
+- [x] *** deno_core::JsRuntime BOOTS + runs 1+1 on the Hermes backend (D8 BackingStore closed the boot) ***
 - [x] *** deno_core boots to the LAST step of new_inner on Hermes (past primordials, ops, 01_core.js, module graph); wall = ArrayBuffer BackingStore. rusty_v8 89/267. CEILING: async gens pervasive in full runtime ***
 - [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
@@ -39,6 +40,18 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle D8 - external-memory BackingStore -> deno_core BOOTS + runs 1+1 on Hermes (agent crashed, verified manually) DONE - THE PAYOFF
+deno_core::JsRuntime::new SUCCEEDS on Hermes and execute_script("1 + 1") runs:
+  BUILD_EXIT=0 / BOOT OK: JsRuntime::new succeeded / 1+1 executed OK (value handle returned) / RUN_EXIT=0
+BackingStore subsystem committed 798c4fe (NewBackingStore__with_data + with_backing_store + accessors,
+via JSI MutableBuffer/createArrayBuffer, v8 deleter drives external free at teardown). It closed
+store_js_callbacks (new_inner's last step). D8 agent crashed on transient API 529 after committing the
+source; boot re-run MANUALLY (no agent) to confirm. Its uncommitted baseline --update (had reached ~93)
+was discarded; re-derive properly (below). Boot re-run in the deno checkout ~/gh/deno-v8x-rebase.
+This is the payoff of the deno-boot grind: a from-scratch Hermes v8x backend now boots deno_core + runs JS.
+CEILING (D7, unchanged): full Deno runtime blocked by pervasive async generators in ext/ (compiler gap,
+not shimmable). deno_core-on-Hermes = the milestone; full-Deno-on-Hermes = needs upstream Hermes.
 
 ### Cycle D7 - past async-gen wall to the last boot step + the VIABILITY crux (agent, opus) DONE
 PART A (the honest crux): async generators are a ONE-OFF in deno_core's boot JS (only the primordials
