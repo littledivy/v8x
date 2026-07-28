@@ -2278,6 +2278,39 @@ int v8x_hermes_set_prototype_from_ctor(void *rtw, v8x_hermes_slot obj_slot,
   }
 }
 
+// Set an object's prototype directly to a value (Object.setPrototypeOf semantics
+// for `Object::with_prototype_and_properties`). `proto_slot` may reference an
+// object OR null: a null (or the JS `null` value) sets a null prototype, exactly
+// like `Object.create(null)`. Returns 1 on success, 0 on error.
+int v8x_hermes_object_set_prototype(void *rtw, v8x_hermes_slot obj_slot,
+                                    v8x_hermes_slot proto_slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  if (ov == nullptr || !ov->isObject()) {
+    return 0;
+  }
+  try {
+    jsi::Object obj = ov->getObject(w->runtime());
+    // A null/absent proto slot, or an explicit JS null, means a null prototype.
+    const jsi::Value *pv = slot_ref(w, proto_slot);
+    jsi::Value proto = (pv == nullptr || pv->isNull() || pv->isUndefined())
+                           ? jsi::Value::null()
+                           : jsi::Value(w->runtime(), *pv);
+    jsi::Function setProto = w->runtime()
+                                 .global()
+                                 .getPropertyAsObject(w->runtime(), "Object")
+                                 .getPropertyAsFunction(w->runtime(),
+                                                        "setPrototypeOf");
+    setProto.call(w->runtime(), obj, std::move(proto));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
 // Function.prototype.name / the `name` property of a JS function value. Used to
 // implement FunctionTemplate::SetClassName by setting the constructed
 // function's `.name` (via defineProperty, since `name` is non-writable). This

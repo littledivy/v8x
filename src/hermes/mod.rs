@@ -1385,4 +1385,55 @@ mod hermes_boot_probe {
       "Function.length did not reflect the declared arity (setUpAsyncStub wall)"
     );
   }
+
+  /// Stage 6 (D7): Object::with_prototype_and_properties. deno_core builds
+  /// objects with a fixed prototype and an initial property set in `new_inner`
+  /// (e.g. the build/version info object). WALL if
+  /// `v8__Object__New__with_prototype_and_properties` is a null stub. This probe
+  /// builds an object with a custom prototype carrying a method, plus two own
+  /// properties, and asserts the own props read back AND the prototype method is
+  /// reachable (prototype was actually set).
+  #[test]
+  fn boot_object_with_prototype_and_properties() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // Build a prototype object with a `tag` property via JS.
+    let proto_src = v8::String::new(scope, "({ tag: 'proto-tag' })").unwrap();
+    let proto_script = v8::Script::compile(scope, proto_src, None).unwrap();
+    let proto_val = proto_script.run(scope).unwrap();
+
+    let k1 = v8::String::new(scope, "a").unwrap();
+    let k2 = v8::String::new(scope, "b").unwrap();
+    let names: [v8::Local<v8::Name>; 2] = [k1.into(), k2.into()];
+    let v1 = v8::Integer::new(scope, 10);
+    let v2 = v8::Integer::new(scope, 20);
+    let values: [v8::Local<v8::Value>; 2] = [v1.into(), v2.into()];
+
+    let obj = v8::Object::with_prototype_and_properties(
+      scope, proto_val, &names, &values,
+    );
+
+    let global = context.global(scope);
+    let key = v8::String::new(scope, "__wpp").unwrap();
+    global.set(scope, key.into(), obj.into()).unwrap();
+
+    // Own props readable, and the prototype's `tag` reachable through the chain.
+    let src = v8::String::new(
+      scope,
+      "(__wpp.a === 10 && __wpp.b === 20 && __wpp.tag === 'proto-tag') \
+       ? 'ok' : 'bad'",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, src, None).unwrap();
+    let result = script.run(scope).unwrap();
+    assert_eq!(
+      result.to_rust_string_lossy(scope),
+      "ok",
+      "with_prototype_and_properties did not set own props + prototype"
+    );
+  }
 }

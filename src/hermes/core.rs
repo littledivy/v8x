@@ -239,6 +239,11 @@ unsafe extern "C" {
     obj_slot: i64,
     ctor_slot: i64,
   ) -> c_int;
+  fn v8x_hermes_object_set_prototype(
+    rtw: *mut c_void,
+    obj_slot: i64,
+    proto_slot: i64,
+  ) -> c_int;
   fn v8x_hermes_object_define_accessor_fns(
     rtw: *mut c_void,
     obj_slot: i64,
@@ -1592,6 +1597,55 @@ pub extern "C" fn v8__Object__New(isolate: *mut RealIsolate) -> *const Object {
   let rtw = iso_state(isolate).rtw;
   let slot = unsafe { v8x_hermes_object_new(rtw) };
   slot_ptr::<Object>(slot)
+}
+
+/// `Object::with_prototype_and_properties` (V8's `Object.create`-like builder).
+/// deno_core uses it in `new_inner` to build objects with a fixed prototype and
+/// an initial property set. Modeled on the existing primitives: create a fresh
+/// object, set each (name, value) as an ordinary enumerable/configurable/
+/// writable own property, then set its prototype. A null `prototype_or_null`
+/// gives a null-prototype object (like `Object.create(null)`).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__New__with_prototype_and_properties(
+  isolate: *mut RealIsolate,
+  prototype_or_null: *const Value,
+  names: *const *const Name,
+  values: *const *const Value,
+  length: usize,
+) -> *const Object {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  let obj = unsafe { v8x_hermes_object_new(rtw) };
+  if obj < 0 {
+    return ptr::null();
+  }
+  if length > 0 && !names.is_null() && !values.is_null() {
+    let name_slice = unsafe { std::slice::from_raw_parts(names, length) };
+    let value_slice = unsafe { std::slice::from_raw_parts(values, length) };
+    for i in 0..length {
+      let key = name_slice[i];
+      let val = value_slice[i];
+      if key.is_null() || val.is_null() {
+        continue;
+      }
+      unsafe {
+        v8x_hermes_object_set(
+          rtw,
+          obj,
+          slot_of(key as *const Value),
+          slot_of(val),
+        );
+      }
+    }
+  }
+  // Set the prototype (null => null prototype). A null handle is the null slot,
+  // which the C++ helper treats as "null prototype".
+  unsafe {
+    v8x_hermes_object_set_prototype(rtw, obj, slot_of(prototype_or_null));
+  }
+  slot_ptr::<Object>(obj)
 }
 
 /// `Object::Get`: the v8 C-ABI key is a generic `Value` (not just a `Name`),

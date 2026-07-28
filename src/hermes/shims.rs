@@ -418,8 +418,6 @@ pub extern "C" fn v8__Object__HasRealNamedProperty() -> *const ::std::ffi::c_voi
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__IsApiWrapper() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__New__with_prototype_and_properties() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__PreviewEntries() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetIntegrityLevel() -> *const ::std::ffi::c_void { ::std::ptr::null() }
