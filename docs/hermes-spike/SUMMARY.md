@@ -258,3 +258,16 @@ runs, in one process through real Deno extension code driven by the real deno_co
 ext/web (encoding, structured clone, streams, console, URL), deferred-op async, real socket I/O with for-await
 over a listener, and HTTP fetch. TLS/https fetch is the next increment; the larger capstone is an end-to-end
 Deno program (deno run) assembling these on Hermes.
+
+E10 reached that capstone. A real user ES module, loaded through deno_core's actual module loader
+(load_main_es_module + async mod_evaluate driven with run_event_loop, not execute_script), runs to completion on
+Hermes and exercises five capabilities in one program on one event loop: fetch over real http:// + await
+r.text(), an async generator consumed by for await, new URL().pathname, console.log through ext/web's real
+inspectArgs, and top-level await in the module body. Asserted output: "BODY: hello-from-hermes SUM: 6 URL: /y".
+The one wall was top-level await: the modeled module body had been wrapped in a plain closure, making TLA a
+SyntaxError; wrapping it in an async function and returning the real promise from Module::Evaluate fixed it.
+Backend suite 45/45 from a clean build. So the north star the spike set out after, a from-scratch static Hermes
+backend that can run a real multi-feature Deno program, is reached. What remains is breadth and hardening
+(multi-module import graphs, TLS, the cppgc/Oilpan subsystem for the Console class and the test_api/test_cppgc
+link, and folding these gains back toward a shippable deno-on-Hermes binary), not a question of whether the
+engine can do it.
