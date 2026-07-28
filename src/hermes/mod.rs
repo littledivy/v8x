@@ -2833,3 +2833,131 @@ mod hermes_async_generator {
     );
   }
 }
+// E12: the async-loop-capture defect that stalled E11's HTTP server, and the
+// argument-passing workaround the E12 server relies on.
+//
+// THE BUG (Hermes engine, reproduced with ZERO deno_core below): when a
+// loop-scoped `const`/`let` is bound AFTER an `await` in the loop body and then
+// CAPTURED by a detached async closure that itself awaits, the captured binding
+// reads back `undefined` after the inner closure resumes -- for every iteration
+// except the last live one. (E11 misdiagnosed the resulting downstream
+// `op_write_sync(undefined, buf)` "expected i32" throw as a "write-buffer
+// marshaling gap"; it was neither a buffer nor a marshaling problem.)
+//
+// THE WORKAROUND (the fix the E12 HTTP server uses): pass the per-iteration
+// value as a FUNCTION ARGUMENT instead of closing over it. Argument slots live
+// in the callee's own frame, which Hermes preserves correctly across `await`;
+// only captured lexical loop bindings are corrupted. Both facts are locked in
+// by the two tests below so a future Hermes bump that fixes the engine bug (or
+// regresses the workaround) is caught.
+#[cfg(all(test, feature = "link_hermes"))]
+mod hermes_async_capture {
+  use crate as v8;
+  use super::init_v8_once;
+
+  fn run_and_drain<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    context: v8::Local<'s, v8::Context>,
+    src: &str,
+    promise_name: &str,
+  ) -> String {
+    let source = v8::String::new(scope, src).unwrap();
+    let script = v8::Script::compile(scope, source, None).expect("compile");
+    script.run(scope).expect("run");
+    let global = context.global(scope);
+    let key = v8::String::new(scope, promise_name).unwrap();
+    let promise_val = global.get(scope, key.into()).unwrap();
+    let promise =
+      v8::Local::<v8::Promise>::try_from(promise_val).expect("promise");
+    for _ in 0..1000 {
+      if promise.state() != v8::PromiseState::Pending {
+        break;
+      }
+      scope.perform_microtask_checkpoint();
+    }
+    promise.result(scope).to_rust_string_lossy(scope)
+  }
+
+  /// The E12 HTTP-server pattern: fan out per-iteration work from an accept-loop
+  /// that awaits inside its body, passing the per-iteration id BY ARGUMENT. This
+  /// is the shape the server's `handleConn(connRid, RESPONSE)` uses, and it MUST
+  /// preserve the id across the handler's own await for the server to write the
+  /// right response to the right connection.
+  #[test]
+  fn arg_passing_preserves_value_across_await() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    // Two "connections" (ids 7,8). The accept loop awaits, then hands each id to
+    // a detached async handler BY ARGUMENT; the handler awaits and re-reads it.
+    let src = "\
+      globalThis.__log = []; \
+      async function handle(id) { \
+        const before = id; \
+        await Promise.resolve(1); \
+        const after = id; \
+        globalThis.__log.push(before + ':' + after); \
+      } \
+      globalThis.__cap = (async () => { \
+        let i = 0; \
+        while (i < 2) { \
+          await Promise.resolve(0); \
+          const id = 7 + i; \
+          handle(id); \
+          i++; \
+        } \
+        await Promise.resolve(0); await Promise.resolve(0); await Promise.resolve(0); \
+        return globalThis.__log.join('|'); \
+      })();";
+    let got = run_and_drain(scope, context, src, "__cap");
+    println!("hermes_async_capture arg-passing: {got:?}");
+    assert_eq!(
+      got, "7:7|8:8",
+      "argument-passed value must survive the handler's await for every \
+       connection (the E12 HTTP-server correctness invariant)"
+    );
+  }
+
+  /// The engine defect itself, pinned so a future fix is noticed: the SAME loop,
+  /// but the handler CLOSES OVER the loop const instead of taking it as an arg.
+  /// On the current vendored Hermes the non-final iteration's captured const is
+  /// lost (reads `undefined`) after the inner await. If a Hermes bump fixes this,
+  /// this test flips to `7:7|8:8` and should be updated to a plain equality.
+  #[test]
+  fn captured_loop_const_lost_across_await_known_defect() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let src = "\
+      globalThis.__log = []; \
+      globalThis.__cap = (async () => { \
+        let i = 0; \
+        while (i < 2) { \
+          await Promise.resolve(0); \
+          const id = 7 + i; \
+          (async () => { \
+            const before = id; \
+            await Promise.resolve(1); \
+            const after = id; \
+            globalThis.__log.push(before + ':' + after); \
+          })(); \
+          i++; \
+        } \
+        await Promise.resolve(0); await Promise.resolve(0); await Promise.resolve(0); \
+        return globalThis.__log.join('|'); \
+      })();";
+    let got = run_and_drain(scope, context, src, "__cap");
+    println!("hermes_async_capture captured-defect: {got:?}");
+    // Documents current (buggy) behaviour: first iteration's captured const is
+    // lost. The last live iteration's binding survives.
+    assert_eq!(
+      got, "7:undefined|8:8",
+      "Hermes loop-const-capture-across-await defect changed; if this is now \
+       '7:7|8:8' the engine bug is FIXED -- update this test and the E12 notes"
+    );
+  }
+}
