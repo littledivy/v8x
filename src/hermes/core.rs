@@ -78,6 +78,10 @@ unsafe extern "C" {
   // C6: Object / Array / Number / Integer / Boolean / Function. See
   // docs/hermes-spike/experiments/C6-hermes-surface.md.
   fn v8x_hermes_object_new(rtw: *mut c_void) -> i64;
+  // D3: durable JS-value pins (shared with modules.rs). Used to keep the
+  // per-context extras binding object alive across HandleScope pops (C2).
+  fn v8x_hermes_pin(rtw: *mut c_void, slot: i64) -> i64;
+  fn v8x_hermes_pin_get(rtw: *mut c_void, pin_id: i64) -> i64;
   fn v8x_hermes_object_get(rtw: *mut c_void, obj_slot: i64, key_slot: i64) -> i64;
   fn v8x_hermes_object_set(
     rtw: *mut c_void,
@@ -321,6 +325,13 @@ pub(crate) struct IsoState {
   /// through the JSI handle table), so they must be freed here at Dispose. See
   /// docs/hermes-spike/experiments/D2-hermes-modules.md.
   pub module_records: Vec<Box<dyn FnOnce()>>,
+  /// D3: the per-context "extras binding object" (V8's
+  /// `Context::GetExtrasBindingObject`). deno_core's bootstrap reads built-ins
+  /// (e.g. the console) off this object. V8 returns the SAME object every call,
+  /// so it is created lazily on first use, pinned into a runtime-owned durable
+  /// slot (C2 lifetime), and every call returns a fresh Local resolving to that
+  /// one pinned object (C4 identity). -1 = not created yet.
+  pub extras_binding_pin: i64,
 }
 
 thread_local! {
@@ -397,6 +408,7 @@ pub extern "C" fn v8__Isolate__New(_params: *const c_void) -> *mut RealIsolate {
     microtask_queue: ptr::null_mut(),
     pending_exception: NULL_SLOT,
     module_records: Vec::new(),
+    extras_binding_pin: -1,
   });
   // A stable non-null default marker: the box's own state address. Overwritten
   // by any later SetMicrotaskQueue.
@@ -739,6 +751,39 @@ pub extern "C" fn v8__Context__SetMicrotaskQueue(
     return;
   }
   iso_state(this as *mut RealIsolate).microtask_queue = queue;
+}
+
+/// `Context::GetExtrasBindingObject`. V8 keeps one plain object per context on
+/// which the embedder installs helper bindings; deno_core's bootstrap reads
+/// built-ins (e.g. the console) off it. Hermes has no such object, so we create
+/// a plain JS object lazily on first call, pin it into a runtime-owned durable
+/// slot so it survives HandleScope pops (C2), and hand back a fresh Local
+/// resolving to that same pinned object every call (C4 identity: two calls
+/// return handles to one object). Never null: the vendored getter `cast_local`s
+/// and would treat null as an empty MaybeLocal, but deno_core deref's the
+/// result, so a live object is required.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Context__GetExtrasBindingObject(
+  this: *const Context,
+) -> *const Object {
+  if this.is_null() {
+    return ptr::null();
+  }
+  let st = iso_state(this as *mut RealIsolate);
+  let rtw = st.rtw;
+  if st.extras_binding_pin < 0 {
+    let slot = unsafe { v8x_hermes_object_new(rtw) };
+    if slot < 0 {
+      return ptr::null();
+    }
+    let pin = unsafe { v8x_hermes_pin(rtw, slot) };
+    if pin < 0 {
+      return ptr::null();
+    }
+    st.extras_binding_pin = pin;
+  }
+  let slot = unsafe { v8x_hermes_pin_get(rtw, st.extras_binding_pin) };
+  slot_ptr::<Object>(slot)
 }
 
 // ---- Context embedder data (aligned-pointer fields) -----------------------
@@ -2449,6 +2494,52 @@ pub extern "C" fn v8__Function__New(
     return ptr::null();
   }
   slot_ptr::<Function>(out)
+}
+
+/// `Function::SetName`. JSI has no name setter, so the name is (re)defined as
+/// the function's `name` own property via `Object.defineProperty` (writable
+/// false, configurable true, matching V8's `Function.name`). Reuses the same
+/// C++ helper the FunctionTemplate class-name path uses. deno_core calls this
+/// on every op function during bootstrap.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Function__SetName(
+  this: *const Function,
+  name: *const V8String,
+) {
+  if this.is_null() || name.is_null() {
+    return;
+  }
+  let rtw = current_rtw();
+  if rtw.is_null() {
+    return;
+  }
+  unsafe {
+    v8x_hermes_function_set_name(rtw, slot_of(this), slot_of(name));
+  }
+}
+
+/// `Function::GetName`. Reads the function's `name` own property (a JS string).
+/// Returns null if there is no current runtime; the vendored surface treats a
+/// null as an empty Local, which its callers `.unwrap()`, so a live function
+/// always has a `name` (the engine defaults it to "").
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Function__GetName(
+  this: *const Function,
+) -> *const V8String {
+  if this.is_null() {
+    return ptr::null();
+  }
+  let rtw = current_rtw();
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  let key = intern_string_utf8(current_iso(), b"name");
+  if key.is_null() {
+    return ptr::null();
+  }
+  let slot =
+    unsafe { v8x_hermes_object_get(rtw, slot_of(this), slot_of(key)) };
+  slot_ptr::<V8String>(slot)
 }
 
 // ---- FunctionCallbackInfo accessors ----------------------------------------

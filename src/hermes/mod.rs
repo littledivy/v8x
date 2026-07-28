@@ -1206,4 +1206,87 @@ mod hermes_boot_probe {
     let ran = global.get(scope, flag.into()).unwrap();
     assert_eq!(ran.to_rust_string_lossy(scope), "7");
   }
+
+  /// Stage 3 (D3): the op round trip end to end. deno_core binds every op as a
+  /// `FunctionTemplate` whose `.data()` is a `v8::External` wrapping the op's
+  /// `OpCtx` pointer; the native callback reads that External back out of
+  /// `FunctionCallbackInfo::data()` to dispatch. This probe reproduces exactly
+  /// that shape with ONE op: an External wrapping a sentinel pointer, a
+  /// FunctionTemplate whose data is that External, installed on the global,
+  /// called from JS, and the External read back inside the callback and its
+  /// pointer checked against the sentinel. If this is green, the External +
+  /// FunctionTemplate + FunctionCallbackInfo::data path deno_core's op glue
+  /// rides on works.
+  #[test]
+  fn boot_op_external_roundtrip() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // The sentinel "OpCtx" pointer the op callback must recover from its data.
+    const SENTINEL: usize = 0xABCD_1234;
+
+    fn op_cb(
+      scope: &mut v8::PinScope,
+      args: v8::FunctionCallbackArguments,
+      mut rv: v8::ReturnValue<v8::Value>,
+    ) {
+      // Read the External back out of the callback data (this is how deno_core
+      // recovers its OpCtx*). Return 1 iff it matches the sentinel, else 0.
+      let data = args.data();
+      let ext = v8::Local::<v8::External>::try_from(data)
+        .expect("callback data should be an External");
+      let got = ext.value() as usize;
+      rv.set_int32(if got == SENTINEL { 1 } else { 0 });
+      let _ = scope;
+    }
+
+    let external = v8::External::new(scope, SENTINEL as *mut std::ffi::c_void);
+    let templ = v8::FunctionTemplate::builder(op_cb)
+      .data(external.into())
+      .build(scope);
+    let func = templ.get_function(scope).unwrap();
+
+    // SetName the op function (deno_core names every op) and read it back.
+    let op_name = v8::String::new(scope, "op_probe").unwrap();
+    func.set_name(op_name);
+    let got_name = func.get_name(scope);
+    assert_eq!(
+      got_name.to_rust_string_lossy(scope),
+      "op_probe",
+      "Function::SetName/GetName round trip failed"
+    );
+
+    let global = context.global(scope);
+    let key = v8::String::new(scope, "op_probe").unwrap();
+    global.set(scope, key.into(), func.into()).unwrap();
+
+    let src = v8::String::new(scope, "op_probe()").unwrap();
+    let script = v8::Script::compile(scope, src, None).unwrap();
+    let result = script.run(scope).expect("op_probe() should run");
+    assert_eq!(
+      result.to_rust_string_lossy(scope),
+      "1",
+      "op callback did not recover the External sentinel (op glue broken)"
+    );
+
+    // The extras binding object must exist, be an object, and be stable
+    // (deno_core reads built-ins off it during bootstrap).
+    let extras = context.get_extras_binding_object(scope);
+    assert!(extras.is_object(), "extras binding should be an object");
+    let extras2 = context.get_extras_binding_object(scope);
+    // C4 identity: same underlying object across two calls.
+    let a = v8::String::new(scope, "__extras_marker").unwrap();
+    let one = v8::Integer::new(scope, 99);
+    extras.set(scope, a.into(), one.into()).unwrap();
+    let b = v8::String::new(scope, "__extras_marker").unwrap();
+    let read = extras2.get(scope, b.into()).unwrap();
+    assert_eq!(
+      read.to_rust_string_lossy(scope),
+      "99",
+      "extras binding object identity is not stable across calls"
+    );
+  }
 }

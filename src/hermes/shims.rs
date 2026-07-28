@@ -106,8 +106,6 @@ pub extern "C" fn v8__Context__GetDataFromSnapshotOnce() -> *const ::std::ffi::c
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetEmbedderData() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Context__GetExtrasBindingObject() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetSecurityToken() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__SetContinuationPreservedEmbedderData() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -194,8 +192,6 @@ pub extern "C" fn v8__FastOneByteString() -> *const ::std::ffi::c_void { ::std::
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__CreateCodeCache() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Function__GetName() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__GetScriptColumnNumber() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__GetScriptLineNumber() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -205,8 +201,6 @@ pub extern "C" fn v8__Function__GetScriptOrigin() -> *const ::std::ffi::c_void {
 pub extern "C" fn v8__Function__NewInstance() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Function__ScriptId() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Function__SetName() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__FunctionTemplate__Inherit() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
