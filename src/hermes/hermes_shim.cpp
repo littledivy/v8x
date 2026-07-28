@@ -2752,9 +2752,23 @@ static bool ensure_promise_infra(RuntimeWrapper *w) {
             "    record(p);"
             "    return [p, resolve, reject];"
             "  }"
+            // Promises created purely in JS (e.g. the result of an async IIFE,
+            // as produced by the E1 async-generator lowering) never pass through
+            // makeResolver/record, so they have no WeakMap entry and would read
+            // as Pending forever. So getState lazily attaches the state recorder
+            // to any not-yet-tracked promise on first query; a following
+            // drainJobs then runs its reaction and settles the recorded state.
+            // `tracked` guards against attaching the recorder more than once.
+            "  var tracked = new WeakSet();"
+            "  function ensureTracked(p) {"
+            "    if (p && typeof p.then === 'function' && !tracked.has(p)) {"
+            "      tracked.add(p); record(p);"
+            "    }"
+            "  }"
             "  function getState(p) {"
             "    var e = m.get(p);"
-            "    return e ? e.state : 0;"
+            "    if (!e) { ensureTracked(p); return 0; }"
+            "    return e.state;"
             "  }"
             "  function getResult(p) {"
             "    var e = m.get(p);"

@@ -77,7 +77,7 @@ engine_quickjs = []
 # C2 feasibility proof that Hermes' C++-only JSI can be reached from Rust
 # through an extern "C" boundary. See docs/hermes-spike/experiments/
 # C2-hermes-ffi.md.
-engine_hermes = []
+engine_hermes = ["dep:oxc"]
 link_hermes = []
 # Short aliases (README-facing).
 jsc = ["engine_jsc", "vendor_jsc"]
@@ -117,6 +117,14 @@ paste = "1.0"
 temporal_capi = { version = "0.2.3", features = ["zoneinfo64"] }
 temporal_rs = { version = "0.2.3", default-features = false }
 timezone_provider = { version = "0.2.3", features = ["zoneinfo64"] }
+# Hermes-only: source-to-source lowering of `async function*` / `async *method`
+# into the ES2017 downlevel Hermes' compiler accepts (regular `function*` +
+# runtime helpers, native `for await`). Hermes' parser rejects the async
+# generator *declaration* syntax; every other primitive the downlevel needs is
+# supported. Gated behind `engine_hermes` (via the `oxc-lowering` feature) so no
+# other backend pays for the oxc dependency tree. See src/hermes/lower.rs and
+# docs/hermes-spike/experiments/E1-asyncgen-lowering.md.
+oxc = { version = "0.90", default-features = false, features = ["transformer", "codegen", "semantic", "ast_visit"], optional = true }
 
 [build-dependencies]
 cc = "1.0"

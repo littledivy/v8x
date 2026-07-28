@@ -735,8 +735,15 @@ fn evaluate_rec(
     _ => return false,
   };
 
+  // E1: lower any `async function*` / `async *method` in the module body into
+  // the ES2017 downlevel Hermes accepts (a no-op for module bodies without one).
+  // This runs on the fully-formed closure source (after import/export rewriting)
+  // so the whole module body flows through the same async-generator lowering the
+  // Script::compile path uses. See src/hermes/lower.rs.
+  let lowered = crate::hermes::lower::lower_async_generators(&closure_source);
+
   // Compile the closure (an expression producing a function).
-  let src_slot = intern(rtw, &closure_source);
+  let src_slot = intern(rtw, &lowered);
   let mut ok: c_int = 0;
   let fn_slot = unsafe { v8x_hermes_run(rtw, src_slot, &mut ok) };
   if ok == 0 || fn_slot < 0 {
