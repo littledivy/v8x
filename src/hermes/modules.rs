@@ -455,12 +455,47 @@ pub extern "C" fn v8__Module__GetModuleNamespace2(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Module__GetUnboundModuleScript(
-  _this: *const Module,
+  this: *const Module,
 ) -> *const c_void {
   // Our modules carry no separate UnboundModuleScript (the closure source is
-  // re-compiled on each Evaluate). No caller on the boot path needs it; return
-  // null so any user of this handle short-circuits rather than crashing.
-  ptr::null()
+  // re-compiled on each Evaluate). deno_core's `new_module_from_js_source`
+  // unconditionally calls this and `.unwrap()`s the result, then reads
+  // `get_source_mapping_url` off it. So return the module record pointer itself
+  // as an opaque, non-null UnboundModuleScript handle (it is never dereferenced
+  // as a script; the only method called on it, GetSourceMappingURL/GetSourceURL,
+  // returns undefined below). Return null only for a null module.
+  if this.is_null() {
+    return ptr::null();
+  }
+  this as *const c_void
+}
+
+/// `UnboundModuleScript::GetSourceMappingURL`. Our modeled modules carry no
+/// V8-embedded `//# sourceMappingURL`, so return `undefined` (a real value, not
+/// null: the vendored accessor `.unwrap()`s it). deno_core skips the source-map
+/// branch when this is undefined/null.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__UnboundModuleScript__GetSourceMappingURL(
+  _script: *const c_void,
+) -> *const Value {
+  let rtw = current_rtw();
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  slot_ptr::<Value>(unsafe { v8x_hermes_undefined(rtw) })
+}
+
+/// `UnboundModuleScript::GetSourceURL`. Same as above: no embedded
+/// `//# sourceURL`, return `undefined`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__UnboundModuleScript__GetSourceURL(
+  _script: *const c_void,
+) -> *const Value {
+  let rtw = current_rtw();
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  slot_ptr::<Value>(unsafe { v8x_hermes_undefined(rtw) })
 }
 
 /// `Module::GetStalledTopLevelAwaitMessage`: our modeled modules have no

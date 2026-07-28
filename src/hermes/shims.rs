@@ -736,10 +736,6 @@ pub extern "C" fn v8__Uint32__Value() -> *const ::std::ffi::c_void { ::std::ptr:
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__UnboundModuleScript__CreateCodeCache() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__UnboundModuleScript__GetSourceMappingURL() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__UnboundModuleScript__GetSourceURL() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__UnboundScript__BindToCurrentContext() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__UnboundScript__CreateCodeCache() -> *const ::std::ffi::c_void { ::std::ptr::null() }
