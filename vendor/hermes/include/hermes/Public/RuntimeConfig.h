@@ -12,6 +12,7 @@
 #include "hermes/Public/CtorConfig.h"
 #include "hermes/Public/GCConfig.h"
 
+#include <cstdint>
 #include <memory>
 
 namespace hermes {
@@ -21,6 +22,13 @@ enum CompilationMode {
   SmartCompilation,
   ForceEagerCompilation,
   ForceLazyCompilation
+};
+
+enum class SynthTraceMode : int8_t {
+  None,
+  Replaying,
+  Tracing,
+  TracingAndReplaying,
 };
 
 class PinnedHermesValue;
@@ -35,10 +43,10 @@ class PinnedHermesValue;
   F(constexpr, PinnedHermesValue *, RegisterStack, nullptr)            \
                                                                        \
   /* Register Stack Size */                                            \
-  F(constexpr, unsigned, MaxNumRegisters, 1024 * 1024)                 \
+  F(constexpr, unsigned, MaxNumRegisters, 128 * 1024)                  \
                                                                        \
-  /* Whether or not the JIT is enabled */                              \
-  F(constexpr, bool, EnableJIT, false)                                 \
+  /* Native stack remaining before assuming overflow */                \
+  F(constexpr, unsigned, NativeStackGap, 64 * 1024)                    \
                                                                        \
   /* Whether to allow eval and Function ctor */                        \
   F(constexpr, bool, EnableEval, true)                                 \
@@ -50,7 +58,7 @@ class PinnedHermesValue;
   F(constexpr, bool, OptimizedEval, false)                             \
                                                                        \
   /* Whether to emit async break check instructions in eval code */    \
-  F(constexpr, bool, AsyncBreakCheckInEval, false)                     \
+  F(constexpr, bool, AsyncBreakCheckInEval, true)                      \
                                                                        \
   /* Support for ES6 Promise. */                                       \
   F(constexpr, bool, ES6Promise, true)                                 \
@@ -58,30 +66,26 @@ class PinnedHermesValue;
   /* Support for ES6 Proxy. */                                         \
   F(constexpr, bool, ES6Proxy, true)                                   \
                                                                        \
+  /* Support for ES6 Class. */                                         \
+  F(constexpr, bool, ES6Class, false)                                  \
+                                                                       \
   /* Support for ECMA-402 Intl APIs. */                                \
   F(constexpr, bool, Intl, true)                                       \
                                                                        \
-  /* Enable synth trace. */                                            \
-  F(constexpr, bool, TraceEnabled, false)                              \
+  /* Support for ArrayBuffer, DataView and typed arrays. */            \
+  F(constexpr, bool, ArrayBuffer, true)                                \
                                                                        \
-  /* Scratch path for synth trace. */                                  \
-  F(HERMES_NON_CONSTEXPR, std::string, TraceScratchPath, "")           \
+  /* Support for using microtasks. */                                  \
+  F(constexpr, bool, MicrotaskQueue, false)                            \
                                                                        \
-  /* Result path for synth trace. */                                   \
-  F(HERMES_NON_CONSTEXPR, std::string, TraceResultPath, "")            \
-                                                                       \
-  /* Callout to register an interesting (e.g. lead to crash) */        \
-  /* and completed trace. */                                           \
-  F(HERMES_NON_CONSTEXPR,                                              \
-    std::function<bool()>,                                             \
-    TraceRegisterCallback,                                             \
-    nullptr)                                                           \
+  /* Runtime set up for synth trace. */                                \
+  F(constexpr, SynthTraceMode, SynthTraceMode, SynthTraceMode::None)   \
                                                                        \
   /* Enable sampling certain statistics. */                            \
   F(constexpr, bool, EnableSampledStats, false)                        \
                                                                        \
-  /* Whether to enable sampling profiler */                            \
-  F(constexpr, bool, EnableSampleProfiling, true)                      \
+  /* Whether to enable automatic sampling profiler registration */     \
+  F(constexpr, bool, EnableSampleProfiling, false)                     \
                                                                        \
   /* Whether to randomize stack placement etc. */                      \
   F(constexpr, bool, RandomizeMemoryLayout, false)                     \
@@ -116,9 +120,12 @@ class PinnedHermesValue;
                                                                        \
   /* The flags passed from a VM experiment */                          \
   F(constexpr, uint32_t, VMExperimentFlags, 0)                         \
+                                                                       \
+  /* Whether or not block scoping is enabled */                        \
+  F(constexpr, bool, EnableBlockScoping, false)                        \
   /* RUNTIME_FIELDS END */
 
-_HERMES_CTORCONFIG_STRUCT(RuntimeConfig, RUNTIME_FIELDS, {});
+_HERMES_CTORCONFIG_STRUCT(RuntimeConfig, RUNTIME_FIELDS, {})
 
 #undef RUNTIME_FIELDS
 

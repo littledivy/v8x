@@ -12,30 +12,19 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <ostream>
 #include <string>
 
+#include <hermes/Public/HermesExport.h>
 #include <hermes/Public/RuntimeConfig.h>
 #include <jsi/jsi.h>
 #include <unordered_map>
 
-#ifndef HERMES_EXPORT
-#ifdef _MSC_VER
-#define HERMES_EXPORT __declspec(dllexport)
-#else // _MSC_VER
-#define HERMES_EXPORT __attribute__((visibility("default")))
-#endif // _MSC_VER
-#endif // !defined(HERMES_EXPORT)
-
 struct HermesTestHelper;
-
-namespace llvh {
-class raw_ostream;
-}
 
 namespace hermes {
 namespace vm {
 class GCExecTrace;
-struct MockedEnvironment;
 } // namespace vm
 } // namespace hermes
 
@@ -48,11 +37,9 @@ class ThreadSafeRuntime;
 
 namespace hermes {
 
-#ifdef HERMES_ENABLE_DEBUGGER
 namespace debugger {
 class Debugger;
 }
-#endif
 
 class HermesRuntimeImpl;
 
@@ -83,7 +70,10 @@ class HERMES_EXPORT HermesRuntime : public jsi::Runtime {
       size_t len);
 
   /// Enable sampling profiler.
-  static void enableSamplingProfiler();
+  /// Starts a separate thread that polls VM state with \p meanHzFreq frequency.
+  /// Any subsequent call to \c enableSamplingProfiler() is ignored until
+  /// next call to \c disableSamplingProfiler()
+  static void enableSamplingProfiler(double meanHzFreq = 100);
 
   /// Disable the sampling profiler
   static void disableSamplingProfiler();
@@ -92,7 +82,11 @@ class HERMES_EXPORT HermesRuntime : public jsi::Runtime {
   static void dumpSampledTraceToFile(const std::string &fileName);
 
   /// Dump sampled stack trace to the given stream.
-  static void dumpSampledTraceToStream(llvh::raw_ostream &stream);
+  static void dumpSampledTraceToStream(std::ostream &stream);
+
+  /// Serialize the sampled stack to the format expected by DevTools'
+  /// Profiler.stop return type.
+  void sampledTraceToStreamInDevToolsFormat(std::ostream &stream);
 
   /// Return the executed JavaScript function info.
   /// This information holds the segmentID, Virtualoffset and sourceURL.
@@ -129,8 +123,10 @@ class HERMES_EXPORT HermesRuntime : public jsi::Runtime {
   /// static throughout that object's (or string's, or PropNameID's)
   /// lifetime.
   uint64_t getUniqueID(const jsi::Object &o) const;
+  uint64_t getUniqueID(const jsi::BigInt &s) const;
   uint64_t getUniqueID(const jsi::String &s) const;
   uint64_t getUniqueID(const jsi::PropNameID &pni) const;
+  uint64_t getUniqueID(const jsi::Symbol &sym) const;
 
   /// Same as the other \c getUniqueID, except it can return 0 for some values.
   /// 0 means there is no ID associated with the value.
@@ -142,18 +138,10 @@ class HERMES_EXPORT HermesRuntime : public jsi::Runtime {
   /// \return a jsi::Object if a matching object is found, else returns null.
   jsi::Value getObjectForID(uint64_t id);
 
-  /// Get a structure representing the environment-dependent behavior, so
-  /// it can be written into the trace for later replay.
-  const ::hermes::vm::MockedEnvironment &getMockedEnvironment() const;
-
   /// Get a structure representing the execution history (currently just of
   /// GC, but will be generalized as necessary), to aid in debugging
   /// non-deterministic execution.
   const ::hermes::vm::GCExecTrace &getGCExecTrace() const;
-
-  /// Make the runtime read from \p env to replay its environment-dependent
-  /// behavior.
-  void setMockedEnvironment(const ::hermes::vm::MockedEnvironment &env);
 
   /// Get IO tracking (aka HBC page access) info as a JSON string.
   /// See hermes::vm::Runtime::getIOTrackingInfoJSON() for conditions
@@ -162,22 +150,18 @@ class HERMES_EXPORT HermesRuntime : public jsi::Runtime {
 
 #ifdef HERMESVM_PROFILER_BB
   /// Write the trace to the given stream.
-  void dumpBasicBlockProfileTrace(llvh::raw_ostream &os) const;
+  void dumpBasicBlockProfileTrace(std::ostream &os) const;
 #endif
 
 #ifdef HERMESVM_PROFILER_OPCODE
   /// Write the opcode stats to the given stream.
-  void dumpOpcodeStats(llvh::raw_ostream &os) const;
+  void dumpOpcodeStats(std::ostream &os) const;
 #endif
 
-#ifdef HERMESVM_PROFILER_EXTERN
-  /// Dump map of profiler symbols to given file name.
-  void dumpProfilerSymbolsToFile(const std::string &fileName) const;
-#endif
-
-#ifdef HERMES_ENABLE_DEBUGGER
   /// \return a reference to the Debugger for this Runtime.
   debugger::Debugger &getDebugger();
+
+#ifdef HERMES_ENABLE_DEBUGGER
 
   struct DebugFlags {
     // Looking for the .lazy flag? It's no longer necessary.
@@ -193,17 +177,28 @@ class HERMES_EXPORT HermesRuntime : public jsi::Runtime {
       const DebugFlags &debugFlags);
 #endif
 
-  /// Register this runtime for sampling profiler.
+  /// Register this runtime and thread for sampling profiler. Before using the
+  /// runtime on another thread, invoke this function again from the new thread
+  /// to make the sampling profiler target the new thread (and forget the old
+  /// thread).
   void registerForProfiling();
   /// Unregister this runtime for sampling profiler.
   void unregisterForProfiling();
 
+  /// Define methods to interrupt JS execution and set time limits.
+  /// All JS compiled to bytecode via prepareJS, or evaluateJS, will support
+  /// interruption and time limit monitoring if the runtime is configured with
+  /// AsyncBreakCheckInEval. If JS prepared in other ways is executed, care must
+  /// be taken to ensure that it is compiled in a mode that supports it (i.e.,
+  /// the emitted code contains async break checks).
+
+  /// Asynchronously terminates the current execution. This can be called on
+  /// any thread.
+  void asyncTriggerTimeout();
+
   /// Register this runtime for execution time limit monitoring, with a time
   /// limit of \p timeoutInMs milliseconds.
-  /// All JS compiled to bytecode via prepareJS, or evaluateJS, will support the
-  /// time limit monitoring.  If JS prepared in other ways is executed, care
-  /// must be taken to ensure that it is compiled in a mode that supports the
-  /// monitoring (i.e., the emitted code contains async break checks).
+  /// See compilation notes above.
   void watchTimeLimit(uint32_t timeoutInMs);
   /// Unregister this runtime for execution time limit monitoring.
   void unwatchTimeLimit();
@@ -225,12 +220,23 @@ class HERMES_EXPORT HermesRuntime : public jsi::Runtime {
   friend class HermesRuntimeImpl;
 
   friend struct ::HermesTestHelper;
-  size_t rootsListLength() const;
+  size_t rootsListLengthForTests() const;
 
   // Do not add any members here.  This ensures that there are no
   // object size inconsistencies.  All data should be in the impl
   // class in the .cpp file.
 };
+
+/// Return a RuntimeConfig that is more suited for running untrusted JS than
+/// the default config. Disables some language features and may trade off some
+/// performance for security.
+///
+/// Can serve as a starting point with tweaks to re-enable needed features:
+///   auto conf = hardenedHermesRuntimeConfig().rebuild();
+///   conf.withArrayBuffer(true);
+///   ...
+///   auto runtime = makeHermesRuntime(conf.build());
+HERMES_EXPORT ::hermes::vm::RuntimeConfig hardenedHermesRuntimeConfig();
 
 HERMES_EXPORT std::unique_ptr<HermesRuntime> makeHermesRuntime(
     const ::hermes::vm::RuntimeConfig &runtimeConfig =

@@ -24,13 +24,13 @@ class TracingRuntime : public jsi::RuntimeDecorator<jsi::Runtime> {
 
   TracingRuntime(
       std::unique_ptr<jsi::Runtime> runtime,
-      uint64_t globalID,
       const ::hermes::vm::RuntimeConfig &conf,
       std::unique_ptr<llvh::raw_ostream> traceStream);
 
-  virtual SynthTrace::ObjectID getUniqueID(const jsi::Object &o) = 0;
-  virtual SynthTrace::ObjectID getUniqueID(const jsi::String &s) = 0;
-  virtual SynthTrace::ObjectID getUniqueID(const jsi::PropNameID &pni) = 0;
+  /// Assign a new ObjectID for given jsi::Pointer.
+  SynthTrace::ObjectID defObjectID(const jsi::Pointer &p);
+  /// Get the ObjectID for given jsi::Pointer.
+  SynthTrace::ObjectID useObjectID(const jsi::Pointer &p) const;
 
   virtual void flushAndDisableTrace() = 0;
 
@@ -41,17 +41,35 @@ class TracingRuntime : public jsi::RuntimeDecorator<jsi::Runtime> {
       const std::shared_ptr<const jsi::Buffer> &buffer,
       const std::string &sourceURL) override;
 
+  void queueMicrotask(const jsi::Function &callback) override;
+  bool drainMicrotasks(int maxMicrotasksHint = -1) override;
+
+  jsi::Object global() override;
+
   jsi::Object createObject() override;
   jsi::Object createObject(std::shared_ptr<jsi::HostObject> ho) override;
 
+  // Note that the NativeState methods do not need to be traced since they
+  // cannot be observed in JS.
+
+  jsi::BigInt createBigIntFromInt64(int64_t value) override;
+  jsi::BigInt createBigIntFromUint64(uint64_t value) override;
+  jsi::String bigintToString(const jsi::BigInt &bigint, int radix) override;
+
   jsi::String createStringFromAscii(const char *str, size_t length) override;
   jsi::String createStringFromUtf8(const uint8_t *utf8, size_t length) override;
+  std::string utf8(const jsi::PropNameID &) override;
 
   jsi::PropNameID createPropNameIDFromAscii(const char *str, size_t length)
       override;
   jsi::PropNameID createPropNameIDFromUtf8(const uint8_t *utf8, size_t length)
       override;
+  std::string utf8(const jsi::String &) override;
+
+  std::string symbolToString(const jsi::Symbol &) override;
+
   jsi::PropNameID createPropNameIDFromString(const jsi::String &str) override;
+  jsi::PropNameID createPropNameIDFromSymbol(const jsi::Symbol &sym) override;
 
   jsi::Value getProperty(const jsi::Object &obj, const jsi::String &name)
       override;
@@ -63,11 +81,11 @@ class TracingRuntime : public jsi::RuntimeDecorator<jsi::Runtime> {
       override;
 
   void setPropertyValue(
-      jsi::Object &obj,
+      const jsi::Object &obj,
       const jsi::String &name,
       const jsi::Value &value) override;
   void setPropertyValue(
-      jsi::Object &obj,
+      const jsi::Object &obj,
       const jsi::PropNameID &name,
       const jsi::Value &value) override;
 
@@ -75,9 +93,11 @@ class TracingRuntime : public jsi::RuntimeDecorator<jsi::Runtime> {
 
   jsi::WeakObject createWeakObject(const jsi::Object &o) override;
 
-  jsi::Value lockWeakObject(jsi::WeakObject &wo) override;
+  jsi::Value lockWeakObject(const jsi::WeakObject &wo) override;
 
   jsi::Array createArray(size_t length) override;
+  jsi::ArrayBuffer createArrayBuffer(
+      std::shared_ptr<jsi::MutableBuffer> buffer) override;
 
   size_t size(const jsi::Array &arr) override;
   size_t size(const jsi::ArrayBuffer &buf) override;
@@ -86,8 +106,10 @@ class TracingRuntime : public jsi::RuntimeDecorator<jsi::Runtime> {
 
   jsi::Value getValueAtIndex(const jsi::Array &arr, size_t i) override;
 
-  void setValueAtIndexImpl(jsi::Array &arr, size_t i, const jsi::Value &value)
-      override;
+  void setValueAtIndexImpl(
+      const jsi::Array &arr,
+      size_t i,
+      const jsi::Value &value) override;
 
   jsi::Function createFunctionFromHostFunction(
       const jsi::PropNameID &name,
@@ -105,6 +127,9 @@ class TracingRuntime : public jsi::RuntimeDecorator<jsi::Runtime> {
       const jsi::Value *args,
       size_t count) override;
 
+  void setExternalMemoryPressure(const jsi::Object &obj, size_t amount)
+      override;
+
   /// @}
 
   void addMarker(const std::string &marker);
@@ -117,18 +142,55 @@ class TracingRuntime : public jsi::RuntimeDecorator<jsi::Runtime> {
     return trace_;
   }
 
+  void replaceNondeterministicFuncs();
+
+  // This is the number of records recorded as part of the 'preamble' of a synth
+  // trace. This means all the records after this amount are from the actual
+  // execution of the trace.
+  uint32_t getNumPreambleRecordsForTest() const {
+    assert(
+        numPreambleRecords_ > 0 &&
+        "Only call this method if the preamble has been executed");
+    return numPreambleRecords_;
+  }
+
  private:
-  SynthTrace::TraceValue toTraceValue(const jsi::Value &value);
+  SynthTrace::TraceValue defTraceValue(const jsi::Value &value) {
+    return toTraceValue(value, true);
+  }
+  SynthTrace::TraceValue useTraceValue(const jsi::Value &value) {
+    return toTraceValue(value, false);
+  }
+  SynthTrace::TraceValue toTraceValue(
+      const jsi::Value &value,
+      bool assignNewUID = false);
 
   std::vector<SynthTrace::TraceValue> argStringifyer(
       const jsi::Value *args,
-      size_t count);
+      size_t count,
+      bool assignNewUID = false);
 
   SynthTrace::TimeSinceStart getTimeSinceStart() const;
 
   std::unique_ptr<jsi::Runtime> runtime_;
   SynthTrace trace_;
+  std::deque<jsi::Function> savedFunctions;
   const SynthTrace::TimePoint startTime_{std::chrono::steady_clock::now()};
+  uint32_t numPreambleRecords_;
+
+  SynthTrace::ObjectID currentUniqueID_{0};
+
+  /// Map from PointerValue* to ObjectID. Except WeakRef case (see below), we
+  /// assign a new ObjectID whenever we see a new def of jsi::Pointer Value.
+  std::unordered_map<const jsi::Runtime::PointerValue *, SynthTrace::ObjectID>
+      uniqueIDs_;
+
+  /// WeakObject's PointerValue* to ObjectID mapping.
+  /// The key is the PointerValue of the WeakObject at the time of
+  /// it is created.
+  /// The value is newly assign ObjectID for that PointerValue.
+  std::unordered_map<const jsi::Runtime::PointerValue *, SynthTrace::ObjectID>
+      weakRefIDs_;
 };
 
 // TracingRuntime is *almost* vm independent.  This provides the
@@ -153,17 +215,7 @@ class TracingHermesRuntime final : public TracingRuntime {
       std::function<std::string()> commitAction,
       std::function<void()> rollbackAction);
 
-  ~TracingHermesRuntime();
-
-  SynthTrace::ObjectID getUniqueID(const jsi::Object &o) override {
-    return static_cast<SynthTrace::ObjectID>(hermesRuntime().getUniqueID(o));
-  }
-  SynthTrace::ObjectID getUniqueID(const jsi::String &s) override {
-    return static_cast<SynthTrace::ObjectID>(hermesRuntime().getUniqueID(s));
-  }
-  SynthTrace::ObjectID getUniqueID(const jsi::PropNameID &pni) override {
-    return static_cast<SynthTrace::ObjectID>(hermesRuntime().getUniqueID(pni));
-  }
+  ~TracingHermesRuntime() override;
 
   void flushAndDisableTrace() override;
 
@@ -182,21 +234,6 @@ class TracingHermesRuntime final : public TracingRuntime {
   }
 
  private:
-  // Why do we have a private ctor executed from the public one,
-  // instead of just having a single public ctor which calls
-  // getUniqueID() to initialize the base class?  This one weird trick
-  // is needed to avoid undefined behavior in that case.  Otherwise,
-  // when calling the base class ctor, the order of evaluating the
-  // globalID value and the side effect of moving the runtime would be
-  // unspecified.
-  TracingHermesRuntime(
-      std::unique_ptr<HermesRuntime> &runtime,
-      uint64_t globalID,
-      const ::hermes::vm::RuntimeConfig &runtimeConfig,
-      std::unique_ptr<llvh::raw_ostream> traceStream,
-      std::function<std::string()> commitAction,
-      std::function<void()> rollbackAction);
-
   void crashCallback(int fd);
 
   const ::hermes::vm::RuntimeConfig conf_;

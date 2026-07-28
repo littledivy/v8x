@@ -8,9 +8,14 @@
 #ifndef HERMES_PUBLIC_DEBUGGERTYPES_H
 #define HERMES_PUBLIC_DEBUGGERTYPES_H
 
+#include <cstdint>
 #include <string>
 #include <vector>
+#pragma GCC diagnostic push
 
+#ifdef HERMES_COMPILER_SUPPORTS_WSHORTEN_64_TO_32
+#pragma GCC diagnostic ignored "-Wshorten-64-to-32"
+#endif
 namespace hermes {
 namespace vm {
 class Debugger;
@@ -43,10 +48,10 @@ using ScriptID = uint32_t;
 /// file.
 constexpr uint32_t kInvalidLocation = ~0u;
 struct SourceLocation {
-  /// Line in the source.
+  /// Line in the source. 1 based.
   uint32_t line = kInvalidLocation;
 
-  /// Column in the source.
+  /// Column in the source. 1 based.
   uint32_t column = kInvalidLocation;
 
   /// Identifier of the source file.
@@ -115,7 +120,10 @@ enum class PauseReason {
   Breakpoint, /// A breakpoint was hit.
   StepFinish, /// A Step operation completed.
   Exception, /// An Exception was thrown.
-  AsyncTrigger, /// The Pause is the result of triggerAsyncPause().
+  AsyncTriggerImplicit, /// The Pause is the result of
+                        /// triggerAsyncPause(Implicit).
+  AsyncTriggerExplicit, /// The Pause is the result of
+                        /// triggerAsyncPause(Explicit).
   EvalComplete, /// An eval() function finished.
 };
 
