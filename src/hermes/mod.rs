@@ -89,6 +89,7 @@ pub mod aot {
 
   unsafe extern "C" {
     fn v8x_hermes_runtime_new() -> *mut c_void;
+    fn v8x_hermes_runtime_new_jit() -> *mut c_void;
     fn v8x_hermes_runtime_free(rtw: *mut c_void);
     fn v8x_hermes_is_hbc(data: *const u8, len: usize) -> c_int;
     fn v8x_hermes_eval_buffer(
@@ -116,6 +117,16 @@ pub mod aot {
     pub fn new() -> Self {
       let rtw = unsafe { v8x_hermes_runtime_new() };
       assert!(!rtw.is_null(), "v8x_hermes_runtime_new failed");
+      Rt(rtw)
+    }
+
+    /// Create a fresh HermesRuntime with the JIT config knobs enabled
+    /// (`withEnableJIT`/`withForceJIT`). Used only by the E11 benchmark to
+    /// measure JIT-on vs JIT-off; if the vendored framework lacks the JIT
+    /// codegen backend these knobs are inert and this is identical to `new`.
+    pub fn new_jit() -> Self {
+      let rtw = unsafe { v8x_hermes_runtime_new_jit() };
+      assert!(!rtw.is_null(), "v8x_hermes_runtime_new_jit failed");
       Rt(rtw)
     }
 
@@ -1211,6 +1222,301 @@ mod hermes_hbc {
     println!("hermes_hbc bench raw hbc times: {:?}", hbc_times);
 
     assert_eq!(last_source_result, last_hbc_result);
+  }
+}
+
+// E11: the honest benchmark suite. Measures, on the Hermes backend, the same
+// CPU tasks BENCHMARKS.md ran for QuickJS/V8, plus engine-level startup
+// (source vs precompiled HBC), plus a JIT-on/JIT-off comparison that
+// empirically detects whether the vendored framework actually carries a JIT
+// codegen backend. All medians over >= 20 runs. Prints machine-parseable
+// lines prefixed `E11:`. See docs/hermes-spike/experiments/E11-benchmarks.md.
+#[cfg(all(test, feature = "link_hermes"))]
+mod e11_bench {
+  use super::aot::Rt;
+  use std::io::Write;
+  use std::process::Command;
+  use std::time::{Duration, Instant};
+
+  fn hermesc_path() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/hermes/bin/hermesc")
+  }
+
+  fn compile_to_hbc(source: &str, optimize: bool) -> Vec<u8> {
+    let dir = std::env::temp_dir().join(format!(
+      "v8x-e11-hbc-{}-{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src_path = dir.join("in.js");
+    let hbc_path = dir.join("out.hbc");
+    std::fs::File::create(&src_path)
+      .unwrap()
+      .write_all(source.as_bytes())
+      .unwrap();
+    let mut cmd = Command::new(hermesc_path());
+    cmd.arg("-emit-binary");
+    if optimize {
+      cmd.arg("-O");
+    }
+    cmd.arg("-out").arg(&hbc_path).arg(&src_path);
+    let out = cmd.output().expect("failed to spawn hermesc");
+    assert!(
+      out.status.success(),
+      "hermesc failed: {}",
+      String::from_utf8_lossy(&out.stderr)
+    );
+    let hbc = std::fs::read(&hbc_path).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    hbc
+  }
+
+  fn median(mut xs: Vec<Duration>) -> Duration {
+    xs.sort();
+    xs[xs.len() / 2]
+  }
+  fn percentile(mut xs: Vec<Duration>, p: f64) -> Duration {
+    xs.sort();
+    let idx = ((xs.len() as f64) * p).ceil() as usize;
+    xs[idx.saturating_sub(1).min(xs.len() - 1)]
+  }
+  fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+  }
+
+  // --- The exact BENCHMARKS.md CPU tasks, as JS source. ---
+  // fib(32) x5, loop-sum 50M, string build 1M, json 200k obj. Each returns a
+  // stringifiable result so we can confirm the work actually ran.
+  fn task_fib() -> &'static str {
+    "(function(){\
+       function fib(n){ return n < 2 ? n : fib(n-1) + fib(n-2); }\
+       var s = 0; for (var i = 0; i < 5; i++) s += fib(32);\
+       return String(s);\
+     })()"
+  }
+  fn task_loopsum() -> &'static str {
+    "(function(){\
+       var s = 0; for (var i = 0; i < 50000000; i++) s += i;\
+       return String(s);\
+     })()"
+  }
+  fn task_stringbuild() -> &'static str {
+    "(function(){\
+       var s = ''; for (var i = 0; i < 1000000; i++) s += 'x';\
+       return String(s.length);\
+     })()"
+  }
+  fn task_json() -> &'static str {
+    "(function(){\
+       var a = []; for (var i = 0; i < 200000; i++) a.push({id:i,name:'item_'+i,v:i*2,ok:(i&1)===0});\
+       var s = JSON.stringify(a); var b = JSON.parse(s);\
+       return String(b.length);\
+     })()"
+  }
+
+  // Time N cold-runtime evals of `src` through `make_rt`, return all samples.
+  // Fresh runtime each iteration: matches BENCHMARKS.md 'single run' framing
+  // for CPU tasks (no cross-iteration warmup), which is also the fair way to
+  // compare source vs HBC and JIT vs no-JIT.
+  fn bench_cold<F: Fn() -> Rt>(make_rt: F, buf: &[u8], url: &str, iters: usize) -> (Vec<Duration>, String) {
+    let mut times = Vec::with_capacity(iters);
+    let mut last = String::new();
+    for _ in 0..iters {
+      let rt = make_rt();
+      let t0 = Instant::now();
+      last = rt.eval_buffer(buf, url).expect("eval should succeed");
+      times.push(t0.elapsed());
+      drop(rt);
+    }
+    (times, last)
+  }
+
+  const CPU_ITERS: usize = 21;
+
+  // (1) JIT reachability + (2) COMPUTE table. Runs each CPU task through a
+  // JIT-OFF runtime and a JIT-ON runtime (withEnableJIT/withForceJIT). If the
+  // framework has no JIT codegen backend, the knobs are inert and the two
+  // columns are statistically identical -> we report interpreter-only.
+  #[test]
+  fn e11_compute_and_jit() {
+    let tasks: &[(&str, &str)] = &[
+      ("fib32x5", task_fib()),
+      ("loopsum50M", task_loopsum()),
+      ("stringbuild1M", task_stringbuild()),
+      ("json200k", task_json()),
+    ];
+    println!("E11:COMPUTE iters={CPU_ITERS} (fresh runtime each, median ms)");
+    let mut max_ratio_delta = 0.0f64;
+    for (name, src) in tasks {
+      // JIT OFF (default runtime)
+      let (t_off, r_off) = bench_cold(Rt::new, src.as_bytes(), name, CPU_ITERS);
+      // JIT ON (withEnableJIT+withForceJIT)
+      let (t_on, r_on) = bench_cold(Rt::new_jit, src.as_bytes(), name, CPU_ITERS);
+      assert_eq!(r_off, r_on, "JIT on/off must compute identical result for {name}");
+      let m_off = median(t_off.clone());
+      let m_on = median(t_on.clone());
+      let ratio = ms(m_off) / ms(m_on).max(1e-9);
+      let delta = (ratio - 1.0).abs();
+      if delta > max_ratio_delta {
+        max_ratio_delta = delta;
+      }
+      println!(
+        "E11:COMPUTE task={name} jit_off_ms={:.2} jit_on_ms={:.2} on/off_ratio={:.3} result={r_off}",
+        ms(m_off), ms(m_on), ratio
+      );
+    }
+    // Honest verdict on JIT reachability: forcing the JIT on every function
+    // (ForceJIT) should visibly change fib32x5 (deep recursion, the most
+    // JIT-favorable task) if a real codegen backend exists. A <5% difference
+    // across all tasks means the knobs are inert -> interpreter-only.
+    let reachable = max_ratio_delta > 0.05;
+    println!(
+      "E11:JIT reachable={reachable} max_on_off_delta={:.1}% \
+       (withEnableJIT+withForceJIT+JITThreshold=0 vs default; \
+       >5% would indicate the codegen backend is active)",
+      max_ratio_delta * 100.0
+    );
+  }
+
+  // (2) STARTUP: engine-level boot + run a TRIVIAL program, from SOURCE vs
+  // from precompiled HBC. This is the fresh-runtime cold path (construct
+  // HermesRuntime + evaluate). Labeled engine-level; NOT full-Deno cold start.
+  #[test]
+  fn e11_startup() {
+    const ITERS: usize = 30;
+    let trivial_src = "0"; // the BENCHMARKS.md `deno eval 0` shape, engine-level
+    let hbc = compile_to_hbc(trivial_src, true);
+
+    // boot-only: construct + destroy a runtime, nothing evaluated.
+    let mut boot = Vec::with_capacity(ITERS);
+    for _ in 0..ITERS {
+      let t0 = Instant::now();
+      let rt = Rt::new();
+      boot.push(t0.elapsed());
+      drop(rt);
+    }
+    // boot + eval trivial SOURCE / HBC: the timer spans BOTH runtime
+    // construction and the eval, the honest engine-level cold path.
+    let mut t_src = Vec::with_capacity(ITERS);
+    let mut t_hbc = Vec::with_capacity(ITERS);
+    for _ in 0..ITERS {
+      let t0 = Instant::now();
+      let rt = Rt::new();
+      let _ = rt.eval_buffer(trivial_src.as_bytes(), "trivial.js").unwrap();
+      t_src.push(t0.elapsed());
+      drop(rt);
+    }
+    for _ in 0..ITERS {
+      let t0 = Instant::now();
+      let rt = Rt::new();
+      let _ = rt.eval_buffer(&hbc, "trivial.hbc").unwrap();
+      t_hbc.push(t0.elapsed());
+      drop(rt);
+    }
+
+    let m_boot = median(boot.clone());
+    let m_src = median(t_src.clone());
+    let m_hbc = median(t_hbc.clone());
+    println!(
+      "E11:STARTUP iters={ITERS} boot_only_ms={:.3} boot+src_ms={:.3} boot+hbc_ms={:.3} \
+       src_p50_ms={:.3} src_p99_ms={:.3} hbc_p50_ms={:.3} hbc_p99_ms={:.3}",
+      ms(m_boot), ms(m_src), ms(m_hbc),
+      ms(percentile(t_src.clone(), 0.50)), ms(percentile(t_src.clone(), 0.99)),
+      ms(percentile(t_hbc.clone(), 0.50)), ms(percentile(t_hbc.clone(), 0.99)),
+    );
+    println!(
+      "E11:STARTUP note: engine-level (Hermes runtime construct + eval trivial), \
+       NOT full-Deno cold start. hbc/src on a trivial program is dominated by \
+       runtime construction; the parse-free win shows on bootstrap-shaped JS \
+       (see E11:HBCBOOT)."
+    );
+  }
+
+  // (2b) The parse-free delta on a BOOTSTRAP-SHAPED chunk (the headline HBC
+  // number), measured fresh here at >= 20 iters so E11 is self-contained.
+  fn gen_bootstrap(n: usize) -> String {
+    let mut s = String::with_capacity(n * 120);
+    s.push_str("'use strict';\nvar __ns = {};\n");
+    for i in 0..n {
+      s.push_str(&format!(
+        "function __fn_{i}(a,b){{return a+b+{i};}}\n__ns.f{i}=__fn_{i};\n\
+         function __C_{i}(x){{this.x=x;this.t={i};}}\n__C_{i}.prototype.get=function(){{return this.x+this.t;}};\n\
+         __ns.o{i}={{id:{i},name:'i_{i}',n:{{a:{i},b:{i}*2}}}};\n"
+      ));
+    }
+    s.push_str("var __tot=0;\n");
+    for i in 0..n {
+      s.push_str(&format!("__tot+=new __C_{i}({i}).get();\n"));
+    }
+    s.push_str("String(__tot);\n");
+    s
+  }
+
+  // (3) HTTP per-request JS-handler cost (the honest PROXY for req/s). We do
+  // NOT have Deno.serve on Hermes, so we measure the pure-JS work a handler
+  // does per request, in a warm loop, matching the BENCHMARKS.md compute
+  // handler (fib(24)+JSON per request) and a trivial handler. This isolates
+  // the engine's per-request JS cost, which BENCHMARKS.md identifies as the
+  // ONLY place the engine choice is visible (trivial HTTP is native/hyper
+  // bound). Compared against the same handlers run through the QuickJS and V8
+  // deno binaries on this machine.
+  #[test]
+  fn e11_http_handler_cost() {
+    // Warm loop INSIDE one eval (matches how QuickJS/V8 were measured: warm,
+    // amortized, single process). Returns "rps per_req_us" as a string.
+    let trivial = "(function(){\
+       function h(i){ var body='hello world';\
+         var headers={'content-type':'text/plain','content-length':String(body.length)};\
+         return body.length + Object.keys(headers).length; }\
+       var N=1000000; for(var w=0;w<1000;w++) h(w);\
+       var t0=Date.now(); var acc=0; for(var i=0;i<N;i++) acc+=h(i);\
+       var dt=Date.now()-t0; var rps=Math.round(N/(dt/1000));\
+       return String(rps)+' '+String((dt*1000/N).toFixed(3)); })()";
+    let compute = "(function(){\
+       function fib(n){ return n<2?n:fib(n-1)+fib(n-2); }\
+       function h(i){ var v=fib(24);\
+         var obj={n:i,fib:v,ts:i*1000,items:[1,2,3,{a:i}]};\
+         var s=JSON.stringify(obj); return JSON.parse(s).fib; }\
+       var N=20000; for(var w=0;w<1000;w++) h(w);\
+       var t0=Date.now(); var acc=0; for(var i=0;i<N;i++) acc+=h(i);\
+       var dt=Date.now()-t0; var rps=Math.round(N/(dt/1000));\
+       return String(rps)+' '+String((dt*1000/N).toFixed(3)); })()";
+    let rt = Rt::new();
+    let r_trivial = rt.eval_buffer(trivial.as_bytes(), "trivial-handler.js").unwrap();
+    drop(rt);
+    let rt = Rt::new();
+    let r_compute = rt.eval_buffer(compute.as_bytes(), "compute-handler.js").unwrap();
+    println!(
+      "E11:HANDLER trivial pure_js_rps={} (rps per_req_us) — warm loop, interpreter",
+      r_trivial
+    );
+    println!(
+      "E11:HANDLER compute_fib24_json pure_js_rps={} (rps per_req_us) — warm loop, interpreter",
+      r_compute
+    );
+  }
+
+  #[test]
+  fn e11_hbc_boot_win() {
+    const N: usize = 4000;
+    const ITERS: usize = 21;
+    let source = gen_bootstrap(N);
+    let hbc = compile_to_hbc(&source, true);
+    let (t_src, r_src) = bench_cold(Rt::new, source.as_bytes(), "boot-src.js", ITERS);
+    let (t_hbc, r_hbc) = bench_cold(Rt::new, &hbc, "boot.hbc", ITERS);
+    assert_eq!(r_src, r_hbc);
+    let m_src = median(t_src);
+    let m_hbc = median(t_hbc);
+    println!(
+      "E11:HBCBOOT defs={N} iters={ITERS} src_median_ms={:.2} hbc_median_ms={:.2} \
+       speedup={:.1}x src_bytes={} hbc_bytes={} hbc/src_size={:.2}x",
+      ms(m_src), ms(m_hbc), ms(m_src) / ms(m_hbc).max(1e-9),
+      source.len(), hbc.len(), hbc.len() as f64 / source.len() as f64
+    );
   }
 }
 

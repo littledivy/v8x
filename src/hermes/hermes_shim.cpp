@@ -319,6 +319,33 @@ void *v8x_hermes_runtime_new() {
   }
 }
 
+// E11 benchmark harness only. Identical to v8x_hermes_runtime_new but flips
+// the RuntimeConfig JIT knobs on: withEnableJIT(true) turns the JIT on,
+// withForceJIT(true) forces every function to be JIT-compiled on first call
+// (bypassing the call-count warmup threshold), and a JITThreshold of 0 makes
+// tiered warmup immediate for any path that still consults it. This exists to
+// empirically answer "is the JIT reachable through our JSI embedding?" — if
+// the vendored framework was built without the JIT codegen backend
+// (HERMESVM_JIT off), these knobs are silently inert and the runtime stays
+// interpreter-only; the bench compares the two runtimes to detect that.
+void *v8x_hermes_runtime_new_jit() {
+  try {
+    auto *w = new RuntimeWrapper();
+    auto gc = ::hermes::vm::GCConfig::Builder().withName("v8x-hermes-jit").build();
+    auto cfg = ::hermes::vm::RuntimeConfig::Builder()
+                   .withGCConfig(gc)
+                   .withMicrotaskQueue(true)
+                   .withEnableJIT(true)
+                   .withForceJIT(true)
+                   .withJITThreshold(0)
+                   .build();
+    w->rt = facebook::hermes::makeHermesRuntime(cfg);
+    return static_cast<void *>(w);
+  } catch (...) {
+    return nullptr;
+  }
+}
+
 // Destroy the wrapper. Clears the handle table (Values) BEFORE the Runtime,
 // because ~RuntimeWrapper destroys members in reverse declaration order (rt
 // first would violate the lifetime rule), so we clear explicitly here to be
