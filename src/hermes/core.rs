@@ -1100,6 +1100,152 @@ fn read_string(rtw: *mut c_void, slot: i64) -> Option<String> {
 
 // ---- Script ----------------------------------------------------------------
 
+/// WORKAROUND for a Hermes compiler gap (D7): Hermes rejects the async
+/// generator FUNCTION syntax (`async function* () {}`) at parse time
+/// ("async generators are unsupported"). Hermes DOES support generators, async
+/// functions and `for await`; only the `async function*` combinator is missing.
+///
+/// deno_core's `ext:core/00_primordials.js` contains exactly one such literal
+/// (line ~285): `Reflect.getPrototypeOf(async function* () {})`, used only to
+/// capture the `%AsyncGenerator%` intrinsic prototype for the primordials table.
+/// It never actually drives an async generator; it only reflects on the shape.
+///
+/// This is NOT a real async-generator implementation. It is a source rewrite
+/// that replaces the `async function* () {}` expression with a plain expression
+/// yielding a synthesized object graph whose prototype chain matches the shape
+/// V8 exposes, so `Reflect.getPrototypeOf(...)` (and the subsequent
+/// `.prototype`, `.next`/`.return`/`.throw`, `Symbol.asyncIterator` reads in
+/// primordials) return usable stand-ins. An actual `async function*` call would
+/// still be unsupported by Hermes; this only satisfies reflection at bootstrap.
+///
+/// V8 shape being modeled (names as primordials uses them):
+///   asyncGenFn                                 (an `async function*`)
+///   Reflect.getPrototypeOf(asyncGenFn)      == %AsyncGenerator%
+///                                              (== AsyncGeneratorFunction.prototype)
+///   %AsyncGenerator%.prototype              == %AsyncGeneratorPrototype%
+///     .next / .return / .throw               (function stubs)
+///     [Symbol.asyncIterator]                 (returns `this`)
+///
+/// The rewrite only fires when the literal is textually present, so scripts
+/// without it pay nothing and are returned unchanged.
+pub(super) fn rewrite_async_generator_literal(src: &str) -> Option<String> {
+  // Fast bail: only touch sources that contain the unsupported combinator.
+  if !src.contains("async function*") {
+    return None;
+  }
+
+  // A once-per-script IIFE that builds a synthetic %AsyncGenerator% function
+  // object with the V8 prototype shape, exposed on a fresh unique global so the
+  // rewritten literal can reference it. Kept side-effect-local (a single
+  // property on globalThis) and idempotent.
+  const SYNTH_PROLOGUE: &str = "\
+;(function(){ if (globalThis.__v8x_synthAsyncGen) return; \
+var proto = {}; \
+var makeStub = function(){ return function(){ \
+  return Promise.resolve({ value: undefined, done: true }); }; }; \
+proto.next = makeStub(); proto.return = makeStub(); proto.throw = makeStub(); \
+proto[Symbol.asyncIterator] = function(){ return this; }; \
+var asyncGenerator = Object.create(Object.prototype); \
+Object.defineProperty(asyncGenerator, 'prototype', \
+  { value: proto, writable: false, enumerable: false, configurable: false }); \
+var fn = function(){ return Object.create(proto); }; \
+Object.setPrototypeOf(fn, asyncGenerator); \
+globalThis.__v8x_synthAsyncGen = fn; })();\n";
+
+  // Replace every `async function* (...) { ... }` occurrence with a reference to
+  // the synthetic function. Because Hermes cannot parse the literal at all, the
+  // replacement must remove the whole expression, not keep its (empty) body.
+  let mut out = String::with_capacity(src.len() + SYNTH_PROLOGUE.len());
+  out.push_str(SYNTH_PROLOGUE);
+
+  let mut rest = src;
+  while let Some(pos) = rest.find("async function*") {
+    out.push_str(&rest[..pos]);
+    // Skip the header up to the parameter list `(`, then the balanced `(...)`,
+    // then the balanced `{...}` body. This spans the whole literal so the
+    // Hermes parser never sees `async function*`.
+    let after = &rest[pos + "async function*".len()..];
+    let consumed = span_async_generator_body(after);
+    match consumed {
+      Some(n) => {
+        out.push_str("(globalThis.__v8x_synthAsyncGen)");
+        rest = &after[n..];
+      }
+      None => {
+        // Could not find a balanced body; leave the remainder untouched so we
+        // do not corrupt the source. Hermes will still reject it, surfacing the
+        // original error honestly rather than a silent miscompile.
+        out.push_str("async function*");
+        rest = after;
+      }
+    }
+  }
+  out.push_str(rest);
+  Some(out)
+}
+
+/// Given the text immediately AFTER `async function*`, return the byte length
+/// (relative to that text) spanning an optional name, the `(...)` param list,
+/// and the `{...}` body, so the caller can drop the whole function literal.
+/// Returns None if a balanced `(` and `{` pair is not found.
+fn span_async_generator_body(after: &str) -> Option<usize> {
+  let bytes = after.as_bytes();
+  let mut i = 0usize;
+  // Skip whitespace and an optional generator name up to the param `(`.
+  while i < bytes.len() && bytes[i] != b'(' {
+    i += 1;
+  }
+  if i >= bytes.len() {
+    return None;
+  }
+  // Balance the parameter list `(...)`.
+  let mut depth = 0i32;
+  loop {
+    if i >= bytes.len() {
+      return None;
+    }
+    match bytes[i] {
+      b'(' => depth += 1,
+      b')' => {
+        depth -= 1;
+        if depth == 0 {
+          i += 1;
+          break;
+        }
+      }
+      _ => {}
+    }
+    i += 1;
+  }
+  // Skip whitespace to the body `{`.
+  while i < bytes.len() && bytes[i] != b'{' {
+    i += 1;
+  }
+  if i >= bytes.len() {
+    return None;
+  }
+  // Balance the body `{...}`.
+  depth = 0;
+  loop {
+    if i >= bytes.len() {
+      return None;
+    }
+    match bytes[i] {
+      b'{' => depth += 1,
+      b'}' => {
+        depth -= 1;
+        if depth == 0 {
+          i += 1;
+          break;
+        }
+      }
+      _ => {}
+    }
+    i += 1;
+  }
+  Some(i)
+}
+
 /// A compiled script handle. Because Hermes compiles-and-runs in one JSI call,
 /// "compile" just remembers the source-string slot; "run" evaluates it. The
 /// Script handle reuses the source-string slot's tagged pointer.
@@ -1112,15 +1258,26 @@ pub extern "C" fn v8__Script__Compile(
   if context.is_null() || source.is_null() {
     return ptr::null();
   }
-  // Under `--use_strict` (V8 makes every top-level script strict), prepend a
-  // `"use strict";` directive by re-interning the source. Otherwise the source
-  // string is already a slot, carried directly as the Script handle.
-  if USE_STRICT.load(Ordering::Relaxed) {
-    let isolate = context as *mut RealIsolate;
-    let rtw = iso_state(isolate).rtw;
-    if let Some(src) = read_string(rtw, slot_of(source)) {
-      let strict = format!("\"use strict\";\n{src}");
-      let new_src = intern_string_utf8(isolate, strict.as_bytes());
+  let isolate = context as *mut RealIsolate;
+  let rtw = iso_state(isolate).rtw;
+  let use_strict = USE_STRICT.load(Ordering::Relaxed);
+
+  // Read the source once if we might need to rewrite it (strict prefix and/or
+  // the D7 async-generator workaround). Otherwise carry the slot unchanged.
+  if let Some(src) = read_string(rtw, slot_of(source)) {
+    // D7: rewrite the one unsupported `async function*` literal deno_core's
+    // primordials capture into a synthetic %AsyncGenerator% shape so Hermes can
+    // parse the script. See `rewrite_async_generator_literal`.
+    let rewritten = rewrite_async_generator_literal(&src);
+    let needs_reintern = use_strict || rewritten.is_some();
+    if needs_reintern {
+      let body = rewritten.unwrap_or(src);
+      let final_src = if use_strict {
+        format!("\"use strict\";\n{body}")
+      } else {
+        body
+      };
+      let new_src = intern_string_utf8(isolate, final_src.as_bytes());
       if !new_src.is_null() {
         return new_src as *const Script;
       }

@@ -1299,4 +1299,48 @@ mod hermes_boot_probe {
       "extras binding object identity is not stable across calls"
     );
   }
+
+  /// Stage 4 (D7): the async-generator primordials capture. deno_core's
+  /// `ext:core/00_primordials.js` (line ~285) reflects on
+  /// `Reflect.getPrototypeOf(async function* () {})` to pin the
+  /// `%AsyncGenerator%` intrinsic. Hermes cannot PARSE `async function*`, so the
+  /// backend rewrites that one literal into a synthetic prototype shape (see
+  /// `rewrite_async_generator_literal`). This probe reproduces the exact
+  /// primordials reads: the literal must compile, and the reflected shape must
+  /// expose `.prototype`, `.prototype.next`, and `[Symbol.asyncIterator]`.
+  ///
+  /// This is a WORKAROUND for a Hermes compiler gap, not a real async-generator
+  /// implementation. The probe asserts reflection works, not that iterating an
+  /// async generator works (Hermes cannot do the latter).
+  #[test]
+  fn boot_async_generator_primordials_capture() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // Mirror the primordials capture: grab %AsyncGenerator% and probe its shape.
+    let src = v8::String::new(
+      scope,
+      "const AsyncGenerator = Reflect.getPrototypeOf(async function* () {}); \
+       const proto = AsyncGenerator.prototype; \
+       const hasNext = typeof proto.next === 'function'; \
+       const hasReturn = typeof proto.return === 'function'; \
+       const hasThrow = typeof proto.throw === 'function'; \
+       const hasAsyncIter = typeof proto[Symbol.asyncIterator] === 'function'; \
+       (hasNext && hasReturn && hasThrow && hasAsyncIter) ? 'ok' : 'bad';",
+    )
+    .unwrap();
+    let script = v8::Script::compile(scope, src, None)
+      .expect("async function* literal should compile after the D7 rewrite");
+    let result = script
+      .run(scope)
+      .expect("async-generator capture script should run");
+    assert_eq!(
+      result.to_rust_string_lossy(scope),
+      "ok",
+      "synthetic %AsyncGenerator% shape is missing next/return/throw/asyncIterator"
+    );
+  }
 }
