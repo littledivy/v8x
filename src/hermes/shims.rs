@@ -258,8 +258,6 @@ pub extern "C" fn v8__Isolate__ClearKeptObjects() -> *const ::std::ffi::c_void {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__DateTimeConfigurationChangeNotification() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Isolate__EnqueueMicrotask() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetCppHeap() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetCurrentHostDefinedOptions() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -383,18 +381,6 @@ pub extern "C" fn v8__Message__GetWasmFunctionIndex() -> *const ::std::ffi::c_vo
 pub extern "C" fn v8__Message__IsOpaque() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Message__IsSharedCrossOrigin() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__MicrotaskQueue__DESTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__MicrotaskQueue__EnqueueMicrotask() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__MicrotaskQueue__GetMicrotasksScopeDepth() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__MicrotaskQueue__IsRunningMicrotasks() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__MicrotaskQueue__New() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__MicrotaskQueue__PerformCheckpoint() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__MINOR_VERSION() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -537,28 +523,6 @@ pub extern "C" fn v8__Private__ForApi() -> *const ::std::ffi::c_void { ::std::pt
 pub extern "C" fn v8__Private__Name() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Private__New() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Promise__Catch() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Promise__HasHandler() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Promise__MarkAsHandled() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Promise__Resolver__GetPromise() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Promise__Resolver__New() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Promise__Resolver__Reject() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Promise__Resolver__Resolve() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Promise__Result() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Promise__State() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Promise__Then() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Promise__Then2() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__PromiseRejectMessage__GetEvent() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]

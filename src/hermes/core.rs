@@ -38,8 +38,9 @@ use crate::support::{MaybeBool, SharedPtrBase};
 use crate::{
   Allocator, Array, ArrayBuffer, Boolean, Context, Data, External, Function,
   FunctionCallback, FunctionCallbackInfo, FunctionTemplate, Integer, Message,
-  Name, Number, Object, ObjectTemplate, Platform, Primitive, RealIsolate,
-  Script, String as V8String, Template, UniquePtr, Value,
+  MicrotaskQueue, Name, Number, Object, ObjectTemplate, Platform, Primitive,
+  Promise, PromiseResolver, PromiseState, RealIsolate, Script,
+  String as V8String, Template, UniquePtr, Value,
 };
 use std::cell::Cell;
 use std::os::raw::{c_char, c_int, c_void};
@@ -241,6 +242,46 @@ unsafe extern "C" {
     setter_fn_slot: i64,
     attr: c_int,
   ) -> c_int;
+
+  // D1: Promises + microtask queue. See
+  // docs/hermes-spike/experiments/D1-hermes-promises.md.
+  fn v8x_hermes_promise_resolver_new(rtw: *mut c_void) -> i64;
+  fn v8x_hermes_promise_resolver_get_promise(
+    rtw: *mut c_void,
+    resolver_slot: i64,
+  ) -> i64;
+  fn v8x_hermes_promise_resolver_resolve(
+    rtw: *mut c_void,
+    resolver_slot: i64,
+    value_slot: i64,
+  ) -> c_int;
+  fn v8x_hermes_promise_resolver_reject(
+    rtw: *mut c_void,
+    resolver_slot: i64,
+    value_slot: i64,
+  ) -> c_int;
+  fn v8x_hermes_promise_state(rtw: *mut c_void, promise_slot: i64) -> c_int;
+  fn v8x_hermes_promise_result(rtw: *mut c_void, promise_slot: i64) -> i64;
+  fn v8x_hermes_promise_then(
+    rtw: *mut c_void,
+    promise_slot: i64,
+    handler_slot: i64,
+  ) -> i64;
+  fn v8x_hermes_promise_catch(
+    rtw: *mut c_void,
+    promise_slot: i64,
+    handler_slot: i64,
+  ) -> i64;
+  fn v8x_hermes_promise_then2(
+    rtw: *mut c_void,
+    promise_slot: i64,
+    on_fulfilled_slot: i64,
+    on_rejected_slot: i64,
+  ) -> i64;
+  fn v8x_hermes_promise_has_handler(rtw: *mut c_void, promise_slot: i64) -> c_int;
+  fn v8x_hermes_promise_mark_handled(rtw: *mut c_void, promise_slot: i64);
+  fn v8x_hermes_enqueue_microtask(rtw: *mut c_void, fn_slot: i64) -> c_int;
+  fn v8x_hermes_drain_microtasks(rtw: *mut c_void) -> c_int;
 }
 
 /// The C++ null-slot sentinel (must match `V8X_HERMES_NULL_SLOT` in the shim).
@@ -1924,6 +1965,300 @@ pub extern "C" fn v8__Function__Call(
     return ptr::null();
   }
   slot_ptr::<Value>(out)
+}
+
+// ---- D1: Promises + microtask queue ----------------------------------------
+//
+// Hermes has native JS Promises but JSI exposes no Promise API and no
+// [[PromiseState]] accessor, so these route through a cached JS helper on the
+// C++ side (hermes_shim.cpp's promise infra). A v8 `PromiseResolver` is a
+// handle to the `[promise, resolve, reject]` array that helper returns; a
+// `Promise` handle is the array's element 0. State/result are recorded into a
+// closure-captured WeakMap by a `.then` the helper attaches, so settlement is
+// only observable AFTER a microtask drain, matching v8 semantics. See
+// docs/hermes-spike/experiments/D1-hermes-promises.md.
+
+/// `Promise::Resolver::New`: create a pending promise plus its resolve/reject.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Promise__Resolver__New(
+  context: *const Context,
+) -> *const PromiseResolver {
+  if context.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let out = unsafe { v8x_hermes_promise_resolver_new(rtw) };
+  slot_ptr::<PromiseResolver>(out)
+}
+
+/// `Promise::Resolver::GetPromise`: the resolver's associated promise.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Promise__Resolver__GetPromise(
+  this: *const PromiseResolver,
+) -> *const Promise {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let out = unsafe { v8x_hermes_promise_resolver_get_promise(rtw, slot_of(this)) };
+  slot_ptr::<Promise>(out)
+}
+
+/// `Promise::Resolver::Resolve`: settle the promise fulfilled with `value`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Promise__Resolver__Resolve(
+  this: *const PromiseResolver,
+  context: *const Context,
+  value: *const Value,
+) -> MaybeBool {
+  if this.is_null() || context.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let ok = unsafe {
+    v8x_hermes_promise_resolver_resolve(rtw, slot_of(this), slot_of(value))
+  };
+  if ok != 0 {
+    MaybeBool::JustTrue
+  } else {
+    MaybeBool::Nothing
+  }
+}
+
+/// `Promise::Resolver::Reject`: settle the promise rejected with `value`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Promise__Resolver__Reject(
+  this: *const PromiseResolver,
+  context: *const Context,
+  value: *const Value,
+) -> MaybeBool {
+  if this.is_null() || context.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let ok = unsafe {
+    v8x_hermes_promise_resolver_reject(rtw, slot_of(this), slot_of(value))
+  };
+  if ok != 0 {
+    MaybeBool::JustTrue
+  } else {
+    MaybeBool::Nothing
+  }
+}
+
+/// `Promise::State`: pending / fulfilled / rejected (observable after a drain).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Promise__State(this: *const Promise) -> PromiseState {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return PromiseState::Pending;
+  }
+  match unsafe { v8x_hermes_promise_state(rtw, slot_of(this)) } {
+    1 => PromiseState::Fulfilled,
+    2 => PromiseState::Rejected,
+    _ => PromiseState::Pending,
+  }
+}
+
+/// `Promise::Result`: the settled `[[PromiseResult]]` value.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Promise__Result(this: *const Promise) -> *const Value {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let out = unsafe { v8x_hermes_promise_result(rtw, slot_of(this)) };
+  slot_ptr::<Value>(out)
+}
+
+/// `Promise::HasHandler`: whether a reaction is attached.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Promise__HasHandler(this: *const Promise) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_promise_has_handler(rtw, slot_of(this)) != 0 }
+}
+
+/// `Promise::MarkAsHandled`: suppress unhandled-rejection reporting by marking
+/// the promise handled (the same flag `HasHandler` reads).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Promise__MarkAsHandled(this: *const Promise) {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return;
+  }
+  unsafe { v8x_hermes_promise_mark_handled(rtw, slot_of(this)) };
+}
+
+/// `Promise::Then`: `promise.then(handler)`, returning the derived promise.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Promise__Then(
+  this: *const Promise,
+  context: *const Context,
+  handler: *const Function,
+) -> *const Promise {
+  if this.is_null() || context.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let out = unsafe {
+    v8x_hermes_promise_then(rtw, slot_of(this), slot_of(handler))
+  };
+  slot_ptr::<Promise>(out)
+}
+
+/// `Promise::Catch`: `promise.catch(handler)`, returning the derived promise.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Promise__Catch(
+  this: *const Promise,
+  context: *const Context,
+  handler: *const Function,
+) -> *const Promise {
+  if this.is_null() || context.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let out = unsafe {
+    v8x_hermes_promise_catch(rtw, slot_of(this), slot_of(handler))
+  };
+  slot_ptr::<Promise>(out)
+}
+
+/// `Promise::Then2`: `promise.then(onFulfilled, onRejected)`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Promise__Then2(
+  this: *const Promise,
+  context: *const Context,
+  on_fulfilled: *const Function,
+  on_rejected: *const Function,
+) -> *const Promise {
+  if this.is_null() || context.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  let out = unsafe {
+    v8x_hermes_promise_then2(
+      rtw,
+      slot_of(this),
+      slot_of(on_fulfilled),
+      slot_of(on_rejected),
+    )
+  };
+  slot_ptr::<Promise>(out)
+}
+
+/// `Isolate::EnqueueMicrotask`: schedule `function` to run at the next
+/// checkpoint.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__EnqueueMicrotask(
+  isolate: *mut RealIsolate,
+  function: *const Function,
+) {
+  if isolate.is_null() || function.is_null() {
+    return;
+  }
+  let rtw = iso_state(isolate).rtw;
+  unsafe {
+    v8x_hermes_enqueue_microtask(rtw, slot_of(function));
+  }
+}
+
+// ---- MicrotaskQueue object API ---------------------------------------------
+//
+// deno_core can drive microtasks through an explicit `MicrotaskQueue` object
+// (Context::New(queue) / Context::get_microtask_queue) as well as through the
+// isolate. Hermes has one shared job queue per runtime (the setImmediate FIFO
+// the promise infra installs), so a `MicrotaskQueue` handle is just a small
+// heap marker: enqueue/checkpoint on it route to that same shared queue. This
+// gives a real, non-null, round-trippable pointer (the identity check in
+// `microtask_queue_new`) and working enqueue+drain, without a second queue.
+
+/// Backing object for a `MicrotaskQueue` handle. Boxed; its address is the
+/// `*mut MicrotaskQueue` the vendored surface passes around.
+struct MtqState {
+  /// Whether a drain is currently running (IsRunningMicrotasks).
+  running: Cell<bool>,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__MicrotaskQueue__New(
+  _isolate: *mut RealIsolate,
+  _policy: crate::MicrotasksPolicy,
+) -> *mut MicrotaskQueue {
+  let boxed = Box::new(MtqState {
+    running: Cell::new(false),
+  });
+  Box::into_raw(boxed) as *mut MicrotaskQueue
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__MicrotaskQueue__DESTRUCT(queue: *mut MicrotaskQueue) {
+  if queue.is_null() {
+    return;
+  }
+  // SAFETY: queue was produced by `New` (a Box<MtqState>::into_raw).
+  drop(unsafe { Box::from_raw(queue as *mut MtqState) });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__MicrotaskQueue__EnqueueMicrotask(
+  isolate: *mut RealIsolate,
+  _queue: *const MicrotaskQueue,
+  microtask: *const Function,
+) {
+  if isolate.is_null() || microtask.is_null() {
+    return;
+  }
+  let rtw = iso_state(isolate).rtw;
+  unsafe {
+    v8x_hermes_enqueue_microtask(rtw, slot_of(microtask));
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__MicrotaskQueue__PerformCheckpoint(
+  isolate: *mut RealIsolate,
+  queue: *const MicrotaskQueue,
+) {
+  if isolate.is_null() {
+    return;
+  }
+  let mtq = if queue.is_null() {
+    None
+  } else {
+    // SAFETY: queue was produced by `New`.
+    Some(unsafe { &*(queue as *const MtqState) })
+  };
+  if let Some(m) = mtq {
+    m.running.set(true);
+  }
+  let rtw = iso_state(isolate).rtw;
+  unsafe {
+    v8x_hermes_drain_microtasks(rtw);
+  }
+  if let Some(m) = mtq {
+    m.running.set(false);
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__MicrotaskQueue__IsRunningMicrotasks(
+  queue: *const MicrotaskQueue,
+) -> bool {
+  if queue.is_null() {
+    return false;
+  }
+  // SAFETY: queue was produced by `New`.
+  unsafe { &*(queue as *const MtqState) }.running.get()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__MicrotaskQueue__GetMicrotasksScopeDepth(
+  _queue: *const MicrotaskQueue,
+) -> c_int {
+  0
 }
 
 // ---- C10: native function callbacks ----------------------------------------
@@ -3693,16 +4028,21 @@ pub extern "C" fn v8__V8__SetFlagsFromString(
   }
 }
 
-/// `Isolate::perform_microtask_checkpoint`: drain the JS microtask queue.
-/// Hermes runs microtasks (promise jobs) as part of `evaluateJavaScript` and
-/// exposes no separate embedder drain entry point through JSI, so for the
-/// current surface this is a no-op: the tests that call it (the `slots`
-/// layer1/layer2 Deno-pattern tests) only use it to prove `Isolate` methods
-/// are reachable via `Deref`, not to observe queued microtasks.
+/// `Isolate::perform_microtask_checkpoint`: drain the JS microtask/job queue,
+/// running all pending promise reactions and enqueued microtasks. Routes to
+/// Hermes's `jsi::Runtime::drainMicrotasks` (D1). A throwing microtask is
+/// swallowed at the C++ boundary, never unwinding across the C ABI.
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__PerformMicrotaskCheckpoint(
-  _isolate: *mut RealIsolate,
+  isolate: *mut RealIsolate,
 ) {
+  if isolate.is_null() {
+    return;
+  }
+  let rtw = iso_state(isolate).rtw;
+  unsafe {
+    v8x_hermes_drain_microtasks(rtw);
+  }
 }
 
 #[unsafe(no_mangle)]

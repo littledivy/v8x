@@ -103,6 +103,24 @@ struct RuntimeWrapper {
   // the hidden template-id stamp back needs a small JS helper: `(obj, sym) =>
   // obj[sym]`.
   std::unique_ptr<jsi::Value> get_symbol_property_fn;
+  // D1: lazily-created per-runtime Promise infra. Hermes has native JS
+  // Promises but JSI exposes no Promise API and no [[PromiseState]] accessor,
+  // so a small cached JS helper object drives promise creation and state
+  // tracking (see ensure_promise_infra below). Holds:
+  //   makeResolver() -> [promise, resolve, reject]  (state-tracked promise)
+  //   track(promise) -> promise                     (attach a state recorder)
+  //   getState(promise) -> 0|1|2                    (pending/fulfilled/rejected)
+  //   getResult(promise) -> settled value or undefined
+  //   enqueue(fn)                                   (queue a microtask)
+  // State + result live in a closure-captured WeakMap, invisible to JS.
+  std::unique_ptr<jsi::Value> promise_make_resolver_fn;
+  std::unique_ptr<jsi::Value> promise_track_fn;
+  std::unique_ptr<jsi::Value> promise_get_state_fn;
+  std::unique_ptr<jsi::Value> promise_get_result_fn;
+  std::unique_ptr<jsi::Value> promise_enqueue_fn;
+  std::unique_ptr<jsi::Value> promise_drain_jobs_fn;
+  std::unique_ptr<jsi::Value> promise_mark_handled_fn;
+  std::unique_ptr<jsi::Value> promise_has_handler_fn;
   // C9: the TryCatch scope stack. back() is the innermost live scope.
   std::vector<TryCatchFrame> tc_stack;
   // C10: pending exception left by a native FunctionCallback that threw (via
@@ -2436,6 +2454,460 @@ v8x_hermes_slot v8x_hermes_function_new(void *rtw, uintptr_t callback_bits,
     return w->push(jsi::Value(std::move(fn)));
   } catch (...) {
     return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// ---- D1: Promises + microtask queue ---------------------------------------
+//
+// Hermes runs real ES6 Promises, but JSI exposes no Promise C++ API and no
+// way to read [[PromiseState]]/[[PromiseResult]]. So promise creation and
+// state tracking are driven through a single cached JS helper object, built
+// once per runtime. The helper keeps promise state + result in a
+// closure-captured WeakMap (keyed by the promise object), so it is invisible
+// to ordinary JS (no property is added to the promise). A promise's recorded
+// state only becomes observable AFTER its reaction runs, i.e. after a
+// microtask drain - which is exactly the v8 semantics the probe/tests expect.
+//
+// See docs/hermes-spike/experiments/D1-hermes-promises.md.
+
+static bool ensure_promise_infra(RuntimeWrapper *w) {
+  if (w->promise_make_resolver_fn && w->promise_track_fn &&
+      w->promise_get_state_fn && w->promise_get_result_fn &&
+      w->promise_enqueue_fn && w->promise_drain_jobs_fn &&
+      w->promise_mark_handled_fn && w->promise_has_handler_fn) {
+    return true;
+  }
+  try {
+    // Hermes ships an internal Promise polyfill (InternalBytecode) that
+    // schedules its reaction jobs through a GLOBAL `setImmediate`, which the
+    // bare JSI global does NOT provide (this Hermes build has no native
+    // microtask queue config). So the very first thing the infra does is
+    // install a `setImmediate` backed by our own FIFO job queue, plus a
+    // `drainJobs()` that runs that queue to completion. `drainJobs` is what
+    // v8x_hermes_drain_microtasks calls to actually run promise reactions and
+    // enqueued microtasks. Without this, resolve/then throw
+    // "Property 'setImmediate' doesn't exist".
+    //
+    // The IIFE returns [makeResolver, record, getState, getResult, enqueue,
+    // drainJobs] sharing one WeakMap for promise state.
+    jsi::Value setup = w->runtime().evaluateJavaScript(
+        std::make_unique<jsi::StringBuffer>(
+            "(function () {"
+            "  var jobs = [];"
+            // Hermes's Promise polyfill calls setImmediate(fn) to defer a
+            // reaction; queue it. clearImmediate is a no-op stub (we never
+            // cancel). Both are installed globally so InternalBytecode finds
+            // them.
+            "  globalThis.setImmediate = function (fn) {"
+            "    jobs.push(fn); return jobs.length;"
+            "  };"
+            "  globalThis.clearImmediate = function () {};"
+            "  function drainJobs() {"
+            // Run queued jobs to completion. A job may enqueue more jobs
+            // (chained .then), so loop until empty, with a large cap so a
+            // pathological re-enqueue cannot hang. A throwing job is swallowed
+            // (matches V8 discarding an exceptional promise job with no
+            // handler) and draining continues.
+            "    var n = 0;"
+            "    while (jobs.length && n < 1000000) {"
+            "      var fn = jobs.shift(); n++;"
+            "      try { fn(); } catch (e) {}"
+            "    }"
+            "  }"
+            "  var m = new WeakMap();"
+            // Tracks which promises the USER attached a handler to (via our
+            // then/catch/then2 wrappers). Our internal state-recorder .then
+            // does NOT go through those, so it never marks a promise handled -
+            // matching V8, where Promise::HasHandler is false until the
+            // embedder/user attaches a reaction.
+            "  var handled = new WeakSet();"
+            "  function markHandled(p) { handled.add(p); }"
+            "  function hasHandler(p) { return handled.has(p); }"
+            // Synchronous state recorder: V8's Promise::State reflects a
+            // settled promise IMMEDIATELY after Resolve/Reject (before any
+            // reaction runs). So record state the moment resolve/reject is
+            // called, guarding against a double-settle (only the first wins,
+            // matching a real promise). A separate async .then also records,
+            // to cover promises settled by ordinary JS (not via our resolver)
+            // once they are drained.
+            "  function setOnce(p, state, result) {"
+            "    if (!m.has(p)) m.set(p, { state: state, result: result });"
+            "  }"
+            "  function record(p) {"
+            "    p.then("
+            "      function (v) { setOnce(p, 1, v); },"
+            "      function (e) { setOnce(p, 2, e); }"
+            "    );"
+            "    return p;"
+            "  }"
+            "  function makeResolver() {"
+            "    var res, rej;"
+            "    var p = new Promise(function (a, b) { res = a; rej = b; });"
+            "    var resolve = function (v) { setOnce(p, 1, v); res(v); };"
+            "    var reject = function (e) { setOnce(p, 2, e); rej(e); };"
+            "    record(p);"
+            "    return [p, resolve, reject];"
+            "  }"
+            "  function getState(p) {"
+            "    var e = m.get(p);"
+            "    return e ? e.state : 0;"
+            "  }"
+            "  function getResult(p) {"
+            "    var e = m.get(p);"
+            "    return e ? e.result : undefined;"
+            "  }"
+            "  function enqueue(fn) {"
+            "    jobs.push(fn);"
+            "  }"
+            "  return [makeResolver, record, getState, getResult, enqueue,"
+            "          drainJobs, markHandled, hasHandler];"
+            "})()"),
+        "v8x-promise-setup.js");
+    jsi::Array arr = setup.getObject(w->runtime()).asArray(w->runtime());
+    w->promise_make_resolver_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 0));
+    w->promise_track_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 1));
+    w->promise_get_state_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 2));
+    w->promise_get_result_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 3));
+    w->promise_enqueue_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 4));
+    w->promise_drain_jobs_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 5));
+    w->promise_mark_handled_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 6));
+    w->promise_has_handler_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 7));
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+// v8__Promise__Resolver__New: create a Promise capturing its resolve/reject.
+// A v8 Resolver is modelled as the 3-element JS array [promise, resolve,
+// reject] the helper returns; its slot is the resolver handle. GetPromise/
+// Resolve/Reject index into that array.
+v8x_hermes_slot v8x_hermes_promise_resolver_new(void *rtw) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    if (!ensure_promise_infra(w)) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Function make =
+        w->promise_make_resolver_fn->getObject(w->runtime())
+            .getFunction(w->runtime());
+    jsi::Value triple = make.call(w->runtime());
+    return w->push(std::move(triple));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// v8__Promise__Resolver__GetPromise: element 0 of the [promise, res, rej]
+// array.
+v8x_hermes_slot v8x_hermes_promise_resolver_get_promise(
+    void *rtw, v8x_hermes_slot resolver_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *rv = slot_ref(w, resolver_slot);
+  if (rv == nullptr || !rv->isObject()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    jsi::Array arr = rv->getObject(w->runtime()).asArray(w->runtime());
+    jsi::Value p = arr.getValueAtIndex(w->runtime(), 0);
+    return w->push(std::move(p));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// Shared resolve/reject: call element `idx` (1=resolve, 2=reject) of the
+// resolver array with the given value. Returns 1 on success, 0 on error.
+static int promise_settle(RuntimeWrapper *w, v8x_hermes_slot resolver_slot,
+                          v8x_hermes_slot value_slot, size_t idx) {
+  const jsi::Value *rv = slot_ref(w, resolver_slot);
+  if (rv == nullptr || !rv->isObject()) {
+    return 0;
+  }
+  const jsi::Value *val = slot_ref(w, value_slot);
+  try {
+    jsi::Array arr = rv->getObject(w->runtime()).asArray(w->runtime());
+    jsi::Function fn =
+        arr.getValueAtIndex(w->runtime(), idx).getObject(w->runtime())
+            .getFunction(w->runtime());
+    jsi::Value arg = (val == nullptr) ? jsi::Value::undefined()
+                                      : jsi::Value(w->runtime(), *val);
+    fn.call(w->runtime(), std::move(arg));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+int v8x_hermes_promise_resolver_resolve(void *rtw,
+                                        v8x_hermes_slot resolver_slot,
+                                        v8x_hermes_slot value_slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  return promise_settle(static_cast<RuntimeWrapper *>(rtw), resolver_slot,
+                        value_slot, 1);
+}
+
+int v8x_hermes_promise_resolver_reject(void *rtw,
+                                       v8x_hermes_slot resolver_slot,
+                                       v8x_hermes_slot value_slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  return promise_settle(static_cast<RuntimeWrapper *>(rtw), resolver_slot,
+                        value_slot, 2);
+}
+
+// v8__Promise__State: 0=pending, 1=fulfilled, 2=rejected. Reads the recorder
+// WeakMap; a promise's settled state only shows AFTER a microtask drain.
+int v8x_hermes_promise_state(void *rtw, v8x_hermes_slot promise_slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *p = slot_ref(w, promise_slot);
+  if (p == nullptr) {
+    return 0;
+  }
+  try {
+    if (!ensure_promise_infra(w)) {
+      return 0;
+    }
+    jsi::Function fn = w->promise_get_state_fn->getObject(w->runtime())
+                           .getFunction(w->runtime());
+    jsi::Value s = fn.call(w->runtime(), jsi::Value(w->runtime(), *p));
+    return s.isNumber() ? static_cast<int>(s.getNumber()) : 0;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// v8__Promise__Result: the settled [[PromiseResult]] (undefined while
+// pending). The promise must not be pending per the v8 contract.
+v8x_hermes_slot v8x_hermes_promise_result(void *rtw,
+                                          v8x_hermes_slot promise_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *p = slot_ref(w, promise_slot);
+  if (p == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    if (!ensure_promise_infra(w)) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Function fn = w->promise_get_result_fn->getObject(w->runtime())
+                           .getFunction(w->runtime());
+    jsi::Value r = fn.call(w->runtime(), jsi::Value(w->runtime(), *p));
+    return w->push(std::move(r));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// Shared then/catch: call promise.then(onFulfilled[, onRejected]) or
+// promise.catch(onRejected), state-track the derived promise, and return its
+// slot. A negative handler slot means "omit that handler" (undefined).
+static v8x_hermes_slot promise_then_impl(RuntimeWrapper *w,
+                                         v8x_hermes_slot promise_slot,
+                                         v8x_hermes_slot on_fulfilled_slot,
+                                         v8x_hermes_slot on_rejected_slot,
+                                         bool is_catch) {
+  const jsi::Value *p = slot_ref(w, promise_slot);
+  if (p == nullptr || !p->isObject()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    if (!ensure_promise_infra(w)) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Object pobj = p->getObject(w->runtime());
+    const char *method = is_catch ? "catch" : "then";
+    jsi::Function fn = pobj.getPropertyAsFunction(w->runtime(), method);
+    std::vector<jsi::Value> args;
+    const jsi::Value *onf = slot_ref(w, on_fulfilled_slot);
+    const jsi::Value *onr = slot_ref(w, on_rejected_slot);
+    if (is_catch) {
+      args.emplace_back(onr == nullptr ? jsi::Value::undefined()
+                                       : jsi::Value(w->runtime(), *onr));
+    } else {
+      args.emplace_back(onf == nullptr ? jsi::Value::undefined()
+                                       : jsi::Value(w->runtime(), *onf));
+      if (on_rejected_slot >= 0) {
+        args.emplace_back(onr == nullptr ? jsi::Value::undefined()
+                                         : jsi::Value(w->runtime(), *onr));
+      }
+    }
+    jsi::Value derived = fn.callWithThis(
+        w->runtime(), pobj,
+        static_cast<const jsi::Value *>(args.data()), args.size());
+    // The user attached a reaction to `p`, so mark it handled (drives
+    // Promise::HasHandler). The derived promise is state-tracked so its own
+    // state is observable too.
+    jsi::Function mark = w->promise_mark_handled_fn->getObject(w->runtime())
+                             .getFunction(w->runtime());
+    mark.call(w->runtime(), jsi::Value(w->runtime(), pobj));
+    jsi::Function track = w->promise_track_fn->getObject(w->runtime())
+                              .getFunction(w->runtime());
+    jsi::Value tracked =
+        track.call(w->runtime(), jsi::Value(w->runtime(), derived));
+    return w->push(std::move(tracked));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+v8x_hermes_slot v8x_hermes_promise_then(void *rtw, v8x_hermes_slot promise_slot,
+                                        v8x_hermes_slot handler_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  return promise_then_impl(static_cast<RuntimeWrapper *>(rtw), promise_slot,
+                           handler_slot, V8X_HERMES_NULL_SLOT, false);
+}
+
+v8x_hermes_slot v8x_hermes_promise_catch(void *rtw, v8x_hermes_slot promise_slot,
+                                         v8x_hermes_slot handler_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  return promise_then_impl(static_cast<RuntimeWrapper *>(rtw), promise_slot,
+                           V8X_HERMES_NULL_SLOT, handler_slot, true);
+}
+
+v8x_hermes_slot v8x_hermes_promise_then2(void *rtw, v8x_hermes_slot promise_slot,
+                                         v8x_hermes_slot on_fulfilled_slot,
+                                         v8x_hermes_slot on_rejected_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  return promise_then_impl(static_cast<RuntimeWrapper *>(rtw), promise_slot,
+                           on_fulfilled_slot, on_rejected_slot, false);
+}
+
+// v8__Promise__HasHandler: whether the USER attached a reaction (then/catch/
+// then2). Our internal state-recorder .then does not count. Reads the
+// `handled` WeakSet. Returns 1/0.
+int v8x_hermes_promise_has_handler(void *rtw, v8x_hermes_slot promise_slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *p = slot_ref(w, promise_slot);
+  if (p == nullptr || !p->isObject()) {
+    return 0;
+  }
+  try {
+    if (!ensure_promise_infra(w)) {
+      return 0;
+    }
+    jsi::Function fn = w->promise_has_handler_fn->getObject(w->runtime())
+                           .getFunction(w->runtime());
+    jsi::Value r = fn.call(w->runtime(), jsi::Value(w->runtime(), *p));
+    return (r.isBool() && r.getBool()) ? 1 : 0;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// v8__Promise__MarkAsHandled: mark the promise handled so unhandled-rejection
+// reporting is suppressed. Routes through the same `handled` WeakSet.
+void v8x_hermes_promise_mark_handled(void *rtw, v8x_hermes_slot promise_slot) {
+  if (rtw == nullptr) {
+    return;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *p = slot_ref(w, promise_slot);
+  if (p == nullptr || !p->isObject()) {
+    return;
+  }
+  try {
+    if (!ensure_promise_infra(w)) {
+      return;
+    }
+    jsi::Function fn = w->promise_mark_handled_fn->getObject(w->runtime())
+                           .getFunction(w->runtime());
+    fn.call(w->runtime(), jsi::Value(w->runtime(), *p));
+  } catch (...) {
+  }
+}
+
+// EnqueueMicrotask / queueMicrotask: schedule `fn` to run at the next drain.
+int v8x_hermes_enqueue_microtask(void *rtw, v8x_hermes_slot fn_slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *fn = slot_ref(w, fn_slot);
+  if (fn == nullptr || !fn->isObject()) {
+    return 0;
+  }
+  try {
+    if (!ensure_promise_infra(w)) {
+      return 0;
+    }
+    jsi::Function enq = w->promise_enqueue_fn->getObject(w->runtime())
+                            .getFunction(w->runtime());
+    enq.call(w->runtime(), jsi::Value(w->runtime(), *fn));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// PerformMicrotaskCheckpoint: drain Hermes's job/microtask queue, running all
+// pending promise reactions and enqueued microtasks. Returns 1 on success.
+// Loops drainMicrotasks until it reports the queue empty (it returns false
+// when more work remains), so a bounded implementation still fully drains.
+int v8x_hermes_drain_microtasks(void *rtw) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    if (!ensure_promise_infra(w)) {
+      return 0;
+    }
+    // Run our setImmediate-backed job queue to completion: this is where
+    // Hermes's Promise polyfill reactions and any EnqueueMicrotask callbacks
+    // actually run. Also poke Hermes's own drainMicrotasks in case a future
+    // build routes jobs through the native queue; harmless when empty.
+    jsi::Function drain = w->promise_drain_jobs_fn->getObject(w->runtime())
+                              .getFunction(w->runtime());
+    for (int i = 0; i < 100000; ++i) {
+      drain.call(w->runtime());
+      bool hermes_done = w->runtime().drainMicrotasks();
+      // drainJobs already loops to empty; if Hermes reports done and drainJobs
+      // enqueued nothing new we are finished. One more pass covers a job that
+      // re-armed setImmediate right at the boundary.
+      if (hermes_done) {
+        drain.call(w->runtime());
+        break;
+      }
+    }
+    return 1;
+  } catch (...) {
+    // A throwing microtask must not unwind across the C boundary; swallow it
+    // like V8's checkpoint does for jobs with no handler. C9: no TryCatch is
+    // on the stack at a checkpoint.
+    return 1;
   }
 }
 
