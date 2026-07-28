@@ -271,3 +271,19 @@ backend that can run a real multi-feature Deno program, is reached. What remains
 (multi-module import graphs, TLS, the cppgc/Oilpan subsystem for the Console class and the test_api/test_cppgc
 link, and folding these gains back toward a shippable deno-on-Hermes binary), not a question of whether the
 engine can do it.
+
+Benchmarks (E11-E12, all re-verified). The honest case for Hermes as a Deno engine is size and cold-start, not
+throughput. Size: the Hermes engine is 6.34 MB arm64 vs 68 MB (QuickJS deno) / 79 MB (V8 deno), an order of
+magnitude smaller. Startup: parse-free HBC boots 23x faster than from source on bootstrap-shaped JS. Compute:
+the vendored framework has NO JIT (0 JitEmitter symbols; force-enabling the JIT config moves compute 0.5%), so
+Hermes is interpreter-only and loses to QuickJS on arithmetic (fib32x5 1051ms vs 557ms) while winning JSON,
+and trails V8 by 3-18x. HTTP: a real JS HTTP server on Hermes serves correctly (curl -> 200, ApacheBench 30k
+requests 0 failed), but a FAIR throughput comparison is not yet possible: the Hermes server is a debug build
+with a JS accept loop (rps flat vs concurrency, loop-bound) while the QuickJS/V8 numbers are release builds on
+native-hyper Deno.serve, and a Hermes release build currently panics in JsRuntime::try_new on an embedder-data
+assertion. Also corrected: E11's "write-buffer marshaling gap" was a misdiagnosis; the real cause was a genuine
+Hermes engine defect where a loop-scoped const/let bound after an await, captured by a detached async closure,
+reads back undefined on resume (worked around by passing per-connection state as a function argument, whose
+frame slots survive the await). Verdict: worth adding for small-footprint, fast-cold-start, IO-bound
+edge/serverless/mobile use; not for compute-heavy JS in this build. The two levers that would change the story
+are a JIT-enabled Hermes build (compute) and fixing the release-build panic (a fair HTTP throughput number).
