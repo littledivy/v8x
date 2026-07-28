@@ -354,8 +354,7 @@ pub extern "C" fn v8__Object__DefineProperty() -> *const ::std::ffi::c_void { ::
 pub extern "C" fn v8__Object__Delete() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__DeleteIndex() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__DeletePrivate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Object__DeletePrivate is implemented in core.rs (real impl, E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetConstructorName() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -365,7 +364,7 @@ pub extern "C" fn v8__Object__GetOwnPropertyDescriptor() -> *const ::std::ffi::c
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetOwnPropertyNames() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__GetPrivate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Object__GetPrivate is implemented in core.rs (real impl, E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__GetPropertyAttributes() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -382,7 +381,7 @@ pub extern "C" fn v8__Object__HasIndex() -> *const ::std::ffi::c_void { ::std::p
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__HasOwnProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__HasPrivate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Object__HasPrivate is implemented in core.rs (real impl, E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__HasRealNamedProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -394,7 +393,7 @@ pub extern "C" fn v8__Object__SetIntegrityLevel() -> *const ::std::ffi::c_void {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetLazyDataProperty() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Object__SetPrivate() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Object__SetPrivate is implemented in core.rs (real impl, E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Object__SetPrototype() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -424,11 +423,8 @@ pub extern "C" fn v8__PrimitiveArray__New() -> *const ::std::ffi::c_void { ::std
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__PrimitiveArray__Set() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Private__ForApi() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Private__Name() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Private__New() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Private__ForApi / v8__Private__Name / v8__Private__New are implemented in
+// core.rs (real impl, E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__PromiseRejectMessage__GetEvent() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]

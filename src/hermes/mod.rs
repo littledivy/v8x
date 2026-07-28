@@ -388,6 +388,140 @@ mod hermes_identity {
   }
 }
 
+// E4: v8::Private. A `Private` is a hidden Symbol used as a non-enumerable
+// property key. deno_core's error machinery stores callsite metadata on thrown
+// errors via `Object::set_private`/`get_private`; without a real Private the
+// error formatter panics. This test proves the backend implements the full
+// Private contract: ForApi is interned (same Symbol per name, distinct across
+// names), set/get/has/delete round-trip, and the private key never surfaces in
+// ordinary string-keyed enumeration.
+#[cfg(all(test, feature = "link_hermes"))]
+mod hermes_private {
+  use crate as v8;
+  use super::init_v8_once;
+
+  fn eval<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    src: &str,
+  ) -> v8::Local<'s, v8::Value> {
+    let source = v8::String::new(scope, src).unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    script.run(scope).unwrap()
+  }
+
+  #[test]
+  fn hermes_private() {
+    init_v8_once();
+
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // ---- ForApi is interned by name ------------------------------------
+    let name_a = v8::String::new(scope, "Class#meta").unwrap();
+    let name_b = v8::String::new(scope, "Class#other").unwrap();
+    let p_a1 = v8::Private::for_api(scope, Some(name_a));
+    let name_a_again = v8::String::new(scope, "Class#meta").unwrap();
+    let p_a2 = v8::Private::for_api(scope, Some(name_a_again));
+    let p_b = v8::Private::for_api(scope, Some(name_b));
+
+    // Two ForApi lookups for the same name yield the SAME private symbol; a
+    // different name yields a different one. Compare by using them as keys:
+    // a value set under p_a1 must be readable via p_a2 but not via p_b.
+    let obj = v8::Object::new(scope);
+    let val = v8::Integer::new(scope, 42).into();
+    assert_eq!(
+      obj.set_private(scope, p_a1, val),
+      Some(true),
+      "set_private must succeed"
+    );
+    let got_via_a2 = obj.get_private(scope, p_a2).unwrap();
+    assert!(
+      got_via_a2.is_number() && got_via_a2.number_value(scope).unwrap() == 42.0,
+      "ForApi(name) must be interned: a value set under one ForApi handle is \
+       readable under another ForApi handle for the SAME name"
+    );
+    let got_via_b = obj.get_private(scope, p_b).unwrap();
+    assert!(
+      got_via_b.is_undefined(),
+      "a DIFFERENT ForApi name must not read the value (distinct symbols)"
+    );
+
+    // ---- has / delete round-trip --------------------------------------
+    assert_eq!(
+      obj.has_private(scope, p_a1),
+      Some(true),
+      "has_private must see the set key"
+    );
+    assert_eq!(
+      obj.has_private(scope, p_b),
+      Some(false),
+      "has_private must be false for an unset key"
+    );
+    assert_eq!(
+      obj.delete_private(scope, p_a2),
+      Some(true),
+      "delete_private must succeed"
+    );
+    assert_eq!(
+      obj.has_private(scope, p_a1),
+      Some(false),
+      "after delete, has_private must be false"
+    );
+    assert!(
+      obj.get_private(scope, p_a1).unwrap().is_undefined(),
+      "after delete, get_private must read undefined"
+    );
+
+    // ---- New is a FRESH (non-interned) symbol --------------------------
+    let fresh_name = v8::String::new(scope, "Class#meta").unwrap();
+    let p_new = v8::Private::new(scope, Some(fresh_name));
+    let str_val = v8::String::new(scope, "brand").unwrap().into();
+    obj.set_private(scope, p_new, str_val);
+    // A ForApi handle with the SAME description must NOT collide with a New()
+    // symbol (New is a distinct, unregistered Symbol).
+    let p_forapi_same = {
+      let n = v8::String::new(scope, "Class#meta").unwrap();
+      v8::Private::for_api(scope, Some(n))
+    };
+    assert!(
+      obj.get_private(scope, p_forapi_same).unwrap().is_undefined(),
+      "Private::New must be a distinct symbol from a same-named ForApi"
+    );
+
+    // ---- the private key is invisible to string-keyed enumeration ------
+    // Stash the object on the global and set a private + a normal property,
+    // then confirm Object.keys / JSON only surface the normal one.
+    let global = context.global(scope);
+    let key = v8::String::new(scope, "probe").unwrap();
+    global.set(scope, key.into(), obj.into());
+    let public_key = v8::String::new(scope, "visible").unwrap();
+    let one = v8::Integer::new(scope, 1).into();
+    obj.set(scope, public_key.into(), one);
+    let keys = eval(scope, "JSON.stringify(Object.keys(globalThis.probe))")
+      .to_rust_string_lossy(scope);
+    assert_eq!(
+      keys, r#"["visible"]"#,
+      "a private (Symbol) key must never appear in Object.keys"
+    );
+
+    // ---- Private::Name returns the description -------------------------
+    let named = {
+      let n = v8::String::new(scope, "desc#here").unwrap();
+      v8::Private::new(scope, Some(n))
+    };
+    let desc = named.name(scope).to_rust_string_lossy(scope);
+    assert_eq!(desc, "desc#here", "Private::Name must return the description");
+
+    println!(
+      "hermes_private: PASS - ForApi interned by name, set/get/has/delete \
+       round-trip, New is distinct, private key hidden from Object.keys, Name \
+       returns description"
+    );
+  }
+}
+
 // C5: parse-free AOT execution proof + measured win. Compiles JS source to
 // Hermes Bytecode (HBC) ahead of time with `hermesc` (the Hermes AOT
 // compiler, extracted from the `hermes-engine` npm package, see

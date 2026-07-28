@@ -40,7 +40,7 @@ use crate::{
   Boolean, Context, Data, External, Function, FunctionCallback,
   FunctionCallbackInfo, FunctionTemplate, Integer, Message, MicrotaskQueue,
   Name, Number, Object, ObjectTemplate, OneByteConst, Platform, Primitive,
-  Promise, PromiseResolver, PromiseState, RealIsolate, Script,
+  Private, Promise, PromiseResolver, PromiseState, RealIsolate, Script,
   String as V8String, Template, UniquePtr, Value,
 };
 use std::cell::Cell;
@@ -161,6 +161,32 @@ unsafe extern "C" {
     length: usize,
   ) -> i64;
   fn v8x_hermes_typed_array_length(rtw: *mut c_void, slot: i64) -> usize;
+
+  // E4: v8::Private (hidden Symbol keys). See the E4 web-functional doc.
+  fn v8x_hermes_private_new(rtw: *mut c_void, name_slot: i64) -> i64;
+  fn v8x_hermes_private_for_api(rtw: *mut c_void, name_slot: i64) -> i64;
+  fn v8x_hermes_private_name(rtw: *mut c_void, sym_slot: i64) -> i64;
+  fn v8x_hermes_object_get_private(
+    rtw: *mut c_void,
+    obj_slot: i64,
+    key_slot: i64,
+  ) -> i64;
+  fn v8x_hermes_object_set_private(
+    rtw: *mut c_void,
+    obj_slot: i64,
+    key_slot: i64,
+    val_slot: i64,
+  ) -> c_int;
+  fn v8x_hermes_object_has_private(
+    rtw: *mut c_void,
+    obj_slot: i64,
+    key_slot: i64,
+  ) -> c_int;
+  fn v8x_hermes_object_delete_private(
+    rtw: *mut c_void,
+    obj_slot: i64,
+    key_slot: i64,
+  ) -> c_int;
 
   // C9: TryCatch / exception surfacing. See
   // docs/hermes-spike/experiments/C9-hermes-trycatch.md.
@@ -1582,6 +1608,189 @@ pub extern "C" fn v8__Object__GetIdentityHash(this: *const Object) -> c_int {
   // v8's identity hash is a 31-bit-ish int; our monotonic counter fits easily
   // for any test-scale object count.
   h as c_int
+}
+
+// ---- v8::Private (E4) ------------------------------------------------------
+//
+// A `v8::Private` is a private Symbol used as a hidden property key. deno_core's
+// error machinery brands thrown errors with callsite metadata via
+// `Object::set_private`/`get_private`, and the error formatter reads it back, so
+// without a real Private a thrown ext/web error panics during formatting. Each
+// entry point is a thin wrapper over the C++ Symbol-keyed helpers; a `Private`
+// handle is just a handle-table slot holding a JS Symbol.
+
+/// `Private::New(scope, name)`: a fresh (never-interned) private Symbol whose
+/// description is `name` (or none). A null `name` is the null slot on the C++
+/// side (no description).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Private__New(
+  isolate: *mut RealIsolate,
+  name: *const V8String,
+) -> *const Private {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  let name_slot = if name.is_null() {
+    NULL_SLOT
+  } else {
+    slot_of(name as *const Value)
+  };
+  let slot = unsafe { v8x_hermes_private_new(rtw, name_slot) };
+  slot_ptr::<Private>(slot)
+}
+
+/// `Private::ForApi(scope, name)`: a per-isolate interned private Symbol, the
+/// SAME for a given `name` across calls (v8's global registry contract). A null
+/// `name` interns under the empty string.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Private__ForApi(
+  isolate: *mut RealIsolate,
+  name: *const V8String,
+) -> *const Private {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  let name_slot = if name.is_null() {
+    NULL_SLOT
+  } else {
+    slot_of(name as *const Value)
+  };
+  let slot = unsafe { v8x_hermes_private_for_api(rtw, name_slot) };
+  slot_ptr::<Private>(slot)
+}
+
+/// `Private::Name()`: the private Symbol's description (a `Value` holding a
+/// string, empty string if none), or a null handle on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Private__Name(this: *const Private) -> *const Value {
+  if this.is_null() {
+    return ptr::null();
+  }
+  let rtw = current_rtw();
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  let slot = unsafe { v8x_hermes_private_name(rtw, slot_of(this as *const Value)) };
+  slot_ptr::<Value>(slot)
+}
+
+/// `Object::GetPrivate(obj, context, key)`: read `obj[keySym]` (undefined if
+/// absent), or a null handle on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__GetPrivate(
+  this: *const Object,
+  context: *const Context,
+  key: *const Private,
+) -> *const Value {
+  if this.is_null() || context.is_null() || key.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  let slot = unsafe {
+    v8x_hermes_object_get_private(
+      rtw,
+      slot_of(this),
+      slot_of(key as *const Value),
+    )
+  };
+  slot_ptr::<Value>(slot)
+}
+
+/// `Object::SetPrivate(obj, context, key, value)`: set `obj[keySym] = value`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__SetPrivate(
+  this: *const Object,
+  context: *const Context,
+  key: *const Private,
+  value: *const Value,
+) -> MaybeBool {
+  if this.is_null() || context.is_null() || key.is_null() || value.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  if rtw.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let ok = unsafe {
+    v8x_hermes_object_set_private(
+      rtw,
+      slot_of(this),
+      slot_of(key as *const Value),
+      slot_of(value),
+    )
+  };
+  if ok != 0 {
+    MaybeBool::JustTrue
+  } else {
+    MaybeBool::Nothing
+  }
+}
+
+/// `Object::HasPrivate(obj, context, key)`: `keySym in obj`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__HasPrivate(
+  this: *const Object,
+  context: *const Context,
+  key: *const Private,
+) -> MaybeBool {
+  if this.is_null() || context.is_null() || key.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  if rtw.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let r = unsafe {
+    v8x_hermes_object_has_private(
+      rtw,
+      slot_of(this),
+      slot_of(key as *const Value),
+    )
+  };
+  match r {
+    1 => MaybeBool::JustTrue,
+    0 => MaybeBool::JustFalse,
+    _ => MaybeBool::Nothing,
+  }
+}
+
+/// `Object::DeletePrivate(obj, context, key)`: `delete obj[keySym]`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__DeletePrivate(
+  this: *const Object,
+  context: *const Context,
+  key: *const Private,
+) -> MaybeBool {
+  if this.is_null() || context.is_null() || key.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let rtw = iso_state(context as *mut RealIsolate).rtw;
+  if rtw.is_null() {
+    return MaybeBool::Nothing;
+  }
+  let r = unsafe {
+    v8x_hermes_object_delete_private(
+      rtw,
+      slot_of(this),
+      slot_of(key as *const Value),
+    )
+  };
+  match r {
+    1 => MaybeBool::JustTrue,
+    0 => MaybeBool::JustFalse,
+    _ => MaybeBool::Nothing,
+  }
 }
 
 // ---- Object / Array / Number / Integer / Boolean / Function (C6) ---------

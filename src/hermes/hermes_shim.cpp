@@ -29,6 +29,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace facebook;
@@ -105,6 +106,19 @@ struct RuntimeWrapper {
   // the hidden template-id stamp back needs a small JS helper: `(obj, sym) =>
   // obj[sym]`.
   std::unique_ptr<jsi::Value> get_symbol_property_fn;
+  // E4: v8::Private support. A `v8::Private` is a hidden Symbol used as a
+  // non-enumerable property key; deno_core's error machinery stores callsite
+  // metadata on thrown errors via Private keys. `Private::ForApi(name)` returns
+  // a per-name-STABLE Symbol (v8 keeps a global registry), so name->Symbol are
+  // interned here. get/set/has/delete_private are Symbol-keyed property ops
+  // driven through cached JS helpers (JSI has no Symbol-keyed Object accessor).
+  std::unordered_map<std::string, std::unique_ptr<jsi::Value>> private_registry;
+  std::unique_ptr<jsi::Value> private_get_fn;    // (obj, sym) => obj[sym]
+  std::unique_ptr<jsi::Value> private_set_fn;    // (obj, sym, val) => (obj[sym]=val,true)
+  std::unique_ptr<jsi::Value> private_has_fn;    // (obj, sym) => sym in obj
+  std::unique_ptr<jsi::Value> private_delete_fn; // (obj, sym) => delete obj[sym]
+  std::unique_ptr<jsi::Value> symbol_new_fn;     // (desc) => Symbol(desc)
+  std::unique_ptr<jsi::Value> symbol_desc_fn;    // (sym) => sym.description
   // D1: lazily-created per-runtime Promise infra. Hermes has native JS
   // Promises but JSI exposes no Promise API and no [[PromiseState]] accessor,
   // so a small cached JS helper object drives promise creation and state
@@ -790,6 +804,270 @@ const jsi::Value *slot_ref(RuntimeWrapper *w, v8x_hermes_slot slot) {
 }
 
 } // namespace
+
+// ---- E4: v8::Private (hidden Symbol keys) ---------------------------------
+//
+// A `v8::Private` in V8 is a private Symbol: a property key never surfaced by
+// ordinary enumeration and never clashing with a same-named string key.
+// deno_core's error machinery (`error.rs`) attaches callsite metadata to
+// thrown Error objects via `Object::set_private`/`get_private`, and its
+// formatter reads it back, so an unimplemented Private means every thrown
+// ext/web error re-panics during formatting. We model a Private as an ordinary
+// JS Symbol held in a slot; `ForApi(name)` interns one Symbol per name (V8's
+// global registry contract). Symbol-keyed get/set/has/delete need JS helpers
+// because JSI's jsi::Object accessors are string-/PropNameID-keyed only, and
+// bracket notation `obj[sym]` is the JS-level way to key by a Symbol.
+
+namespace {
+
+// Lazily create (once per runtime) the JS helpers for Symbol-keyed property
+// get/set/has/delete plus Symbol creation and description reads.
+bool ensure_private_infra(RuntimeWrapper *w) {
+  if (w->private_get_fn && w->private_set_fn && w->private_has_fn &&
+      w->private_delete_fn && w->symbol_new_fn && w->symbol_desc_fn) {
+    return true;
+  }
+  try {
+    jsi::Value setup = w->runtime().evaluateJavaScript(
+        std::make_unique<jsi::StringBuffer>(
+            "(function() { return ["
+            "(o,s) => o[s],"
+            "(o,s,v) => { o[s] = v; return true; },"
+            "(o,s) => s in o,"
+            "(o,s) => delete o[s],"
+            "(d) => (d === undefined ? Symbol() : Symbol(d)),"
+            "(s) => { const d = s.description; return d === undefined ? '' : d; }"
+            "]; })()"),
+        "v8x-private-setup.js");
+    jsi::Array arr = setup.getObject(w->runtime()).asArray(w->runtime());
+    w->private_get_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 0));
+    w->private_set_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 1));
+    w->private_has_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 2));
+    w->private_delete_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 3));
+    w->symbol_new_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 4));
+    w->symbol_desc_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 5));
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+// Create a fresh Symbol with an optional description (the utf8 of the name slot,
+// or none when name_slot is the null slot / not a string).
+v8x_hermes_slot make_private_symbol(RuntimeWrapper *w,
+                                    v8x_hermes_slot name_slot) {
+  if (!ensure_private_infra(w)) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  jsi::Function symNew =
+      w->symbol_new_fn->getObject(w->runtime()).getFunction(w->runtime());
+  const jsi::Value *nv = slot_ref(w, name_slot);
+  jsi::Value desc = jsi::Value::undefined();
+  if (nv != nullptr && nv->isString()) {
+    desc = jsi::Value(w->runtime(), *nv);
+  }
+  jsi::Value sym = symNew.call(w->runtime(), std::move(desc));
+  return w->push(std::move(sym));
+}
+
+} // namespace
+
+extern "C" {
+
+// v8::Private::New(isolate, name): a fresh, never-interned private Symbol.
+// `name` (a String slot, or the null slot) becomes the Symbol's description.
+v8x_hermes_slot v8x_hermes_private_new(void *rtw, v8x_hermes_slot name_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    return make_private_symbol(w, name_slot);
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// v8::Private::ForApi(isolate, name): interned by name. Returns a slot holding
+// the SAME Symbol value for the same name across calls (V8's global registry
+// contract). A null name slot interns under the empty string. The returned
+// slot is a fresh handle each call (slots are per-Local) but wraps the
+// identical Symbol, so Symbol-keyed lookups against it collide as required.
+v8x_hermes_slot v8x_hermes_private_for_api(void *rtw,
+                                           v8x_hermes_slot name_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    if (!ensure_private_infra(w)) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    std::string key;
+    const jsi::Value *nv = slot_ref(w, name_slot);
+    if (nv != nullptr && nv->isString()) {
+      key = nv->getString(w->runtime()).utf8(w->runtime());
+    }
+    auto it = w->private_registry.find(key);
+    if (it != w->private_registry.end() && it->second) {
+      return w->push(jsi::Value(w->runtime(), *it->second));
+    }
+    v8x_hermes_slot sym_slot = make_private_symbol(w, name_slot);
+    if (sym_slot < 0) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    const jsi::Value *sv = slot_ref(w, sym_slot);
+    if (sv == nullptr) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    w->private_registry[key] =
+        std::make_unique<jsi::Value>(w->runtime(), *sv);
+    return sym_slot;
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// v8::Private::Name(): the Symbol's description string (empty string if none).
+v8x_hermes_slot v8x_hermes_private_name(void *rtw, v8x_hermes_slot sym_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *sv = slot_ref(w, sym_slot);
+  if (sv == nullptr || !sv->isSymbol()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    if (!ensure_private_infra(w)) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Function descFn =
+        w->symbol_desc_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Value d = descFn.call(w->runtime(), jsi::Value(w->runtime(), *sv));
+    return w->push(std::move(d));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// Object::GetPrivate(obj, key): obj[keySym]. Returns a slot (undefined if the
+// key is absent), or the null slot on error / non-object receiver.
+v8x_hermes_slot v8x_hermes_object_get_private(void *rtw,
+                                              v8x_hermes_slot obj_slot,
+                                              v8x_hermes_slot key_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  const jsi::Value *kv = slot_ref(w, key_slot);
+  if (ov == nullptr || !ov->isObject() || kv == nullptr || !kv->isSymbol()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    if (!ensure_private_infra(w)) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Function getFn =
+        w->private_get_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Value r = getFn.call(w->runtime(), jsi::Value(w->runtime(), *ov),
+                              jsi::Value(w->runtime(), *kv));
+    return w->push(std::move(r));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// Object::SetPrivate(obj, key, value): obj[keySym] = value. Returns 1 on
+// success, 0 on error.
+int v8x_hermes_object_set_private(void *rtw, v8x_hermes_slot obj_slot,
+                                  v8x_hermes_slot key_slot,
+                                  v8x_hermes_slot val_slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  const jsi::Value *kv = slot_ref(w, key_slot);
+  const jsi::Value *vv = slot_ref(w, val_slot);
+  if (ov == nullptr || !ov->isObject() || kv == nullptr || !kv->isSymbol() ||
+      vv == nullptr) {
+    return 0;
+  }
+  try {
+    if (!ensure_private_infra(w)) {
+      return 0;
+    }
+    jsi::Function setFn =
+        w->private_set_fn->getObject(w->runtime()).getFunction(w->runtime());
+    setFn.call(w->runtime(), jsi::Value(w->runtime(), *ov),
+               jsi::Value(w->runtime(), *kv), jsi::Value(w->runtime(), *vv));
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// Object::HasPrivate(obj, key): keySym in obj. Returns 1/0, or -1 on error.
+int v8x_hermes_object_has_private(void *rtw, v8x_hermes_slot obj_slot,
+                                  v8x_hermes_slot key_slot) {
+  if (rtw == nullptr) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  const jsi::Value *kv = slot_ref(w, key_slot);
+  if (ov == nullptr || !ov->isObject() || kv == nullptr || !kv->isSymbol()) {
+    return -1;
+  }
+  try {
+    if (!ensure_private_infra(w)) {
+      return -1;
+    }
+    jsi::Function hasFn =
+        w->private_has_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Value r = hasFn.call(w->runtime(), jsi::Value(w->runtime(), *ov),
+                              jsi::Value(w->runtime(), *kv));
+    return r.isBool() && r.getBool() ? 1 : 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+// Object::DeletePrivate(obj, key): delete obj[keySym]. Returns 1/0, -1 error.
+int v8x_hermes_object_delete_private(void *rtw, v8x_hermes_slot obj_slot,
+                                     v8x_hermes_slot key_slot) {
+  if (rtw == nullptr) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *ov = slot_ref(w, obj_slot);
+  const jsi::Value *kv = slot_ref(w, key_slot);
+  if (ov == nullptr || !ov->isObject() || kv == nullptr || !kv->isSymbol()) {
+    return -1;
+  }
+  try {
+    if (!ensure_private_infra(w)) {
+      return -1;
+    }
+    jsi::Function delFn =
+        w->private_delete_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Value r = delFn.call(w->runtime(), jsi::Value(w->runtime(), *ov),
+                              jsi::Value(w->runtime(), *kv));
+    return r.isBool() && r.getBool() ? 1 : 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+} // extern "C"
 
 // jsi::Value::undefined() / jsi::Value::null(): static factories, no Runtime
 // call needed. Pushed straight into the handle table. Returns a slot, or the
