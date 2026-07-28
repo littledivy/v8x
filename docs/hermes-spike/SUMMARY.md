@@ -94,6 +94,8 @@ The overnight run built the Hermes BACKEND (runs JS, 77/267 rusty_v8), not Deno-
 grinding toward an actual Deno boot. Recon (D0) found the boot path is blocked by exactly three
 missing subsystems, proved with an in-repo boot probe: Promises, microtasks, and ES modules (all
 null stubs). deno_core boots from source but loads its core JS as an ES module, so modules are
-required, not optional. Roadmap: Promises/microtasks -> ES modules -> 2 tiny op stubs -> a deno_core
-JsRuntime running a script on Hermes. This is a multi-session effort. Honest note: Hermes v0.11.0 is
+required, not optional. Progress: Promises + microtasks DONE (2 of 3 boot probes green, rusty_v8 now 81/267). ES modules
+is the last boot wall (deno_core loads its core JS as an ES module; JSI has no module API, so this is
+the hard modeling cycle). Then 2 tiny op stubs -> a deno_core JsRuntime running a script on Hermes.
+Multi-session effort. Honest note: Hermes v0.11.0 is
 interpreter-only (no JIT) and is not a compute win over QuickJS - benchmarks in ~/deno-quickjs/BENCHMARKS.md.

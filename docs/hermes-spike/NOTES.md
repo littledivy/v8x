@@ -11,7 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
-- [x] *** Hermes passes 77/267 rusty_v8 tests; objects/arrays/functions/callbacks/exceptions/templates/accessors/signatures (use --rescue) ***
+- [x] *** Hermes passes 81/267 rusty_v8; +Promises/microtasks; 2/3 deno-boot walls cleared (ES modules last) ***
 - [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities
@@ -39,6 +39,20 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle D1 - Promises + microtask queue (agent: d1, opus) DONE - 2/3 boot walls cleared
+boot_promise_resolver_roundtrip + boot_microtask_enqueue_and_checkpoint GREEN. rusty_v8 77 -> 81
+(promise_resolved, promise_rejected, microtask_queue_new, set_promise_reject_callback). --update, no regressions.
+Impl: Promise::Resolver::New/GetPromise/Resolve/Reject, Promise::State/Result/HasHandler/MarkAsHandled/
+Then/Catch/Then2, Isolate::EnqueueMicrotask, real PerformMicrotaskCheckpoint, MicrotaskQueue::* - one
+cached per-runtime JS helper. A v8 Resolver = the [promise,resolve,reject] array new Promise(...) returns;
+state+result in a closure WeakMap keyed by the promise (first-write-wins, matches V8 sync settle);
+HasHandler via a separate WeakSet only user then/catch mark.
+CRASH FIX: Hermes InternalBytecode Promise polyfill schedules via a global setImmediate the bare JSI
+global lacks (no microtask-queue RuntimeConfig here) -> installed a setImmediate FIFO + drainJobs drained
+by the checkpoint; rejected-no-handler never aborts; drain capped vs re-enqueue hang.
+REMAINING BOOT WALL: ES modules - v8__ScriptCompiler__CompileModule still null. D2.
+Deferred (JSI cannot surface): promise-hook/reject callbacks, Auto-policy auto-flush on eval.
 
 ### Cycle D0 - deno-boot recon (agent: d0, opus) DONE => path is clear + measurable
 FIRST WALLS (all null stubs on hermes): Promises, microtasks, ES modules. Proved via in-repo probe
