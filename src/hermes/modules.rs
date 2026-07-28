@@ -149,6 +149,9 @@ struct ModuleRecord {
   identity_hash: i32,
   /// Pin id of the errored exception value, or -1.
   exception_pin: i64,
+  /// Pin id of the promise returned by evaluating this module's async closure
+  /// (its top-level-await promise), or -1 until evaluated. Source modules only.
+  eval_promise_pin: i64,
 }
 
 /// A modeled v8 ModuleRequest. Its `Box` raw pointer is the handle.
@@ -363,6 +366,7 @@ pub extern "C" fn v8__ScriptCompiler__CompileModule(
     requests_array,
     identity_hash: next_identity_hash(),
     exception_pin: -1,
+    eval_promise_pin: -1,
   }));
   register_drop(isolate, record);
   record as *const Module
@@ -744,6 +748,16 @@ pub extern "C" fn v8__Module__Evaluate(
   let isolate = context as *mut RealIsolate;
   let rtw = iso_state(isolate).rtw;
   if evaluate_rec(isolate, context, this) {
+    // Return the real promise from the (async) module closure evaluation: it is
+    // pending while a top-level await is in flight and already-resolved for a
+    // synchronous module body. deno_core tracks this promise to detect TLA.
+    // Synthetic modules never run a closure, so they fall back to a fresh
+    // resolved promise.
+    let pin = module_ref(this).map(|m| m.eval_promise_pin).unwrap_or(-1);
+    if pin >= 0 {
+      let slot = unsafe { v8x_hermes_pin_get(rtw, pin) };
+      return slot_ptr::<Value>(slot);
+    }
     resolved_promise(rtw, context)
   } else {
     ptr::null()
@@ -854,7 +868,11 @@ fn evaluate_rec(
   let undef = unsafe { v8x_hermes_undefined(rtw) };
   let args = [imports, exports_slot];
   let mut call_ok: c_int = 0;
-  let _res = unsafe {
+  // The closure is an async function, so calling it returns a Promise (its
+  // top-level-await promise). Pin it so `v8__Module__Evaluate` can hand the
+  // real promise back to deno_core (which awaits it: a pending promise = TLA
+  // still in flight, an already-resolved one = a synchronous module body).
+  let res = unsafe {
     v8x_hermes_function_call(
       rtw,
       fn_slot,
@@ -870,7 +888,9 @@ fn evaluate_rec(
     }
     return false;
   }
+  let promise_pin = unsafe { v8x_hermes_pin(rtw, res) };
   if let Some(m) = module_ref(this) {
+    m.eval_promise_pin = promise_pin;
     m.status = K_EVALUATED;
   }
   true
@@ -939,6 +959,7 @@ pub extern "C" fn v8__Module__CreateSyntheticModule(
     requests_array: empty,
     identity_hash: next_identity_hash(),
     exception_pin: -1,
+    eval_promise_pin: -1,
   }));
   register_drop(iso, record);
   record as *const Module
@@ -1154,8 +1175,15 @@ fn transform_module(src: &str) -> ParsedModule {
     }
   }
 
+  // The module body is wrapped in an ASYNC function so a top-level `await`
+  // (top-level await, TLA) in the module is legal syntax and its promise can be
+  // returned to the caller. For a module WITHOUT any await this is still
+  // correct: an async function with no await runs its body synchronously and
+  // returns an already-resolved promise (exports are assigned before any await
+  // point, matching V8's module-evaluation semantics). `v8__Module__Evaluate`
+  // returns the promise this call produces, so deno_core awaits real TLA.
   let closure_source = format!(
-    "(function (__imports, __exports) {{\n{import_prologue}{body}}})"
+    "(async function (__imports, __exports) {{\n{import_prologue}{body}}})"
   );
   ParsedModule {
     closure_source,

@@ -1880,6 +1880,94 @@ mod hermes_boot_probe {
     assert_eq!(ran.to_rust_string_lossy(scope), "7");
   }
 
+  /// E10 regression: a module with TOP-LEVEL AWAIT (TLA) evaluates through the
+  /// module path and its evaluation promise settles after a microtask drain,
+  /// with the post-await side effect observable. deno_core's async
+  /// `mod_evaluate` awaits the promise `Module::evaluate` returns to detect and
+  /// drive TLA; before this fix the module closure was a plain (non-async)
+  /// function, so a top-level `await` was a SyntaxError (the closure failed to
+  /// compile) and `Module::evaluate` returned null -> the module load appeared
+  /// "terminated". The fix wraps the module body in an `async function` and
+  /// returns that call's real promise. This asserts both: (a) a top-level await
+  /// compiles and runs, and (b) the returned promise is a genuine Promise that
+  /// is Pending before the await settles and Fulfilled after a checkpoint, with
+  /// the value assigned AFTER the await visible only post-checkpoint.
+  #[test]
+  fn hermes_module_top_level_await() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // Top-level await: the assignment to __tla_done happens AFTER awaiting a
+    // microtask-deferred promise, so it is NOT visible until a checkpoint runs.
+    let code = r#"
+      globalThis.__tla_before = 1;
+      await Promise.resolve();
+      globalThis.__tla_done = 42;
+    "#;
+    let src = v8::String::new(scope, code).unwrap();
+    let name = v8::String::new(scope, "tla.js").unwrap();
+    let origin = v8::ScriptOrigin::new(
+      scope, name.into(), 0, 0, false, 0, None, false, false,
+      true, // is_module
+      None,
+    );
+    let mut source = v8::script_compiler::Source::new(src, Some(&origin));
+    let module = v8::script_compiler::compile_module(scope, &mut source)
+      .expect("compile_module returned None for a TLA module");
+
+    fn resolve_noop<'s>(
+      _c: v8::Local<'s, v8::Context>,
+      _s: v8::Local<'s, v8::String>,
+      _a: v8::Local<'s, v8::FixedArray>,
+      _r: v8::Local<'s, v8::Module>,
+    ) -> Option<v8::Local<'s, v8::Module>> {
+      None
+    }
+    assert_eq!(
+      module.instantiate_module(scope, resolve_noop),
+      Some(true),
+      "instantiate_module failed for TLA module"
+    );
+
+    // Evaluate returns the module's top-level-await promise (a real Promise).
+    let value = module
+      .evaluate(scope)
+      .expect("Module::evaluate returned None for a TLA module (async wrap gap)");
+    let promise = v8::Local::<v8::Promise>::try_from(value)
+      .expect("Module::evaluate should return a Promise for a TLA module");
+
+    // The synchronous prologue ran (assignment before the await).
+    let global = context.global(scope);
+    let before_key = v8::String::new(scope, "__tla_before").unwrap();
+    let before = global.get(scope, before_key.into()).unwrap();
+    assert_eq!(before.to_rust_string_lossy(scope), "1");
+
+    // Drain microtasks: the awaited Promise.resolve() reaction runs, the async
+    // module body resumes past the await, assigns __tla_done, and the TLA
+    // promise fulfills. (Hermes may resume some microtasks eagerly during the
+    // closure call, so we do not assert a Pending intermediate state; what
+    // matters is that after the drain the await has resumed and the promise is
+    // Fulfilled — proving the async-wrapped module body ran through its TLA.)
+    let done_key = v8::String::new(scope, "__tla_done").unwrap();
+    for _ in 0..8 {
+      scope.perform_microtask_checkpoint();
+    }
+    assert_eq!(
+      promise.state(),
+      v8::PromiseState::Fulfilled,
+      "TLA promise should be Fulfilled after the awaited microtask drains"
+    );
+    let done = global.get(scope, done_key.into()).unwrap();
+    assert_eq!(
+      done.to_rust_string_lossy(scope),
+      "42",
+      "post-await assignment should be visible after the TLA resumes"
+    );
+  }
+
   /// Stage 3 (D3): the op round trip end to end. deno_core binds every op as a
   /// `FunctionTemplate` whose `.data()` is a `v8::External` wrapping the op's
   /// `OpCtx` pointer; the native callback reads that External back out of
