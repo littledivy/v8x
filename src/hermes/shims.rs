@@ -805,56 +805,9 @@ pub extern "C" fn v8__Value__ToNumber() -> *const ::std::ffi::c_void { ::std::pt
 pub extern "C" fn v8__Value__ToUint32() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__TypeOf() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__CONSTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__Delegate__CONSTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__DESTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__GetWireFormatVersion() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__ReadDouble() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__ReadHeader() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__ReadRawBytes() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__ReadUint32() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__ReadUint64() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__ReadValue() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__SetSupportsLegacyWireFormat() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__TransferArrayBuffer() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueDeserializer__TransferSharedArrayBuffer() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__CONSTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__Delegate__CONSTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__DESTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__Release() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__SetTreatArrayBufferViewsAsHostObjects() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__TransferArrayBuffer() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__WriteDouble() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__WriteHeader() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__WriteRawBytes() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__WriteUint32() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__WriteUint64() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ValueSerializer__WriteValue() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Value{Ser,Deser}ializer__* (25 symbols) are implemented in serializer.rs
+// (real structured-clone wire format over JSI values, E5). Their stubs were
+// dropped here so they do not collide with the real link_hermes definitions.
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__VERSION_STRING() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]

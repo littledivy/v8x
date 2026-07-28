@@ -24,8 +24,10 @@
 #include <hermes/Public/RuntimeConfig.h>
 #include <jsi/jsi.h>
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <string>
@@ -3883,6 +3885,316 @@ void v8x_hermes_unpin(void *rtw, int64_t pin_id) {
   }
   if (rc <= 0) {
     w->pins[static_cast<size_t>(pin_id)].reset();
+  }
+}
+
+// ---- E5: structured-clone (v8::ValueSerializer) over JSI values -----------
+//
+// Hermes/JSI has no native value-serialization primitive (unlike QuickJS's
+// JS_WriteObject), so structuredClone is implemented as a self-describing
+// recursive walk over JSI values into a private byte format, and a matching
+// reader that rebuilds an equivalent value graph. deno_core's op_structured_clone
+// drives this through v8::ValueSerializer/Deserializer: WriteHeader, WriteValue,
+// Release, then ReadHeader, ReadValue. The Rust shim owns the byte buffer and
+// calls these two helpers for the actual value <-> bytes conversion.
+//
+// Wire format (little-endian, no header - deno's own WriteHeader/ReadHeader
+// bytes bracket this payload at the Rust layer):
+//   'n' null            'u' undefined       't' true            'f' false
+//   'i' <i32>           int-valued number   'd' <f64>           other number
+//   's' <u32 len><utf8> string              'a' <u32 n> elems*  array
+//   'o' <u32 n> (key,val)*  plain object    (keys are strings)
+// Types NOT covered (honest scope): BigInt, Symbol (uncloneable in V8 too),
+// Date, RegExp, Map, Set, TypedArray/ArrayBuffer, and object identity/cycles.
+// Those fail the serialize with a false return so the op reports a clean
+// DataCloneError rather than silently corrupting. Primitives, arrays, and plain
+// objects round-trip, which is the E5 win condition.
+
+static void sc_put_u32(std::vector<uint8_t> &buf, uint32_t v) {
+  buf.push_back(static_cast<uint8_t>(v & 0xff));
+  buf.push_back(static_cast<uint8_t>((v >> 8) & 0xff));
+  buf.push_back(static_cast<uint8_t>((v >> 16) & 0xff));
+  buf.push_back(static_cast<uint8_t>((v >> 24) & 0xff));
+}
+
+static bool sc_get_u32(const uint8_t *data, size_t len, size_t &pos,
+                       uint32_t &out) {
+  if (pos + 4 > len) {
+    return false;
+  }
+  out = static_cast<uint32_t>(data[pos]) |
+        (static_cast<uint32_t>(data[pos + 1]) << 8) |
+        (static_cast<uint32_t>(data[pos + 2]) << 16) |
+        (static_cast<uint32_t>(data[pos + 3]) << 24);
+  pos += 4;
+  return true;
+}
+
+// Recursively serialize a JSI value into `buf`. Returns false on an uncloneable
+// type or any JSI error (the caller aborts and reports a DataCloneError).
+// `depth` guards against runaway nesting (no cycle detection: a cyclic graph
+// hits the cap and fails cleanly rather than looping).
+static bool sc_write(jsi::Runtime &rt, const jsi::Value &v,
+                     std::vector<uint8_t> &buf, int depth) {
+  if (depth > 512) {
+    return false;
+  }
+  if (v.isNull()) {
+    buf.push_back('n');
+    return true;
+  }
+  if (v.isUndefined()) {
+    buf.push_back('u');
+    return true;
+  }
+  if (v.isBool()) {
+    buf.push_back(v.getBool() ? 't' : 'f');
+    return true;
+  }
+  if (v.isNumber()) {
+    double d = v.getNumber();
+    // Encode integral doubles that fit in i32 compactly, else a full double.
+    double intpart;
+    if (std::modf(d, &intpart) == 0.0 && d >= -2147483648.0 &&
+        d <= 2147483647.0) {
+      buf.push_back('i');
+      sc_put_u32(buf, static_cast<uint32_t>(static_cast<int32_t>(d)));
+    } else {
+      buf.push_back('d');
+      uint64_t bits;
+      std::memcpy(&bits, &d, sizeof(bits));
+      for (int i = 0; i < 8; ++i) {
+        buf.push_back(static_cast<uint8_t>((bits >> (8 * i)) & 0xff));
+      }
+    }
+    return true;
+  }
+  if (v.isString()) {
+    std::string s = v.getString(rt).utf8(rt);
+    buf.push_back('s');
+    sc_put_u32(buf, static_cast<uint32_t>(s.size()));
+    buf.insert(buf.end(), s.begin(), s.end());
+    return true;
+  }
+  if (v.isObject()) {
+    jsi::Object obj = v.getObject(rt);
+    // Reject non-plain objects we do not model: functions, symbols (symbols are
+    // not isObject anyway), and anything with an unusual shape falls through to
+    // the array/plain-object branches below or is refused.
+    if (obj.isFunction(rt) || obj.isArrayBuffer(rt)) {
+      return false;
+    }
+    if (obj.isArray(rt)) {
+      jsi::Array arr = obj.getArray(rt);
+      size_t n = arr.size(rt);
+      buf.push_back('a');
+      sc_put_u32(buf, static_cast<uint32_t>(n));
+      for (size_t i = 0; i < n; ++i) {
+        jsi::Value el = arr.getValueAtIndex(rt, i);
+        if (!sc_write(rt, el, buf, depth + 1)) {
+          return false;
+        }
+      }
+      return true;
+    }
+    // Plain object: enumerate own enumerable property names (string-keyed).
+    jsi::Array names = obj.getPropertyNames(rt);
+    size_t n = names.size(rt);
+    // Reserve the count slot, then fill with the number actually written (skips
+    // any property that fails to read).
+    buf.push_back('o');
+    size_t count_pos = buf.size();
+    sc_put_u32(buf, 0);
+    uint32_t written = 0;
+    for (size_t i = 0; i < n; ++i) {
+      jsi::Value keyv = names.getValueAtIndex(rt, i);
+      if (!keyv.isString()) {
+        continue;  // skip non-string keys (symbols); V8 clones string keys only
+      }
+      jsi::String key = keyv.getString(rt);
+      jsi::Value val = obj.getProperty(rt, key);
+      std::string ks = key.utf8(rt);
+      // key
+      buf.push_back('s');
+      sc_put_u32(buf, static_cast<uint32_t>(ks.size()));
+      buf.insert(buf.end(), ks.begin(), ks.end());
+      if (!sc_write(rt, val, buf, depth + 1)) {
+        return false;
+      }
+      ++written;
+    }
+    // Backpatch the real property count.
+    buf[count_pos] = static_cast<uint8_t>(written & 0xff);
+    buf[count_pos + 1] = static_cast<uint8_t>((written >> 8) & 0xff);
+    buf[count_pos + 2] = static_cast<uint8_t>((written >> 16) & 0xff);
+    buf[count_pos + 3] = static_cast<uint8_t>((written >> 24) & 0xff);
+    return true;
+  }
+  // Symbol, BigInt, or anything else: uncloneable.
+  return false;
+}
+
+// Recursively read one value from `data` at `pos`. Returns the value; on any
+// malformed input sets `ok = false` and returns undefined.
+static jsi::Value sc_read(jsi::Runtime &rt, const uint8_t *data, size_t len,
+                          size_t &pos, int depth, bool &ok) {
+  if (!ok || depth > 512 || pos >= len) {
+    ok = false;
+    return jsi::Value::undefined();
+  }
+  uint8_t tag = data[pos++];
+  switch (tag) {
+    case 'n':
+      return jsi::Value::null();
+    case 'u':
+      return jsi::Value::undefined();
+    case 't':
+      return jsi::Value(true);
+    case 'f':
+      return jsi::Value(false);
+    case 'i': {
+      uint32_t u;
+      if (!sc_get_u32(data, len, pos, u)) {
+        ok = false;
+        return jsi::Value::undefined();
+      }
+      return jsi::Value(static_cast<double>(static_cast<int32_t>(u)));
+    }
+    case 'd': {
+      if (pos + 8 > len) {
+        ok = false;
+        return jsi::Value::undefined();
+      }
+      uint64_t bits = 0;
+      for (int i = 0; i < 8; ++i) {
+        bits |= static_cast<uint64_t>(data[pos + i]) << (8 * i);
+      }
+      pos += 8;
+      double d;
+      std::memcpy(&d, &bits, sizeof(d));
+      return jsi::Value(d);
+    }
+    case 's': {
+      uint32_t slen;
+      if (!sc_get_u32(data, len, pos, slen) || pos + slen > len) {
+        ok = false;
+        return jsi::Value::undefined();
+      }
+      jsi::String s = jsi::String::createFromUtf8(
+          rt, data + pos, static_cast<size_t>(slen));
+      pos += slen;
+      return jsi::Value(rt, s);
+    }
+    case 'a': {
+      uint32_t n;
+      if (!sc_get_u32(data, len, pos, n)) {
+        ok = false;
+        return jsi::Value::undefined();
+      }
+      jsi::Array arr(rt, static_cast<size_t>(n));
+      for (uint32_t i = 0; i < n; ++i) {
+        jsi::Value el = sc_read(rt, data, len, pos, depth + 1, ok);
+        if (!ok) {
+          return jsi::Value::undefined();
+        }
+        arr.setValueAtIndex(rt, i, el);
+      }
+      return jsi::Value(rt, arr);
+    }
+    case 'o': {
+      uint32_t n;
+      if (!sc_get_u32(data, len, pos, n)) {
+        ok = false;
+        return jsi::Value::undefined();
+      }
+      jsi::Object obj(rt);
+      for (uint32_t i = 0; i < n; ++i) {
+        // Key: must be a string ('s').
+        jsi::Value keyv = sc_read(rt, data, len, pos, depth + 1, ok);
+        if (!ok || !keyv.isString()) {
+          ok = false;
+          return jsi::Value::undefined();
+        }
+        jsi::Value val = sc_read(rt, data, len, pos, depth + 1, ok);
+        if (!ok) {
+          return jsi::Value::undefined();
+        }
+        obj.setProperty(rt, keyv.getString(rt), val);
+      }
+      return jsi::Value(rt, obj);
+    }
+    default:
+      ok = false;
+      return jsi::Value::undefined();
+  }
+}
+
+// Serialize the value in `slot` into a freshly malloc'd byte buffer. On success
+// returns 1 and sets *out_ptr / *out_len (caller frees *out_ptr with
+// v8x_hermes_sc_free). On an uncloneable value or error returns 0 and leaves a
+// null buffer.
+int v8x_hermes_structured_serialize(void *rtw, v8x_hermes_slot slot,
+                                    uint8_t **out_ptr, size_t *out_len) {
+  if (out_ptr != nullptr) {
+    *out_ptr = nullptr;
+  }
+  if (out_len != nullptr) {
+    *out_len = 0;
+  }
+  if (rtw == nullptr || out_ptr == nullptr || out_len == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr) {
+    return 0;
+  }
+  try {
+    std::vector<uint8_t> buf;
+    if (!sc_write(w->runtime(), *v, buf, 0)) {
+      return 0;
+    }
+    size_t n = buf.size();
+    // Even an empty payload is valid (e.g. this never happens since every value
+    // writes >= 1 byte, but be defensive). Allocate at least 1 byte so the
+    // pointer is non-null.
+    uint8_t *out = static_cast<uint8_t *>(std::malloc(n == 0 ? 1 : n));
+    if (out == nullptr) {
+      return 0;
+    }
+    if (n > 0) {
+      std::memcpy(out, buf.data(), n);
+    }
+    *out_ptr = out;
+    *out_len = n;
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+// Free a buffer returned by v8x_hermes_structured_serialize.
+void v8x_hermes_sc_free(uint8_t *ptr) { std::free(ptr); }
+
+// Deserialize `len` bytes at `data` into a fresh handle slot. Returns the slot,
+// or V8X_HERMES_NULL_SLOT on malformed input / error.
+v8x_hermes_slot v8x_hermes_structured_deserialize(void *rtw,
+                                                  const uint8_t *data,
+                                                  size_t len) {
+  if (rtw == nullptr || data == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    size_t pos = 0;
+    bool ok = true;
+    jsi::Value v = sc_read(w->runtime(), data, len, pos, 0, ok);
+    if (!ok) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    return w->push(std::move(v));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
   }
 }
 

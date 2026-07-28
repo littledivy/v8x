@@ -28,6 +28,10 @@ mod lower;
 #[cfg(feature = "link_hermes")]
 mod modules;
 mod misc;
+// E5: v8::ValueSerializer/Deserializer (structuredClone wire format) over JSI
+// values. Needs the live Hermes runtime (the C++ walk helpers), so link_hermes.
+#[cfg(feature = "link_hermes")]
+mod serializer;
 mod shims;
 
 // Pure-Rust simdutf__* C-ABI surface (UTF validation/conversion/base64) the
@@ -603,6 +607,135 @@ mod hermes_typed_array {
       "hermes_typed_array: PASS - Is{{ArrayBufferView,TypedArray,Uint8Array}} \
        classify correctly, ByteOffset/ByteLength/Buffer/CopyContents/data() \
        read JS-created typed arrays exactly (incl. non-zero byteOffset)"
+    );
+  }
+}
+
+// E5: v8::ValueSerializer / ValueDeserializer round-trip (structuredClone wire
+// format over JSI values). Proves the same write_header -> write_value ->
+// release -> read_header -> read_value flow deno_core's op_structured_clone uses
+// reconstructs an equal, independent value graph for primitives, strings,
+// arrays, and nested plain objects. Also proves an uncloneable value
+// (a function) makes write_value return None so the op raises a DataCloneError.
+#[cfg(all(test, feature = "link_hermes"))]
+mod hermes_serializer {
+  use crate as v8;
+  use super::init_v8_once;
+  use crate::ValueDeserializerHelper;
+  use crate::ValueSerializerHelper;
+
+  // Minimal delegate: no host objects / transferables (out of scope). Only
+  // throw_data_clone_error is required by the trait; the defaults refuse the
+  // rest, which the Hermes walk never reaches for in-scope types.
+  struct Ser;
+  impl v8::ValueSerializerImpl for Ser {
+    fn throw_data_clone_error<'s>(
+      &self,
+      scope: &mut v8::PinScope<'s, '_>,
+      message: v8::Local<'s, v8::String>,
+    ) {
+      let exc = v8::Exception::error(scope, message);
+      scope.throw_exception(exc);
+    }
+  }
+
+  struct Deser;
+  impl v8::ValueDeserializerImpl for Deser {}
+
+  fn eval<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    src: &str,
+  ) -> v8::Local<'s, v8::Value> {
+    let source = v8::String::new(scope, src).unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    script.run(scope).unwrap()
+  }
+
+  /// Serialize `value`, then deserialize the bytes back into a fresh value.
+  fn round_trip<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    context: v8::Local<'s, v8::Context>,
+    value: v8::Local<'s, v8::Value>,
+  ) -> Option<v8::Local<'s, v8::Value>> {
+    let serializer = v8::ValueSerializer::new(scope, Box::new(Ser));
+    serializer.write_header();
+    serializer.write_value(context, value)?;
+    let bytes = serializer.release();
+
+    let deserializer =
+      v8::ValueDeserializer::new(scope, Box::new(Deser), &bytes);
+    deserializer.read_header(context)?;
+    deserializer.read_value(context)
+  }
+
+  #[test]
+  fn hermes_value_serializer_round_trip() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // Build the same shape the E5 probe asserts: { a: 1, b: [2, 3] }, plus a
+    // string and a boolean/null/undefined mix to cover the primitive tags.
+    let input = eval(
+      scope,
+      "({ a: 1, b: [2, 3], s: \"héllo\", t: true, n: null, u: undefined, \
+        d: 3.5, nested: { x: [10, 20], y: \"z\" } })",
+    );
+
+    let cloned =
+      round_trip(scope, context, input).expect("round_trip returned None");
+
+    // The clone must be a DIFFERENT object (structured clone, not aliasing) ...
+    assert!(cloned.is_object());
+    assert!(
+      !cloned.strict_equals(input),
+      "clone must not be the same reference as the input"
+    );
+
+    // ... and deep-equal by JSON (covers a, b, s, t, n, d, nested; `undefined`
+    // properties are dropped by JSON on both sides, matching V8).
+    let global = context.global(scope);
+    let key_in = v8::String::new(scope, "__ser_in").unwrap();
+    let key_out = v8::String::new(scope, "__ser_out").unwrap();
+    global.set(scope, key_in.into(), input);
+    global.set(scope, key_out.into(), cloned);
+    let eq = eval(
+      scope,
+      "JSON.stringify(globalThis.__ser_in) === \
+       JSON.stringify(globalThis.__ser_out)",
+    );
+    assert!(
+      eq.is_true(),
+      "deserialized value must deep-equal the input by JSON"
+    );
+
+    // Mutating the clone must not affect the input (independent graphs).
+    let mutate = eval(
+      scope,
+      "globalThis.__ser_out.b[0] = 99; globalThis.__ser_in.b[0]",
+    );
+    assert_eq!(
+      mutate.to_rust_string_lossy(scope),
+      "2",
+      "mutating the clone must not alias the input array"
+    );
+
+    // An uncloneable value (a function) must make write_value return None so
+    // the op surfaces a DataCloneError rather than silently corrupting.
+    let func = eval(scope, "(function foo() {})");
+    let serializer = v8::ValueSerializer::new(scope, Box::new(Ser));
+    serializer.write_header();
+    assert_eq!(
+      serializer.write_value(context, func),
+      None,
+      "serializing a function must return None (uncloneable)"
+    );
+
+    println!(
+      "hermes_serializer: PASS - primitives/strings/arrays/nested objects \
+       round-trip and deep-equal, clone is independent, functions are refused"
     );
   }
 }
