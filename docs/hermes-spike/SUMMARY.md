@@ -182,3 +182,12 @@ probes pass: atob/btoa, Event, ReadableStream construction. So ext/web is hydrat
 on Hermes. The next walls are the v8::Private subsystem (used by the error formatter and callsite metadata)
 and the ArrayBuffer/TypedArray ABI that TextEncoder/structured-clone need. This is exactly the ordinary
 op/API grind the retraction predicted, not a fundamental block.
+
+E4 closed the first two of those. v8::Private is implemented (a hidden non-enumerable per-object key), so a
+thrown error inside ext/web now FORMATS and propagates as a normal JS error instead of panicking. The
+TypedArray/ArrayBufferView ABI now reports JS-created typed arrays correctly to deno_core's op layer, and
+with v8::Symbol added, TextEncoder/TextDecoder round-trip real text through ext/web's JS
+(new TextDecoder().decode(new TextEncoder().encode("héllo")) === "héllo"). So ext/web is genuinely (not
+cosmetically) functional for encoding and error handling. Two ext/web features remain deferred, each a named
+next wall: structuredClone needs v8::ValueSerializer/Deserializer, and a real ReadableStream chunk read needs
+the deno_core event-loop / microtask drive fully wired. Backend suite 37/37.
