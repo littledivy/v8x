@@ -11,7 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
-- [x] *** deno_core::JsRuntime BOOTS on Hermes into Deno bootstrap JS (00_primordials.js); wall = Hermes v0.11.0 missing 6 intrinsics. rusty_v8 84/267 ***
+- [x] *** deno_core BOOTS on Hermes past intrinsics into primordials.js; wall = Hermes has no `async function*`. Hermes bumped to 2026/HBC99. rusty_v8 86/267 ***
 - [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities
@@ -39,6 +39,25 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle D6 - bump Hermes v0.11.0 -> 260318099.0.1 (HBC 99) (agent, opus) DONE - boot past intrinsics
+Bumped to Hermes 260318099.0.1 (current HERMES_VERSION on RN main, HBC v99); hermesc+runtime both v99
+(C5 HBC path stays matched). Sourcing was hard: facebook/hermes releases ship the macOS-HOST framework
+only for v0.11.0; newer host frameworks live inside RN's Maven Central hermes-ios artifact
+(destroot/Library/Frameworks/macosx/). Chose 260 not RN 0.75.4 because FinalizationRegistry did not land
+in Hermes until March 2026 (absent from all RN-tagged builds); only 260 has all 6 intrinsics.
+2 engine fixes: named GCConfig in runtime_new (empty heap name null-derefs in HadesGC under deno = SIGSEGV
+before any JS); withMicrotaskQueue(true) (WeakRef/FinalizationRegistry need it). build.rs auto-detects the
+renamed hermesvm.framework; is_hbc uses new IHermesRootAPI. ~3000-line JSI shim recompiled clean vs 2026 headers.
+RE-VERIFY: 20/20 hermes lib tests (smoke+5 probes+HBC); rusty_v8 84->86 (newer Hermes conformant Intl/ICU
+-> icu_collator + icu_date pass); baseline updated.
+NEW BOOT RESULT: past the intrinsics wall - primordials.js no longer throws on globalThis[name]. Fails one
+step deeper at COMPILE time: "285:40: async generators are unsupported" - line 285 is
+Reflect.getPrototypeOf(async function* () {}). Hermes has generators/async/for-await but NOT async function*.
+Wall moved from missing-intrinsics to an UNSUPPORTED SOURCE-LANGUAGE feature (Hermes compiler gap).
+NEXT (D7): source-transform the one async function* in the boot script (it only captures %AsyncGenerator%
+prototype) in the Script/CompileModule path (like D2), OR provide %AsyncGenerator% another way; then re-run
+boot -> next wall. Honest risk: if Deno's runtime uses async generators for real elsewhere, this becomes pervasive.
 
 ### Cycle D4/D5 - REAL deno_core boot on Hermes (agent, opus) DONE - THE MILESTONE
 An actual deno_core::JsRuntime::new RUNS on the Hermes backend. Path a: wired real deno_core (checkout

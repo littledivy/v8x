@@ -109,6 +109,9 @@ context (with deno_core's global ObjectTemplate + embedder data), the full strin
 the Deno.core namespace, and INTO executing Deno's real bootstrap JavaScript. It stops at the first
 bootstrap script ext:core/00_primordials.js, which throws because the vendored Hermes v0.11.0 is an OLD
 build missing 6 intrinsics Deno needs (AggregateError, BigInt, BigInt64Array, BigUint64Array,
-FinalizationRegistry, WeakRef). The wall is now the Hermes ENGINE VERSION, not our v8 shim. Next: bump the
-vendored Hermes framework (all 6 landed upstream after v0.11.0) to clear primordials, then the boot advances
-to the ext:core/mod.js module graph. rusty_v8 now 84/267. It does NOT run 1+1 yet - honest milestone, not a boot.
+FinalizationRegistry, WeakRef). Then bumped Hermes to a 2026 build (260318099.0.1, HBC 99) - which cleared the intrinsics wall and pushed
+rusty_v8 to 86/267. The boot now gets PAST primordials' intrinsic enumeration and fails one step deeper at
+compile time: Hermes has no `async function*` (async generators), which primordials.js uses to grab the
+%AsyncGenerator% prototype. So the wall is now a Hermes source-language gap. Next: transform/polyfill that
+construct and advance toward the ext:core/mod.js module graph. Still no 1+1 - honest, incremental. Risk: async
+generators may recur in Deno's real runtime code, which would make this a pervasive blocker.
