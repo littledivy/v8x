@@ -11,7 +11,7 @@ Porffor) can replace the V8 startup snapshot.
 Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
-- [x] *** Hermes passes 81/267 rusty_v8; +Promises/microtasks; 2/3 deno-boot walls cleared (ES modules last) ***
+- [x] *** Hermes passes 83/267 rusty_v8; +Promises/microtasks/ES-modules; all 4 boot PROBES green (real deno_core boot next) ***
 - [x] *** Hermes backend runs real JS: objects/arrays/numbers/functions (12/12 smoke tests), on the ratchet ***
 - [x] *** SHIP: working QuickJS deno binary at ~/deno-quickjs/deno (TS+HTTP+npm verified) ***
 - [x] C0 research: Hermes embedding API + AOT capabilities
@@ -39,6 +39,26 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Cycle log
 (newest first)
+
+### Cycle D2 - ES modules on Hermes (agent: d2, opus) DONE - all 4 boot probes GREEN
+boot_es_module_instantiate_evaluate GREEN => 4/4 boot probes pass. rusty_v8 81 -> 83
+(script_compiler_source, module_evaluation). --update, no regressions, test_api still links.
+JSI has NO ES-module API, so v8 module semantics modeled in Rust (src/hermes/modules.rs) on JSI:
+- CompileModule = line-oriented source transform -> closure (function(__imports,__exports){...});
+  imports -> `const x = __imports["spec"].x;` prologue; exports -> `__exports.x = ...`.
+- InstantiateModule = walk import requests, call resolve cb, recursively instantiate, build namespaces.
+- Evaluate = depth-first deps (V8 order), build __imports from dep namespaces, run closure, resolved
+  promise (reuses D1). Synthetic modules = exports obj filled by native steps + SetSyntheticModuleExport.
+- Module/ModuleRequest/FixedArray = Rust Box records, raw ptr = v8 Local; cross-scope JS values held in
+  runtime-owned durable pins (v8x_hermes_pin, the C2 pattern).
+Handles import "spec" / {a, b as c} / default / *as ns; export const/let/var/fn/class/default/{a,b as c}.
+Boot-graph shape (source module importing named bindings from a SYNTHETIC module) supported end-to-end.
+GAPS (documented): re-exports `export {x} from` + `export *` don't register a request; Location offsets 0;
+no top-level await. Not needed for the boot graph shape.
+IMPORTANT: probes green is a PROXY. The REAL test is booting an actual deno_core JsRuntime (full
+bootstrap + real module graph + ops). Next: D3 op glue (2 stubs Context__GetExtrasBindingObject +
+Function__SetName + verify External FunctionTemplate op roundtrip) -> D4 wire deno_core to build against
+LOCAL v8x with hermes,link_hermes -> D5 attempt the real boot, report exact failures.
 
 ### Cycle D1 - Promises + microtask queue (agent: d1, opus) DONE - 2/3 boot walls cleared
 boot_promise_resolver_roundtrip + boot_microtask_enqueue_and_checkpoint GREEN. rusty_v8 77 -> 81
