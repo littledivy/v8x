@@ -637,11 +637,7 @@ pub extern "C" fn v8__String__Write_v2() -> *const ::std::ffi::c_void { ::std::p
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__WriteOneByte_v2() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__Description() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__For() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__ForApi() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Symbol__{Description,For,ForApi} are implemented in core.rs (real, E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Symbol__GetAsyncIterator() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -664,8 +660,7 @@ pub extern "C" fn v8__Symbol__GetToPrimitive() -> *const ::std::ffi::c_void { ::
 pub extern "C" fn v8__Symbol__GetToStringTag() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Symbol__GetUnscopables() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Symbol__New() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Symbol__New is implemented in core.rs (real impl, E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Task__DELETE() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]

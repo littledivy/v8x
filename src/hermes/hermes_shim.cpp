@@ -119,6 +119,7 @@ struct RuntimeWrapper {
   std::unique_ptr<jsi::Value> private_delete_fn; // (obj, sym) => delete obj[sym]
   std::unique_ptr<jsi::Value> symbol_new_fn;     // (desc) => Symbol(desc)
   std::unique_ptr<jsi::Value> symbol_desc_fn;    // (sym) => sym.description
+  std::unique_ptr<jsi::Value> symbol_for_fn;     // (key) => Symbol.for(key)
   // D1: lazily-created per-runtime Promise infra. Hermes has native JS
   // Promises but JSI exposes no Promise API and no [[PromiseState]] accessor,
   // so a small cached JS helper object drives promise creation and state
@@ -824,7 +825,8 @@ namespace {
 // get/set/has/delete plus Symbol creation and description reads.
 bool ensure_private_infra(RuntimeWrapper *w) {
   if (w->private_get_fn && w->private_set_fn && w->private_has_fn &&
-      w->private_delete_fn && w->symbol_new_fn && w->symbol_desc_fn) {
+      w->private_delete_fn && w->symbol_new_fn && w->symbol_desc_fn &&
+      w->symbol_for_fn) {
     return true;
   }
   try {
@@ -836,7 +838,8 @@ bool ensure_private_infra(RuntimeWrapper *w) {
             "(o,s) => s in o,"
             "(o,s) => delete o[s],"
             "(d) => (d === undefined ? Symbol() : Symbol(d)),"
-            "(s) => { const d = s.description; return d === undefined ? '' : d; }"
+            "(s) => { const d = s.description; return d === undefined ? '' : d; },"
+            "(k) => Symbol.for(k)"
             "]; })()"),
         "v8x-private-setup.js");
     jsi::Array arr = setup.getObject(w->runtime()).asArray(w->runtime());
@@ -852,6 +855,8 @@ bool ensure_private_infra(RuntimeWrapper *w) {
         w->runtime(), arr.getValueAtIndex(w->runtime(), 4));
     w->symbol_desc_fn = std::make_unique<jsi::Value>(
         w->runtime(), arr.getValueAtIndex(w->runtime(), 5));
+    w->symbol_for_fn = std::make_unique<jsi::Value>(
+        w->runtime(), arr.getValueAtIndex(w->runtime(), 6));
     return true;
   } catch (...) {
     return false;
@@ -1064,6 +1069,75 @@ int v8x_hermes_object_delete_private(void *rtw, v8x_hermes_slot obj_slot,
     return r.isBool() && r.getBool() ? 1 : 0;
   } catch (...) {
     return -1;
+  }
+}
+
+// ---- v8::Symbol (real JS-visible symbols) ---------------------------------
+//
+// Distinct from Private (a hidden Symbol): these are ordinary JS Symbols.
+// deno_core's error machinery uses `Symbol::for_key` (== `Symbol.for(key)`, the
+// JS-visible global registry) to brand error-additional-properties, so the
+// error formatter needs a real Symbol.For. Symbol.New/Description reuse the
+// private infra's cached helpers.
+
+// v8::Symbol::New(isolate, description): a fresh unique Symbol.
+v8x_hermes_slot v8x_hermes_symbol_new(void *rtw, v8x_hermes_slot desc_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    return make_private_symbol(w, desc_slot);
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// v8::Symbol::For(isolate, key) == Symbol.for(key): the JS-visible global
+// registry (interned by key string, one namespace shared with JS `Symbol.for`).
+v8x_hermes_slot v8x_hermes_symbol_for(void *rtw, v8x_hermes_slot key_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *kv = slot_ref(w, key_slot);
+  if (kv == nullptr || !kv->isString()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    if (!ensure_private_infra(w)) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Function forFn =
+        w->symbol_for_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Value sym = forFn.call(w->runtime(), jsi::Value(w->runtime(), *kv));
+    return w->push(std::move(sym));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// v8::Symbol::Description(): the symbol's description string, or undefined.
+v8x_hermes_slot v8x_hermes_symbol_description(void *rtw,
+                                              v8x_hermes_slot sym_slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *sv = slot_ref(w, sym_slot);
+  if (sv == nullptr || !sv->isSymbol()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    if (!ensure_private_infra(w)) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::Function descFn =
+        w->symbol_desc_fn->getObject(w->runtime()).getFunction(w->runtime());
+    jsi::Value d = descFn.call(w->runtime(), jsi::Value(w->runtime(), *sv));
+    return w->push(std::move(d));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
   }
 }
 
@@ -3248,6 +3322,20 @@ static bool ensure_promise_infra(RuntimeWrapper *w) {
             "    jobs.push(fn); return jobs.length;"
             "  };"
             "  globalThis.clearImmediate = function () {};"
+            // deno_core's `queueMicrotask` (01_core.js) captures the NATIVE
+            // global `queueMicrotask` that V8 installs, and routes stream chunk
+            // delivery and other reactions through it. A from-scratch Hermes
+            // runtime has no such native global, so without this the capture is
+            // `undefined` and any `queueMicrotask(fn)` (e.g. ReadableStream's
+            // chunkStepsMicrotask) is a no-op / throw and its promise never
+            // settles. Install one that shares the SAME `jobs` FIFO as
+            // setImmediate so a single drainJobs() flushes both promise
+            // reactions and queued microtasks in FIFO order.
+            "  globalThis.queueMicrotask = function (fn) {"
+            "    if (typeof fn !== 'function')"
+            "      throw new TypeError('queueMicrotask expects a function');"
+            "    jobs.push(fn);"
+            "  };"
             "  function drainJobs() {"
             // Run queued jobs to completion. A job may enqueue more jobs
             // (chained .then), so loop until empty, with a large cap so a

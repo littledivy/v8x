@@ -42,7 +42,7 @@ use crate::{
   FunctionCallbackInfo, FunctionTemplate, Integer, Message, MicrotaskQueue,
   Name, Number, Object, ObjectTemplate, OneByteConst, Platform, Primitive,
   Private, Promise, PromiseResolver, PromiseState, RealIsolate, Script,
-  String as V8String, Template, UniquePtr, Value,
+  String as V8String, Symbol, Template, UniquePtr, Value,
 };
 use std::cell::Cell;
 use std::os::raw::{c_char, c_int, c_void};
@@ -205,6 +205,9 @@ unsafe extern "C" {
     obj_slot: i64,
     key_slot: i64,
   ) -> c_int;
+  fn v8x_hermes_symbol_new(rtw: *mut c_void, desc_slot: i64) -> i64;
+  fn v8x_hermes_symbol_for(rtw: *mut c_void, key_slot: i64) -> i64;
+  fn v8x_hermes_symbol_description(rtw: *mut c_void, sym_slot: i64) -> i64;
 
   // C9: TryCatch / exception surfacing. See
   // docs/hermes-spike/experiments/C9-hermes-trycatch.md.
@@ -1809,6 +1812,95 @@ pub extern "C" fn v8__Object__DeletePrivate(
     0 => MaybeBool::JustFalse,
     _ => MaybeBool::Nothing,
   }
+}
+
+// ---- v8::Symbol (real JS-visible symbols, E4) ------------------------------
+//
+// Distinct from Private (a hidden Symbol). deno_core's error machinery uses
+// `Symbol::for_key` (== `Symbol.for(key)`) to brand error metadata, so the
+// error formatter needs a real Symbol::For; without it a thrown ext/web error
+// panics at symbol.rs before it can be reported.
+
+/// `Symbol::new(scope, description)`: a fresh unique Symbol. A null description
+/// yields a Symbol with no description.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Symbol__New(
+  isolate: *mut RealIsolate,
+  description: *const V8String,
+) -> *const Symbol {
+  if isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  let desc_slot = if description.is_null() {
+    NULL_SLOT
+  } else {
+    slot_of(description as *const Value)
+  };
+  let slot = unsafe { v8x_hermes_symbol_new(rtw, desc_slot) };
+  slot_ptr::<Symbol>(slot)
+}
+
+/// `Symbol::for_key(scope, description)` == `Symbol.for(key)`: the JS-visible
+/// global symbol registry (shared namespace with JS `Symbol.for`).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Symbol__For(
+  isolate: *mut RealIsolate,
+  description: *const V8String,
+) -> *const Symbol {
+  if isolate.is_null() || description.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  let slot =
+    unsafe { v8x_hermes_symbol_for(rtw, slot_of(description as *const Value)) };
+  slot_ptr::<Symbol>(slot)
+}
+
+/// `Symbol::for_api(scope, description)`: a private (JS-inaccessible) global
+/// registry. We route it through the Private registry (same interning
+/// semantics), which is the JS-inaccessible namespace v8's ForApi promises.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Symbol__ForApi(
+  isolate: *mut RealIsolate,
+  description: *const V8String,
+) -> *const Symbol {
+  if isolate.is_null() || description.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  let slot = unsafe {
+    v8x_hermes_private_for_api(rtw, slot_of(description as *const Value))
+  };
+  slot_ptr::<Symbol>(slot)
+}
+
+/// `Symbol::description()`: the symbol's description (a `Value` holding a string
+/// or undefined), or a null handle on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Symbol__Description(
+  this: *const Symbol,
+  isolate: *mut RealIsolate,
+) -> *const Value {
+  if this.is_null() || isolate.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  let slot =
+    unsafe { v8x_hermes_symbol_description(rtw, slot_of(this as *const Value)) };
+  slot_ptr::<Value>(slot)
 }
 
 // ---- Object / Array / Number / Integer / Boolean / Function (C6) ---------
