@@ -160,3 +160,14 @@ Corrected framing: async generators are a **scalable wall, not a ceiling**. Full
 grind over two independent surfaces - (1) the syntax-lowering pass, proven tractable, and (2) the large
 but ordinary op / Web-API surface of the full Deno runtime beyond deno_core - not a fundamental
 engine block. The E-series pursues both.
+
+E1 landed the lowering pass (src/hermes/lower.rs, oxc ES2018 transform gated behind engine_hermes, wired
+into Script::compile + module eval); async generators + for-await run end-to-end through the backend.
+E2 then tested it against REAL Deno and found+fixed a fatal gap: the lowering must give lowered async
+generators the %AsyncGeneratorFunction.prototype% intrinsic chain, or Deno's 00_primordials.js throws
+while pinning %AsyncGenerator%. (This also corrected the record: the earlier D8 "1+1" milestone had run on
+a stale pre-lowering binary.) With the fix, deno_core boots and runs 1+1 with the real lowering active,
+async iteration inside the booted runtime yields "1,2,3,4", and ext/web-shaped async-gen streaming yields
+"1,2,3,4,5". The remaining path to full Deno is the ordinary op + Web-API-global surface; the immediate
+blocker for the whole deno_runtime crate is a non-Hermes deno_napi compile error, while deno_web builds
+clean, so the next target is a minimal deno_webidl + deno_web worker on Hermes.
