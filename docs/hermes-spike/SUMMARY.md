@@ -86,3 +86,14 @@ Not done (this was a spike, not a product):
 Prioritized next targets: named/indexed property interceptors -> BackingStore/shared_ptr (also kills the last crashers) -> Promises/microtask queue -> ES modules ->
 start the deno_core hill-climb. Separately, wire an HBC path into `deno compile` to cash in the 21x
 startup win on real Deno bootstrap.
+
+
+## Update: grinding toward Deno-on-Hermes (D-series)
+
+The overnight run built the Hermes BACKEND (runs JS, 77/267 rusty_v8), not Deno-on-Hermes. Now
+grinding toward an actual Deno boot. Recon (D0) found the boot path is blocked by exactly three
+missing subsystems, proved with an in-repo boot probe: Promises, microtasks, and ES modules (all
+null stubs). deno_core boots from source but loads its core JS as an ES module, so modules are
+required, not optional. Roadmap: Promises/microtasks -> ES modules -> 2 tiny op stubs -> a deno_core
+JsRuntime running a script on Hermes. This is a multi-session effort. Honest note: Hermes v0.11.0 is
+interpreter-only (no JIT) and is not a compute win over QuickJS - benchmarks in ~/deno-quickjs/BENCHMARKS.md.

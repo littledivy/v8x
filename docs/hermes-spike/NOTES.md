@@ -40,6 +40,25 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 ## Cycle log
 (newest first)
 
+### Cycle D0 - deno-boot recon (agent: d0, opus) DONE => path is clear + measurable
+FIRST WALLS (all null stubs on hermes): Promises, microtasks, ES modules. Proved via in-repo probe
+`hermes_boot_probe` (src/hermes/mod.rs): boot_baseline_isolate_context_script OK; promise_resolver /
+microtask_checkpoint / es_module_compile all FAIL (stubs). Run: cargo test --features hermes,link_hermes
+--lib hermes_boot_probe -- --test-threads=1.
+STRUCTURAL: deno_core boots FROM SOURCE (InitMode::New, no snapshot required) BUT loads ext:core/mod.js
+as an ES MODULE + ext:core/ops as a SYNTHETIC module -> module subsystem is ON the minimal boot path,
+not deferrable. External/op infra (External__New, FunctionCallbackInfo::Data, FunctionTemplate) is
+ALREADY real on hermes = NOT the wall.
+ROADMAP to boot: D1 Promises + MicrotaskQueue + PerformMicrotaskCheckpoint (hermes has native JS
+Promises + rt.drainMicrotasks -> JSI host-fn work). D2 ES modules (ScriptCompiler__CompileModule,
+Module__{InstantiateModule,Evaluate,GetModuleRequests,CreateSyntheticModule,SetSyntheticModuleExport,
+GetModuleNamespace,GetStatus}) - the real headline, no clean JSI analogue, needs a modeling spike. D3
+op glue (verify External FunctionTemplate roundtrip + 2 tiny stubs Context__GetExtrasBindingObject,
+Function__SetName). D4 deno_core JsRuntime runs a script on hermes.
+deno_core HARNESS not run yet: ~/gh/deno-v8x-rebase pulls v8x from crates.io (quickjs alias only, no
+hermes/path dep) so ensureDenoV8Patch fails + full deno_core build won't link until Promises+modules
+exist. Re-attempt after D1-D2. Probe (33ab561) is the interim measure.
+
 ### Cycle C12 - FunctionTemplate signatures + a TryCatch lifetime fix, ratchet 76 -> 77 (agent: c12) DONE (wind-down)
 FunctionTemplate::Signature (v8__Signature__New + receiver check): each FnTemplate gets a process-global
 template_id; instances stamped via hidden Symbol-keyed prop; signature-bearing fns walk the receiver
