@@ -12,6 +12,7 @@ Branch: `hermes-backend-spike`. Loop state in `.omc/hermes-loop/`.
 
 ## Status board (updated each cycle)
 - [ ] *** E-SERIES (user: "attempt full Deno anyway"): break the async-gen wall via a compile-boundary lowering pass, then grind the full Deno runtime op/API surface ***
+- [x] *** E1: async generators RUN END-TO-END through the Hermes backend. Compile-boundary lowering pass (src/hermes/lower.rs, oxc ES2018 transform, gated behind engine_hermes) wired into Script::compile + module eval; `for await` over `async function*` resolves "1,2,3" and yield*/method mix "1,2,3,a,b,10" (asserted). Needed a promise-state fix (track JS-created promises). 34/34 hermes tests. Next wall: primordials %AsyncGenerator% intrinsic-identity. See experiments/E1. ***
 - [x] *** E0: the async-gen "ceiling" is OVERTURNED. Hermes rejects ONLY `async function*` decl syntax; function*/async-await/Symbol.asyncIterator/`for await` all compile. Async gens lower to Hermes-supported primitives (hermesc compiles the lowered form). D7/D8 "not transformable" RETRACTED. See experiments/E0. ***
 - [x] *** deno_core::JsRuntime BOOTS + runs 1+1 on the Hermes backend (D8 BackingStore closed the boot); rusty_v8 re-derived to 93/267 ***
 - [x] deno_core boots to the LAST step of new_inner on Hermes (past primordials, ops, 01_core.js, module graph); wall was ArrayBuffer BackingStore (closed in D8)
