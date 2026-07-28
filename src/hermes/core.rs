@@ -34,12 +34,13 @@
 
 #![allow(non_snake_case)]
 
-use crate::support::{MaybeBool, SharedPtrBase};
+use crate::support::{MaybeBool, SharedPtrBase, SharedRef};
 use crate::{
-  Allocator, Array, ArrayBuffer, Boolean, Context, Data, External, Function,
-  FunctionCallback, FunctionCallbackInfo, FunctionTemplate, Integer, Message,
-  MicrotaskQueue, Name, Number, Object, ObjectTemplate, OneByteConst, Platform,
-  Primitive, Promise, PromiseResolver, PromiseState, RealIsolate, Script,
+  Allocator, Array, ArrayBuffer, BackingStore, BackingStoreDeleterCallback,
+  Boolean, Context, Data, External, Function, FunctionCallback,
+  FunctionCallbackInfo, FunctionTemplate, Integer, Message, MicrotaskQueue,
+  Name, Number, Object, ObjectTemplate, OneByteConst, Platform, Primitive,
+  Promise, PromiseResolver, PromiseState, RealIsolate, Script,
   String as V8String, Template, UniquePtr, Value,
 };
 use std::cell::Cell;
@@ -140,6 +141,15 @@ unsafe extern "C" {
   // C8: ArrayBuffer + TypedArray. See
   // docs/hermes-spike/experiments/C8-hermes-testapi.md.
   fn v8x_hermes_array_buffer_new(rtw: *mut c_void, byte_length: usize) -> i64;
+  fn v8x_hermes_array_buffer_new_external(
+    rtw: *mut c_void,
+    data: *mut c_void,
+    byte_length: usize,
+    deleter: Option<
+      unsafe extern "C" fn(*mut c_void, usize, *mut c_void),
+    >,
+    deleter_data: *mut c_void,
+  ) -> i64;
   fn v8x_hermes_array_buffer_byte_length(rtw: *mut c_void, slot: i64) -> usize;
   fn v8x_hermes_array_buffer_data(rtw: *mut c_void, slot: i64) -> *mut c_void;
   fn v8x_hermes_typed_array_new(
@@ -2370,6 +2380,365 @@ pub extern "C" fn v8__ArrayBuffer__Data(this: *const ArrayBuffer) -> *mut c_void
     return ptr::null_mut();
   }
   unsafe { v8x_hermes_array_buffer_data(rtw, slot_of(this)) }
+}
+
+// ---- BackingStore (external-memory ArrayBuffer, C2 lifetime) ----------------
+//
+// A v8 BackingStore is the raw memory of an ArrayBuffer, owned via
+// std::unique_ptr / std::shared_ptr so V8-internal objects may alias it. deno
+// uses external-memory BackingStores to share Rust memory with JS without
+// copying: `store_js_callbacks` wraps `ContextState::tick_info` (Rust-owned
+// bytes) as a BackingStore, then builds a JS `Uint8Array` over it so JS reads
+// and writes hit the same memory.
+//
+// Hermes/JSI has no v8 BackingStore type, so (as with C11 templates and D2
+// modules) we model it as a Rust-owned record: a `BsInner` box holding the
+// external pointer, length, and the v8 deleter. The `*mut BackingStore` handle
+// v8 passes around is a `*mut BsInner` in disguise (never dereferenced as a real
+// BackingStore). A `SharedRef<BackingStore>`/`SharedPtrBase<BackingStore>` is an
+// intrusively refcounted pointer to the same `BsInner`.
+//
+// C2 lifetime: the deleter, not us, owns the external bytes. We never free them
+// directly. When `NewBackingStore__with_data` supplies a deleter, that deleter
+// is called exactly once, when the last owner of the memory is dropped: either
+// the JS ArrayBuffer built over it is GC'd (the ExternalMutableBuffer destructor
+// runs) OR, if no ArrayBuffer was ever built, when the last BackingStore
+// reference is dropped. `owns_bytes` tracks which path is responsible so the
+// deleter fires exactly once.
+
+struct BsInner {
+  refcount: AtomicUsize,
+  data: *mut c_void,
+  byte_length: usize,
+  is_shared: bool,
+  deleter: BackingStoreDeleterCallback,
+  deleter_data: *mut c_void,
+  // True while this record still owns the right to run the deleter. Set false
+  // once ownership of the bytes is handed to a JS ArrayBuffer (the
+  // ExternalMutableBuffer becomes responsible for the deleter). `owns_alloc`
+  // marks bytes we malloc'd ourselves (empty allocate path), freed on drop.
+  owns_bytes: bool,
+  owns_alloc: bool,
+}
+
+unsafe extern "C" fn noop_deleter(
+  _data: *mut c_void,
+  _len: usize,
+  _deleter_data: *mut c_void,
+) {
+}
+
+unsafe extern "C" {
+  fn calloc(count: usize, size: usize) -> *mut c_void;
+  fn free(ptr: *mut c_void);
+}
+
+impl BsInner {
+  fn boxed(
+    data: *mut c_void,
+    byte_length: usize,
+    is_shared: bool,
+    deleter: BackingStoreDeleterCallback,
+    deleter_data: *mut c_void,
+    owns_bytes: bool,
+    owns_alloc: bool,
+  ) -> *mut BsInner {
+    Box::into_raw(Box::new(BsInner {
+      refcount: AtomicUsize::new(1),
+      data,
+      byte_length,
+      is_shared,
+      deleter,
+      deleter_data,
+      owns_bytes,
+      owns_alloc,
+    }))
+  }
+
+  fn new_allocated(byte_length: usize, is_shared: bool) -> *mut BsInner {
+    let data = if byte_length == 0 {
+      ptr::null_mut()
+    } else {
+      unsafe { calloc(byte_length, 1) }
+    };
+    BsInner::boxed(data, byte_length, is_shared, noop_deleter, ptr::null_mut(), true, true)
+  }
+
+  // Drop the record. Runs the deleter (or frees owned memory) only if this
+  // record still holds byte ownership; if a JS ArrayBuffer took over, the
+  // ExternalMutableBuffer destructor runs the deleter instead.
+  unsafe fn destroy(ptr: *mut BsInner) {
+    if ptr.is_null() {
+      return;
+    }
+    let b = unsafe { Box::from_raw(ptr) };
+    if b.owns_bytes && !b.data.is_null() {
+      if b.owns_alloc {
+        unsafe { free(b.data) };
+      } else {
+        unsafe { (b.deleter)(b.data, b.byte_length, b.deleter_data) };
+      }
+    }
+  }
+}
+
+#[inline]
+fn bs_inner<'a>(p: *const BackingStore) -> Option<&'a BsInner> {
+  unsafe { (p as *const BsInner).as_ref() }
+}
+
+#[inline]
+fn sp_get(p: *const SharedPtrBase<BackingStore>) -> *mut BsInner {
+  if p.is_null() {
+    return ptr::null_mut();
+  }
+  unsafe { *(p as *const usize) as *mut BsInner }
+}
+
+#[inline]
+fn sp_set(p: *mut SharedPtrBase<BackingStore>, inner: *mut BsInner) {
+  unsafe {
+    let words = p as *mut usize;
+    *words = inner as usize;
+    *words.add(1) = 0;
+  }
+}
+
+#[inline]
+fn make_shared_ref(inner: *mut BsInner) -> SharedRef<BackingStore> {
+  let base: SharedPtrBase<BackingStore> = Default::default();
+  let mut sref = unsafe {
+    std::mem::transmute_copy::<
+      SharedPtrBase<BackingStore>,
+      SharedRef<BackingStore>,
+    >(&base)
+  };
+  std::mem::forget(base);
+  sp_set(
+    &mut sref as *mut SharedRef<BackingStore>
+      as *mut SharedPtrBase<BackingStore>,
+    inner,
+  );
+  sref
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBuffer__NewBackingStore__with_byte_length(
+  isolate: *mut RealIsolate,
+  byte_length: usize,
+) -> *mut BackingStore {
+  let _ = isolate;
+  BsInner::new_allocated(byte_length, false) as *mut BackingStore
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBuffer__NewBackingStore__with_data(
+  data: *mut c_void,
+  byte_length: usize,
+  deleter: BackingStoreDeleterCallback,
+  deleter_data: *mut c_void,
+) -> *mut BackingStore {
+  BsInner::boxed(data, byte_length, false, deleter, deleter_data, true, false)
+    as *mut BackingStore
+}
+
+// Build a JS ArrayBuffer that ALIASES the backing store's external memory, so
+// Rust writes (e.g. deno's tick_info) are visible to the JS view and vice
+// versa. Ownership of the bytes and the deleter transfers to the JS
+// ArrayBuffer's ExternalMutableBuffer: this record stops owning the deleter
+// (`owns_bytes = false`) so the bytes are freed exactly once, when the JS
+// ArrayBuffer is GC'd.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBuffer__New__with_backing_store(
+  isolate: *mut RealIsolate,
+  backing_store: *const SharedRef<BackingStore>,
+) -> *const ArrayBuffer {
+  if isolate.is_null() || backing_store.is_null() {
+    return ptr::null();
+  }
+  let rtw = iso_state(isolate).rtw;
+  if rtw.is_null() {
+    return ptr::null();
+  }
+  let inner = sp_get(backing_store as *const SharedPtrBase<BackingStore>);
+  if inner.is_null() {
+    return ptr::null();
+  }
+  let (data, len, deleter, deleter_data, owns_bytes, owns_alloc) = unsafe {
+    (
+      (*inner).data,
+      (*inner).byte_length,
+      (*inner).deleter,
+      (*inner).deleter_data,
+      (*inner).owns_bytes,
+      (*inner).owns_alloc,
+    )
+  };
+
+  // The JS ArrayBuffer aliases the external pointer. Ownership of the bytes
+  // passes to the ArrayBuffer's ExternalMutableBuffer, which runs the v8 deleter
+  // when collected. For our own malloc'd bytes (empty allocate path) or a record
+  // that no longer owns the bytes, pass a no-op deleter so nothing is
+  // double-freed; the JS ArrayBuffer just aliases and this record keeps
+  // responsibility (or already relinquished it).
+  let (js_deleter, js_deleter_data): (
+    Option<unsafe extern "C" fn(*mut c_void, usize, *mut c_void)>,
+    *mut c_void,
+  ) = if owns_bytes && !owns_alloc {
+    unsafe { (*inner).owns_bytes = false };
+    (Some(deleter), deleter_data)
+  } else {
+    (Some(noop_deleter), ptr::null_mut())
+  };
+
+  let slot = unsafe {
+    v8x_hermes_array_buffer_new_external(
+      rtw,
+      data,
+      len,
+      js_deleter,
+      js_deleter_data,
+    )
+  };
+  if slot == NULL_SLOT {
+    // Creation failed: we did not hand ownership off after all.
+    if owns_bytes && !owns_alloc {
+      unsafe { (*inner).owns_bytes = true };
+    }
+    return ptr::null();
+  }
+  slot_ptr::<ArrayBuffer>(slot)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__BackingStore__Data(
+  this: *const BackingStore,
+) -> *mut c_void {
+  bs_inner(this).map_or(ptr::null_mut(), |b| {
+    if b.byte_length == 0 {
+      ptr::null_mut()
+    } else {
+      b.data
+    }
+  })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__BackingStore__ByteLength(
+  this: *const BackingStore,
+) -> usize {
+  bs_inner(this).map_or(0, |b| b.byte_length)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__BackingStore__IsShared(
+  this: *const BackingStore,
+) -> bool {
+  bs_inner(this).map_or(false, |b| b.is_shared)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__BackingStore__IsResizableByUserJavaScript(
+  this: *const BackingStore,
+) -> bool {
+  let _ = this;
+  false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__BackingStore__DELETE(this: *mut BackingStore) {
+  let inner = this as *mut BsInner;
+  if inner.is_null() {
+    return;
+  }
+  if unsafe { (*inner).refcount.fetch_sub(1, Ordering::SeqCst) } == 1 {
+    unsafe { BsInner::destroy(inner) };
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__BackingStore__COPY(
+  ptr: *const SharedPtrBase<BackingStore>,
+) -> SharedPtrBase<BackingStore> {
+  let inner = sp_get(ptr);
+  if !inner.is_null() {
+    unsafe { (*inner).refcount.fetch_add(1, Ordering::SeqCst) };
+  }
+  let mut out: SharedPtrBase<BackingStore> = Default::default();
+  sp_set(&mut out, inner);
+  out
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__BackingStore__CONVERT__std__unique_ptr(
+  unique_ptr: UniquePtr<BackingStore>,
+) -> SharedPtrBase<BackingStore> {
+  let raw = unique_ptr.into_raw() as *mut BsInner;
+  let mut out: SharedPtrBase<BackingStore> = Default::default();
+  sp_set(&mut out, raw);
+  out
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__BackingStore__get(
+  ptr: *const SharedPtrBase<BackingStore>,
+) -> *mut BackingStore {
+  sp_get(ptr) as *mut BackingStore
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__BackingStore__reset(
+  ptr: *mut SharedPtrBase<BackingStore>,
+) {
+  let inner = sp_get(ptr);
+  if !inner.is_null()
+    && unsafe { (*inner).refcount.fetch_sub(1, Ordering::SeqCst) } == 1
+  {
+    unsafe { BsInner::destroy(inner) };
+  }
+  if !ptr.is_null() {
+    sp_set(ptr, ptr::null_mut());
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn std__shared_ptr__v8__BackingStore__use_count(
+  ptr: *const SharedPtrBase<BackingStore>,
+) -> crate::support::long {
+  let inner = sp_get(ptr);
+  if inner.is_null() {
+    0
+  } else {
+    unsafe { (*inner).refcount.load(Ordering::SeqCst) as crate::support::long }
+  }
+}
+
+// Return a BackingStore that aliases an existing JS ArrayBuffer's bytes. The
+// record is non-owning (no deleter): the JS ArrayBuffer, not this record, owns
+// the memory, so the data pointer is only valid while that ArrayBuffer lives.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBuffer__GetBackingStore(
+  this: *const ArrayBuffer,
+) -> SharedRef<BackingStore> {
+  let rtw = current_rtw();
+  let (data, len) = if rtw.is_null() || this.is_null() {
+    (ptr::null_mut(), 0)
+  } else {
+    let slot = slot_of(this);
+    let data = unsafe { v8x_hermes_array_buffer_data(rtw, slot) };
+    let len = unsafe { v8x_hermes_array_buffer_byte_length(rtw, slot) };
+    (data, if len == usize::MAX { 0 } else { len })
+  };
+  let inner = BsInner::boxed(
+    data,
+    len,
+    false,
+    noop_deleter,
+    ptr::null_mut(),
+    false,
+    false,
+  );
+  make_shared_ref(inner)
 }
 
 #[unsafe(no_mangle)]

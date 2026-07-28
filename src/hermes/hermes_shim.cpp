@@ -1297,6 +1297,63 @@ v8x_hermes_slot v8x_hermes_array_buffer_new(void *rtw, size_t byte_length) {
   }
 }
 
+// A jsi::MutableBuffer that ALIASES external memory (a Rust-owned pointer, e.g.
+// deno_core's ContextState::tick_info). It does NOT own the bytes: the v8
+// deleter callback owns them and decides when they are freed. When the JS
+// ArrayBuffer built over this buffer is garbage-collected, Hermes drops the last
+// shared_ptr and this destructor runs, which is where we hand ownership back by
+// invoking the v8 deleter (C2 lifetime: the deleter, not us, frees the memory).
+//
+// The pointer/len/deleter are the same fields a v8 BackingStore carries; the
+// Rust BsInner mirror keeps a matching record so BackingStore accessors work
+// without crossing back into JSI. See src/hermes/core.rs.
+class ExternalMutableBuffer : public jsi::MutableBuffer {
+public:
+  ExternalMutableBuffer(uint8_t *data, size_t size,
+                        void (*deleter)(void *, size_t, void *),
+                        void *deleter_data)
+      : data_(data), size_(size), deleter_(deleter),
+        deleter_data_(deleter_data) {}
+
+  ~ExternalMutableBuffer() override {
+    if (deleter_ != nullptr) {
+      deleter_(data_, size_, deleter_data_);
+    }
+  }
+
+  size_t size() const override { return size_; }
+  uint8_t *data() override { return data_; }
+
+private:
+  uint8_t *data_;
+  size_t size_;
+  void (*deleter_)(void *, size_t, void *);
+  void *deleter_data_;
+};
+
+// Create a jsi::ArrayBuffer that ALIASES external memory `data` (`byte_length`
+// bytes). Ownership of the memory transfers to the v8 `deleter`: when the JS
+// ArrayBuffer is collected, Hermes releases the ExternalMutableBuffer, whose
+// destructor calls `deleter(data, byte_length, deleter_data)`. Returns a slot
+// holding the new ArrayBuffer, or the null slot on error. A null `deleter` means
+// the caller retains ownership (the buffer aliases but never frees).
+v8x_hermes_slot v8x_hermes_array_buffer_new_external(
+    void *rtw, void *data, size_t byte_length,
+    void (*deleter)(void *, size_t, void *), void *deleter_data) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  try {
+    auto buf = std::make_shared<ExternalMutableBuffer>(
+        static_cast<uint8_t *>(data), byte_length, deleter, deleter_data);
+    jsi::ArrayBuffer ab = w->runtime().createArrayBuffer(std::move(buf));
+    return w->push(jsi::Value(w->runtime(), ab));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
 // ArrayBuffer.prototype.byteLength as a size_t. Returns SIZE_MAX on error so a
 // genuine 0-length buffer is distinguishable from a bad slot.
 size_t v8x_hermes_array_buffer_byte_length(void *rtw, v8x_hermes_slot slot) {

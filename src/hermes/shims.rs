@@ -10,16 +10,6 @@
 #[unsafe(no_mangle)]
 pub extern "C" fn std__shared_ptr__v8__ArrayBuffer__Allocator__use_count() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn std__shared_ptr__v8__BackingStore__CONVERT__std__unique_ptr() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn std__shared_ptr__v8__BackingStore__COPY() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn std__shared_ptr__v8__BackingStore__get() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn std__shared_ptr__v8__BackingStore__reset() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn std__shared_ptr__v8__BackingStore__use_count() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn std__shared_ptr__v8__Platform__use_count() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__AllowJavascriptExecutionScope__CONSTRUCT() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -32,15 +22,7 @@ pub extern "C" fn v8__ArrayBuffer__Allocator__NewRustAllocator() -> *const ::std
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ArrayBuffer__Detach() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBuffer__GetBackingStore() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__ArrayBuffer__IsDetachable() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBuffer__New__with_backing_store() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBuffer__NewBackingStore__with_byte_length() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBuffer__NewBackingStore__with_data() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ArrayBuffer__SetDetachKey() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -59,16 +41,6 @@ pub extern "C" fn v8__ArrayBufferView__CopyContents() -> *const ::std::ffi::c_vo
 pub extern "C" fn v8__ArrayBufferView__GetContents() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ArrayBufferView__HasBuffer() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__BackingStore__ByteLength() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__BackingStore__Data() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__BackingStore__DELETE() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__BackingStore__IsResizableByUserJavaScript() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__BackingStore__IsShared() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__BigInt__Int64Value() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
