@@ -20,6 +20,8 @@
 // See docs/hermes-spike/experiments/C3-hermes-helloworld.md.
 
 #include <hermes/hermes.h>
+#include <hermes/Public/GCConfig.h>
+#include <hermes/Public/RuntimeConfig.h>
 #include <jsi/jsi.h>
 
 #include <cstddef>
@@ -229,7 +231,19 @@ extern "C" {
 void *v8x_hermes_runtime_new() {
   try {
     auto *w = new RuntimeWrapper();
-    w->rt = facebook::hermes::makeHermesRuntime();
+    // The RN 0.75.4 Hermes gates WeakRef (and, in newer builds,
+    // FinalizationRegistry) on the microtask queue being enabled: the
+    // constructors exist but are absent from globalThis unless the runtime
+    // is built with withMicrotaskQueue(true). deno_core's
+    // ext:core/00_primordials.js enumerates WeakRef, so enable it here.
+    // A named GCConfig is supplied so the (default HadesGC) crash-manager
+    // custom-data registration has a non-empty heap name.
+    auto gc = ::hermes::vm::GCConfig::Builder().withName("v8x-hermes").build();
+    auto cfg = ::hermes::vm::RuntimeConfig::Builder()
+                   .withGCConfig(gc)
+                   .withMicrotaskQueue(true)
+                   .build();
+    w->rt = facebook::hermes::makeHermesRuntime(cfg);
     return static_cast<void *>(w);
   } catch (...) {
     return nullptr;
