@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=hermes suite=rusty_v8.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 84 passing. DO NOT hand-sort; the
+# (run.mjs --update). 86 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 rv8_slots::context_slots
 rv8_slots::dropped_context_slots_on_kept_context
@@ -48,6 +48,8 @@ rv8_test_api::get_version
 rv8_test_api::global_handle_drop
 rv8_test_api::handle_scope_nested
 rv8_test_api::handles_from_isolate
+rv8_test_api::icu_collator
+rv8_test_api::icu_date
 rv8_test_api::icu_set_common_data_fail
 rv8_test_api::inspector_string_view
 rv8_test_api::instance_template_with_internal_field
