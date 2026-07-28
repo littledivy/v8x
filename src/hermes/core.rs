@@ -36,7 +36,8 @@
 
 use crate::support::{MaybeBool, SharedPtrBase, SharedRef};
 use crate::{
-  Allocator, Array, ArrayBuffer, BackingStore, BackingStoreDeleterCallback,
+  Allocator, Array, ArrayBuffer, ArrayBufferView, BackingStore,
+  BackingStoreDeleterCallback,
   Boolean, Context, Data, External, Function, FunctionCallback,
   FunctionCallbackInfo, FunctionTemplate, Integer, Message, MicrotaskQueue,
   Name, Number, Object, ObjectTemplate, OneByteConst, Platform, Primitive,
@@ -161,6 +162,23 @@ unsafe extern "C" {
     length: usize,
   ) -> i64;
   fn v8x_hermes_typed_array_length(rtw: *mut c_void, slot: i64) -> usize;
+  fn v8x_hermes_value_is_typed_array(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_value_is_uint8_array(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_value_is_array_buffer(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_value_is_array_buffer_view(
+    rtw: *mut c_void,
+    slot: i64,
+  ) -> c_int;
+  fn v8x_hermes_typed_array_byte_offset(rtw: *mut c_void, slot: i64) -> usize;
+  fn v8x_hermes_typed_array_byte_length(rtw: *mut c_void, slot: i64) -> usize;
+  fn v8x_hermes_typed_array_buffer(rtw: *mut c_void, slot: i64) -> i64;
+  fn v8x_hermes_typed_array_data(rtw: *mut c_void, slot: i64) -> *mut c_void;
+  fn v8x_hermes_typed_array_copy_contents(
+    rtw: *mut c_void,
+    slot: i64,
+    dest: *mut c_void,
+    dest_len: usize,
+  ) -> usize;
 
   // E4: v8::Private (hidden Symbol keys). See the E4 web-functional doc.
   fn v8x_hermes_private_new(rtw: *mut c_void, name_slot: i64) -> i64;
@@ -2941,6 +2959,142 @@ hermes_typed_array_new!(v8__BigInt64Array__New, BigInt64Array, "BigInt64Array");
 // symbol, so it must link. Route it through the same path (it returns the null
 // slot when the `Float16Array` global is absent, rather than aborting).
 hermes_typed_array_new!(v8__Float16Array__New, Float16Array, "Float16Array");
+
+// ---- Value type predicates + ArrayBufferView accessors (E4) ---------------
+//
+// deno_core's op layer marshals a JS Uint8Array/ArrayBufferView into a Rust
+// slice: it checks `IsArrayBufferView`/`IsUint8Array`, then reads the view's
+// `ByteOffset`/`ByteLength` and its backing ArrayBuffer to alias the bytes.
+// These were null stubs, so `op_encoding_encode_into` rejected every JS-created
+// typed array with "expected ArrayBuffer or ArrayBufferView". Backed by the
+// vendored Hermes JSI's first-class TypedArray support.
+
+/// Turn the shim's tri-state (1 true / 0 false / -1 error) into a bool, mapping
+/// the error case to false (a non-object / bad slot is not the queried type).
+#[inline]
+fn is_predicate(f: unsafe extern "C" fn(*mut c_void, i64) -> c_int, this: *const Value) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { f(rtw, slot_of(this)) == 1 }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsArrayBuffer(this: *const Value) -> bool {
+  is_predicate(v8x_hermes_value_is_array_buffer, this)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsArrayBufferView(this: *const Value) -> bool {
+  is_predicate(v8x_hermes_value_is_array_buffer_view, this)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsTypedArray(this: *const Value) -> bool {
+  is_predicate(v8x_hermes_value_is_typed_array, this)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsUint8Array(this: *const Value) -> bool {
+  is_predicate(v8x_hermes_value_is_uint8_array, this)
+}
+
+/// `ArrayBufferView::Buffer`: the backing ArrayBuffer, or null on error.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBufferView__Buffer(
+  this: *const ArrayBufferView,
+) -> *const ArrayBuffer {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return ptr::null();
+  }
+  let slot = unsafe { v8x_hermes_typed_array_buffer(rtw, slot_of(this)) };
+  slot_ptr::<ArrayBuffer>(slot)
+}
+
+/// `ArrayBufferView::Buffer::Data`: pointer to the BACKING BUFFER's start (NOT
+/// offset by byteOffset; the vendored `data()` wrapper adds byteOffset itself).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBufferView__Buffer__Data(
+  this: *const ArrayBufferView,
+) -> *mut c_void {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return ptr::null_mut();
+  }
+  // typed_array_data already returns base + byteOffset; subtract it back off so
+  // the vendored `data()` (which does `Buffer__Data + ByteOffset`) lands right.
+  let with_off = unsafe { v8x_hermes_typed_array_data(rtw, slot_of(this)) };
+  if with_off.is_null() {
+    return ptr::null_mut();
+  }
+  let off = unsafe { v8x_hermes_typed_array_byte_offset(rtw, slot_of(this)) };
+  if off == usize::MAX {
+    return ptr::null_mut();
+  }
+  unsafe { with_off.cast::<u8>().sub(off) as *mut c_void }
+}
+
+/// `ArrayBufferView::ByteLength`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBufferView__ByteLength(
+  this: *const ArrayBufferView,
+) -> usize {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return 0;
+  }
+  let n = unsafe { v8x_hermes_typed_array_byte_length(rtw, slot_of(this)) };
+  if n == usize::MAX { 0 } else { n }
+}
+
+/// `ArrayBufferView::ByteOffset`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBufferView__ByteOffset(
+  this: *const ArrayBufferView,
+) -> usize {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return 0;
+  }
+  let n = unsafe { v8x_hermes_typed_array_byte_offset(rtw, slot_of(this)) };
+  if n == usize::MAX { 0 } else { n }
+}
+
+/// `ArrayBufferView::HasBuffer`: our views always alias a real ArrayBuffer.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBufferView__HasBuffer(
+  this: *const ArrayBufferView,
+) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_value_is_typed_array(rtw, slot_of(this)) == 1 }
+}
+
+/// `ArrayBufferView::CopyContents`: copy up to `byte_length` bytes of the view
+/// into `dest`, returning the number of bytes written.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ArrayBufferView__CopyContents(
+  this: *const ArrayBufferView,
+  dest: *mut c_void,
+  byte_length: c_int,
+) -> usize {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() || dest.is_null() || byte_length < 0 {
+    return 0;
+  }
+  unsafe {
+    v8x_hermes_typed_array_copy_contents(
+      rtw,
+      slot_of(this),
+      dest,
+      byte_length as usize,
+    )
+  }
+}
 
 /// `Function::Call`: JSI's `Function::call`/`callWithThis`. `recv` may be
 /// null (v8 passes a null receiver for `undefined`), in which case the shim

@@ -1773,6 +1773,200 @@ size_t v8x_hermes_typed_array_length(void *rtw, v8x_hermes_slot slot) {
   }
 }
 
+// ---- E4: TypedArray / ArrayBufferView ABI ---------------------------------
+//
+// deno_core's op layer marshals a JS Uint8Array/ArrayBufferView into a Rust
+// slice by (1) checking IsArrayBufferView/IsUint8Array, then (2) reading the
+// view's ArrayBuffer + byteOffset + byteLength to alias the bytes. The vendored
+// Hermes JSI exposes first-class TypedArray/Uint8Array support (isTypedArray,
+// isUint8Array, byteOffset/byteLength, buffer), so these route straight through
+// it rather than driving JS. Predicates return 1/0 (or -1 on error); accessors
+// return SIZE_MAX / the null slot on error.
+
+// Object.prototype-independent typed-array check.
+int v8x_hermes_value_is_typed_array(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return 0;
+  }
+  try {
+    return v->getObject(w->runtime()).isTypedArray(w->runtime()) ? 1 : 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+int v8x_hermes_value_is_uint8_array(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return 0;
+  }
+  try {
+    return v->getObject(w->runtime()).isUint8Array(w->runtime()) ? 1 : 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+int v8x_hermes_value_is_array_buffer(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return -1;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return 0;
+  }
+  try {
+    return v->getObject(w->runtime()).isArrayBuffer(w->runtime()) ? 1 : 0;
+  } catch (...) {
+    return -1;
+  }
+}
+
+// v8's ArrayBufferView is a TypedArray OR a DataView. JSI has no DataView
+// predicate, so a view is any TypedArray (covers Uint8Array etc, which is all
+// ext/web's encoding path uses). A DataView would be missed, but nothing in the
+// current surface constructs one over the op boundary.
+int v8x_hermes_value_is_array_buffer_view(void *rtw, v8x_hermes_slot slot) {
+  return v8x_hermes_value_is_typed_array(rtw, slot);
+}
+
+// TypedArray.byteOffset (bytes into the backing ArrayBuffer). SIZE_MAX on error.
+size_t v8x_hermes_typed_array_byte_offset(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return SIZE_MAX;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return SIZE_MAX;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    if (!obj.isTypedArray(w->runtime())) {
+      return SIZE_MAX;
+    }
+    return obj.getTypedArray(w->runtime()).byteOffset(w->runtime());
+  } catch (...) {
+    return SIZE_MAX;
+  }
+}
+
+// TypedArray.byteLength (bytes in the view). SIZE_MAX on error.
+size_t v8x_hermes_typed_array_byte_length(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return SIZE_MAX;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return SIZE_MAX;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    if (!obj.isTypedArray(w->runtime())) {
+      return SIZE_MAX;
+    }
+    return obj.getTypedArray(w->runtime()).byteLength(w->runtime());
+  } catch (...) {
+    return SIZE_MAX;
+  }
+}
+
+// The TypedArray's backing ArrayBuffer, as a fresh slot. Null slot on error.
+v8x_hermes_slot v8x_hermes_typed_array_buffer(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    if (!obj.isTypedArray(w->runtime())) {
+      return V8X_HERMES_NULL_SLOT;
+    }
+    jsi::ArrayBuffer buf =
+        obj.getTypedArray(w->runtime()).buffer(w->runtime());
+    return w->push(jsi::Value(w->runtime(), std::move(buf)));
+  } catch (...) {
+    return V8X_HERMES_NULL_SLOT;
+  }
+}
+
+// Pointer to the START of a TypedArray view's bytes: buffer.data() + byteOffset.
+// Returns nullptr on error. Valid only while the backing ArrayBuffer is alive.
+void *v8x_hermes_typed_array_data(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return nullptr;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return nullptr;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    if (!obj.isTypedArray(w->runtime())) {
+      return nullptr;
+    }
+    jsi::TypedArray ta = obj.getTypedArray(w->runtime());
+    size_t off = ta.byteOffset(w->runtime());
+    jsi::ArrayBuffer buf = ta.buffer(w->runtime());
+    uint8_t *base = buf.data(w->runtime());
+    if (base == nullptr) {
+      return nullptr;
+    }
+    return base + off;
+  } catch (...) {
+    return nullptr;
+  }
+}
+
+// Copy up to `dest_len` bytes of the view's contents into `dest`. Returns the
+// number of bytes copied (0 on error). Mirrors v8 ArrayBufferView::CopyContents.
+size_t v8x_hermes_typed_array_copy_contents(void *rtw, v8x_hermes_slot slot,
+                                            void *dest, size_t dest_len) {
+  if (rtw == nullptr || dest == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return 0;
+  }
+  try {
+    jsi::Object obj = v->getObject(w->runtime());
+    if (!obj.isTypedArray(w->runtime())) {
+      return 0;
+    }
+    jsi::TypedArray ta = obj.getTypedArray(w->runtime());
+    size_t off = ta.byteOffset(w->runtime());
+    size_t len = ta.byteLength(w->runtime());
+    jsi::ArrayBuffer buf = ta.buffer(w->runtime());
+    uint8_t *base = buf.data(w->runtime());
+    if (base == nullptr) {
+      return 0;
+    }
+    size_t n = len < dest_len ? len : dest_len;
+    std::memcpy(dest, base + off, n);
+    return n;
+  } catch (...) {
+    return 0;
+  }
+}
+
 // ---- TryCatch / exception surfacing (C9) ----------------------------------
 //
 // v8's TryCatch is a stack-discipline scope: CONSTRUCT pushes a frame,

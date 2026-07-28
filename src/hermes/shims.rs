@@ -28,19 +28,10 @@ pub extern "C" fn v8__ArrayBuffer__SetDetachKey() -> *const ::std::ffi::c_void {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ArrayBuffer__WasDetached() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBufferView__Buffer() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBufferView__Buffer__Data() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBufferView__ByteLength() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBufferView__ByteOffset() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBufferView__CopyContents() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__ArrayBufferView__{Buffer,Buffer__Data,ByteLength,ByteOffset,CopyContents,
+// HasBuffer} are implemented in core.rs (real impl, E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__ArrayBufferView__GetContents() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__ArrayBufferView__HasBuffer() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__BigInt__Int64Value() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -722,9 +713,7 @@ pub extern "C" fn v8__Value__InstanceOf() -> *const ::std::ffi::c_void { ::std::
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsArgumentsObject() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsArrayBuffer() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsArrayBufferView() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Value__IsArrayBuffer / IsArrayBufferView implemented in core.rs (E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsAsyncFunction() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -790,13 +779,13 @@ pub extern "C" fn v8__Value__IsSymbol() -> *const ::std::ffi::c_void { ::std::pt
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsSymbolObject() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsTypedArray() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Value__IsTypedArray implemented in core.rs (E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsUint16Array() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsUint32Array() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsUint8Array() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__Value__IsUint8Array implemented in core.rs (E4).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsUint8ClampedArray() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]

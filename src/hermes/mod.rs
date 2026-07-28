@@ -522,6 +522,91 @@ mod hermes_private {
   }
 }
 
+// E4: TypedArray / ArrayBufferView ABI. deno_core's op layer marshals a
+// JS-created Uint8Array into a Rust slice by checking IsArrayBufferView /
+// IsUint8Array and reading ByteOffset / ByteLength / the backing ArrayBuffer;
+// these were null stubs, so `op_encoding_encode_into` rejected every JS typed
+// array with "expected ArrayBuffer or ArrayBufferView". This test proves the
+// predicates classify correctly and the bytes read back exactly, including a
+// non-zero byteOffset subarray (the interesting case for aliasing).
+#[cfg(all(test, feature = "link_hermes"))]
+mod hermes_typed_array {
+  use crate as v8;
+  use super::init_v8_once;
+
+  fn eval<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    src: &str,
+  ) -> v8::Local<'s, v8::Value> {
+    let source = v8::String::new(scope, src).unwrap();
+    let script = v8::Script::compile(scope, source, None).unwrap();
+    script.run(scope).unwrap()
+  }
+
+  #[test]
+  fn hermes_typed_array_abi() {
+    init_v8_once();
+
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // A plain Uint8Array [10,20,30,40,50].
+    let ta = eval(scope, "new Uint8Array([10,20,30,40,50])");
+    assert!(ta.is_array_buffer_view(), "Uint8Array is an ArrayBufferView");
+    assert!(ta.is_typed_array(), "Uint8Array is a TypedArray");
+    assert!(ta.is_uint8_array(), "Uint8Array is a Uint8Array");
+    assert!(!ta.is_array_buffer(), "a view is not itself an ArrayBuffer");
+
+    // A non-typed-array must classify false.
+    let obj = eval(scope, "({})");
+    assert!(!obj.is_array_buffer_view(), "a plain object is not a view");
+    assert!(!obj.is_uint8_array(), "a plain object is not a Uint8Array");
+
+    let view: v8::Local<v8::ArrayBufferView> = ta.try_into().unwrap();
+    assert_eq!(view.byte_offset(), 0, "full view starts at offset 0");
+    assert_eq!(view.byte_length(), 5, "5 bytes");
+
+    // Read the bytes back via CopyContents (deno's marshalling path).
+    let mut buf = [0u8; 5];
+    let n = view.copy_contents(&mut buf);
+    assert_eq!(n, 5, "copy_contents must report 5 bytes");
+    assert_eq!(buf, [10, 20, 30, 40, 50], "bytes must read back exactly");
+
+    // The backing ArrayBuffer must be reachable and the right size.
+    let ab = view.buffer(scope).unwrap();
+    assert_eq!(ab.byte_length(), 5, "backing buffer is 5 bytes");
+
+    // A subarray with a NON-ZERO byteOffset (the aliasing case): the view's
+    // data pointer and byteOffset must land on the right window of the buffer.
+    let sub = eval(
+      scope,
+      "(() => { const a = new Uint8Array([1,2,3,4,5,6,7,8]); \
+        return a.subarray(3, 6); })()",
+    );
+    let sub_view: v8::Local<v8::ArrayBufferView> = sub.try_into().unwrap();
+    assert_eq!(sub_view.byte_offset(), 3, "subarray byteOffset is 3");
+    assert_eq!(sub_view.byte_length(), 3, "subarray byteLength is 3");
+    let mut sbuf = [0u8; 3];
+    assert_eq!(sub_view.copy_contents(&mut sbuf), 3);
+    assert_eq!(sbuf, [4, 5, 6], "subarray bytes must be the [3,6) window");
+
+    // `data()` = Buffer__Data + byteOffset must point at the subarray's first
+    // byte. Read it directly to prove the offset arithmetic is correct.
+    let data_ptr = sub_view.data() as *const u8;
+    assert!(!data_ptr.is_null(), "data() must be non-null");
+    let first = unsafe { *data_ptr };
+    assert_eq!(first, 4, "data() must point at the subarray's first byte (4)");
+
+    println!(
+      "hermes_typed_array: PASS - Is{{ArrayBufferView,TypedArray,Uint8Array}} \
+       classify correctly, ByteOffset/ByteLength/Buffer/CopyContents/data() \
+       read JS-created typed arrays exactly (incl. non-zero byteOffset)"
+    );
+  }
+}
+
 // C5: parse-free AOT execution proof + measured win. Compiles JS source to
 // Hermes Bytecode (HBC) ahead of time with `hermesc` (the Hermes AOT
 // compiler, extracted from the `hermes-engine` npm package, see
