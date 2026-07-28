@@ -203,3 +203,14 @@ DataCloneError. Backend suite 39/39. So ext/web is substantially functional on H
 handling, structured clone, and microtask-driven stream reads. The honest remaining boundary is a promise
 resolved LATER by a deferred op (a timer or a socket op) settling on run_event_loop, which is the bridge to
 for-await over a socket and the target of the network-stack cycles.
+
+E6 crossed that boundary. A genuinely-deferred async op (it awaits a real tokio sleep and is Pending on its
+first poll) now settles its JS promise through the real deno_core run_event_loop: await op_delayed(41) === 42,
+with run_event_loop taking the real ~7ms. The bug in the way was subtle and load-bearing: v8__Function__Call
+could not decode a Global<Function> stored as a pin-handle (a different tagged shape than a value slot), so
+deno_core's __eventLoopTick callback silently did nothing and every deferred-op promise hung. With the
+handle-decode fix, the op -> promise-resolve -> event-loop path works. On top of that, console.log produces
+real output through ext/web's inspector op (console.log("hi", {a:1}, [2,3]) -> "hi { a: 1 } [ 2, 3 ]") and URL
+parses through op_url_parse (new URL("https://a.b/p/q?x=1#h") -> pathname "/p/q", searchParams x "1"). Backend
+suite 41/41. So the real async-I/O foundation is in place; the network stack (ext/net, then fetch), where
+for-await over a socket lives, is the next target and reuses exactly this proven op/promise/loop plumbing.
