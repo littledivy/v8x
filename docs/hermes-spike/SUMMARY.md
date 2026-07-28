@@ -230,3 +230,18 @@ pass was targeting ES2017 and thereby also rewriting ES2022 #private fields into
 it now lowers async generators only. Backend suite 42/42. The next cycle fixes the uv_compat reactor so the
 op-driver's spawned poll_task is serviced by the reactor the loop parks on, which unblocks ext/net, the raw-op
 path, and fetch at once.
+
+E8 did that and closed the loop: `for await (const conn of listener)` now accepts a REAL connection and a byte
+round-trips client -> server -> client over a real loopback OS socket, through real ext/net, driven by
+run_event_loop on Hermes (both E7 assertions PASS, verified independently). This is the exact construct the
+overnight spike declared impossible, and it works. The E7 "uv_compat reactor" diagnosis turned out wrong; the
+real causes were (A) a probe-harness bug (a fresh per-test tokio runtime orphaned the op-driver's spawned
+poll_task) and (B) a genuine Hermes backend gap: v8__Uint32__Value and v8__Int32__Value were null stubs with the
+wrong C-ABI signature, so Uint32::value()/Int32::value() always read 0. Those accessors are the first branch of
+deno_core's promiseId decode, so every non-zero async-op promiseId was silently zeroed and any second concurrent
+deferred op resolved into "Missing promise @ 0" (E6's single timer op only worked because its id was 0).
+Implementing both via ECMAScript ToUint32/ToInt32 fixed it. Backend suite 43/43. So the arc is complete end to
+end: async generators lower and run, deno_core boots, ext/web is functional, real deferred-op async settles
+through the event loop, and for-await over a real socket delivers bytes. The overnight "full Deno is impossible
+on Hermes" conclusion is retired. The next target is fetch (deno_fetch + hyper + TLS), which rides the same
+now-proven op/promise/event-loop path.
