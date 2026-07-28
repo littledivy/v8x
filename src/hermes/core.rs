@@ -1134,6 +1134,19 @@ pub extern "C" fn v8__Context__GetExtrasBindingObject(
 // `IsoState`. Only the aligned-pointer variants are needed by the context-slot
 // tests; the `Value`-typed `Get/SetEmbedderData` pair is not on this surface.
 
+// These three context embedder-data functions form a Set-then-read pair that
+// deno_core / rusty_v8 (`Context::get_annex_mut`, context.rs) invokes back to
+// back and then `assert!`s about. In this backend a Context handle IS the boxed
+// `IsoState` pointer, so the storage the reads and the write touch is the same
+// object. Under the release profile's fat LTO these `extern "C"` bodies get
+// inlined into `get_annex_mut`, dissolving the FFI barrier rusty_v8 assumes; the
+// optimizer then reused a stale `len` (0) it had loaded earlier in the same
+// function, so the post-`Set` `assert!(GetNumberOfEmbedderDataFields > 1)`
+// tripped in release but not debug. `#[inline(never)]` restores the opaque
+// call boundary a real V8 (a separate shared library) would present, forcing
+// the length to be re-loaded after the store; the reads also go through raw
+// pointers (no fabricated `&mut IsoState`) so no spurious `noalias` is asserted.
+#[inline(never)]
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetNumberOfEmbedderDataFields(
   this: *const Context,
@@ -1141,9 +1154,14 @@ pub extern "C" fn v8__Context__GetNumberOfEmbedderDataFields(
   if this.is_null() {
     return 0;
   }
-  iso_state(this as *mut RealIsolate).ctx_embedder_data.len() as u32
+  unsafe {
+    let vec: &Vec<*mut c_void> =
+      &*ptr::addr_of!((*(this as *const IsoState)).ctx_embedder_data);
+    vec.len() as u32
+  }
 }
 
+#[inline(never)]
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__GetAlignedPointerFromEmbedderData(
   this: *const Context,
@@ -1152,13 +1170,17 @@ pub extern "C" fn v8__Context__GetAlignedPointerFromEmbedderData(
   if this.is_null() || index < 0 {
     return ptr::null_mut();
   }
-  let st = iso_state(this as *mut RealIsolate);
-  st.ctx_embedder_data
-    .get(index as usize)
-    .copied()
-    .unwrap_or(ptr::null_mut())
+  // See v8__Context__GetNumberOfEmbedderDataFields: raw-pointer read, no
+  // fabricated `&mut IsoState`, kept non-inlined so a preceding `Set` is
+  // observed under release LTO.
+  unsafe {
+    let vec: &Vec<*mut c_void> =
+      &*ptr::addr_of!((*(this as *const IsoState)).ctx_embedder_data);
+    vec.get(index as usize).copied().unwrap_or(ptr::null_mut())
+  }
 }
 
+#[inline(never)]
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Context__SetAlignedPointerInEmbedderData(
   this: *const Context,
@@ -1168,12 +1190,19 @@ pub extern "C" fn v8__Context__SetAlignedPointerInEmbedderData(
   if this.is_null() || index < 0 {
     return;
   }
-  let st = iso_state(this as *mut RealIsolate);
   let idx = index as usize;
-  if idx >= st.ctx_embedder_data.len() {
-    st.ctx_embedder_data.resize(idx + 1, ptr::null_mut());
+  // Mutate the field through a single raw-pointer-derived `&mut Vec` (not a
+  // `&mut IsoState`) bounded to this block; kept non-inlined so the resize+write
+  // is observed by the immediately following reads under release LTO.
+  unsafe {
+    let vec = &mut *ptr::addr_of_mut!(
+      (*(this as *mut IsoState)).ctx_embedder_data
+    );
+    if idx >= vec.len() {
+      vec.resize(idx + 1, ptr::null_mut());
+    }
+    vec[idx] = value;
   }
-  st.ctx_embedder_data[idx] = value;
 }
 
 // ---- String ----------------------------------------------------------------
@@ -6034,4 +6063,84 @@ pub extern "C" fn std__shared_ptr__v8__ArrayBuffer__Allocator__reset(
     }
   }
   unsafe { alloc_write_words(ptr, 0, 0) };
+}
+
+#[cfg(test)]
+mod embedder_data_tests {
+  use super::*;
+
+  // Build an IsoState with an empty embedder-data vec, WITHOUT a live Hermes
+  // runtime (rtw is null; the embedder-data path never touches it). Returns the
+  // leaked pointer the vendored surface would pass as `*const Context`
+  // (== `*mut RealIsolate` == `*mut IsoState`).
+  fn fake_iso() -> *mut RealIsolate {
+    let st = Box::new(IsoState {
+      rtw: ptr::null_mut(),
+      data_slots: [ptr::null_mut(); 4],
+      ctx_embedder_data: Vec::new(),
+      microtask_queue: ptr::null_mut(),
+      pending_exception: NULL_SLOT,
+      module_records: Vec::new(),
+      extras_binding_pin: -1,
+    });
+    Box::into_raw(st) as *mut RealIsolate
+  }
+
+  unsafe fn free_iso(p: *mut RealIsolate) {
+    drop(unsafe { Box::from_raw(p as *mut IsoState) });
+  }
+
+  // Reproduces the deno_core / rusty_v8 `get_annex_mut` sequence
+  // (context.rs:166-202): read GetNumberOfEmbedderDataFields (sees 0 on a fresh
+  // context), then SetAlignedPointerInEmbedderData(ctx, ANNEX_SLOT=1), then read
+  // GetNumberOfEmbedderDataFields again and assert the count now exceeds
+  // ANNEX_SLOT. The second read MUST reflect the Set. This is the assertion that
+  // panicked in the RELEASE deno probe.
+  //
+  // Note: this in-crate test cannot reproduce the exact release miscompile,
+  // which required fat LTO to inline these `extern "C"` bodies into
+  // `get_annex_mut` (across the v8x -> rusty_v8 crate boundary) and then reuse
+  // the first `len` load. It locks the functional Set-then-read contract; the
+  // authoritative release repro is the deno_program probe. The
+  // `#[inline(never)]` on the three functions is what defeats the LTO variant.
+  #[test]
+  fn set_then_get_number_of_fields_reflects_set() {
+    const ANNEX_SLOT: c_int = 1;
+    let iso = fake_iso();
+    let ctx = iso as *const Context;
+    let annex = 0xdead_beef_usize as *mut c_void;
+
+    // First read, exactly like get_annex_mut's `num_data_fields`.
+    let before = v8__Context__GetNumberOfEmbedderDataFields(ctx);
+    assert_eq!(before, 0, "fresh context should have 0 embedder-data fields");
+
+    v8__Context__SetAlignedPointerInEmbedderData(ctx, ANNEX_SLOT, annex);
+    // Second read, exactly like the post-Set assert.
+    let n = v8__Context__GetNumberOfEmbedderDataFields(ctx);
+    assert!(
+      n as c_int > ANNEX_SLOT,
+      "GetNumberOfEmbedderDataFields returned {n}, expected > {ANNEX_SLOT}"
+    );
+    assert_eq!(
+      v8__Context__GetAlignedPointerFromEmbedderData(ctx, ANNEX_SLOT),
+      annex
+    );
+    unsafe { free_iso(iso) };
+  }
+
+  // Same shape but hammered in a loop with fresh isolates so any release-only
+  // reorder/caching of the len read has many chances to bite.
+  #[test]
+  fn set_then_get_stress() {
+    const ANNEX_SLOT: c_int = 1;
+    for i in 0..10_000usize {
+      let iso = fake_iso();
+      let ctx = iso as *const Context;
+      let annex = (i | 1) as *mut c_void;
+      v8__Context__SetAlignedPointerInEmbedderData(ctx, ANNEX_SLOT, annex);
+      let n = v8__Context__GetNumberOfEmbedderDataFields(ctx);
+      assert!(n as c_int > ANNEX_SLOT, "iter {i}: got {n}");
+      unsafe { free_iso(iso) };
+    }
+  }
 }
