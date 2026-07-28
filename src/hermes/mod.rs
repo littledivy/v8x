@@ -773,6 +773,59 @@ mod hermes_reflection {
     );
   }
 
+  // E9: the Latin-1 (one-byte) string read path. serde_v8's `ByteString`
+  // deserialization gates on `contains_only_onebyte()` then copies via
+  // `write_one_byte_v2()`. Both were null-returning stubs, so ByteString decode
+  // threw "invalid type, expected: latin1" for pure-ASCII strings like "GET" —
+  // which blocked op_fetch (method/headers are ByteString). Assert the real
+  // accessors now report correctly and the byte copy is exact.
+  #[test]
+  fn hermes_string_onebyte_read() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    // A pure-ASCII string (op_fetch's method) must report one-byte and copy
+    // its exact bytes — this was the exact string that threw ExpectedLatin1.
+    let v = eval(scope, "'GET'");
+    let s = v8::Local::<v8::String>::try_from(v).unwrap();
+    assert!(
+      s.contains_only_onebyte(),
+      "'GET' contains only one-byte chars (was false pre-fix -> ExpectedLatin1)"
+    );
+    assert!(s.is_onebyte(), "'GET' is one-byte");
+    assert_eq!(s.length(), 3);
+    let mut buf = [0u8; 3];
+    s.write_one_byte_v2(scope, 0, &mut buf, v8::WriteFlags::empty());
+    assert_eq!(&buf, b"GET", "write_one_byte_v2 must copy the real bytes");
+
+    // A high-latin1 string (bytes 0x80..0xFF) still fits one-byte and copies
+    // exactly (guards a sign/mask bug in the low-byte truncation).
+    let v = eval(scope, "'\\u00e9\\u00ff'"); // é ÿ  -> 0xE9 0xFF
+    let s = v8::Local::<v8::String>::try_from(v).unwrap();
+    assert!(s.contains_only_onebyte(), "é ÿ are one-byte (latin1)");
+    let mut buf = [0u8; 2];
+    s.write_one_byte_v2(scope, 0, &mut buf, v8::WriteFlags::empty());
+    assert_eq!(&buf, &[0xE9u8, 0xFF], "high latin1 bytes copy exactly");
+
+    // A string with a genuinely two-byte char (U+2603 SNOWMAN) must report
+    // NOT one-byte, so ByteString callers correctly reject / take the wide path.
+    let v = eval(scope, "'a\\u2603'");
+    let s = v8::Local::<v8::String>::try_from(v).unwrap();
+    assert!(
+      !s.contains_only_onebyte(),
+      "a + U+2603 is NOT one-byte (must not falsely claim latin1)"
+    );
+
+    println!(
+      "hermes_string_onebyte_read: PASS - contains_only_onebyte()/is_onebyte()/\
+       write_one_byte_v2() decode Latin-1 (were null stubs that threw \
+       ExpectedLatin1 for op_fetch's ByteString method/headers)"
+    );
+  }
+
   // The deferred-op crux, isolated at the ABI level: calling a function through
   // a v8::Global<Function> (opened -> a global-pin handle, NOT a scope-local
   // value slot) must succeed. deno_core stores __eventLoopTick this way and

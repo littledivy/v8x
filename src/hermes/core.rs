@@ -1345,6 +1345,78 @@ pub extern "C" fn v8__String__WriteUtf8_v2(
   written as c_int
 }
 
+/// True if every code point of the string fits in a single Latin-1 byte
+/// (<= 0xFF). serde_v8's `ByteString`/webidl ByteString deserialization gates on
+/// this before calling `WriteOneByte_v2`; a null stub made it return false for
+/// pure-ASCII strings like `"GET"`, so every op taking a `ByteString` arg
+/// (op_fetch's method/headers) threw `ExpectedLatin1`. Hermes does not expose an
+/// internal one-byte flag, so we answer the semantic question (does it CONTAIN
+/// only one-byte chars) by inspecting the decoded string. On any read failure we
+/// return false (the safe answer: caller falls back to a two-byte path).
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__ContainsOnlyOneByte(this: *const V8String) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() {
+    return false;
+  }
+  match read_string(rtw, slot_of(this)) {
+    Some(s) => s.chars().all(|c| (c as u32) <= 0xFF),
+    None => false,
+  }
+}
+
+/// Whether the string's storage is one-byte. Hermes does not expose the internal
+/// representation, so we answer the observable-equivalent question (contains only
+/// one-byte code points). This is what deno_core's `is_onebyte()` callers use to
+/// pick the fast latin1 read path; returning the semantic answer is correct.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__IsOneByte(this: *const V8String) -> bool {
+  v8__String__ContainsOnlyOneByte(this)
+}
+
+/// Write the string's Latin-1 bytes into `buffer` starting at code-unit
+/// `offset`, up to `length` bytes. Mirrors V8's `WriteOneByte`: each UTF-16 code
+/// unit is truncated to its low byte. Returns nothing (the vendored binding is
+/// `-> ()`); callers size the buffer via `Length()` first. A null stub here left
+/// the `ByteString` buffer uninitialized, so even past the ContainsOnlyOneByte
+/// gate the bytes would have been garbage.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__String__WriteOneByte_v2(
+  this: *const V8String,
+  isolate: *mut RealIsolate,
+  offset: u32,
+  length: u32,
+  buffer: *mut u8,
+  _flags: c_int,
+) {
+  let rtw = if isolate.is_null() {
+    current_rtw()
+  } else {
+    iso_state(isolate).rtw
+  };
+  if rtw.is_null() || buffer.is_null() {
+    return;
+  }
+  let s = match read_string(rtw, slot_of(this)) {
+    Some(s) => s,
+    None => return,
+  };
+  // Iterate UTF-16 code units (V8's addressing unit), skip `offset`, take
+  // `length`, truncate each to its low byte (Latin-1). For strings that
+  // contain only one-byte chars (the ContainsOnlyOneByte precondition) this is
+  // an exact, lossless copy.
+  let units: Vec<u16> = s.encode_utf16().collect();
+  let start = offset as usize;
+  if start >= units.len() {
+    return;
+  }
+  let end = (start + length as usize).min(units.len());
+  let dst = unsafe { std::slice::from_raw_parts_mut(buffer, end - start) };
+  for (i, &u) in units[start..end].iter().enumerate() {
+    dst[i] = (u & 0xFF) as u8;
+  }
+}
+
 /// Read the JS string in `slot` back into a Rust `String` (coercing if needed).
 pub(super) fn read_string_slot(rtw: *mut c_void, slot: i64) -> Option<String> {
   read_string(rtw, slot)

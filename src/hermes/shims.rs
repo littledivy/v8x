@@ -599,8 +599,7 @@ pub extern "C" fn v8__StartupData__data__DELETE() -> *const ::std::ffi::c_void {
 pub extern "C" fn v8__StartupData__IsValid() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__Concat() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__ContainsOnlyOneByte() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__String__ContainsOnlyOneByte is implemented in core.rs (real impl, E9).
 // v8__String__Empty is implemented in core.rs (real impl).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__GetExternalStringResource() -> *const ::std::ffi::c_void { ::std::ptr::null() }
@@ -612,8 +611,7 @@ pub extern "C" fn v8__String__IsExternal() -> *const ::std::ffi::c_void { ::std:
 pub extern "C" fn v8__String__IsExternalOneByte() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__IsExternalTwoByte() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__IsOneByte() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__String__IsOneByte is implemented in core.rs (real impl, E9).
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__kMaxLength() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
@@ -628,8 +626,7 @@ pub extern "C" fn v8__String__NewFromTwoByte() -> *const ::std::ffi::c_void { ::
 pub extern "C" fn v8__String__ValueView_SIZE() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__String__Write_v2() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__WriteOneByte_v2() -> *const ::std::ffi::c_void { ::std::ptr::null() }
+// v8__String__WriteOneByte_v2 is implemented in core.rs (real impl, E9).
 #[unsafe(no_mangle)]
 // v8__Symbol__{Description,For,ForApi} are implemented in core.rs (real, E4).
 // v8__Symbol__Get{AsyncIterator,HasInstance,IsConcatSpreadable,Iterator,Match,
