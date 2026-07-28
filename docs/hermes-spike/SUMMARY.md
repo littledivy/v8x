@@ -191,3 +191,15 @@ with v8::Symbol added, TextEncoder/TextDecoder round-trip real text through ext/
 cosmetically) functional for encoding and error handling. Two ext/web features remain deferred, each a named
 next wall: structuredClone needs v8::ValueSerializer/Deserializer, and a real ReadableStream chunk read needs
 the deno_core event-loop / microtask drive fully wired. Backend suite 37/37.
+
+E5 closed both. The ReadableStream "Pending" turned out to be a Promise::State observation lag, not a drain
+gap (a state-read armed a lazy recorder whose reaction only fired on a later drain; the sole read happened
+after all drains, so it stayed Pending forever). The fix drains the microtask queue once on a Pending
+state-read. With it, a ReadableStream that was enqueued a chunk delivers through real ext/web 06_streams.js +
+the deno_core event loop: reader.read() resolves to {value: 42, done: false}. A 25-symbol
+v8::ValueSerializer/Deserializer (a recursive JSI-value walk) then makes structuredClone round-trip
+primitives, arrays, and plain objects, and refuse BigInt/Symbol/Date/Map/Set/TypedArray/cycles with a clean
+DataCloneError. Backend suite 39/39. So ext/web is substantially functional on Hermes: encoding, error
+handling, structured clone, and microtask-driven stream reads. The honest remaining boundary is a promise
+resolved LATER by a deferred op (a timer or a socket op) settling on run_event_loop, which is the bridge to
+for-await over a socket and the target of the network-stack cycles.
