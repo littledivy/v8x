@@ -812,8 +812,6 @@ pub extern "C" fn v8__Value__IsNullOrUndefined() -> *const ::std::ffi::c_void { 
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsNumberObject() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__Value__IsPromise() -> *const ::std::ffi::c_void { ::std::ptr::null() }
-#[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsProxy() -> *const ::std::ffi::c_void { ::std::ptr::null() }
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Value__IsRegExp() -> *const ::std::ffi::c_void { ::std::ptr::null() }

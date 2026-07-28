@@ -1436,4 +1436,41 @@ mod hermes_boot_probe {
       "with_prototype_and_properties did not set own props + prototype"
     );
   }
+
+  /// Stage 7 (D7): Value::IsPromise. deno_core reads a source module's Evaluate
+  /// result as a Promise (`mod_evaluate_sync` type-checks it); the modeled D2
+  /// Evaluate returns the D1 resolved promise. WALL if `v8__Value__IsPromise` is
+  /// a null stub (it read as a garbage bool -> `BadType`). This probe builds a
+  /// real promise via the resolver and asserts IsPromise is true for it and
+  /// false for a plain object.
+  #[test]
+  fn boot_value_is_promise() {
+    init_v8_once();
+    let isolate = &mut v8::Isolate::new(Default::default());
+    v8::scope!(let scope, isolate);
+    let context = v8::Context::new(scope, Default::default());
+    let scope = &mut v8::ContextScope::new(scope, context);
+
+    let resolver = v8::PromiseResolver::new(scope).unwrap();
+    let promise = resolver.get_promise(scope);
+    let promise_val: v8::Local<v8::Value> = promise.into();
+    assert!(
+      promise_val.is_promise(),
+      "IsPromise should be true for a real promise (v8__Value__IsPromise stub?)"
+    );
+
+    let plain = v8::Object::new(scope);
+    let plain_val: v8::Local<v8::Value> = plain.into();
+    assert!(
+      !plain_val.is_promise(),
+      "IsPromise should be false for a plain object"
+    );
+
+    // And the try_from::<Promise> path deno_core uses must succeed.
+    let back = v8::Local::<v8::Promise>::try_from(promise_val);
+    assert!(
+      back.is_ok(),
+      "Local::<Promise>::try_from should accept a real promise"
+    );
+  }
 }

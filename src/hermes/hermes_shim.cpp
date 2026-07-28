@@ -1116,6 +1116,39 @@ int v8x_hermes_value_is_function(void *rtw, v8x_hermes_slot slot) {
   }
 }
 
+// v8__Value__IsPromise: is the value a Promise? JSI has no Promise type tag, so
+// this is `value instanceof Promise` against the runtime's global `Promise`.
+// deno_core checks this on module-evaluation results (a source module's Evaluate
+// returns a Promise) and elsewhere on the async path.
+int v8x_hermes_value_is_promise(void *rtw, v8x_hermes_slot slot) {
+  if (rtw == nullptr) {
+    return 0;
+  }
+  auto *w = static_cast<RuntimeWrapper *>(rtw);
+  const jsi::Value *v = slot_ref(w, slot);
+  if (v == nullptr || !v->isObject()) {
+    return 0;
+  }
+  try {
+    jsi::Value promiseCtor =
+        w->runtime().global().getProperty(w->runtime(), "Promise");
+    if (!promiseCtor.isObject() ||
+        !promiseCtor.getObject(w->runtime()).isFunction(w->runtime())) {
+      return 0;
+    }
+    // `instanceof` is the walk-the-prototype-chain check; drive it through the
+    // JSI object's own instanceOf against the Promise constructor function.
+    return v->getObject(w->runtime())
+                   .instanceOf(w->runtime(),
+                               promiseCtor.getObject(w->runtime())
+                                   .getFunction(w->runtime()))
+               ? 1
+               : 0;
+  } catch (...) {
+    return 0;
+  }
+}
+
 int v8x_hermes_value_is_number(void *rtw, v8x_hermes_slot slot) {
   if (rtw == nullptr) {
     return 0;

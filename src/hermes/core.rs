@@ -114,6 +114,7 @@ unsafe extern "C" {
   ) -> i64;
   fn v8x_hermes_value_is_array(rtw: *mut c_void, slot: i64) -> c_int;
   fn v8x_hermes_value_is_function(rtw: *mut c_void, slot: i64) -> c_int;
+  fn v8x_hermes_value_is_promise(rtw: *mut c_void, slot: i64) -> c_int;
   fn v8x_hermes_value_is_number(rtw: *mut c_void, slot: i64) -> c_int;
   fn v8x_hermes_value_is_boolean(rtw: *mut c_void, slot: i64) -> c_int;
   fn v8x_hermes_undefined(rtw: *mut c_void) -> i64;
@@ -1878,6 +1879,20 @@ pub extern "C" fn v8__Value__IsFunction(this: *const Value) -> bool {
     return false;
   }
   unsafe { v8x_hermes_value_is_function(rtw, slot_of(this)) != 0 }
+}
+
+/// `Value::IsPromise` (`value instanceof Promise`). deno_core reads a source
+/// module's `Evaluate` result as a Promise (the modeled `Evaluate` returns the
+/// D1 resolved promise); the vendored `Local::<Promise>::try_from` calls this to
+/// type-check. Was a null stub, which read as a garbage bool and made
+/// `mod_evaluate_sync` report `BadType`.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Value__IsPromise(this: *const Value) -> bool {
+  let rtw = current_rtw();
+  if rtw.is_null() || this.is_null() {
+    return false;
+  }
+  unsafe { v8x_hermes_value_is_promise(rtw, slot_of(this)) != 0 }
 }
 
 #[unsafe(no_mangle)]
