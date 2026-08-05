@@ -167,7 +167,35 @@ jobs:
       # Link a test executable, not just an rlib, so CRT mismatches in WAMR's
       # static archive are caught here rather than in downstream binaries.
       - name: Link --lib test executable (quickjs)
-        run: cargo test --no-default-features --features quickjs --lib --no-run
+        shell: pwsh
+        run: |
+          $lockJob = $null
+          if ("${{ matrix.arch }}" -eq "x86_64" -and "${{ matrix.crt }}" -eq "dynamic") {
+            $stalePath = (Resolve-Path ".git/modules/vendor/rusty_v8/stale-cache-entry").Path
+            $lockJob = Start-Job -ScriptBlock {
+              param($path)
+              $stream = [System.IO.File]::Open(
+                $path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::None
+              )
+              Write-Output "locked"
+              Start-Sleep -Seconds 3
+              $stream.Dispose()
+            } -ArgumentList $stalePath
+            while (@(Receive-Job -Job $lockJob -Keep) -notcontains "locked") {
+              Start-Sleep -Milliseconds 50
+            }
+          }
+
+          cargo test --no-default-features --features quickjs --lib --no-run
+          $cargoExit = $LASTEXITCODE
+          if ($null -ne $lockJob) {
+            Wait-Job -Job $lockJob | Out-Null
+            Remove-Job -Job $lockJob -Force
+          }
+          exit $cargoExit
 
   # ---------------------------------------------------------------------------
   # deno_core test suite per backend: clone+patch deno, `cargo nextest run -p
