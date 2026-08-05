@@ -75,7 +75,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: vendor/webkit/WebKitBuild
-          key: webkit-${{ runner.os }}-${{ steps.wk.outputs.sha }}-${{ hashFiles('patches/**', 'tools/setup_webkit.sh') }}
+          key: webkit-${{ runner.os }}-${{ steps.wk.outputs.sha }}-${{ hashFiles('patches/webkit-*.patch', 'tools/setup_webkit.sh') }}
 
       - name: Clone deno + apply the v82jsc integration patch
         run: |
