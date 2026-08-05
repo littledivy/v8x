@@ -66,6 +66,8 @@ apply_series() {
         sleep 1
       done
       [ "$initialized" = true ] || return 1
+      git -c core.autocrlf=false -C "$sub" reset --hard HEAD
+      git -C "$sub" clean -ffdx
     fi
   fi
   mkdir -p "$stamp_dir"
