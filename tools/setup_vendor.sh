@@ -47,7 +47,16 @@ apply_series() {
       [ -f .cargo-ok ] || return 1
       echo "repairing stale Cargo submodule checkout: $sub"
       rm -rf -- "$sub" ".git/modules/$sub"
-      git -c "submodule.$sub.update=checkout" submodule update --init "$sub"
+      local initialized=false
+      for _ in 1 2 3; do
+        if git -c "submodule.$sub.update=checkout" submodule update --init "$sub"; then
+          initialized=true
+          break
+        fi
+        rm -f -- ".git/modules/$sub/index.lock"
+        sleep 1
+      done
+      [ "$initialized" = true ] || return 1
     fi
   fi
   mkdir -p "$stamp_dir"

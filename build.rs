@@ -262,8 +262,24 @@ fn initialize_submodule(root: &Path, sub: &str) {
       });
     }
   }
-  assert!(
-    update(),
+  let index_lock = root.join(".git/modules").join(sub).join("index.lock");
+  for attempt in 1..=3 {
+    if update() {
+      return;
+    }
+    // Git for Windows may return before a failed submodule helper has removed
+    // the lock it recreated in the freshly initialized module directory.
+    // Once the update has failed, this lock is stale and safe to clear inside
+    // the already-guarded Cargo checkout repair path.
+    if index_lock.is_file() {
+      println!("cargo:warning=clearing stale Cargo submodule lock: {sub}");
+      let _ = std::fs::remove_file(&index_lock);
+    }
+    if attempt < 3 {
+      std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+  }
+  panic!(
     "git submodule update --init {sub} failed after clearing Cargo cache state"
   );
 }
