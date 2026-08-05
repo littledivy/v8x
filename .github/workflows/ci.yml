@@ -156,8 +156,10 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType File .cargo-ok
-          Remove-Item vendor/rusty_v8/.git
-          Remove-Item -Recurse -Force .git/modules/vendor/rusty_v8
+          New-Item -ItemType Directory -Force vendor/rusty_v8
+          Set-Content vendor/rusty_v8/stale-cache-entry "stale worktree"
+          New-Item -ItemType Directory -Force .git/modules/vendor/rusty_v8
+          Set-Content .git/modules/vendor/rusty_v8/stale-cache-entry "stale metadata"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
