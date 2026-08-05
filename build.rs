@@ -220,6 +220,27 @@ fn run_git(cwd: &Path, args: &[&str]) -> bool {
     .unwrap_or(false)
 }
 
+fn remove_stale_submodule_dir(path: &Path) {
+  for attempt in 1..=30 {
+    match std::fs::remove_dir_all(path) {
+      Ok(()) => return,
+      Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+      Err(_) if attempt < 30 => {
+        if attempt == 1 {
+          println!(
+            "cargo:warning=waiting to clear stale Cargo submodule state: {}",
+            path.display()
+          );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+      }
+      Err(err) => {
+        panic!("failed to remove stale {}: {err}", path.display())
+      }
+    }
+  }
+}
+
 fn initialize_submodule(root: &Path, sub: &str) {
   let update_cfg = format!("submodule.{sub}.update=checkout");
   let update = || {
@@ -256,11 +277,7 @@ fn initialize_submodule(root: &Path, sub: &str) {
   );
   println!("cargo:warning=repairing stale Cargo submodule checkout: {sub}");
   for stale in [root.join(sub), root.join(".git/modules").join(sub)] {
-    if stale.exists() {
-      std::fs::remove_dir_all(&stale).unwrap_or_else(|err| {
-        panic!("failed to remove stale {}: {err}", stale.display())
-      });
-    }
+    remove_stale_submodule_dir(&stale);
   }
   let index_lock = root.join(".git/modules").join(sub).join("index.lock");
   for attempt in 1..=3 {

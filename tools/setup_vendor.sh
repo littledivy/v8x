@@ -46,7 +46,16 @@ apply_series() {
       # detached from stale submodule metadata. Never clean a normal checkout.
       [ -f .cargo-ok ] || return 1
       echo "repairing stale Cargo submodule checkout: $sub"
-      rm -rf -- "$sub" ".git/modules/$sub"
+      local cleared=false
+      for _ in {1..10}; do
+        rm -rf -- "$sub" ".git/modules/$sub"
+        if [ ! -e "$sub" ] && [ ! -e ".git/modules/$sub" ]; then
+          cleared=true
+          break
+        fi
+        sleep 1
+      done
+      [ "$cleared" = true ] || return 1
       local initialized=false
       for _ in 1 2 3; do
         if git -c "submodule.$sub.update=checkout" submodule update --init "$sub"; then
