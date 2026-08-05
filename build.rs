@@ -241,6 +241,21 @@ fn remove_stale_submodule_dir(path: &Path) {
   }
 }
 
+fn reset_repaired_submodule(root: &Path, sub: &str) {
+  let sub_dir = root.join(sub);
+  assert!(
+    run_git(
+      &sub_dir,
+      &["-c", "core.autocrlf=false", "reset", "--hard", "HEAD"]
+    ),
+    "failed to reset repaired Cargo submodule {sub}"
+  );
+  assert!(
+    run_git(&sub_dir, &["clean", "-ffdx"]),
+    "failed to clean repaired Cargo submodule {sub}"
+  );
+}
+
 fn initialize_submodule(root: &Path, sub: &str) {
   let update_cfg = format!("submodule.{sub}.update=checkout");
   let update = || {
@@ -263,6 +278,9 @@ fn initialize_submodule(root: &Path, sub: &str) {
     )
   };
   if update() {
+    if root.join(".cargo-ok").is_file() {
+      reset_repaired_submodule(root, sub);
+    }
     return;
   }
 
@@ -282,6 +300,7 @@ fn initialize_submodule(root: &Path, sub: &str) {
   let index_lock = root.join(".git/modules").join(sub).join("index.lock");
   for attempt in 1..=3 {
     if update() {
+      reset_repaired_submodule(root, sub);
       return;
     }
     // Git for Windows may return before a failed submodule helper has removed
