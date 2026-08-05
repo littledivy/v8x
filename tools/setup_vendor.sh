@@ -41,7 +41,32 @@ apply_series() {
   local sub="$1" prefix="$2"
   local stamp_dir="$sub/.v8x-patches"
   if [ ! -e "$sub/.git" ]; then
-    git -c "submodule.$sub.update=checkout" submodule update --init "$sub"
+    if ! git -c "submodule.$sub.update=checkout" submodule update --init "$sub"; then
+      # Cargo git checkouts may be restored with the source tree present but
+      # detached from stale submodule metadata. Never clean a normal checkout.
+      [ -f .cargo-ok ] || return 1
+      echo "repairing stale Cargo submodule checkout: $sub"
+      local cleared=false
+      for _ in {1..10}; do
+        rm -rf -- "$sub" ".git/modules/$sub"
+        if [ ! -e "$sub" ] && [ ! -e ".git/modules/$sub" ]; then
+          cleared=true
+          break
+        fi
+        sleep 1
+      done
+      [ "$cleared" = true ] || return 1
+      local initialized=false
+      for _ in 1 2 3; do
+        if git -c "submodule.$sub.update=checkout" submodule update --init "$sub"; then
+          initialized=true
+          break
+        fi
+        rm -f -- ".git/modules/$sub/index.lock"
+        sleep 1
+      done
+      [ "$initialized" = true ] || return 1
+    fi
   fi
   mkdir -p "$stamp_dir"
   while IFS= read -r p; do

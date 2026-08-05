@@ -118,9 +118,27 @@ jobs:
   # atomics for quickjs, multi-config cmake for WAMR).
   # ---------------------------------------------------------------------------
   windows-build:
-    name: check-quickjs-windows
-    runs-on: windows-latest
+    name: check-quickjs-windows-${{ matrix.arch }}-${{ matrix.crt }}
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            crt: dynamic
+            runner: windows-2022
+            rustflags: ""
+          - arch: x86_64
+            crt: static
+            runner: windows-2022
+            rustflags: "-C target-feature=+crt-static"
+          - arch: aarch64
+            crt: static
+            runner: windows-11-arm
+            rustflags: "-C target-feature=+crt-static"
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
     steps:
       # Git for Windows defaults to core.autocrlf=true, which corrupts the
       # git-binary-delta patches at checkout and CRLFs the submodule trees the
@@ -133,12 +151,55 @@ jobs:
           submodules: false
       - name: Init submodules
         run: git submodule update --init --depth 1 vendor/rusty_v8 vendor/quickjs-ng vendor/wamr
+      - name: Simulate stale Cargo git checkout
+        if: matrix.arch == 'x86_64' && matrix.crt == 'dynamic'
+        shell: pwsh
+        run: |
+          New-Item -ItemType File .cargo-ok
+          New-Item -ItemType Directory -Force vendor/rusty_v8
+          Set-Content vendor/rusty_v8/stale-cache-entry "stale worktree"
+          New-Item -ItemType Directory -Force .git/modules/vendor/rusty_v8
+          Set-Content .git/modules/vendor/rusty_v8/stale-cache-entry "stale metadata"
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: check-quickjs-windows
-      - name: Build --lib (quickjs)
-        run: cargo build --no-default-features --features quickjs --lib
+          key: check-quickjs-windows-${{ matrix.arch }}-${{ matrix.crt }}
+      # Link a test executable, not just an rlib, so CRT mismatches in WAMR's
+      # static archive are caught here rather than in downstream binaries.
+      - name: Link --lib test executable (quickjs)
+        shell: pwsh
+        run: |
+          $lockJob = $null
+          if ("${{ matrix.arch }}" -eq "x86_64" -and "${{ matrix.crt }}" -eq "dynamic") {
+            $stalePath = (Resolve-Path ".git/modules/vendor/rusty_v8/stale-cache-entry").Path
+            $worktreePath = (Resolve-Path "vendor/rusty_v8").Path
+            $lockJob = Start-Job -ScriptBlock {
+              param($path, $worktree)
+              $stream = [System.IO.File]::Open(
+                $path,
+                [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read,
+                [System.IO.FileShare]::None
+              )
+              Write-Output "locked"
+              while ([System.IO.Directory]::Exists($worktree)) {
+                Start-Sleep -Milliseconds 50
+              }
+              Start-Sleep -Seconds 3
+              $stream.Dispose()
+            } -ArgumentList $stalePath, $worktreePath
+            while (@(Receive-Job -Job $lockJob -Keep) -notcontains "locked") {
+              Start-Sleep -Milliseconds 50
+            }
+          }
+
+          cargo test --no-default-features --features quickjs --lib --no-run
+          $cargoExit = $LASTEXITCODE
+          if ($null -ne $lockJob) {
+            Wait-Job -Job $lockJob | Out-Null
+            Remove-Job -Job $lockJob -Force
+          }
+          exit $cargoExit
 
   # ---------------------------------------------------------------------------
   # deno_core test suite per backend: clone+patch deno, `cargo nextest run -p

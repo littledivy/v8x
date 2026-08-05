@@ -220,33 +220,94 @@ fn run_git(cwd: &Path, args: &[&str]) -> bool {
     .unwrap_or(false)
 }
 
+fn remove_stale_submodule_dir(path: &Path) {
+  for attempt in 1..=30 {
+    match std::fs::remove_dir_all(path) {
+      Ok(()) => return,
+      Err(err) if err.kind() == std::io::ErrorKind::NotFound => return,
+      Err(_) if attempt < 30 => {
+        if attempt == 1 {
+          println!(
+            "cargo:warning=waiting to clear stale Cargo submodule state: {}",
+            path.display()
+          );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+      }
+      Err(err) => {
+        panic!("failed to remove stale {}: {err}", path.display())
+      }
+    }
+  }
+}
+
+fn initialize_submodule(root: &Path, sub: &str) {
+  let update_cfg = format!("submodule.{sub}.update=checkout");
+  let update = || {
+    // core.autocrlf=false: the patches are made against LF trees; a Windows
+    // clone with the Git for Windows default (autocrlf=true) would otherwise
+    // check the submodule out with CRLF and every patch context would miss.
+    // (-c propagates to the spawned clone/checkout via GIT_CONFIG_PARAMETERS.)
+    run_git(
+      root,
+      &[
+        "-c",
+        "core.autocrlf=false",
+        "-c",
+        &update_cfg,
+        "submodule",
+        "update",
+        "--init",
+        sub,
+      ],
+    )
+  };
+  if update() {
+    return;
+  }
+
+  // Cargo marks its managed git checkouts with `.cargo-ok`. Restored Cargo
+  // caches can retain a populated submodule worktree after its `.git` file or
+  // module metadata has gone stale, making `git submodule update` refuse the
+  // non-empty destination. Only in a Cargo-owned checkout, discard both stale
+  // halves and retry from the pinned gitlink.
+  assert!(
+    root.join(".cargo-ok").is_file(),
+    "git submodule update --init {sub} failed"
+  );
+  println!("cargo:warning=repairing stale Cargo submodule checkout: {sub}");
+  for stale in [root.join(sub), root.join(".git/modules").join(sub)] {
+    remove_stale_submodule_dir(&stale);
+  }
+  let index_lock = root.join(".git/modules").join(sub).join("index.lock");
+  for attempt in 1..=3 {
+    if update() {
+      return;
+    }
+    // Git for Windows may return before a failed submodule helper has removed
+    // the lock it recreated in the freshly initialized module directory.
+    // Once the update has failed, this lock is stale and safe to clear inside
+    // the already-guarded Cargo checkout repair path.
+    if index_lock.is_file() {
+      println!("cargo:warning=clearing stale Cargo submodule lock: {sub}");
+      let _ = std::fs::remove_file(&index_lock);
+    }
+    if attempt < 3 {
+      std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+  }
+  panic!(
+    "git submodule update --init {sub} failed after clearing Cargo cache state"
+  );
+}
+
 /// Apply every patches/<prefix>-NN-*.patch onto a submodule, ordered like
 /// `sort -V` (numerically by NN, then by name). Initializes the submodule
 /// first if its working tree is absent.
 fn apply_patch_series(root: &Path, sub: &str, prefix: &str) {
   let sub_dir = root.join(sub);
   if !sub_dir.join(".git").exists() {
-    let update_cfg = format!("submodule.{sub}.update=checkout");
-    // core.autocrlf=false: the patches are made against LF trees; a Windows
-    // clone with the Git for Windows default (autocrlf=true) would otherwise
-    // check the submodule out with CRLF and every patch context would miss.
-    // (-c propagates to the spawned clone/checkout via GIT_CONFIG_PARAMETERS.)
-    assert!(
-      run_git(
-        root,
-        &[
-          "-c",
-          "core.autocrlf=false",
-          "-c",
-          &update_cfg,
-          "submodule",
-          "update",
-          "--init",
-          sub
-        ]
-      ),
-      "git submodule update --init {sub} failed"
-    );
+    initialize_submodule(root, sub);
   }
   let stamp_dir = sub_dir.join(".v8x-patches");
   std::fs::create_dir_all(&stamp_dir).unwrap();
@@ -401,6 +462,9 @@ fn build_wamr(manifest_dir: &std::path::Path) {
   // disable) always take effect.
   let _ = std::fs::remove_dir_all(&out);
   std::fs::create_dir_all(&out).unwrap();
+  let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+  let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+  let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
   let cmake = |args: &[&str]| {
     let status = std::process::Command::new("cmake")
       .args(args)
@@ -409,15 +473,51 @@ fn build_wamr(manifest_dir: &std::path::Path) {
       .expect("cmake not found — needed to build WAMR");
     assert!(status.success(), "cmake step failed: {args:?}");
   };
-  cmake(&[
-    "-DCMAKE_BUILD_TYPE=Release",
-    "-DCMAKE_POLICY_VERSION_MINIMUM=3.5",
+  let mut configure_args = vec![
+    "-DCMAKE_BUILD_TYPE=Release".to_string(),
+    "-DCMAKE_POLICY_VERSION_MINIMUM=3.5".to_string(),
     // WAMR's hardware bound-check installs SIGSEGV/SIGBUS handlers that fight
     // Rust's stack-overflow guard (instant abort). Force software checks.
-    "-DWAMR_DISABLE_HW_BOUND_CHECK=1",
-    "-DWAMR_DISABLE_STACK_HW_BOUND_CHECK=1",
-    src.to_str().unwrap(),
-  ]);
+    "-DWAMR_DISABLE_HW_BOUND_CHECK=1".to_string(),
+    "-DWAMR_DISABLE_STACK_HW_BOUND_CHECK=1".to_string(),
+  ];
+  if let Some(target) = match target_arch.as_str() {
+    "aarch64" => Some("AARCH64"),
+    "x86_64" => Some("X86_64"),
+    "x86" => Some("X86_32"),
+    _ => None,
+  } {
+    // CMake reports the host architecture for some generators and spells
+    // native Windows ARM64 differently than WAMR expects. Cargo's target is
+    // authoritative for both native and cross builds.
+    configure_args.push(format!("-DWAMR_BUILD_TARGET={target}"));
+  }
+  if target_os == "windows" && target_env == "msvc" && target_arch == "aarch64"
+  {
+    // Visual Studio's ASM_MASM integration invokes x86 MASM even for native
+    // ARM64 projects and ignores WAMR's armasm64 compiler override. Use WAMR's
+    // portable native-call bridge so the ARM64 build has no assembler input.
+    configure_args.push("-DWAMR_BUILD_INVOKE_NATIVE_GENERAL=1".to_string());
+  }
+  if target_os == "windows" && target_env == "msvc" {
+    // Keep WAMR's C runtime linkage aligned with Rust. In particular, Deno
+    // enables crt-static and otherwise gets a mixture of /MT and /MD objects.
+    let target_features =
+      env::var("CARGO_CFG_TARGET_FEATURE").unwrap_or_default();
+    let runtime = if target_features.split(',').any(|f| f == "crt-static") {
+      "MultiThreaded"
+    } else {
+      "MultiThreadedDLL"
+    };
+    configure_args.push("-DCMAKE_POLICY_DEFAULT_CMP0091=NEW".to_string());
+    configure_args.push(format!("-DCMAKE_MSVC_RUNTIME_LIBRARY={runtime}"));
+  }
+  configure_args.push(src.to_string_lossy().into_owned());
+  let configure_arg_refs = configure_args
+    .iter()
+    .map(String::as_str)
+    .collect::<Vec<_>>();
+  cmake(&configure_arg_refs);
   // `--config` matters only for multi-config generators (the Visual Studio
   // default on Windows, which emits into a Release/ subdir); single-config
   // generators ignore it.

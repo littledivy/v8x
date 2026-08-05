@@ -1,0 +1,13 @@
+diff --git a/core/iwasm/common/iwasm_common.cmake b/core/iwasm/common/iwasm_common.cmake
+--- a/core/iwasm/common/iwasm_common.cmake
++++ b/core/iwasm/common/iwasm_common.cmake
+@@ -4,7 +4,8 @@
+ set (IWASM_COMMON_DIR ${CMAKE_CURRENT_LIST_DIR})
+ 
+ include_directories (${IWASM_COMMON_DIR})
+-if (MSVC AND WAMR_BUILD_PLATFORM STREQUAL "windows" AND WAMR_BUILD_TARGET MATCHES "AARCH64.*")
++if (MSVC AND WAMR_BUILD_PLATFORM STREQUAL "windows" AND WAMR_BUILD_TARGET MATCHES "AARCH64.*"
++    AND NOT WAMR_BUILD_INVOKE_NATIVE_GENERAL EQUAL 1)
+   if (DEFINED ENV{VCToolsInstallDir})
+     # Detect host tool dir
+     set(_ARMASM64_CANDIDATES
