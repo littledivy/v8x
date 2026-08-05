@@ -30,12 +30,15 @@ jobs:
     name: cargo publish
     runs-on: ubuntu-latest
     steps:
-      # The crate's `include = [...]` curates the packaged files to in-repo
-      # sources only (the multi-GB vendored submodules are excluded on
-      # purpose), so `cargo package` does not need submodules checked out.
       - uses: actions/checkout@v4
         with:
           submodules: false
+
+      # The package embeds the patched QuickJS, WAMR, and rusty_v8 API sources.
+      # WebKit remains excluded: it is multi-GB and not used by the portable
+      # QuickJS crates.io build.
+      - name: Init package submodules
+        run: git submodule update --init --depth 1 vendor/rusty_v8 vendor/quickjs-ng vendor/wamr
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -51,11 +54,31 @@ jobs:
             exit 1
           fi
 
-      # --no-verify: verification would rebuild V8 from the vendored sources we
-      # intentionally skip above (multi-hour, needs submodules). The commit the
-      # tag points at is already gated by the CI workflow, so we package and
-      # upload without re-building here.
+      # setup_vendor applies the v8x patches to the initialized submodules.
+      # Cargo otherwise treats vendor/rusty_v8 as a nested package and omits its
+      # Rust API sources from the outer crate, so hide its manifest while both
+      # the verification package and published package are assembled.
+      - name: Verify packaged QuickJS build
+        run: |
+          set -euo pipefail
+          cargo check --locked --no-default-features --features quickjs
+          version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "v8x") | .version')"
+          mv vendor/rusty_v8/Cargo.toml vendor/rusty_v8/Cargo.toml.v8x-package
+          cargo package --locked --allow-dirty --no-verify
+          package_dir="$(mktemp -d)"
+          tar -xzf "target/package/v8x-${version}.crate" -C "$package_dir"
+          crate_dir="$package_dir/v8x-${version}"
+          test -f "$crate_dir/vendor/rusty_v8/src/lib.rs"
+          test -f "$crate_dir/vendor/quickjs-ng/quickjs.c"
+          test -f "$crate_dir/vendor/wamr/core/iwasm/common/wasm_runtime_common.c"
+          CARGO_TARGET_DIR="$package_dir/target" cargo check --locked \
+            --manifest-path "$crate_dir/Cargo.toml" \
+            --no-default-features --features quickjs
+
+      # The extracted package was built explicitly above. Keep --no-verify so
+      # cargo does not try the macOS-only default JSC backend on this Linux job.
       - name: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish --no-verify --locked
+        run: cargo publish --no-verify --locked --allow-dirty

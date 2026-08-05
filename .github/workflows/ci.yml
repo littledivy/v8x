@@ -202,6 +202,46 @@ jobs:
           exit $cargoExit
 
   # ---------------------------------------------------------------------------
+  # crates.io package buildability. Cargo excludes nested packages, so the
+  # vendored rusty_v8 submodule must have its Cargo.toml hidden while the outer
+  # v8x crate is packaged. Build once from the repository to materialize and
+  # patch the required submodules, then build again from the extracted .crate.
+  # This catches missing vendored sources before a version tag is published.
+  # ---------------------------------------------------------------------------
+  package-quickjs:
+    name: package-quickjs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - name: Init package submodules
+        run: git submodule update --init --depth 1 vendor/rusty_v8 vendor/quickjs-ng vendor/wamr
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package-quickjs
+      - name: Materialize patched vendored sources
+        run: cargo check --locked --no-default-features --features quickjs
+      - name: Build and verify extracted crate
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "v8x") | .version')"
+          mv vendor/rusty_v8/Cargo.toml vendor/rusty_v8/Cargo.toml.v8x-package
+          cargo package --locked --allow-dirty --no-verify
+          package_dir="$(mktemp -d)"
+          tar -xzf "target/package/v8x-${version}.crate" -C "$package_dir"
+          crate_dir="$package_dir/v8x-${version}"
+          test -f "$crate_dir/vendor/rusty_v8/src/lib.rs"
+          test -f "$crate_dir/vendor/quickjs-ng/quickjs.c"
+          test -f "$crate_dir/vendor/wamr/core/iwasm/common/wasm_runtime_common.c"
+          CARGO_TARGET_DIR="$package_dir/target" cargo check --locked \
+            --manifest-path "$crate_dir/Cargo.toml" \
+            --no-default-features --features quickjs
+
+  # ---------------------------------------------------------------------------
   # deno_core test suite per backend: clone+patch deno, `cargo nextest run -p
   # deno_core` against our v8 shim. No full deno binary (node-compat + unit are
   # dropped for now to keep CI cheap). macOS so the JSC backends link/JIT.
