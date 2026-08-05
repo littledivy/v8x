@@ -1,11 +1,17 @@
 name: Release
 
-# Tag-triggered: build a real deno on each v82jsc backend and attach the
-# binaries to the GitHub release for that tag.
+# Tag-triggered (or manually retried): build a real deno on each v82jsc backend
+# and attach the binaries to the GitHub release for that tag.
 on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing v8x tag to build and publish artifacts for
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -31,7 +37,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
+          ref: ${{ inputs.release_tag || github.ref }}
+          submodules: false
+      # The repository defaults submodules to `update = none` so Cargo can
+      # initialize only the backend it builds. Override that policy explicitly:
+      # actions/checkout's recursive mode otherwise registers empty submodule
+      # worktrees, which build.rs mistakes for initialized sources.
+      - name: Init submodules
+        run: |
+          if [ "${{ matrix.ninja }}" = "true" ]; then
+            git \
+              -c submodule.vendor/webkit.update=checkout \
+              -c submodule.vendor/quickjs-ng.update=checkout \
+              -c submodule.vendor/rusty_v8.update=checkout \
+              -c submodule.vendor/wamr.update=checkout \
+              submodule update --init --depth 1 --recursive
+          else
+            git \
+              -c submodule.vendor/quickjs-ng.update=checkout \
+              -c submodule.vendor/rusty_v8.update=checkout \
+              -c submodule.vendor/wamr.update=checkout \
+              submodule update --init --depth 1 --recursive \
+              vendor/rusty_v8 vendor/quickjs-ng vendor/wamr
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - name: Install ninja (WebKit build)
         if: matrix.ninja
@@ -86,4 +114,5 @@ jobs:
       - name: Upload to the release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.release_tag || github.ref_name }}
           files: dist/deno-${{ matrix.backend }}-aarch64-apple-darwin.gz
