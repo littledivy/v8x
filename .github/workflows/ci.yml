@@ -172,8 +172,9 @@ jobs:
           $lockJob = $null
           if ("${{ matrix.arch }}" -eq "x86_64" -and "${{ matrix.crt }}" -eq "dynamic") {
             $stalePath = (Resolve-Path ".git/modules/vendor/rusty_v8/stale-cache-entry").Path
+            $worktreePath = (Resolve-Path "vendor/rusty_v8").Path
             $lockJob = Start-Job -ScriptBlock {
-              param($path)
+              param($path, $worktree)
               $stream = [System.IO.File]::Open(
                 $path,
                 [System.IO.FileMode]::Open,
@@ -181,9 +182,12 @@ jobs:
                 [System.IO.FileShare]::None
               )
               Write-Output "locked"
+              while ([System.IO.Directory]::Exists($worktree)) {
+                Start-Sleep -Milliseconds 50
+              }
               Start-Sleep -Seconds 3
               $stream.Dispose()
-            } -ArgumentList $stalePath
+            } -ArgumentList $stalePath, $worktreePath
             while (@(Receive-Job -Job $lockJob -Keep) -notcontains "locked") {
               Start-Sleep -Milliseconds 50
             }
