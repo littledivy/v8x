@@ -69,6 +69,8 @@ pub mod icu;
 mod isolate;
 #[path = "../vendor/rusty_v8/src/isolate_create_params.rs"]
 mod isolate_create_params;
+#[path = "../vendor/rusty_v8/src/locker.rs"]
+mod locker;
 #[path = "../vendor/rusty_v8/src/microtask.rs"]
 mod microtask;
 #[path = "../vendor/rusty_v8/src/module.rs"]
@@ -155,7 +157,10 @@ pub mod inspector;
 pub mod json;
 #[path = "../vendor/rusty_v8/src/script_compiler.rs"]
 pub mod script_compiler;
-#[cfg(feature = "simdutf")]
+// Unconditional since rusty_v8 v152.0.0 dropped the `simdutf` feature split
+// (denoland/rusty_v8#2048): `string.rs` now calls `crate::simdutf` on every
+// path. The `simdutf` Cargo feature is kept as an accepted no-op so existing
+// dependency declarations keep resolving.
 #[path = "../vendor/rusty_v8/src/simdutf.rs"]
 pub mod simdutf;
 
@@ -185,6 +190,8 @@ pub use isolate::HostCreateShadowRealmContextCallback;
 pub use isolate::HostImportModuleDynamicallyCallback;
 pub use isolate::HostImportModuleWithPhaseDynamicallyCallback;
 pub use isolate::HostInitializeImportMetaObjectCallback;
+pub use isolate::IntoSharedError;
+pub use isolate::IntoSharedErrorKind;
 pub use isolate::Isolate;
 pub use isolate::IsolateHandle;
 pub use isolate::MemoryPressureLevel;
@@ -205,7 +212,10 @@ pub use isolate::UseCounterCallback;
 pub use isolate::UseCounterFeature;
 pub use isolate::WasmAsyncSuccess;
 pub use isolate_create_params::CreateParams;
+pub use locker::Locker;
+pub use locker::SharedIsolate;
 pub use microtask::MicrotaskQueue;
+pub use microtask::MicrotaskQueueHandle;
 pub use module::*;
 pub use object::*;
 pub use platform::IdleTask;

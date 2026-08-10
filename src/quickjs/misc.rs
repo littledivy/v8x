@@ -1620,7 +1620,7 @@ pub extern "C" fn v8__StartupData__data__DELETE(this: *const c_char) {
 // must return `U_INVALID_FORMAT_ERROR`. No length crosses this C ABI, so we read
 // only the 4 header bytes every real caller is guaranteed to provide.
 #[unsafe(no_mangle)]
-pub extern "C" fn udata_setCommonData_77(
+pub extern "C" fn udata_setCommonData_78(
   data: *const u8,
   error_code: *mut i32,
 ) {

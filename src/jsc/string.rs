@@ -464,30 +464,26 @@ pub extern "C" fn v8__String__GetExternalStringResourceBase(
   out
 }
 
+/// Mirrors `v8::String::ValueView` from `v8-primitive.h`. rusty_v8 v152.0.0
+/// stopped calling the `data`/`length`/`is_one_byte` accessors and now reads
+/// these fields straight out of the buffer handed to `CONSTRUCT`: a pointer,
+/// the data pointer, a `u32` length, then a `bool`. `onebyte_owned` occupies
+/// the trailing word V8 uses as padding, keeping the whole thing inside
+/// `v8__String__ValueView_SIZE` (32).
 #[repr(C)]
 struct ValueViewRepr {
   js_string: JSStringRef,
   data: *const c_void,
-
-  length_and_flag: usize,
+  len: u32,
+  is_one_byte: bool,
 
   onebyte_owned: *mut u8,
 }
 
-const ONE_BYTE_FLAG: usize = 1usize << 63;
-
 impl ValueViewRepr {
   #[inline]
-  fn pack(len: usize, is_one_byte: bool) -> usize {
-    (len & !ONE_BYTE_FLAG) | if is_one_byte { ONE_BYTE_FLAG } else { 0 }
-  }
-  #[inline]
   fn length(&self) -> usize {
-    self.length_and_flag & !ONE_BYTE_FLAG
-  }
-  #[inline]
-  fn is_one_byte(&self) -> bool {
-    self.length_and_flag & ONE_BYTE_FLAG != 0
+    self.len as usize
   }
 }
 
@@ -504,7 +500,8 @@ pub extern "C" fn v8__String__ValueView__CONSTRUCT(
       (*repr) = ValueViewRepr {
         js_string: ptr::null_mut(),
         data: ptr::null(),
-        length_and_flag: ValueViewRepr::pack(0, true),
+        len: 0 as u32,
+        is_one_byte: true,
         onebyte_owned: ptr::null_mut(),
       };
       return;
@@ -514,7 +511,8 @@ pub extern "C" fn v8__String__ValueView__CONSTRUCT(
       (*repr) = ValueViewRepr {
         js_string: ptr::null_mut(),
         data: ptr::null(),
-        length_and_flag: ValueViewRepr::pack(0, true),
+        len: 0 as u32,
+        is_one_byte: true,
         onebyte_owned: ptr::null_mut(),
       };
       return;
@@ -543,14 +541,16 @@ pub extern "C" fn v8__String__ValueView__CONSTRUCT(
       (*repr) = ValueViewRepr {
         js_string: s,
         data: ptr as *const c_void,
-        length_and_flag: ValueViewRepr::pack(len, true),
+        len: len as u32,
+        is_one_byte: true,
         onebyte_owned: ptr,
       };
     } else {
       (*repr) = ValueViewRepr {
         js_string: s,
         data: chars as *const c_void,
-        length_and_flag: ValueViewRepr::pack(len, false),
+        len: len as u32,
+        is_one_byte: false,
         onebyte_owned: ptr::null_mut(),
       };
     }
@@ -574,32 +574,8 @@ pub extern "C" fn v8__String__ValueView__DESTRUCT(
       (*repr).js_string = ptr::null_mut();
     }
     (*repr).data = ptr::null();
-    (*repr).length_and_flag = 0;
+    (*repr).len = 0;
   }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__ValueView__is_one_byte(
-  this: *const crate::string::ValueView,
-) -> bool {
-  let repr = this as *const ValueViewRepr;
-  unsafe { (*repr).is_one_byte() }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__ValueView__data(
-  this: *const crate::string::ValueView,
-) -> *const c_void {
-  let repr = this as *const ValueViewRepr;
-  unsafe { (*repr).data }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn v8__String__ValueView__length(
-  this: *const crate::string::ValueView,
-) -> int {
-  let repr = this as *const ValueViewRepr;
-  unsafe { (*repr).length() as int }
 }
 
 #[unsafe(no_mangle)]
