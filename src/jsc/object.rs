@@ -1192,6 +1192,62 @@ pub extern "C" fn v8__Set__Add(
   this
 }
 
+// Callable objects (rusty_v8 v152.0.0, denoland/rusty_v8#1893). JSC makes no
+// distinction between a function object and a callable object, so these
+// delegate to the `Function` implementations.
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__IsCallable(this: *const Object) -> bool {
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return false;
+  }
+  let obj = obj_of(ctx, this);
+  !obj.is_null() && unsafe { JSObjectIsFunction(ctx, obj) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__IsConstructor(this: *const Object) -> bool {
+  let ctx = current_ctx();
+  if ctx.is_null() || this.is_null() {
+    return false;
+  }
+  let obj = obj_of(ctx, this);
+  !obj.is_null() && unsafe { JSObjectIsConstructor(ctx, obj) }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__CallAsFunction(
+  this: *const Object,
+  context: *const Context,
+  recv: *const Value,
+  argc: int,
+  argv: *const *const Value,
+) -> *const Value {
+  crate::jsc::function::v8__Function__Call(
+    this as *const crate::Function,
+    context,
+    recv,
+    argc,
+    argv,
+  )
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Object__CallAsConstructor(
+  this: *const Object,
+  context: *const Context,
+  argc: int,
+  argv: *const *const Value,
+) -> *const Value {
+  crate::jsc::function::v8__Function__NewInstance(
+    this as *const crate::Function,
+    context,
+    argc,
+    argv,
+  ) as *const Value
+}
+
 // ---------------------------------------------------------------------------
 // Link-stubs for v8 C-ABI symbols that `test_api.rs` references but this
 // backend doesn't implement yet. Each returns a benign default

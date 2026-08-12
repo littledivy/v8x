@@ -1,6 +1,6 @@
 # Baseline: tests that PASS for backend=quickjs suite=rusty_v8.
 # Ratchet — CI goes red if any of these regress. Add new passes here
-# (run.mjs --update). 268 passing. DO NOT hand-sort; the
+# (run.mjs --update). 303 passing. DO NOT hand-sort; the
 # harness keeps this sorted + unique.
 rv8_slots::clear_all_context_slots
 rv8_slots::context_slots
@@ -113,9 +113,16 @@ rv8_test_api::get_own_property_descriptor
 rv8_test_api::get_property_attributes
 rv8_test_api::get_source_mapping_from_comment
 rv8_test_api::get_version
+rv8_test_api::global_clone_inside_unlock_window_panics
+rv8_test_api::global_clone_off_thread_panics
+rv8_test_api::global_drop_from_cold_tls_destructor
+rv8_test_api::global_eq_off_thread_panics
 rv8_test_api::global_from_into_raw
 rv8_test_api::global_handle_drop
 rv8_test_api::global_handles
+rv8_test_api::global_hash_after_isolate_disposal_has_stable_panic
+rv8_test_api::global_send_across_threads
+rv8_test_api::globals_from_different_isolates_compare_false_off_thread
 rv8_test_api::guaranteed_finalizers
 rv8_test_api::handle_scope_nested
 rv8_test_api::handle_scope_numbers
@@ -138,6 +145,7 @@ rv8_test_api::inspector_cancel_pause_on_next_statement
 rv8_test_api::inspector_console_api_message
 rv8_test_api::inspector_dispatch_protocol_message
 rv8_test_api::inspector_exception_thrown
+rv8_test_api::inspector_inspectable_drops_rust_impl_when_not_added
 rv8_test_api::inspector_schedule_pause_on_next_statement
 rv8_test_api::inspector_string_buffer
 rv8_test_api::inspector_string_view
@@ -149,6 +157,7 @@ rv8_test_api::isolate_slot_drop_can_access_annex_during_teardown
 rv8_test_api::isolate_termination_methods
 rv8_test_api::json
 rv8_test_api::latin1_to_utf8
+rv8_test_api::local_eq_global_off_thread_panics
 rv8_test_api::local_handle_deref
 rv8_test_api::low_memory_notification
 rv8_test_api::map
@@ -160,10 +169,13 @@ rv8_test_api::module_evaluation
 rv8_test_api::module_instantiation_failures1
 rv8_test_api::module_snapshot
 rv8_test_api::module_stalled_top_level_await
+rv8_test_api::new_from_utf8_simd_transcode
 rv8_test_api::no_internal_field
 rv8_test_api::no_source_map_comment
 rv8_test_api::object
+rv8_test_api::object_call_as_function_with_context
 rv8_test_api::object_define_property
+rv8_test_api::object_is_constructor_and_call_as_constructor
 rv8_test_api::object_set_accessor
 rv8_test_api::object_set_accessor_with_data
 rv8_test_api::object_set_accessor_with_setter
@@ -173,8 +185,10 @@ rv8_test_api::object_template
 rv8_test_api::object_template_from_function_template
 rv8_test_api::object_template_immutable_proto
 rv8_test_api::object_template_set_accessor
+rv8_test_api::object_template_set_call_as_function_handler
 rv8_test_api::object_template_set_indexed_property_handler
 rv8_test_api::object_template_set_named_property_handler
+rv8_test_api::one_byte_string_paths_round_trip
 rv8_test_api::oom_callback
 rv8_test_api::origin_source_map_overrides_source_mapping_url_comment
 rv8_test_api::prepare_stack_trace_callback
@@ -202,6 +216,25 @@ rv8_test_api::set_idle
 rv8_test_api::set_promise_reject_callback
 rv8_test_api::shared_array_buffer
 rv8_test_api::shared_array_buffer_allocator
+rv8_test_api::shared_isolate_concurrent_use
+rv8_test_api::shared_isolate_conversion_errors_return_the_isolate
+rv8_test_api::shared_isolate_deferred_global_resets_drain_at_lock_boundaries
+rv8_test_api::shared_isolate_deferred_global_resets_race_with_teardown
+rv8_test_api::shared_isolate_global_clone_without_locker_is_rejected
+rv8_test_api::shared_isolate_global_open_under_lock
+rv8_test_api::shared_isolate_global_send
+rv8_test_api::shared_isolate_js_state_across_threads
+rv8_test_api::shared_isolate_moves_between_threads
+rv8_test_api::shared_isolate_recursive_lock_panics
+rv8_test_api::shared_isolate_rejected_weak_finalizer_has_no_side_effect
+rv8_test_api::shared_isolate_rejects_nested_lockers
+rv8_test_api::shared_isolate_terminate_from_thread_safe_handle
+rv8_test_api::shared_isolate_unlock_drains_globals_on_relock
+rv8_test_api::shared_isolate_unlock_exits_and_reenters
+rv8_test_api::shared_isolate_unlock_lets_another_thread_in
+rv8_test_api::shared_isolate_unlock_rejects_returned_entered_isolate
+rv8_test_api::shared_isolate_unlock_restores_lock_on_panic
+rv8_test_api::shared_isolate_weak_panics
 rv8_test_api::snapshot_creator
 rv8_test_api::snapshot_creator_context_embedder_data
 rv8_test_api::snapshot_creator_multiple_contexts
@@ -236,6 +269,7 @@ rv8_test_api::test_regexp
 rv8_test_api::test_string
 rv8_test_api::thread_safe_handle_drop_after_isolate
 rv8_test_api::throw_exception
+rv8_test_api::to_rust_string_lossy_wtf16_simd_path
 rv8_test_api::try_catch
 rv8_test_api::try_catch_caught_lifetime
 rv8_test_api::try_from_data
@@ -246,6 +280,7 @@ rv8_test_api::uint8_array
 rv8_test_api::unbound_module_script_conversion
 rv8_test_api::unbound_script_conversion
 rv8_test_api::use_counter_callback
+rv8_test_api::v8_string_is_not_sync
 rv8_test_api::value_checker
 rv8_test_api::value_serializer_and_deserializer
 rv8_test_api::value_serializer_and_deserializer_array_buffers

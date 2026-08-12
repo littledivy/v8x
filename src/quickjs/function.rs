@@ -300,6 +300,11 @@ struct ObjTemplateState {
   indexed_handler: Option<IndexedHandler>,
   immutable_proto: bool,
 
+  /// Set by `SetCallAsFunctionHandler`: instances of this template are
+  /// callable and invoke this callback. The `JSValue` is the handler's data,
+  /// owned by the template.
+  call_handler: Option<(FunctionCallback, JSValue)>,
+
   parent_fn: *const FnTemplate,
 }
 
@@ -313,6 +318,7 @@ impl ObjTemplate {
         named_handler: None,
         indexed_handler: None,
         immutable_proto: false,
+        call_handler: None,
         parent_fn,
       }),
     }
@@ -774,6 +780,25 @@ fn new_object_for_template(
   ctx: *mut JSContext,
   templ: &ObjTemplateState,
 ) -> JSValue {
+  // A call handler makes the instance a function object. QuickJS has no way to
+  // add a [[Call]] slot to an existing ordinary object, so the instance is
+  // built as one from the start; property and accessor installation afterwards
+  // is the same for both shapes. Interceptors need the exotic class instead,
+  // and the two cannot be combined here.
+  if let Some((callback, data)) = templ.call_handler {
+    return unsafe {
+      make_function_len_with_instance(
+        ctx,
+        callback,
+        data,
+        0,
+        true,
+        ptr::null(),
+        ptr::null(),
+        Vec::new(),
+      )
+    };
+  }
   if templ.named_handler.is_none() && templ.indexed_handler.is_none() {
     return unsafe { JS_NewObject(ctx) };
   }
@@ -1017,8 +1042,8 @@ unsafe fn call_named_setter(
   });
   let info_ptr = Box::into_raw(info);
   let mut raw_info = info_ptr as *mut c_void;
-  let prop_info =
-    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Boolean>;
 
   let key = unsafe { JS_AtomToValue(ctx, atom) };
   let key_handle = intern::<Name>(key);
@@ -1235,8 +1260,8 @@ unsafe fn call_named_definer(
   });
   let info_ptr = Box::into_raw(info);
   let mut raw_info = info_ptr as *mut c_void;
-  let prop_info =
-    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Boolean>;
 
   let key = unsafe { JS_AtomToValue(ctx, atom) };
   let key_handle = intern::<Name>(key);
@@ -1399,8 +1424,8 @@ unsafe fn call_indexed_setter(
   });
   let info_ptr = Box::into_raw(info);
   let mut raw_info = info_ptr as *mut c_void;
-  let prop_info =
-    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Boolean>;
 
   let value_handle = intern_dup::<Value>(ctx, value);
   let Some(value_handle) = NonNull::new(value_handle as *mut Value) else {
@@ -1544,8 +1569,8 @@ unsafe fn call_indexed_definer(
   });
   let info_ptr = Box::into_raw(info);
   let mut raw_info = info_ptr as *mut c_void;
-  let prop_info =
-    &mut raw_info as *mut *mut c_void as *const crate::PropertyCallbackInfo<()>;
+  let prop_info = &mut raw_info as *mut *mut c_void
+    as *const crate::PropertyCallbackInfo<Boolean>;
 
   let mut pd = MaybeUninit::<PropertyDescriptor>::zeroed();
   unsafe {
@@ -5551,6 +5576,32 @@ pub extern "C" fn v8__ObjectTemplate__InternalFieldCount(
   }
   let t = unsafe { (&*(this as *const ObjTemplate)).state() };
   t.internal_field_count
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ObjectTemplate__SetCallAsFunctionHandler(
+  this: *const std::os::raw::c_void,
+  callback: FunctionCallback,
+  data_or_null: *const Value,
+) {
+  if this.is_null() {
+    return;
+  }
+  let t = unsafe { (&*(this as *const ObjTemplate)).state_mut() };
+  // The data outlives the call that set it, so the template owns a reference
+  // to it, the same way `FunctionTemplate` does.
+  let data = if data_or_null.is_null() {
+    jsv_undefined()
+  } else {
+    let ctx = current_ctx();
+    let raw = jsval_of(data_or_null);
+    if ctx.is_null() {
+      raw
+    } else {
+      unsafe { JS_DupValue(ctx, raw) }
+    }
+  };
+  t.call_handler = Some((callback, data));
 }
 
 #[unsafe(no_mangle)]

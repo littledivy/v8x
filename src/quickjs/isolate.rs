@@ -1540,8 +1540,12 @@ pub extern "C" fn v8__Isolate__GetEnteredOrMicrotaskContext(
   super::core::intern_ctx(ctx)
 }
 
+/// Since rusty_v8 v152.0.0 the owning handle and the queue it points at are
+/// separate types (`MicrotaskQueueHandle` owns, `MicrotaskQueue` is borrowed
+/// from it). This backend keeps one heap allocation for both, so the handle is
+/// the queue pointer and `Get` is the identity.
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__MicrotaskQueue__New(
+pub extern "C" fn v8__MicrotaskQueueHandle__New(
   _isolate: *mut RealIsolate,
   policy: MicrotasksPolicy,
 ) -> *mut MicrotaskQueue {
@@ -1549,8 +1553,17 @@ pub extern "C" fn v8__MicrotaskQueue__New(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__MicrotaskQueue__DESTRUCT(queue: *mut MicrotaskQueue) {
-  unsafe { drop_microtask_queue_state(queue) };
+pub extern "C" fn v8__MicrotaskQueueHandle__Get(
+  handle: *const MicrotaskQueue,
+) -> *mut MicrotaskQueue {
+  handle as *mut MicrotaskQueue
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__MicrotaskQueueHandle__DELETE(
+  handle: *mut MicrotaskQueue,
+) {
+  unsafe { drop_microtask_queue_state(handle) };
 }
 
 #[unsafe(no_mangle)]

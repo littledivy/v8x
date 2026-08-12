@@ -707,8 +707,12 @@ pub extern "C" fn v8__Isolate__CreateParams__SIZEOF() -> usize {
   std::mem::size_of::<crate::isolate_create_params::raw::CreateParams>()
 }
 
+/// Since rusty_v8 v152.0.0 the owning handle and the queue it points at are
+/// separate types (`MicrotaskQueueHandle` owns, `MicrotaskQueue` is borrowed
+/// from it). This backend keeps one allocation for both, so the handle is the
+/// queue pointer and `Get` is the identity.
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__MicrotaskQueue__New(
+pub extern "C" fn v8__MicrotaskQueueHandle__New(
   _isolate: *mut RealIsolate,
   _policy: MicrotasksPolicy,
 ) -> *mut MicrotaskQueue {
@@ -717,10 +721,19 @@ pub extern "C" fn v8__MicrotaskQueue__New(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn v8__MicrotaskQueue__DESTRUCT(queue: *mut MicrotaskQueue) {
-  if !queue.is_null() {
+pub extern "C" fn v8__MicrotaskQueueHandle__Get(
+  handle: *const MicrotaskQueue,
+) -> *mut MicrotaskQueue {
+  handle as *mut MicrotaskQueue
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__MicrotaskQueueHandle__DELETE(
+  handle: *mut MicrotaskQueue,
+) {
+  if !handle.is_null() {
     unsafe {
-      drop(Box::from_raw(queue as *mut u8));
+      drop(Box::from_raw(handle as *mut u8));
     }
   }
 }

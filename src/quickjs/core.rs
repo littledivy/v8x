@@ -345,6 +345,10 @@ pub(crate) fn note_compilation_cache_miss() {
 pub(crate) struct IsoState {
   pub rt: *mut JSRuntime,
 
+  /// Serializes the threads that use this isolate, for `v8::Locker`. Unused
+  /// until the embedder converts the isolate with `try_into_shared`.
+  pub lock: super::locker::IsolateLock,
+
   pub ctx: *mut JSContext,
 
   pub contexts: Vec<*mut JSContext>,
@@ -923,6 +927,7 @@ pub extern "C" fn v8__Isolate__New(params: *const c_void) -> *mut RealIsolate {
     .unwrap_or_default();
   let state = Box::new(IsoState {
     rt,
+    lock: super::locker::IsolateLock::new(),
     ctx,
     contexts: Vec::new(),
     handles: Vec::new(),
@@ -1131,6 +1136,17 @@ pub extern "C" fn v8__Isolate__Exit(this: *mut RealIsolate) {
 #[unsafe(no_mangle)]
 pub extern "C" fn v8__Isolate__GetCurrent() -> *mut RealIsolate {
   current_iso()
+}
+
+/// Unlike `GetCurrent`, this reports only an isolate that is actually entered.
+/// `current_iso` falls back to the last isolate this thread ran, which is what
+/// callbacks arriving outside an Enter/Exit pair need, but `v8::Locker` uses
+/// this to assert that no isolate is entered before it takes the lock, and
+/// that fallback would make the assert fire on a thread that had merely used
+/// an isolate earlier.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__Isolate__TryGetCurrent() -> *mut RealIsolate {
+  CURRENT_ISO.with(|c| *c.borrow())
 }
 
 #[unsafe(no_mangle)]

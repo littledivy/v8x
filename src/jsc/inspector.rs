@@ -165,6 +165,101 @@ pub extern "C" fn v8_inspector__V8InspectorSession__cancelPauseOnNextStatement(
 ) {
 }
 
+/// An owned `Runtime.RemoteObject`. V8 hands back an opaque C++ object that
+/// serializes on demand; this backend serializes eagerly and carries the bytes,
+/// which is all `toBytes` needs.
+pub(crate) struct RemoteObjectBytes(Vec<u8>);
+
+/// This backend's inspector answers the protocol without an injected script,
+/// so it can report a value's type but not wrap it in a live remote reference.
+#[unsafe(no_mangle)]
+pub extern "C" fn v8_inspector__V8InspectorSession__wrapObject(
+  _session: *mut RawV8InspectorSession,
+  _context: *const Context,
+  value: *const Value,
+  _object_group: StringView,
+  _generate_preview: bool,
+) -> *mut RemoteObjectBytes {
+  if value.is_null() {
+    return std::ptr::null_mut();
+  }
+  let json = br#"{"type":"object"}"#.to_vec();
+  Box::into_raw(Box::new(RemoteObjectBytes(json)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8_inspector__RemoteObject__DELETE(
+  this: *mut RemoteObjectBytes,
+) {
+  if !this.is_null() {
+    drop(unsafe { Box::from_raw(this) });
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8_inspector__RemoteObject__toBytes(
+  this: *const RemoteObjectBytes,
+) -> *mut crate::crdtp_shim::CppVecU8 {
+  let bytes = if this.is_null() {
+    Vec::new()
+  } else {
+    unsafe { &*this }.0.clone()
+  };
+  Box::into_raw(Box::new(bytes))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8_inspector__V8InspectorSession__releaseObjectGroup(
+  _session: *mut RawV8InspectorSession,
+  _object_group: StringView,
+) {
+  // No remote references are retained, so there is nothing to release.
+}
+
+unsafe extern "C" {
+  /// Defined by the vendored `inspector.rs`; releases the boxed Rust closure
+  /// an `Inspectable` was built from.
+  fn v8_inspector__V8InspectorSession__Inspectable__BASE__DROP(
+    rust_impl: *mut c_void,
+  );
+}
+
+/// Owns the Rust closure behind an `Inspectable` until it is deleted.
+pub(crate) struct InspectableHandle(*mut c_void);
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8_inspector__V8InspectorSession__Inspectable__NEW(
+  rust_impl: *mut c_void,
+) -> *mut InspectableHandle {
+  Box::into_raw(Box::new(InspectableHandle(rust_impl)))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8_inspector__V8InspectorSession__Inspectable__DELETE(
+  inspectable: *mut InspectableHandle,
+) {
+  if inspectable.is_null() {
+    return;
+  }
+  let handle = unsafe { Box::from_raw(inspectable) };
+  if !handle.0.is_null() {
+    unsafe {
+      v8_inspector__V8InspectorSession__Inspectable__BASE__DROP(handle.0);
+    }
+  }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8_inspector__V8InspectorSession__addInspectedObject(
+  _session: *mut RawV8InspectorSession,
+  inspectable: *mut InspectableHandle,
+) {
+  // V8 keeps the object so the console can reach it through `$0` to `$4`. This
+  // backend serves no console history, so nothing can ever dereference it.
+  // Ownership still transfers here, so release it rather than leak it.
+  v8_inspector__V8InspectorSession__Inspectable__DELETE(inspectable);
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn v8_inspector__V8InspectorSession__canDispatchMethod(
   method: StringView,
