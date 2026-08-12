@@ -28,7 +28,7 @@ use std::ptr;
 use std::sync::OnceLock;
 
 const K_NULL_TERMINATE: int =
-  crate::binding::v8_String_WriteFlags_kNullTerminate as int;
+  crate::binding::v8__String__WriteFlags__kNullTerminate as int;
 const K_MAX_STRING_LENGTH: usize =
   crate::binding::v8__String__kMaxLength as usize;
 

@@ -261,7 +261,7 @@ pub extern "C" fn v8__String__Write_v2(
     return;
   }
   let null_terminate =
-    crate::binding::v8_String_WriteFlags_kNullTerminate as int;
+    crate::binding::v8__String__WriteFlags__kNullTerminate as int;
   let ctx = current_ctx();
   unsafe {
     let s = JSValueToStringCopy(ctx, jsval(this), ptr::null_mut());
@@ -297,7 +297,7 @@ pub extern "C" fn v8__String__WriteOneByte_v2(
     return;
   }
   let null_terminate =
-    crate::binding::v8_String_WriteFlags_kNullTerminate as int;
+    crate::binding::v8__String__WriteFlags__kNullTerminate as int;
   let ctx = current_ctx();
   unsafe {
     let s = JSValueToStringCopy(ctx, jsval(this), ptr::null_mut());

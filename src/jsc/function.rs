@@ -95,6 +95,10 @@ struct ObjTemplate {
   props: Vec<(JSValueRef, JSValueRef, u32)>,
   accessors: Vec<TemplAccessor>,
 
+  /// Set by `SetCallAsFunctionHandler`: instances of this template are
+  /// callable and invoke this callback with this data.
+  call_handler: Option<(FunctionCallback, JSValueRef)>,
+
   parent_fn: *const FnTemplate,
 }
 
@@ -945,12 +949,14 @@ pub extern "C" fn v8__FunctionTemplate__New(
     internal_field_count: 0,
     props: Vec::new(),
     accessors: Vec::new(),
+    call_handler: None,
     parent_fn: ptr::null(),
   }));
   let instance = Box::into_raw(Box::new(ObjTemplate {
     internal_field_count: 0,
     props: Vec::new(),
     accessors: Vec::new(),
+    call_handler: None,
     parent_fn: ptr::null(),
   }));
   register_template(proto as usize, TemplKind::Obj);
@@ -1170,6 +1176,7 @@ pub extern "C" fn v8__ObjectTemplate__New(
     internal_field_count: 0,
     props: Vec::new(),
     accessors: Vec::new(),
+    call_handler: None,
     parent_fn: ptr::null(),
   }));
   register_template(t as usize, TemplKind::Obj);
@@ -1185,7 +1192,21 @@ pub extern "C" fn v8__ObjectTemplate__NewInstance(
   if ctx.is_null() {
     return ptr::null();
   }
-  let obj = unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) };
+  // A call handler makes the instance a function object. JSC cannot add a
+  // [[Call]] slot to an ordinary object after the fact, so the instance is
+  // built as one from the start; the property and accessor installation below
+  // is the same for both shapes.
+  let call_handler = if this.is_null() {
+    None
+  } else {
+    unsafe { &*(this as *const ObjTemplate) }.call_handler
+  };
+  let obj = match call_handler {
+    Some((callback, data)) => unsafe {
+      make_function_len(ctx, callback, data, 0)
+    },
+    None => unsafe { JSObjectMake(ctx, ptr::null_mut(), ptr::null_mut()) },
+  };
   if !this.is_null() {
     let t = unsafe { &*(this as *const ObjTemplate) };
 
@@ -1484,6 +1505,19 @@ pub extern "C" fn v8__ObjectTemplate__InternalFieldCount(
   _this: *const std::os::raw::c_void,
 ) -> crate::support::int {
   0
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn v8__ObjectTemplate__SetCallAsFunctionHandler(
+  this: *const std::os::raw::c_void,
+  callback: FunctionCallback,
+  data_or_null: *const Value,
+) {
+  if this.is_null() {
+    return;
+  }
+  let t = unsafe { &mut *(this as *mut ObjTemplate) };
+  t.call_handler = Some((callback, jsval(data_or_null)));
 }
 
 #[unsafe(no_mangle)]
