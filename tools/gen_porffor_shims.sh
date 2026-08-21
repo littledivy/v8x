@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# Regenerate src/porffor/shims.rs: a no-arg link stub for every v8__* and
+# v8_inspector__* C-ABI symbol the vendored rusty_v8 surface declares, except
+# the cppgc__* symbols (hand-written in src/porffor/misc.rs, since those need
+# real bodies to satisfy the Member/Persistent wrapper logic in
+# vendor/rusty_v8/src/cppgc.rs) and crdtp__* (provided engine-independently by
+# src/crdtp_shim.rs).
+#
+# Rust `extern "C"` FFI linking is name-only: the linker does not check
+# argument/return types against the vendored `unsafe extern "C" { fn ... }`
+# declarations, only that a symbol of that name exists somewhere in the final
+# binary. So a no-arg `unimplemented!()` stub links cleanly against any
+# declared signature (same technique tools/gen_qjs_shims.sh and
+# tools/gen_shims.sh already use for the QuickJS/JSC backends).
+#
+# GATE PRESERVATION (load-bearing, see C4/C6 docs): every symbol that also has
+# a REAL implementation in src/porffor/core.rs (only compiled when
+# `link_porffor` is on, see src/porffor/mod.rs) needs its stub here gated with
+# `#[cfg(not(feature = "link_porffor"))]`, or the real-symbol build gets a
+# duplicate-symbol error at codegen time (both the stub AND the real fn would
+# be defined in the same crate). This generator has no static way to know
+# which symbols core.rs will eventually implement, so it treats the CURRENTLY
+# gated set in the checked-in shims.rs as the source of truth and reapplies
+# those same gates to the freshly generated stub list (a symbol whose stub
+# disappears entirely, because core.rs now implements AND excludes it via
+# /tmp/porffor_implemented.txt, is simply dropped like any other newly
+# implemented symbol - nothing to gate). Re-running this script is therefore
+# idempotent w.r.t. gates: it neither drops an existing gate nor needs a new
+# one hand-added for a symbol whose real implementation predates this run.
+# A symbol getting a REAL implementation for the first time still needs its
+# gate hand-added once, in the same commit as the core.rs change (see the
+# CONSTRUCT/DESTRUCT/etc gate pattern already in shims.rs).
+#
+# Usage: tools/gen_porffor_shims.sh
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+OUT=src/porffor/shims.rs
+
+# Capture the CURRENTLY gated symbol set (the checked-in file, before we
+# overwrite it) so it can be reapplied below.
+PREV_GATED=/tmp/porffor_prev_gated.txt
+: > "$PREV_GATED"
+if [ -f "$OUT" ]; then
+  awk '
+    /#\[cfg\(not\(feature = "link_porffor"\)\)\]/ { gate = 1; next }
+    /#\[unsafe\(no_mangle\)\]/ { next }
+    /^pub extern "C" fn / {
+      if (gate) {
+        sym = $0
+        sub(/^pub extern "C" fn /, "", sym)
+        sub(/\(.*/, "", sym)
+        print sym
+      }
+      gate = 0
+      next
+    }
+    { gate = 0 }
+  ' "$OUT" | sort -u > "$PREV_GATED"
+fi
+
+# v8__* and v8_inspector__* symbols declared anywhere in the vendored crate.
+#
+# Two root causes of the earlier "the vendored rusty_v8 scope.rs/platform.rs
+# decls use a form gen_porffor_shims.sh did not capture" gap (which forced
+# hand-appending 14 symbols at the bottom of shims.rs) are fixed here:
+#
+# 1. FULL-IDENTIFIER match, not substring. A symbol like
+#    `std__shared_ptr__v8__Platform__CONVERT__std__unique_ptr` was being
+#    matched starting mid-identifier (at the embedded `v8__`), yielding a
+#    truncated, WRONG stub name that never satisfies the real symbol at link
+#    time. `[A-Za-z0-9_]*(v8__|v8_inspector__)[A-Za-z0-9_]+` captures the
+#    whole identifier.
+# 2. RECURSIVE file scan, not just the top-level `src/*.rs`. Some symbols
+#    (e.g. `v8__TryCatch__CONSTRUCT`, `v8__AllowJavascriptExecutionScope__
+#    CONSTRUCT`) are declared one directory deeper, in
+#    vendor/rusty_v8/src/scope/raw.rs; a flat `src/*.rs` glob silently misses
+#    that whole file. `find ... -name '*.rs'` walks every module file.
+find vendor/rusty_v8/src -name '*.rs' -print0 \
+  | xargs -0 grep -hoE '[A-Za-z0-9_]*(v8__|v8_inspector__)[A-Za-z0-9_]+' \
+  | sort -u > /tmp/porffor_all_syms.txt
+
+# Already hand-implemented in src/porffor/*.rs (excluding shims.rs itself).
+P='[A-Za-z0-9_]*(v8__|v8_inspector__)[A-Za-z0-9_]+'
+for f in src/porffor/*.rs; do
+  [ "$(basename "$f")" = shims.rs ] && continue
+  cat "$f" 2>/dev/null
+done > /tmp/porffor_all_src.txt
+{
+  { grep -oE "extern \"C\" fn ${P}" /tmp/porffor_all_src.txt || true; } \
+    | sed -E 's/.* //'
+  { grep -oE "!\(${P}" /tmp/porffor_all_src.txt || true; } \
+    | sed -E 's/^!\(//'
+} | sort -u > /tmp/porffor_implemented.txt
+
+# Symbols vendor/rusty_v8/src/**/*.rs itself DEFINES with #[unsafe(no_mangle)]
+# (the engine-independent "BASE" callback bridges for CustomPlatform tasks
+# and Value(De)Serializer::Delegate/Inspector Channel/Client trampolines, plus
+# the crdtp_shim.rs-provided inspector protocol). These are real definitions,
+# not just extern decls, and are compiled unconditionally for every backend,
+# so stubbing them again would be a duplicate-symbol error. Recursive for the
+# same reason as the /tmp/porffor_all_syms.txt scan above.
+while IFS= read -r -d '' f; do
+  awk '/#\[unsafe\(no_mangle\)\]/{getline; print}' "$f"
+done < <(find vendor/rusty_v8/src -name '*.rs' -print0) \
+  | grep -oE "${P}" | sort -u >> /tmp/porffor_implemented.txt
+sort -u /tmp/porffor_implemented.txt -o /tmp/porffor_implemented.txt
+
+# Symbols implemented in core.rs, which mod.rs only compiles under
+# `link_porffor`. These are NOT dropped from the stub list: they get a
+# `#[cfg(not(feature = "link_porffor"))]` stub so the stub-only build still
+# links, and no duplicate symbol exists in the linked build. Everything
+# implemented in an ungated file is dropped outright as before.
+# Files compiled only under `link_porffor` (see src/porffor/mod.rs). Includes
+# modules reused from another backend via #[path], which live outside
+# src/porffor/ and so are invisible to the scan above.
+PORFFOR_LINKED_SRC="src/porffor/core.rs src/porffor/init.rs src/quickjs/allocator.rs"
+{ cat $PORFFOR_LINKED_SRC 2>/dev/null | grep -oE "extern \"C\" fn ${P}" || true; } \
+  | sed -E 's/.* //' | sort -u > /tmp/porffor_core.txt
+comm -23 /tmp/porffor_implemented.txt /tmp/porffor_core.txt \
+  > /tmp/porffor_core_only.txt
+cat /tmp/porffor_core.txt >> "$PREV_GATED"
+sort -u "$PREV_GATED" -o "$PREV_GATED"
+
+{
+  echo "//! AUTO-GENERATED Porffor link stubs (tools/gen_porffor_shims.sh)."
+  echo "//!"
+  echo "//! Cycle 0/1 scaffold: every v8__*/v8_inspector__* symbol the vendored"
+  echo "//! rusty_v8 surface declares, stubbed as an unimplemented!() no-arg"
+  echo "//! function so the crate links with zero Porffor dependency. Real"
+  echo "//! implementations land incrementally in later cycles, same pattern as"
+  echo "//! the QuickJS backend (see tools/gen_qjs_shims.sh)."
+  echo "#![allow(non_snake_case)]"
+  echo
+  comm -23 <(sort -u /tmp/porffor_all_syms.txt) /tmp/porffor_core_only.txt \
+    | while read -r sym; do
+      [ -z "$sym" ] && continue
+      if grep -qxF "$sym" "$PREV_GATED"; then
+        echo "#[cfg(not(feature = \"link_porffor\"))]"
+      fi
+      echo "#[unsafe(no_mangle)]"
+      # Null-returning stub (NOT unimplemented!()): a panic in an extern "C" fn
+      # cannot unwind and aborts the WHOLE test process, masking every other
+      # pass in that binary (rusty_v8 runs a file's hundreds of tests in one
+      # process). Returning a null pointer instead means: void-returning setup
+      # symbols (SetFatalErrorHandler, AddMessageListener, ...) become true
+      # no-ops (the extra x0=null is ignored), and value-returning ones hand
+      # back a NULL handle the many `if this.is_null()` guards in core.rs
+      # short-circuit gracefully - so an unimplemented path fails ONE test
+      # instead of aborting the binary. Linking is name-only (the vendored
+      # extern decl's real signature is never type-checked against this stub),
+      # so a single null-pointer return satisfies every declared shape. Promote
+      # hot stubs to real bodies in core.rs.
+      echo "pub extern \"C\" fn ${sym}() -> *const ::std::ffi::c_void { ::std::ptr::null() }"
+    done
+} > "$OUT"
+
+GATED_NOW=$(grep -c 'cfg(not(feature = "link_porffor"))' "$OUT" || true)
+echo "porffor stubs: $(grep -c no_mangle "$OUT"), implemented: $(wc -l < /tmp/porffor_implemented.txt), gated: ${GATED_NOW}"

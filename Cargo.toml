@@ -84,6 +84,19 @@ quickjs = [
 ]
 # Compile + statically link the vendored QuickJS-ng sources (engine_quickjs).
 link_quickjs = []
+
+# Porffor backend. `engine_porffor` alone builds a pure-Rust stub backend so the
+# crate compiles and links with zero porffor dependency. Adding `link_porffor`
+# runs porffor over src/porffor/seed.js to emit its runtime (heap, collector,
+# builtins) as a linkable C object (`porf c --lib`) and links that.
+#
+# Porffor is an AOT compiler, not an interpreter: it has no runtime `eval`, so
+# `v8__Script__Compile` can only resolve source compiled into the binary ahead
+# of time. Point PORFFOR_DIR at a porffor checkout (default ../porffor).
+engine_porffor = []
+link_porffor = []
+# Stub-only porffor build; add link_porffor for a real engine.
+porffor = ["engine_porffor"]
 # Build JavaScriptCore from the vendored WebKit (JSCOnly port) and link that
 # instead of the system framework. Same C API, so jsc_sys.rs is unchanged.
 vendor_jsc = []
