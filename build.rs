@@ -178,6 +178,57 @@ fn main() {
     // wasm-c-api in src/quickjs/wasm.rs.
     build_wamr(&manifest_dir);
   }
+
+  // --- Porffor backend ---
+  // Porffor is an AOT compiler, so there is no engine library to link against:
+  // we compile the runtime *itself* out of porffor, by asking it to emit its
+  // heap, collector and builtins as a linkable object (`porf c --lib`). The
+  // seed is the contract -- porffor only emits builtins a compilation
+  // references, so what seed.js mentions is what this backend can reach.
+  if env::var_os("CARGO_FEATURE_LINK_PORFFOR").is_some() {
+    build_porffor(&manifest_dir);
+  }
+}
+
+/// Run porffor over `src/porffor/seed.js` with `--lib` and compile the emitted
+/// C into this crate. Override the porffor checkout with `PORFFOR_DIR`.
+fn build_porffor(manifest_dir: &Path) {
+  let porffor_dir = env::var_os("PORFFOR_DIR")
+    .map(PathBuf::from)
+    .unwrap_or_else(|| manifest_dir.join("..").join("porffor"));
+  let entry = porffor_dir.join("runtime").join("index.js");
+  assert!(
+    entry.exists(),
+    "porffor checkout not found at {} (set PORFFOR_DIR)",
+    porffor_dir.display()
+  );
+
+  let seed = manifest_dir.join("src").join("porffor").join("seed.js");
+  let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+  let generated = out_dir.join("porffor_lib.c");
+
+  let status = std::process::Command::new("node")
+    .arg(&entry)
+    .arg("c")
+    .arg("--lib")
+    .arg("--quiet")
+    .arg(&seed)
+    .arg("-o")
+    .arg(&generated)
+    .status()
+    .expect("failed to run porffor (is node on PATH?)");
+  assert!(status.success(), "porffor failed to compile {}", seed.display());
+
+  cc::Build::new()
+    .file(&generated)
+    .opt_level(2)
+    // Generated code, not ours to keep warning-clean.
+    .flag_if_supported("-w")
+    .flag_if_supported("-fno-strict-aliasing")
+    .compile("porffor_lib");
+
+  println!("cargo:rerun-if-changed={}", seed.display());
+  println!("cargo:rerun-if-env-changed=PORFFOR_DIR");
 }
 
 /// Init the pinned vendor submodules and apply our patch files on top.
